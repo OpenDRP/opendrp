@@ -277,7 +277,7 @@ class TestPostgreSQLProductionBoundary:
                     job_id=job.id,
                     threat_type="phishing",
                     channel="email",
-                    target=f"integration-{index}-{suffix}@example.test",
+                    target=f"integration-{suffix}@example.test",
                     payload={"phishing_domain": f"{index}-{suffix}.example"},
                     status=AlertDeliveryStatus.pending,
                     next_attempt_at=datetime.now(timezone.utc),
