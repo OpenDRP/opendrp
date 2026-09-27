@@ -29,6 +29,7 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
 
 # Least privilege, raised only where needed: reading the source, pushing images,
 # signing the attestations, and creating the release.
