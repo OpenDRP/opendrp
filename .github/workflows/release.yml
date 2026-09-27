@@ -175,7 +175,9 @@ jobs:
       # the gate actionable — a release cannot fail on a finding that has no fix
       # to apply, which would only teach maintainers to bypass it.
       - name: Scan the published image
-        uses: aquasecurity/trivy-action@b6643a29fecd7f34b3597bc6acb0a98b03d33ff8 # v0.33.1
+        # 0.35.0 is the first immutable, post-incident Trivy Action release;
+        # earlier tags were force-moved during the March 2026 compromise.
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # 0.35.0
         with:
           image-ref: ${{ steps.prefix.outputs.value }}/${{ matrix.image }}:${{ needs.verify-version.outputs.version }}
           format: table
