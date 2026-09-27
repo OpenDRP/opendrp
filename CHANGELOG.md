@@ -9,7 +9,7 @@ The version in `backend/app/__init__.py` is the single source of truth;
 `scripts/check_version_consistency.py` fails the build if this file disagrees
 with it.
 
-## [0.1.1] - Unreleased
+## [0.1.1] - 2026-09-27
 
 ### Security
 
