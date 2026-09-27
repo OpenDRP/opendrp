@@ -206,7 +206,7 @@ jobs:
           INTEGRATION_MIGRATION_DATABASE_URL: postgresql+asyncpg://opendrp:integration-password@127.0.0.1:5432/opendrp_migrations
           INTEGRATION_REDIS_URL: redis://:ci-redis-password@127.0.0.1:6379/0
           JWT_SECRET_KEY: ci-integration-jwt-secret-that-is-longer-than-32-characters
-          ENCRYPTION_KEY: Z0FBQUFBQmFja2VuZF9jaV9rZXlfZm9yXzMyX2J5dGVzX3Rlc3Q=
+          ENCRYPTION_KEY: NL_l17EbsITJOFSTSHqPXiEL7wWO-GUYc1V1esmo2Gk=
           # Missing connection wiring must fail the job instead of letting the
           # suites skip themselves: a silent skip looks exactly like success.
           REQUIRE_INTEGRATION: "1"
@@ -225,7 +225,7 @@ jobs:
           APP_ENV: integration
           DATABASE_URL: postgresql+asyncpg://opendrp:integration-password@127.0.0.1:5432/opendrp_migrations
           JWT_SECRET_KEY: ci-backup-jwt-secret-that-is-longer-than-32-characters
-          ENCRYPTION_KEY: Z0FBQUFBQmJhY2t1cF9jaV9rZXlfZm9yXzMyYnl0ZXM=
+          ENCRYPTION_KEY: NL_l17EbsITJOFSTSHqPXiEL7wWO-GUYc1V1esmo2Gk=
         run: alembic upgrade head
 
       # The dump and the restore both run inside postgres:17-alpine rather than
@@ -265,7 +265,7 @@ jobs:
           APP_ENV: integration
           DATABASE_URL: postgresql+asyncpg://opendrp:integration-password@127.0.0.1:5432/opendrp_migrations
           JWT_SECRET_KEY: ci-chain-jwt-secret-that-is-longer-than-32-characters
-          ENCRYPTION_KEY: Z0FBQUFBQmNoYWluX2NpX2tleV9mb3JfMzJfYnl0ZXM=
+          ENCRYPTION_KEY: NL_l17EbsITJOFSTSHqPXiEL7wWO-GUYc1V1esmo2Gk=
           AUDIT_CHAIN_KEYS: ci-audit-chain-key-that-is-longer-than-32-characters
         run: |
           python - <<'PY'
@@ -365,7 +365,7 @@ jobs:
       # exemption — that is exactly how an exemption becomes permanent).
       REDIS_PASSWORD: ci-redis-password
       JWT_SECRET_KEY: ci-jwt-secret-that-is-longer-than-32-characters
-      ENCRYPTION_KEY: Z0FBQUFBQmFja2VuZF9jaV9rZXlfZm9yXzMyX2J5dGVzX3Rlc3Q=
+      ENCRYPTION_KEY: NL_l17EbsITJOFSTSHqPXiEL7wWO-GUYc1V1esmo2Gk=
       # Per-connector credentials are required by Compose; there is no shared
       # connector secret any more.
       CONNECTOR_TOKEN_DNSTWIST: ci-dnstwist-connector-token
@@ -494,10 +494,10 @@ jobs:
         language: [python, javascript-typescript]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: github/codeql-action/init@faaca9a8f6edddba5725ffe5adefdab6669a2eca # v3
+      - uses: github/codeql-action/init@1190a975f95ce23525efb6a3fc21ea29567c1b52 # v3.38.2
         with:
           language: ${{ matrix.language }}
-      - uses: github/codeql-action/analyze@faaca9a8f6edddba5725ffe5adefdab6669aeca # v3
+      - uses: github/codeql-action/analyze@1190a975f95ce23525efb6a3fc21ea29567c1b52 # v3.38.2
 
   # Supply-chain gate. Pinned dependencies only help if someone notices when a
   # pinned version becomes vulnerable, so this job fails on a known advisory in

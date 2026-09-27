@@ -15,11 +15,11 @@ rather than trusted:
 * **the header is not sent when it should be** — the deployment believes it is
   protected by a control that is not there, which only shows up in an audit.
 
-The script is run with `sh`, the way the image runs it. `nginx` is deliberately
-absent from the PATH these tests use: the script skips its own `nginx -t` when the
-binary is missing, and the syntax that check would validate is asserted here as
-text instead. What loads the rendered include inside a real container is covered
-by `tests/test_hsts_wiring.py` (the configuration contract) and by the end-to-end
+The script is run with `sh`, the way the image runs it. A tiny `nginx` test stub
+accepts only `nginx -t`, so a runner's globally installed nginx cannot make these
+tests depend on its config or permissions; the directive syntax is asserted here
+as text. What loads the rendered include inside a real container is covered by
+`tests/test_hsts_wiring.py` (the configuration contract) and by the end-to-end
 verification in `docs/deployment.md`.
 """
 
@@ -63,6 +63,17 @@ def _render(tmp_path: Path, *arguments: str, **environment: str) -> Tuple[subpro
     """
     include = tmp_path / "hsts.inc"
     env = {key: value for key, value in os.environ.items() if not key.startswith("HSTS_")}
+    # Some hosted runners install nginx globally. Put a strict stub first so the
+    # script's optional `nginx -t` can never inspect runner config or permissions.
+    test_bin = tmp_path / "bin"
+    test_bin.mkdir(exist_ok=True)
+    nginx_stub = test_bin / "nginx"
+    nginx_stub.write_text(
+        '#!/bin/sh\n[ "$#" -eq 1 ] && [ "$1" = "-t" ] || exit 2\n',
+        encoding="utf-8",
+    )
+    nginx_stub.chmod(0o755)
+    env["PATH"] = os.pathsep.join((str(test_bin), os.environ.get("PATH", "")))
     env.update(environment)
     result = subprocess.run(
         ["sh", str(_SCRIPT), *arguments, str(include)],

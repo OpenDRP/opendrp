@@ -69,7 +69,8 @@ _MAX_BREAKDOWN_VALUES = 4
 _OMISSION_NOTE_RESERVE = 64
 #: Hosts whose "link" would point at the reader's own machine rather than at
 #: this installation.
-_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "0.0.0.0"})
+# B104 is about binding a listener, not rejecting a URL host supplied as input.
+_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "0.0.0.0"})  # nosec B104
 #: The finding list a delivered message links to, per threat type. A module
 #: declared at runtime has its own page, named by its registry id.
 _FINDING_PATHS = {"phishing": "/phishing", "breach": "/breaches"}
