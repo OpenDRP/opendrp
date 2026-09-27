@@ -1,0 +1,192 @@
+# Release pipeline.
+#
+# A tag is the point where several claims have to become true at once: the code
+# says one version, the images are the ones that version was built from, and an
+# operator pulling `0.2.0` gets bytes somebody can audit. This workflow is what
+# turns `git tag` into that, rather than into a label on a commit.
+#
+# It runs on `v*` tags and does four things, in order:
+#
+#   1. Verifies the tag against `backend/app/__init__.py`. A tag that disagrees
+#      with the code would publish images whose `/api/v1/health` reports a
+#      version no release note describes.
+#   2. Builds and pushes every image Compose references, with per-image SBOM and
+#      build provenance attestations. Attestations are what let an operator check
+#      *which* workflow and source revision produced an image without trusting
+#      this repository's word for it.
+#   3. Scans each pushed image for known vulnerabilities and fails the release
+#      on an unfixed HIGH or CRITICAL finding. A released image is the artifact
+#      customers actually run, so this is the last place the check is meaningful.
+#   4. Publishes the GitHub release with the notes taken from `CHANGELOG.md`, so
+#      the curated entry — not a generated commit list — is what a user reads.
+#
+# Actions are pinned to commit SHAs; Dependabot updates them (see
+# .github/dependabot.yml).
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+# Least privilege, raised only where needed: reading the source, pushing images,
+# signing the attestations, and creating the release.
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify-version:
+    name: Tag matches the code
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+      - name: Fail if app, pyproject and CHANGELOG disagree
+        run: python scripts/check_version_consistency.py
+      - id: version
+        name: Fail if the tag does not name the code's version
+        run: |
+          set -euo pipefail
+          version=$(python - <<'PY'
+          import ast, pathlib
+          tree = ast.parse(pathlib.Path("backend/app/__init__.py").read_text(encoding="utf-8"))
+          for node in tree.body:
+              if isinstance(node, ast.Assign):
+                  for target in node.targets:
+                      if isinstance(target, ast.Name) and target.id == "__version__":
+                          print(node.value.value)
+          PY
+          )
+          if [ "v${version}" != "${GITHUB_REF_NAME}" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match app/__init__.py (v${version})"
+            exit 1
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+  build-and-push:
+    name: Build ${{ matrix.image }}
+    needs: verify-version
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Contexts mirror docker-compose.yml exactly. An image built here from
+          # a different context than the one Compose builds is how the published
+          # artifact and the documented deployment drift apart.
+          - image: backend
+            context: ./backend
+            dockerfile: ./backend/Dockerfile
+          - image: frontend
+            context: .
+            dockerfile: ./frontend/Dockerfile
+          - image: connector-dnstwist
+            context: .
+            dockerfile: ./connectors/dnstwist/Dockerfile
+          - image: connector-shodan
+            context: .
+            dockerfile: ./connectors/shodan/Dockerfile
+          - image: connector-hibp
+            context: .
+            dockerfile: ./connectors/hibp/Dockerfile
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Compute lower-case image prefix
+        id: prefix
+        run: echo "value=ghcr.io/$(echo '${{ github.repository_owner }}/opendrp' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Two tags per image: the exact release, and `latest`. Compose defaults to
+      # `latest` and pins with OPENDRP_VERSION=<release>, so both are needed —
+      # but the release tag is the one to deploy, and `latest` exists only so an
+      # unpinned `make up` is not a broken reference.
+      - name: Tags and labels
+        id: meta
+        run: |
+          echo "tags=${{ steps.prefix.outputs.value }}/${{ matrix.image }}:${{ needs.verify-version.outputs.version }},${{ steps.prefix.outputs.value }}/${{ matrix.image }}:latest" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push with SBOM and provenance
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          # `sbom` and `provenance` are attestations attached to the image rather
+          # than files lost in a workflow artifact: whoever pulls the image can
+          # ask the registry what it contains and how it was built.
+          sbom: true
+          provenance: mode=max
+          build-args: |
+            VITE_API_BASE_URL=/api/v1
+            VITE_APP_VERSION=${{ needs.verify-version.outputs.version }}
+          cache-from: type=gha,scope=${{ matrix.image }}
+          cache-to: type=gha,scope=${{ matrix.image }},mode=max
+
+      # The scan runs against the pushed digest, not a local build: it is the
+      # published artifact that an operator deploys, and `ignore-unfixed` keeps
+      # the gate actionable — a release cannot fail on a finding that has no fix
+      # to apply, which would only teach maintainers to bypass it.
+      - name: Scan the published image
+        uses: aquasecurity/trivy-action@b6643a29fecd7f34b3597bc6acb0a98b03d33ff8 # v0.33.1
+        with:
+          image-ref: ${{ steps.prefix.outputs.value }}/${{ matrix.image }}:${{ needs.verify-version.outputs.version }}
+          format: table
+          exit-code: "1"
+          ignore-unfixed: true
+          severity: HIGH,CRITICAL
+          vuln-type: os,library
+
+  release:
+    name: Publish the release
+    needs: [verify-version, build-and-push]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Extract the notes for this version from CHANGELOG.md
+        run: |
+          set -euo pipefail
+          python - "${{ needs.verify-version.outputs.version }}" <<'PY'
+          import pathlib, re, sys
+
+          version = sys.argv[1]
+          text = pathlib.Path("CHANGELOG.md").read_text(encoding="utf-8")
+          pattern = re.compile(rf"^##\s+\[{re.escape(version)}\].*?$(.*?)(?=^##\s+\[|\Z)", re.MULTILINE | re.DOTALL)
+          match = pattern.search(text)
+          if not match:
+              sys.exit(f"CHANGELOG.md has no [{version}] section to publish")
+          body = match.group(1).strip()
+          pathlib.Path("release-notes.md").write_text(body + "\n", encoding="utf-8")
+          PY
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "OpenDRP ${GITHUB_REF_NAME}" \
+            --notes-file release-notes.md \
+            --verify-tag

@@ -1,0 +1,557 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    # The suite runs four times over (tests, connectors, the coverage floor, the
+    # per-module gate) and takes about a quarter of an hour. The bound is for the
+    # step that stops returning: a hung job is otherwise indistinguishable from a
+    # slow one until the six-hour default expires.
+    timeout-minutes: 40
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd="redis-cli ping"
+          --health-interval=5s
+          --health-timeout=3s
+          --health-retries=12
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+      - name: Install backend dependencies
+        run: pip install --requirement requirements-dev.txt
+      - name: Compile Python sources
+        run: python -m compileall -q app scripts tests
+      - name: Run Ruff lint
+        # The repository-level gates and the setup wizard live outside this
+        # working directory (scripts/ and the checkout root) and are linted with
+        # the same default configuration, so a root script cannot rot unlinted.
+        run: ruff check app scripts tests ../scripts ../setup.py
+      - name: Check Alembic revision graph structure
+        # Instant and database-free: exactly one head, intact ancestry, and no
+        # silently empty downgrade() that would make rollback impossible.
+        run: python scripts/check_migrations.py
+      - name: Check the ORM models against the schema the revisions build
+        # The incident this exists for: `SystemSettings` mapped a column no
+        # revision created, so `docker compose up` on a fresh checkout ended in
+        # an unhealthy backend and a restart loop while this suite stayed green.
+        # Database-free and instant, and it runs before any image is built.
+        run: python -m scripts.check_schema_drift
+      - name: Run backend tests
+        env:
+          APP_ENV: test
+          TESTING: "1"
+          DATABASE_URL: sqlite+aiosqlite:///./ci.sqlite3
+          REDIS_URL: redis://127.0.0.1:6379/0
+          # The default C tracer mis-reports async task frames in this stack;
+          # sysmon keeps coverage truthful (~76% vs an understated 67%).
+          COVERAGE_CORE: sysmon
+        run: python -m pytest -q
+      - name: Run connector runtime tests
+        env:
+          APP_ENV: test
+          TESTING: "1"
+          DATABASE_URL: sqlite+aiosqlite:///./ci-connectors.sqlite3
+          REDIS_URL: redis://127.0.0.1:6379/0
+          COVERAGE_CORE: sysmon
+        run: python -m pytest -q tests/test_connector_runtime.py tests/test_connector_sdk_contract.py
+      - name: Enforce coverage floor
+        env:
+          APP_ENV: test
+          TESTING: "1"
+          DATABASE_URL: sqlite+aiosqlite:///./ci-coverage.sqlite3
+          REDIS_URL: redis://127.0.0.1:6379/0
+          COVERAGE_CORE: sysmon
+        run: python -m pytest -q --cov=app --cov-report=term-missing --cov-fail-under=70
+      - name: Enforce critical backend coverage gate
+        env:
+          APP_ENV: test
+          TESTING: "1"
+          DATABASE_URL: sqlite+aiosqlite:///./ci-critical-coverage.sqlite3
+          REDIS_URL: redis://127.0.0.1:6379/0
+          COVERAGE_CORE: sysmon
+        run: >-
+          python -m pytest -q
+          --cov=app.core.security
+          --cov=app.core.crypto
+          --cov=app.api.deps
+          --cov=app.services.connector_manifest
+          --cov=app.services.connector_service
+          --cov=app.services.connector_credentials
+          --cov=app.services.module_registry
+          --cov=app.services.ingestion_service
+          --cov=app.core.request_rate_limit
+          --cov=app.services.alert_service
+          --cov=app.services.alert_delivery_service
+          --cov=app.tasks.alert_tasks
+          --cov=app.api.v1.routers.alerts
+          --cov=app.core.health
+          --cov=app.tasks.report_tasks
+          --cov=app.services.phishing.whois_service
+          --cov-report=json:coverage-critical.json
+          --cov-report=term-missing
+      - name: Validate per-module critical coverage thresholds
+        run: python scripts/check_critical_coverage.py coverage-critical.json
+      - name: Enforce mypy error baseline (ratchet down to zero)
+        run: python scripts/check_mypy_baseline.py
+
+  production-integration:
+    runs-on: ubuntu-latest
+    # A hang is not a failure here, it is a job that holds a runner for the
+    # six-hour default. This job takes about half an hour; the bound exists so
+    # that a step which never returns (the shape the backup loop had) is reported
+    # as a failure with a timestamp instead of as silence.
+    timeout-minutes: 45
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: opendrp
+          POSTGRES_PASSWORD: integration-password
+          POSTGRES_DB: opendrp_integration
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U opendrp -d opendrp_integration"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=12
+      # Redis is deliberately *not* a service container here. GitHub Actions
+      # passes a service's `options:` to `docker create`, which has no way to
+      # give the container a command — and `redis-server --requirepass` is the
+      # command. It is started with `docker run` in a step below instead.
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+      - name: Install backend dependencies
+        run: pip install --requirement requirements-dev.txt
+
+      # The broker runs with a password here for the same reason it does in
+      # production: a suite that only ever talks to an open Redis cannot notice
+      # the day the platform stops sending its credential.
+      - name: Start the broker with the password the platform requires
+        run: |
+          docker run --detach --name integration-redis \
+            --publish 6379:6379 \
+            redis:7-alpine redis-server --requirepass ci-redis-password
+          for attempt in $(seq 1 30); do
+            if docker exec integration-redis \
+                 redis-cli --no-auth-warning -a ci-redis-password ping | grep -q PONG; then
+              echo "broker is answering an authenticated PING"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "the broker never became ready" >&2
+          docker logs integration-redis >&2
+          exit 1
+
+      - name: Create isolated migration database
+        env:
+          PGHOST: 127.0.0.1
+          PGPORT: "5432"
+          PGUSER: opendrp
+          PGPASSWORD: integration-password
+        run: |
+          python - <<'PY'
+          import asyncio
+          import asyncpg
+
+          async def create_database():
+              connection = await asyncpg.connect(
+                  host="127.0.0.1",
+                  port=5432,
+                  user="opendrp",
+                  password="integration-password",
+                  database="postgres",
+              )
+              try:
+                  exists = await connection.fetchval(
+                      "SELECT 1 FROM pg_database WHERE datname = 'opendrp_migrations'"
+                  )
+                  if not exists:
+                      await connection.execute("CREATE DATABASE opendrp_migrations")
+              finally:
+                  await connection.close()
+
+          asyncio.run(create_database())
+          PY
+      - name: Run PostgreSQL and Redis integration tests
+        env:
+          APP_ENV: integration
+          TESTING: "0"
+          DATABASE_URL: postgresql+asyncpg://opendrp:integration-password@127.0.0.1:5432/opendrp_integration
+          REDIS_URL: redis://:ci-redis-password@127.0.0.1:6379/0
+          INTEGRATION_DATABASE_URL: postgresql+asyncpg://opendrp:integration-password@127.0.0.1:5432/opendrp_integration
+          INTEGRATION_MIGRATION_DATABASE_URL: postgresql+asyncpg://opendrp:integration-password@127.0.0.1:5432/opendrp_migrations
+          INTEGRATION_REDIS_URL: redis://:ci-redis-password@127.0.0.1:6379/0
+          JWT_SECRET_KEY: ci-integration-jwt-secret-that-is-longer-than-32-characters
+          ENCRYPTION_KEY: Z0FBQUFBQmFja2VuZF9jaV9rZXlfZm9yXzMyX2J5dGVzX3Rlc3Q=
+          # Missing connection wiring must fail the job instead of letting the
+          # suites skip themselves: a silent skip looks exactly like success.
+          REQUIRE_INTEGRATION: "1"
+        run: >-
+          python -m pytest -q
+          tests/test_production_integrations.py tests/test_alembic_migrations.py
+          -m integration --junitxml=integration.xml
+      - name: Verify integration suite actually ran
+        run: python scripts/check_integration_ran.py integration.xml --min-passed 13
+
+      # Backup correctness is a property that only a real restore can establish,
+      # so it is exercised here rather than trusted. A backup path that is never
+      # run is a belief, and beliefs about backups fail during incidents.
+      - name: Migrate a database to head (the state a real backup captures)
+        env:
+          APP_ENV: integration
+          DATABASE_URL: postgresql+asyncpg://opendrp:integration-password@127.0.0.1:5432/opendrp_migrations
+          JWT_SECRET_KEY: ci-backup-jwt-secret-that-is-longer-than-32-characters
+          ENCRYPTION_KEY: Z0FBQUFBQmJhY2t1cF9jaV9rZXlfZm9yXzMyYnl0ZXM=
+        run: alembic upgrade head
+
+      # The dump and the restore both run inside postgres:17-alpine rather than
+      # in the runner's own shell: pg_dump refuses to dump a newer server, and
+      # the runner's client major version is not ours to choose.
+      - name: Take a backup
+        # BACKUP_ONCE=1, or the script does what the compose profile asks of it:
+        # one pass and then `sleep $BACKUP_INTERVAL_SEC`, which with the default
+        # interval hangs this step for 24 hours instead of returning.
+        run: |
+          docker run --rm --network host \
+            -v "${{ github.workspace }}/scripts:/backup-scripts:ro" \
+            -v "${{ github.workspace }}/backups:/backups" \
+            -e PGHOST=127.0.0.1 -e PGUSER=opendrp -e PGPASSWORD=integration-password \
+            -e PGDATABASE=opendrp_migrations -e BACKUP_DIR=/backups \
+            -e BACKUP_ONCE=1 \
+            postgres:17-alpine sh /backup-scripts/backup.sh
+
+      - name: Prove the backup restores into a scratch database
+        run: |
+          docker run --rm --network host \
+            -v "${{ github.workspace }}/scripts:/backup-scripts:ro" \
+            -v "${{ github.workspace }}/backups:/backups" \
+            -e PGHOST=127.0.0.1 -e PGUSER=opendrp -e PGPASSWORD=integration-password \
+            -e BACKUP_DIR=/backups \
+            postgres:17-alpine sh /backup-scripts/verify_restore.sh
+
+      # The chain's own tests run on SQLite, where the position is "max + 1" and
+      # there is no advisory lock to take. Both PostgreSQL-only paths —
+      # `nextval` on the sequence the migration created, and the
+      # transaction-scoped lock that serialises appends — are exercised here or
+      # nowhere, so this writes real entries against a real server, verifies
+      # them, tampers with one and checks that the pass notices. A chain that
+      # only ever verified in the test database is a chain nobody has seen work.
+      - name: Prove the audit chain on PostgreSQL
+        env:
+          APP_ENV: integration
+          DATABASE_URL: postgresql+asyncpg://opendrp:integration-password@127.0.0.1:5432/opendrp_migrations
+          JWT_SECRET_KEY: ci-chain-jwt-secret-that-is-longer-than-32-characters
+          ENCRYPTION_KEY: Z0FBQUFBQmNoYWluX2NpX2tleV9mb3JfMzJfYnl0ZXM=
+          AUDIT_CHAIN_KEYS: ci-audit-chain-key-that-is-longer-than-32-characters
+        run: |
+          python - <<'PY'
+          import asyncio
+
+          from sqlalchemy import text
+
+          from app.core.audit import AuditLogger
+          from app.core.audit_chain import GENESIS_PREV_HASH, verify
+          from app.core.database import AsyncSessionLocal
+
+          async def main():
+              # A scratch database, but not necessarily an empty one: migration
+              # tests may have written before this step. Clearing it is what makes
+              # "the first entry links to genesis" a statement about the writer
+              # rather than about the order the job happens to run in.
+              async with AsyncSessionLocal() as db:
+                  await db.execute(text("TRUNCATE drp_audit_logs"))
+                  await db.execute(text("TRUNCATE drp_audit_chain"))
+                  await db.execute(
+                      text("ALTER SEQUENCE drp_audit_logs_seq_seq RESTART WITH 1")
+                  )
+                  await db.commit()
+
+              async with AsyncSessionLocal() as db:
+                  for index in range(5):
+                      await AuditLogger.emit(
+                          db,
+                          action="asset.view",
+                          ip_address="203.0.113.7",
+                          details={"index": index},
+                      )
+
+              async with AsyncSessionLocal() as db:
+                  intact = await verify(db, full=True)
+              assert intact.ok, intact.as_details()
+              assert intact.checked == 5, intact.as_details()
+
+              # Positions come from the sequence, so they are contiguous from 1
+              # and the first entry links to genesis.
+              async with AsyncSessionLocal() as db:
+                  rows = (
+                      await db.execute(
+                          text(
+                              "SELECT seq, prev_hash FROM drp_audit_logs "
+                              "ORDER BY seq"
+                          )
+                      )
+                  ).all()
+              assert [int(row[0]) for row in rows] == [1, 2, 3, 4, 5], rows
+              assert rows[0][1] == GENESIS_PREV_HASH, rows[0][1]
+
+              async with AsyncSessionLocal() as db:
+                  await db.execute(
+                      text("UPDATE drp_audit_logs SET action = 'asset.delete' WHERE seq = 3")
+                  )
+                  await db.commit()
+
+              async with AsyncSessionLocal() as db:
+                  broken = await verify(db, full=True)
+              assert not broken.ok, "an edited row must not verify"
+              assert broken.first_broken_seq == 3, broken.as_details()
+              print("audit chain on PostgreSQL: intact pass and tampering pass")
+
+          asyncio.run(main())
+          PY
+
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "20"
+      - name: Install frontend dependencies
+        # package-lock.json is committed so CI and image builds use the exact dependency graph.
+        run: npm ci --no-audit --no-fund
+      - name: Run frontend tests with coverage
+        run: npm run test:coverage
+      - name: Typecheck and build frontend
+        run: npm run build
+
+  compose:
+    runs-on: ubuntu-latest
+    env:
+      # `test`, not `production`: config.py enforces production-only rules
+      # (AUTH_COOKIE_SECURE, no placeholder secrets) that this job is not about.
+      APP_ENV: test
+      POSTGRES_USER: opendrp
+      POSTGRES_PASSWORD: ci-postgres-password
+      POSTGRES_DB: opendrp
+      # Required by the Compose file's interpolation, not by this job's logic:
+      # the broker starts with `--requirepass` in every shape ("test" is not an
+      # exemption — that is exactly how an exemption becomes permanent).
+      REDIS_PASSWORD: ci-redis-password
+      JWT_SECRET_KEY: ci-jwt-secret-that-is-longer-than-32-characters
+      ENCRYPTION_KEY: Z0FBQUFBQmFja2VuZF9jaV9rZXlfZm9yXzMyX2J5dGVzX3Rlc3Q=
+      # Per-connector credentials are required by Compose; there is no shared
+      # connector secret any more.
+      CONNECTOR_TOKEN_DNSTWIST: ci-dnstwist-connector-token
+      CONNECTOR_TOKEN_SHODAN: ci-shodan-connector-token
+      CONNECTOR_TOKEN_HIBP: ci-hibp-connector-token
+      AUTH_COOKIE_SECURE: "false"
+      CORS_ORIGINS: '["http://localhost:3000"]'
+      TRUSTED_PROXY_IPS: 127.0.0.1,::1
+      UVICORN_FORWARDED_ALLOW_IPS: 127.0.0.1
+      OPENDRP_NETWORK_SUBNET: 172.18.0.0/16
+      SHODAN_API_KEY: ci-shodan-key
+      HIBP_API_KEY: ci-hibp-key
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      # Three shapes, each one a file set something real runs. Validating only the
+      # merged file would leave the installation unchecked — and it is the one that
+      # faces the internet, with no source mounts and a read-only root filesystem —
+      # while the replica scenario is the one whose `!reset` tags a Compose upgrade
+      # could silently break. The overlay is validated because the test and lint
+      # targets need it, not because it is a way to deploy.
+      - name: Validate the tooling shape (base + overlay, as `make up-tools` uses)
+        run: docker compose -f docker-compose.yml -f docker-compose.dev.yml config --quiet
+      - name: Validate the installation shape (base file only, as `make up` uses)
+        run: docker compose -f docker-compose.yml config --quiet
+      - name: Validate the two-replica shape
+        run: docker compose -f docker-compose.yml -f docker-compose.replicas.yml config --quiet
+      - name: Validate that two API replicas are possible
+        # `config` alone would not notice a `container_name` or a published port
+        # creeping back into the production file: both parse fine, and both make
+        # `deploy.replicas: 2` impossible at run time. Read as text rather than as
+        # YAML, because the `!reset` tags have no constructor in a plain loader.
+        run: |
+          python3 - <<'PY'
+          import pathlib
+          import re
+
+          base = pathlib.Path("docker-compose.yml").read_text(encoding="utf-8")
+          replicas = pathlib.Path("docker-compose.replicas.yml").read_text(encoding="utf-8")
+
+          # The reset tags below only mean something while the base file really
+          # does pin the API to one container.
+          assert "container_name: opendrp-backend" in base, (
+              "docker-compose.yml no longer names the API container; the reset in "
+              "docker-compose.replicas.yml is now stale"
+          )
+          assert re.search(r'^\s*-\s*"\$\{BACKEND_PORT', base, re.MULTILINE), (
+              "docker-compose.yml no longer publishes the API port; the reset is stale"
+          )
+          for needle in ("container_name: !reset null", "ports: !reset []", "replicas: 2"):
+              assert needle in replicas, f"docker-compose.replicas.yml is missing {needle!r}"
+          print("replica shape: OK - API container name and published port are released, replicas=2")
+          PY
+
+  # Repository hygiene. An over-broad ignore rule removes source from a clone
+  # without failing anything locally, which is how frontend/src/lib was once
+  # excluded from the repository by a bare `lib/` Python pattern.
+  repo-hygiene:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Fail if ignore rules exclude source files
+        run: python3 scripts/check_tracked_sources.py .
+      - name: Fail if any service loses its healthcheck, log bound or network split
+        run: python3 scripts/check_compose_healthchecks.py docker-compose.yml
+      - name: Fail if SPA routes can collide with static directories
+        run: python3 scripts/check_frontend_spa.py
+      # `.env.example` is the configuration reference: the README points at it and
+      # docs/upgrading.md tells an operator to diff it. A setting it documents but
+      # Compose never passes is a control that does not exist; a variable Compose
+      # reads that it never mentions is a knob nobody can find.
+      - name: Fail if .env.example and the Compose files disagree
+        run: python3 scripts/check_env_template.py
+      # A command held together by trailing backslashes is a bash/zsh idiom.
+      # An operator on Windows pastes it, the first line runs without its
+      # arguments and the rest is parsed as expressions: the documentation, the
+      # template and the operator-facing docstrings are checked for it.
+      - name: Fail if a documented command is not portable
+        run: python3 scripts/check_portable_commands.py
+      - name: Fail if the setup wizard does not parse
+        run: python3 -m compileall -q setup.py
+      # Three files carry the platform version. A release tagged from a commit
+      # that disagrees with itself produces images reporting a version no
+      # release note describes, and the moment to notice that is now.
+      - name: Fail if the platform version disagrees with itself
+        run: python3 scripts/check_version_consistency.py
+
+  # Secret scanning over the full history, not just the working tree: a key that
+  # was committed once and "removed" in a later commit is still in every clone.
+  secrets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      # The gitleaks OSS binary in a container rather than gitleaks-action: the
+      # action requires a licence for organisation-owned repositories, and a gate
+      # that cannot run is worse than no gate. `--redact` keeps a matched secret
+      # out of the job log. `.gitleaks.toml` allowlists test fixtures and
+      # documentation examples by path — narrowly, and nothing else.
+      #
+      # `-u $(id -u):$(id -g)` and `HOME=/tmp` are not incidental: gitleaks reads
+      # history through `git`, and root reading a checkout owned by the runner's
+      # user makes git refuse with "detected dubious ownership". Matching the
+      # runner's uid is the fix that does not require relaxing that check.
+      - name: Fail if a credential is present anywhere in the history
+        run: |
+          docker run --rm -u "$(id -u):$(id -g)" -e HOME=/tmp \
+            -v "$PWD:/repo" -w /repo \
+            ghcr.io/gitleaks/gitleaks:v8.30.1 \
+            detect --source . --config .gitleaks.toml --redact --no-banner
+
+  # CodeQL runs only once the repository is public: analysing a private
+  # repository needs GitHub Advanced Security, and a job that cannot start would
+  # just train maintainers to ignore a red workflow. The configuration is here
+  # so that the day the repository is opened is the day the analysis begins.
+  codeql:
+    runs-on: ubuntu-latest
+    if: github.event.repository.visibility == 'public'
+    permissions:
+      security-events: write
+      contents: read
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [python, javascript-typescript]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: github/codeql-action/init@faaca9a8f6edddba5725ffe5adefdab6669a2eca # v3
+        with:
+          language: ${{ matrix.language }}
+      - uses: github/codeql-action/analyze@faaca9a8f6edddba5725ffe5adefdab6669aeca # v3
+
+  # Supply-chain gate. Pinned dependencies only help if someone notices when a
+  # pinned version becomes vulnerable, so this job fails on a known advisory in
+  # either dependency tree. If an advisory has no released fix, add it here as
+  # an explicit `--ignore-vuln <ID>` with the reason in a comment — never by
+  # dropping the gate.
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+      - name: Audit backend dependencies for known vulnerabilities
+        working-directory: backend
+        # requirements.txt is the runtime set, i.e. exactly what the production
+        # image installs — that is the surface a CVE here can actually reach.
+        # This check must stay green: if an advisory has no released fix, add an
+        # explicit `--ignore-vuln <ID>` line with the reason in a comment rather
+        # than dropping the step.
+        run: |
+          python -m pip install --upgrade pip pip-audit
+          pip-audit --strict --requirement requirements.txt
+
+      # Static analysis of our own code, which pip-audit cannot see: someone
+      # else's CVE is tracked above, a mistake in this repository is not. The
+      # gate is set at medium severity and medium confidence, and the current
+      # tree is clean at that level — so a hit here is new, and means something.
+      - name: Scan for insecure code patterns
+        run: |
+          python -m pip install --upgrade bandit
+          bandit --quiet \
+            --severity-level medium --confidence-level medium \
+            -r app ../connectors/base ../connectors/dnstwist \
+               ../connectors/shodan ../connectors/hibp
+        working-directory: backend
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "20"
+      - name: Audit shipped frontend dependencies for known vulnerabilities
+        working-directory: frontend
+        # Blocking gate over production dependencies only (`--omit=dev`), which
+        # is what ends up in the served bundle.
+        run: npm audit --omit=dev --audit-level=high
+      - name: Report build-toolchain advisories
+        working-directory: frontend
+        # Reported, not gated: every remaining advisory is in a devDependency
+        # (vite / esbuild / vitest) and each fix is a major version bump, which
+        # is a migration of its own. Kept visible here so the list cannot be
+        # forgotten. Shipped code is covered by the step above.
+        continue-on-error: true
+        run: npm audit
+      - name: Review new dependencies introduced by this pull request
+        if: github.event_name == 'pull_request'
+        uses: actions/dependency-review-action@2031cfc080254a8a887f58cffee85186f0e49e48 # v4.9.0
+        with:
+          fail-on-severity: high

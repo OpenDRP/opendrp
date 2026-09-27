@@ -1,0 +1,851 @@
+# ==============================================================================
+# Shared logging policy
+# ==============================================================================
+# Every container writes to stdout/stderr (12-factor) and Docker's json-file
+# driver keeps that on the host. Without a bound, those files grow until the
+# volume they live on is full — and for this stack that failure mode is the
+# audit trail silently stopping, because a full disk is a write error, not an
+# alert.
+#
+# 10 MB x 5 files per container is roughly 50 MB per service, which is days of
+# history for a small deployment and enough for `docker compose logs` to stay
+# useful when something just broke. It is deliberately *not* the retention
+# policy: durable audit history belongs in the log pipeline (see
+# docs/observability.md), not in the Docker log file.
+#
+# If the host already runs a collector or a log driver (Elastic Agent, Vector,
+# Promtail, syslog), replace this with that driver instead of stacking both:
+#
+#   x-logging: &default-logging
+#     driver: gelf
+#     options:
+#       gelf-address: "udp://127.0.0.1:12201"
+#
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
+services:
+  # ---------------------------------------------------------------------------
+  # PostgreSQL 17 — Primary Database
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:17-alpine
+    container_name: opendrp-postgres
+    restart: unless-stopped
+    mem_limit: 1g
+    cpus: "1.0"
+    pids_limit: 256
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?Set POSTGRES_USER in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set a strong POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:?Set POSTGRES_DB in .env}
+    ports:
+      # Bind to loopback ONLY to prevent unintended network exposure of the DB.
+      # If you need remote access (e.g. from DBeaver on another host), set
+      # POSTGRES_PORT=0.0.0.0:5432 in .env explicitly.
+      - "${POSTGRES_PORT:-127.0.0.1:5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    logging: *default-logging
+    networks:
+      - opendrp-net
+
+  # ---------------------------------------------------------------------------
+  # Redis 7 — Celery broker + cache
+  # ---------------------------------------------------------------------------
+  # Redis is not "just a cache" in this deployment: it is the Celery broker. A
+  # process that can reach it can read other connectors' job payloads, push a
+  # task the worker will execute with the platform's own database credentials,
+  # and clear the rate-limit counters that slow down a password guessing run.
+  # An unauthenticated broker on a network shared with third-party connector
+  # containers is therefore the widest door in the stack.
+  redis:
+    image: redis:7-alpine
+    container_name: opendrp-redis
+    restart: unless-stopped
+    mem_limit: 512m
+    cpus: "0.5"
+    pids_limit: 128
+    environment:
+      # Read by the healthcheck only. `redis-cli -a <password>` would put the
+      # secret in a process listing instead; the env var keeps it out of `ps`.
+      # Residual, stated plainly: anyone who can run `docker inspect` or read the
+      # host process list already has the deployment's `.env`, so this is the
+      # same trust level rather than a new exposure.
+      REDIS_PASSWORD: '${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env - generate one with python -c "import secrets; print(secrets.token_urlsafe(32))"}'
+    command:
+      - "redis-server"
+      - "--requirepass"
+      - "${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env}"
+    ports:
+      # Same: loopback only unless user opts-in via REDIS_PORT override in .env.
+      - "${REDIS_PORT:-127.0.0.1:6379}:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      # `grep -q PONG` rather than relying on redis-cli's exit code: an
+      # unauthenticated PING answers "NOAUTH Authentication required.", which is
+      # a reply, not a transport failure.
+      test: ["CMD-SHELL", "REDISCLI_AUTH=\"$$REDIS_PASSWORD\" redis-cli ping | grep -q PONG"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    logging: *default-logging
+    # The data network: PostgreSQL, Redis and the core processes that use them.
+    # Connector containers are deliberately absent — they only speak HTTP to the
+    # API (`CORE_URL`), so they have no reason to be able to open a socket to
+    # either datastore, and a plugin is code the platform did not write.
+    networks:
+      - opendrp-net
+
+  # ---------------------------------------------------------------------------
+  # MailHog (OPTIONAL) — Local SMTP for debugging alert emails
+  # Uncomment the block below to enable. SMTP port = 1025, Web UI = 8025
+  # ---------------------------------------------------------------------------
+  # mailhog:
+  #   image: mailhog/mailhog:latest
+  #   container_name: opendrp-mailhog
+  #   restart: unless-stopped
+  #   ports:
+  #     - "${MAILHOG_SMTP_PORT:-1025}:1025"
+  #     - "${MAILHOG_UI_PORT:-8025}:8025"
+  #   networks:
+  #     - opendrp-net
+
+  # ---------------------------------------------------------------------------
+  # Backend — FastAPI (Python 3.12 + Uvicorn)
+  # ---------------------------------------------------------------------------
+  backend:
+    # Both `image` and `build`, deliberately. A service with only `build` can be
+    # run from a checkout but not upgraded without rebuilding, and a service with
+    # only `image` cannot be run from a checkout at all. With both, Compose uses
+    # the local image when one exists, pulls the published one when it does not
+    # (`pull_policy: missing` is the default once `image` is set), and
+    # `docker compose build` / `make up` rebuild from source on demand.
+    #
+    # OPENDRP_IMAGE_PREFIX exists so a fork or a private mirror points at its own
+    # registry without editing this file; OPENDRP_VERSION pins a release.
+    image: ${OPENDRP_IMAGE_PREFIX:-ghcr.io/opendrp/opendrp}/backend:${OPENDRP_VERSION:-latest}
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      args:
+        # Runtime dependencies only: the shipped image carries no test framework
+        # or type checker. The development overlay (docker-compose.dev.yml,
+        # layered on by `make up`) flips this to "true", because the Makefile
+        # targets run pytest inside this container.
+        INSTALL_DEV_REQUIREMENTS: "false"
+        # The image runs as an unprivileged user. On Linux a bind mount keeps the
+        # host's ownership, so a developer whose uid is not 1000 sets these to
+        # their own (see .env.example) or the dev overlay's source mount is not
+        # writable and the coverage targets fail.
+        USER_UID: ${OPENDRP_UID:-1000}
+        USER_GID: ${OPENDRP_GID:-1000}
+    container_name: opendrp-backend
+    restart: unless-stopped
+    mem_limit: 768m
+    cpus: "1.0"
+    pids_limit: 256
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    # No process here writes outside the reports volume, so the root filesystem
+    # can be read-only. That removes "write a file, then have it executed later"
+    # as a persistence path for an exploited API process.
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    # `scripts.migrate`, not `alembic upgrade head`: two API replicas start at the
+    # same moment behind a load balancer, and Alembic has no lock of its own, so
+    # concurrent `upgrade head` runs are a race. The wrapper takes a PostgreSQL
+    # advisory lock, so the second replica waits and then finds the schema already
+    # at head — a no-op instead of a failure. The note has to live here rather
+    # than inside the block below: the command is a folded scalar, so a `#` line
+    # inside it would fold into the same line as the shell command and comment
+    # out everything after it.
+    command:
+      - "bash"
+      - "-c"
+      - >
+        set -e;
+        echo '[OpenDRP] Applying Alembic migrations (advisory-locked)...';
+        python -m scripts.migrate;
+        echo '[OpenDRP] Ensuring system_settings singleton...';
+        python -m scripts.seed_defaults;
+        echo '[OpenDRP] WARNING No admin account yet! Run: docker compose exec backend python -m scripts.manage_admin create -e admin@example.com -p YourStrongPass123!';
+        echo "[OpenDRP] Starting Uvicorn server on 0.0.0.0:8000 with $${UVICORN_WORKERS:-1} workers";
+        exec uvicorn app.main:app
+        --host 0.0.0.0
+        --port 8000
+        --workers "$${UVICORN_WORKERS:-1}"
+        --forwarded-allow-ips="$${UVICORN_FORWARDED_ALLOW_IPS:-127.0.0.1}"
+    environment:
+      APP_ENV: ${APP_ENV:?Set APP_ENV in .env}
+      OPENDRP_VERSION: ${OPENDRP_VERSION:-dev}
+      # HSTS is a property of the deployment, not of whichever server happens to
+      # add the header: `app.main` builds it from these three values and the
+      # frontend's nginx builds it from the same three, so the two cannot
+      # disagree. Off by default, because an internal installation with a
+      # self-signed certificate would otherwise lock its own browsers out for
+      # HSTS_MAX_AGE seconds - a promise the server cannot withdraw early.
+      HSTS_ENABLED: ${HSTS_ENABLED:-false}
+      HSTS_MAX_AGE: ${HSTS_MAX_AGE:-31536000}
+      HSTS_INCLUDE_SUBDOMAINS: ${HSTS_INCLUDE_SUBDOMAINS:-false}
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:?Set POSTGRES_USER in .env}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:?Set POSTGRES_DB in .env}
+      REDIS_URL: redis://:${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env}@redis:6379/0
+      REPORTS_STORE_DIR: /workspace/reports_store
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:?Set a random JWT_SECRET_KEY in .env}
+      JWT_ALGORITHM: ${JWT_ALGORITHM:-HS256}
+      JWT_ACCESS_TOKEN_EXPIRE_MINUTES: ${JWT_ACCESS_TOKEN_EXPIRE_MINUTES:-15}
+      JWT_REFRESH_TOKEN_EXPIRE_DAYS: ${JWT_REFRESH_TOKEN_EXPIRE_DAYS:-3}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:?Set a generated Fernet ENCRYPTION_KEY in .env}
+      # Keys that may still decrypt stored secrets during a rotation; empty
+      # outside one. Passed here so `scripts.rotate_keys status|rewrap` works
+      # inside this container, which is where the documented procedure runs them.
+      ENCRYPTION_PREVIOUS_KEYS: ${ENCRYPTION_PREVIOUS_KEYS:-}
+      JWT_PREVIOUS_SECRET_KEYS: ${JWT_PREVIOUS_SECRET_KEYS:-}
+      # Optional here, required by the application in production: the audit chain
+      # is hash-keyed from the environment, and a deployment that leaves it empty
+      # derives one so that development and the test suite exercise the same code
+      # path. See AUDIT_CHAIN_KEYS in .env.example.
+      AUDIT_CHAIN_KEYS: ${AUDIT_CHAIN_KEYS:-}
+      AUDIT_CHAIN_PREVIOUS_KEYS: ${AUDIT_CHAIN_PREVIOUS_KEYS:-}
+      MFA_ISSUER: ${MFA_ISSUER:-OpenDRP}
+      # Off by default so an installation cannot lock its own administrator out;
+      # set true to make an administrator's second factor a condition of reaching
+      # admin routes rather than an optional feature. Only the API enforces it.
+      REQUIRE_MFA_FOR_ADMINS: ${REQUIRE_MFA_FOR_ADMINS:-false}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      AUDIT_RETENTION_DAYS: ${AUDIT_RETENTION_DAYS:-365}
+      REPORT_RETENTION_DAYS: ${REPORT_RETENTION_DAYS:-365}
+      AUTH_COOKIE_SECURE: ${AUTH_COOKIE_SECURE:-true}
+      # Bound on authenticated requests per account per minute. Every read writes
+      # an audit row, so this is the setting that stops one credential from
+      # amplifying load on PostgreSQL and the SIEM pipeline. 0 disables it.
+      AUTHENTICATED_RATE_LIMIT_PER_MINUTE: ${AUTHENTICATED_RATE_LIMIT_PER_MINUTE:-600}
+      CORS_ORIGINS: ${CORS_ORIGINS:-["http://localhost:3000"]}
+      CONNECTOR_HEALTH_STALE_AFTER_SECONDS: ${CONNECTOR_HEALTH_STALE_AFTER_SECONDS:-120}
+      CONNECTOR_JOB_LEASE_SECONDS: ${CONNECTOR_JOB_LEASE_SECONDS:-180}
+      CONNECTOR_JOB_MAX_ATTEMPTS: ${CONNECTOR_JOB_MAX_ATTEMPTS:-3}
+      ALERT_HEALTH_CHECK_TIMEOUT_SECONDS: ${ALERT_HEALTH_CHECK_TIMEOUT_SECONDS:-15}
+      ALERT_DELIVERY_TIMEOUT_SECONDS: ${ALERT_DELIVERY_TIMEOUT_SECONDS:-20}
+      ALERT_DELIVERY_MAX_ATTEMPTS: ${ALERT_DELIVERY_MAX_ATTEMPTS:-3}
+      ALERT_DELIVERY_RETRY_BASE_SECONDS: ${ALERT_DELIVERY_RETRY_BASE_SECONDS:-2}
+      ALERT_AGGREGATION_DELAY_SECONDS: ${ALERT_AGGREGATION_DELAY_SECONDS:-10}
+      ALERT_MAX_FINDINGS_PER_MESSAGE: ${ALERT_MAX_FINDINGS_PER_MESSAGE:-50}
+      ALERT_MAX_TELEGRAM_MESSAGE_LENGTH: ${ALERT_MAX_TELEGRAM_MESSAGE_LENGTH:-3800}
+      OUTBOUND_DNS_TIMEOUT_SECONDS: ${OUTBOUND_DNS_TIMEOUT_SECONDS:-3}
+      REPORT_MAX_ROWS: ${REPORT_MAX_ROWS:-5000}
+      REPORT_GENERATION_TIMEOUT_SECONDS: ${REPORT_GENERATION_TIMEOUT_SECONDS:-120}
+      # The Compose subnet is appended rather than only defaulted: nginx reaches
+      # the backend from inside that network, never from loopback, so without it
+      # every audit row records the proxy container address instead of the real
+      # client. Appending keeps that guarantee even when TRUSTED_PROXY_IPS is set
+      # explicitly in .env (duplicate ranges are harmless).
+      TRUSTED_PROXY_IPS: ${TRUSTED_PROXY_IPS:-127.0.0.1,::1},${OPENDRP_NETWORK_SUBNET:-172.18.0.0/16}
+      DB_POOL_SIZE: ${DB_POOL_SIZE:-20}
+      DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-10}
+      DB_POOL_RECYCLE_SECONDS: ${DB_POOL_RECYCLE_SECONDS:-1800}
+      DB_POOL_TIMEOUT_SECONDS: ${DB_POOL_TIMEOUT_SECONDS:-30}
+      DB_POOL_USE_LIFO: ${DB_POOL_USE_LIFO:-True}
+      # Server-side, per connection: a single statement may not outlive the first,
+      # may not wait on a lock past the second, and a connection left inside an
+      # open transaction stops holding its snapshot past the third. The pool is
+      # bounded, so an unbounded query does not slow one request down — it takes
+      # a connection away from everyone else. Passed here rather than left to the
+      # code defaults so that .env can raise them for a large inventory
+      # (report aggregation is the statement that needs the headroom).
+      DB_STATEMENT_TIMEOUT_MS: ${DB_STATEMENT_TIMEOUT_MS:-30000}
+      DB_LOCK_TIMEOUT_MS: ${DB_LOCK_TIMEOUT_MS:-5000}
+      DB_IDLE_IN_TRANSACTION_TIMEOUT_MS: ${DB_IDLE_IN_TRANSACTION_TIMEOUT_MS:-60000}
+      # Client-side bound on one round trip, deliberately above the server-side
+      # statement timeout: Postgres should be the one to cancel a slow statement,
+      # because that arrives as an error the API can report as a busy database,
+      # while a client timeout is an abrupt disconnect that looks like a fault.
+      DB_COMMAND_TIMEOUT_SECONDS: ${DB_COMMAND_TIMEOUT_SECONDS:-45}
+      # The deployment's own address space, so the outbound guard can refuse to
+      # dial back into the platform's containers from an operator-supplied
+      # destination (a "SMTP host" that is really the API, or the Docker
+      # gateway). Must stay in step with the three subnets at the bottom of
+      # this file; the application refuses to start when they disagree.
+      OPENDRP_NETWORK_SUBNET: ${OPENDRP_NETWORK_SUBNET:-172.18.0.0/16}
+      # Passed to the application as well as to the network definitions, so that
+      # a `.env` which moves one of them without the others fails at startup
+      # instead of quietly producing audit rows that name the proxy.
+      OPENDRP_EDGE_SUBNET: ${OPENDRP_EDGE_SUBNET:-172.18.10.0/24}
+      OPENDRP_DATA_SUBNET: ${OPENDRP_DATA_SUBNET:-172.18.20.0/24}
+      OPENDRP_CONNECTOR_SUBNET: ${OPENDRP_CONNECTOR_SUBNET:-172.18.30.0/24}
+      # Destination policy for the connections the platform makes on operator
+      # input (SMTP, WHOIS): loopback, cloud metadata and the deployment's own
+      # networks are refused unless the host is named in the allowlist.
+      OUTBOUND_ALLOWED_HOSTS: ${OUTBOUND_ALLOWED_HOSTS:-}
+      OUTBOUND_BLOCKED_CIDRS: ${OUTBOUND_BLOCKED_CIDRS:-}
+      UVICORN_WORKERS: ${UVICORN_WORKERS:-1}
+      UVICORN_FORWARDED_ALLOW_IPS: ${UVICORN_FORWARDED_ALLOW_IPS:-127.0.0.1}
+    volumes:
+      # A named volume, not a bind mount of the checkout: generated reports are
+      # written here by the API process, and a host directory the container can
+      # write is a place a compromised process could leave code for the next
+      # build to pick up. The development overlay bind-mounts ./reports_store
+      # instead, so local runs keep their artefacts on disk.
+      - reports_store:/workspace/reports_store
+    dns:
+      - "${OPENDRP_DNS_PRIMARY:-8.8.8.8}"
+      - "${OPENDRP_DNS_SECONDARY:-1.1.1.1}"
+    ports:
+      # Loopback bind: all API/HTTP traffic should go through the frontend Nginx
+      # container (port 3000 by default). Expose backend publicly ONLY if you
+      # really need direct API access from another machine — set BACKEND_PORT in .env.
+      - "${BACKEND_PORT:-127.0.0.1:8000}:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      # Readiness (PostgreSQL + Redis), not liveness: dependent services wait
+      # for a usable API, and /api/v1/health stays dependency-free.
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8000/api/v1/ready || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    logging: *default-logging
+    # The only container on all three networks, because it is the trust
+    # boundary: the frontend reaches it for API calls, the connectors reach it
+    # for the connector protocol, and only it may speak to PostgreSQL and Redis.
+    networks:
+      - opendrp-net
+      - opendrp-edge
+      - opendrp-connectors
+
+  # ---------------------------------------------------------------------------
+  # Celery Worker — Background task executor
+  # ---------------------------------------------------------------------------
+  celery-worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    image: ${OPENDRP_IMAGE_PREFIX:-ghcr.io/opendrp/opendrp}/backend:${OPENDRP_VERSION:-latest}
+    container_name: opendrp-celery-worker
+    restart: unless-stopped
+    mem_limit: 1g
+    cpus: "1.0"
+    pids_limit: 256
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    command: >
+      celery -A app.core.celery_app worker
+        --loglevel=info
+        --queues=default,reports,alerts
+        -P solo
+    environment:
+      APP_ENV: ${APP_ENV:?Set APP_ENV in .env}
+      OPENDRP_VERSION: ${OPENDRP_VERSION:-dev}
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:?Set POSTGRES_USER in .env}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:?Set POSTGRES_DB in .env}
+      REDIS_URL: redis://:${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env}@redis:6379/0
+      REPORTS_STORE_DIR: /workspace/reports_store
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:?Set JWT_SECRET_KEY in .env}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:?Set ENCRYPTION_KEY in .env}
+      TRUSTED_PROXY_IPS: ${TRUSTED_PROXY_IPS:-127.0.0.1,::1},${OPENDRP_NETWORK_SUBNET:-172.18.0.0/16}
+      DB_POOL_SIZE: ${DB_POOL_SIZE:-10}
+      DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-5}
+      DB_POOL_RECYCLE_SECONDS: ${DB_POOL_RECYCLE_SECONDS:-1800}
+      DB_POOL_TIMEOUT_SECONDS: ${DB_POOL_TIMEOUT_SECONDS:-30}
+      DB_POOL_USE_LIFO: ${DB_POOL_USE_LIFO:-True}
+      # The statement limits apply to every connection regardless of who opened
+      # it, and report generation — the heaviest statement the platform runs —
+      # happens in this container. See the backend service for what each one
+      # bounds; the values must match, or the same query has a different budget
+      # depending on which process runs it.
+      DB_STATEMENT_TIMEOUT_MS: ${DB_STATEMENT_TIMEOUT_MS:-30000}
+      DB_LOCK_TIMEOUT_MS: ${DB_LOCK_TIMEOUT_MS:-5000}
+      DB_IDLE_IN_TRANSACTION_TIMEOUT_MS: ${DB_IDLE_IN_TRANSACTION_TIMEOUT_MS:-60000}
+      DB_COMMAND_TIMEOUT_SECONDS: ${DB_COMMAND_TIMEOUT_SECONDS:-45}
+      OUTBOUND_DNS_TIMEOUT_SECONDS: ${OUTBOUND_DNS_TIMEOUT_SECONDS:-3}
+      REPORT_MAX_ROWS: ${REPORT_MAX_ROWS:-5000}
+      REPORT_GENERATION_TIMEOUT_SECONDS: ${REPORT_GENERATION_TIMEOUT_SECONDS:-120}
+      ALERT_DELIVERY_TIMEOUT_SECONDS: ${ALERT_DELIVERY_TIMEOUT_SECONDS:-20}
+      ALERT_DELIVERY_MAX_ATTEMPTS: ${ALERT_DELIVERY_MAX_ATTEMPTS:-3}
+      ALERT_DELIVERY_RETRY_BASE_SECONDS: ${ALERT_DELIVERY_RETRY_BASE_SECONDS:-2}
+      ALERT_AGGREGATION_DELAY_SECONDS: ${ALERT_AGGREGATION_DELAY_SECONDS:-10}
+      ALERT_MAX_FINDINGS_PER_MESSAGE: ${ALERT_MAX_FINDINGS_PER_MESSAGE:-50}
+      ALERT_MAX_TELEGRAM_MESSAGE_LENGTH: ${ALERT_MAX_TELEGRAM_MESSAGE_LENGTH:-3800}
+      # The retention sweep runs here (beat schedules it, this worker executes
+      # it), so these are the only container that needs the values. The API
+      # replica does not delete history.
+      AUDIT_RETENTION_DAYS: ${AUDIT_RETENTION_DAYS:-365}
+      REPORT_RETENTION_DAYS: ${REPORT_RETENTION_DAYS:-365}
+      RETENTION_BATCH_SIZE: ${RETENTION_BATCH_SIZE:-5000}
+      RETENTION_MAX_BATCHES_PER_RUN: ${RETENTION_MAX_BATCHES_PER_RUN:-200}
+      ENCRYPTION_PREVIOUS_KEYS: ${ENCRYPTION_PREVIOUS_KEYS:-}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      # Background tasks write audit rows (the sweep, the verification), and every
+      # audit row is signed: without the key here those rows would be written with
+      # a derivation the API does not share, and the chain would not verify.
+      AUDIT_CHAIN_KEYS: ${AUDIT_CHAIN_KEYS:-}
+      AUDIT_CHAIN_PREVIOUS_KEYS: ${AUDIT_CHAIN_PREVIOUS_KEYS:-}
+      # The alert dispatcher and the WHOIS enrichment run here, so the
+      # destination policy has to be in this container too — a guard that only
+      # applied to the API would leave the worker free to dial whatever the
+      # settings name.
+      OPENDRP_NETWORK_SUBNET: ${OPENDRP_NETWORK_SUBNET:-172.18.0.0/16}
+      OPENDRP_EDGE_SUBNET: ${OPENDRP_EDGE_SUBNET:-172.18.10.0/24}
+      OPENDRP_DATA_SUBNET: ${OPENDRP_DATA_SUBNET:-172.18.20.0/24}
+      OPENDRP_CONNECTOR_SUBNET: ${OPENDRP_CONNECTOR_SUBNET:-172.18.30.0/24}
+      OUTBOUND_ALLOWED_HOSTS: ${OUTBOUND_ALLOWED_HOSTS:-}
+      OUTBOUND_BLOCKED_CIDRS: ${OUTBOUND_BLOCKED_CIDRS:-}
+    healthcheck:
+      # A broker round trip, not a process check: this only passes when a worker
+      # actually answers, so a worker that is alive but wedged (stuck on a task,
+      # lost its Redis connection) is reported unhealthy instead of "running".
+      test: ["CMD-SHELL", "celery -A app.core.celery_app inspect ping -t 10 >/dev/null 2>&1 || exit 1"]
+      interval: 60s
+      timeout: 20s
+      retries: 3
+      # Generous: the worker waits for PostgreSQL and Redis to be healthy before
+      # it starts, and the first ping has to wait for a full polling cycle.
+      start_period: 90s
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,size=64m
+    volumes:
+      - reports_store:/workspace/reports_store
+    dns:
+      - "${OPENDRP_DNS_PRIMARY:-8.8.8.8}"
+      - "${OPENDRP_DNS_SECONDARY:-1.1.1.1}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      backend:
+        condition: service_healthy
+    logging: *default-logging
+    networks:
+      - opendrp-net
+
+  # ---------------------------------------------------------------------------
+  # Celery Beat — Scheduler for periodic scans (dnstwist, Shodan, HIBP)
+  # ---------------------------------------------------------------------------
+  celery-beat:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    image: ${OPENDRP_IMAGE_PREFIX:-ghcr.io/opendrp/opendrp}/backend:${OPENDRP_VERSION:-latest}
+    container_name: opendrp-celery-beat
+    restart: unless-stopped
+    mem_limit: 256m
+    cpus: "0.5"
+    pids_limit: 128
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    # Beat exposes no endpoint and answers no probe, so the wrapper script runs
+    # it in the background and maintains a liveness file the healthcheck below
+    # can read. See backend/scripts/beat_wrapper.sh for why.
+    command: ["sh", "/app/scripts/beat_wrapper.sh"]
+    environment:
+      APP_ENV: ${APP_ENV:?Set APP_ENV in .env}
+      OPENDRP_VERSION: ${OPENDRP_VERSION:-dev}
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:?Set POSTGRES_USER in .env}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:?Set POSTGRES_DB in .env}
+      REDIS_URL: redis://:${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env}@redis:6379/0
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:?Set JWT_SECRET_KEY in .env}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:?Set ENCRYPTION_KEY in .env}
+      # Beat does not write audit rows itself, but it constructs the same
+      # `Settings` the API and the worker do, and in production that model
+      # refuses to load without this key. Without it the scheduler exits on
+      # import, `restart: unless-stopped` restarts it forever, and everything
+      # only beat can do stops happening - the alert delivery queue is drained
+      # by a beat-scheduled task, so the visible symptom is that findings are
+      # stored and no notification is ever sent.
+      AUDIT_CHAIN_KEYS: ${AUDIT_CHAIN_KEYS:-}
+      AUDIT_CHAIN_PREVIOUS_KEYS: ${AUDIT_CHAIN_PREVIOUS_KEYS:-}
+      TRUSTED_PROXY_IPS: ${TRUSTED_PROXY_IPS:-127.0.0.1,::1},${OPENDRP_NETWORK_SUBNET:-172.18.0.0/16}
+      DB_POOL_SIZE: ${DB_POOL_SIZE:-5}
+      DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-2}
+      DB_POOL_RECYCLE_SECONDS: ${DB_POOL_RECYCLE_SECONDS:-1800}
+      DB_POOL_TIMEOUT_SECONDS: ${DB_POOL_TIMEOUT_SECONDS:-30}
+      DB_POOL_USE_LIFO: ${DB_POOL_USE_LIFO:-True}
+      # The scheduler reads the database, so the same limits apply here; a lock
+      # this process waits on is precisely what DB_LOCK_TIMEOUT_MS bounds.
+      DB_STATEMENT_TIMEOUT_MS: ${DB_STATEMENT_TIMEOUT_MS:-30000}
+      DB_LOCK_TIMEOUT_MS: ${DB_LOCK_TIMEOUT_MS:-5000}
+      DB_IDLE_IN_TRANSACTION_TIMEOUT_MS: ${DB_IDLE_IN_TRANSACTION_TIMEOUT_MS:-60000}
+      DB_COMMAND_TIMEOUT_SECONDS: ${DB_COMMAND_TIMEOUT_SECONDS:-45}
+      OUTBOUND_DNS_TIMEOUT_SECONDS: ${OUTBOUND_DNS_TIMEOUT_SECONDS:-3}
+      REPORT_MAX_ROWS: ${REPORT_MAX_ROWS:-5000}
+      REPORT_GENERATION_TIMEOUT_SECONDS: ${REPORT_GENERATION_TIMEOUT_SECONDS:-120}
+      ALERT_DELIVERY_TIMEOUT_SECONDS: ${ALERT_DELIVERY_TIMEOUT_SECONDS:-20}
+      ALERT_DELIVERY_MAX_ATTEMPTS: ${ALERT_DELIVERY_MAX_ATTEMPTS:-3}
+      ALERT_DELIVERY_RETRY_BASE_SECONDS: ${ALERT_DELIVERY_RETRY_BASE_SECONDS:-2}
+      ALERT_AGGREGATION_DELAY_SECONDS: ${ALERT_AGGREGATION_DELAY_SECONDS:-10}
+      ALERT_MAX_FINDINGS_PER_MESSAGE: ${ALERT_MAX_FINDINGS_PER_MESSAGE:-50}
+      ALERT_MAX_TELEGRAM_MESSAGE_LENGTH: ${ALERT_MAX_TELEGRAM_MESSAGE_LENGTH:-3800}
+      ENCRYPTION_PREVIOUS_KEYS: ${ENCRYPTION_PREVIOUS_KEYS:-}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      BEAT_LIVENESS_FILE: /tmp/opendrp-beat-alive
+    # The wrapper writes its liveness file into the tmpfs below and the schedule
+    # database into the reports volume; nothing else is written.
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,size=16m
+    volumes:
+      - reports_store:/workspace/reports_store
+    dns:
+      - "${OPENDRP_DNS_PRIMARY:-8.8.8.8}"
+      - "${OPENDRP_DNS_SECONDARY:-1.1.1.1}"
+    healthcheck:
+      # Reads the mtime of the file the wrapper touches every 5 s. Two minutes
+      # tolerates a stalled tick without hiding a scheduler that stopped for good;
+      # find prints nothing for a missing file, so the grep stays the test.
+      test: ["CMD-SHELL", "find $$BEAT_LIVENESS_FILE -mmin -2 2>/dev/null | grep -q . || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      celery-worker:
+        # Beat only enqueues to the broker, but starting it against a worker
+        # that cannot run tasks only stores schedules nobody will execute.
+        condition: service_healthy
+      backend:
+        condition: service_healthy
+    logging: *default-logging
+    networks:
+      - opendrp-net
+
+  # ---------------------------------------------------------------------------
+  # Connectors — data-source workers (core + connector architecture).
+  # Comment a block out to disconnect that source; the core will simply stop
+  # receiving its findings. Toggle a running connector from Settings → Connectors.
+  # ---------------------------------------------------------------------------
+  connector-dnstwist:
+    build:
+      context: .
+      dockerfile: ./connectors/dnstwist/Dockerfile
+    image: ${OPENDRP_IMAGE_PREFIX:-ghcr.io/opendrp/opendrp}/connector-dnstwist:${OPENDRP_VERSION:-latest}
+    container_name: opendrp-connector-dnstwist
+    mem_limit: 768m
+    cpus: "1.0"
+    pids_limit: 256
+    # Bounded restart: an unprovisioned connector (no CONNECTOR_TOKEN) exits with
+    # a clear message, and `unless-stopped` would restart it forever, filling the
+    # log and hiding the one real signal. After ten attempts it stays down until
+    # an operator provisions it and runs `docker compose up -d connector-dnstwist`.
+    restart: on-failure:10
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    environment:
+      CORE_URL: http://backend:8000
+      CONNECTOR_NAME: dnstwist
+      CONNECTOR_TYPE: phishing
+      # This connector's own credential — there is no shared connector secret.
+      # One command issues it and records it in .env:
+      #     make connector-token NAME=dnstwist TYPE=phishing
+      #
+      # The default is empty on purpose. A "required" interpolation
+      # (${VAR:?...}) makes *every* compose command fail on an unprovisioned
+      # checkout — including the `docker compose exec` that issues the token —
+      # which would make provisioning impossible. A missing credential fails
+      # closed where it actually matters instead: the connector refuses to
+      # start ("Missing required environment variables: CONNECTOR_TOKEN") and
+      # the core rejects any token it did not issue.
+      # Self-declared manifest: the job type this connector alone claims and the
+      # inventory sections it consumes.
+      CONNECTOR_JOB_TYPE: phishing.dnstwist
+      CONNECTOR_FINDING_KIND: phishing
+      CONNECTOR_ASSET_TYPES: domain
+      CONNECTOR_TOKEN: ${CONNECTOR_TOKEN_DNSTWIST:-}
+      # Empty means use the Docker/system resolver. Set this only when the
+      # deployment requires explicit resolvers (comma-separated).
+      DNS_NAMESERVERS: ${DNS_NAMESERVERS:-}
+      # Optional expensive dimensions are disabled by default. The connector
+      # always uses a bounded fuzzer set unless DNSTWIST_FUZZERS is overridden.
+      DNSTWIST_FUZZERS: ${DNSTWIST_FUZZERS:-addition,omission,repetition,hyphenation,insertion,replacement,transposition,vowel-swap}
+      # Optional TLD dictionary. Enabling the 100-entry common-TLD dictionary
+      # materially increases DNS work and should be an explicit choice.
+      DNSTWIST_TLD_DICTIONARY: ${DNSTWIST_TLD_DICTIONARY:-}
+      # Bound one dnstwist subprocess. A timeout is reported as a partial job,
+      # and the SDK terminates the complete process group rather than leaving a
+      # child resolver behind.
+      DNSTWIST_TIMEOUT_SECONDS: ${DNSTWIST_TIMEOUT_SECONDS:-120}
+      DNSTWIST_THREADS: ${DNSTWIST_THREADS:-8}
+      POLL_INTERVAL_SEC: "5"
+    depends_on:
+      backend:
+        condition: service_healthy
+    logging: *default-logging
+    # Connector network only. This container resolves look-alike domains and
+    # talks to the API; it must not be able to reach PostgreSQL or Redis, so it
+    # is not attached to the data network at all.
+    networks:
+      - opendrp-connectors
+
+  connector-shodan:
+    build:
+      context: .
+      dockerfile: ./connectors/shodan/Dockerfile
+    image: ${OPENDRP_IMAGE_PREFIX:-ghcr.io/opendrp/opendrp}/connector-shodan:${OPENDRP_VERSION:-latest}
+    container_name: opendrp-connector-shodan
+    restart: on-failure:10
+    mem_limit: 512m
+    cpus: "0.75"
+    pids_limit: 128
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    environment:
+      CORE_URL: http://backend:8000
+      CONNECTOR_NAME: shodan
+      CONNECTOR_TYPE: phishing
+      # Own credential — see CONNECTOR_TOKEN_DNSTWIST above.
+      #   make connector-token NAME=shodan TYPE=phishing
+      CONNECTOR_JOB_TYPE: phishing.shodan
+      CONNECTOR_FINDING_KIND: phishing
+      CONNECTOR_ASSET_TYPES: domain,keyword_domain,keyword_title,ip_address
+      # Operator-editable settings, declared by the connector itself; the UI
+      # renders the config form from this schema instead of hardcoding fields.
+      CONNECTOR_CONFIG_SCHEMA: >-
+        {"scan_ssl_text": {"type": "bool", "label": "Certificate text search", "default": true},
+         "scan_http_title": {"type": "bool", "label": "Page title search", "default": true},
+         "scan_favicon": {"type": "bool", "label": "Favicon hash search", "default": true}}
+      CONNECTOR_TOKEN: ${CONNECTOR_TOKEN_SHODAN:-}
+      SHODAN_API_KEY: ${SHODAN_API_KEY:?Set SHODAN_API_KEY in .env}
+      # Capability fallbacks: passed through from .env rather than hardcoded,
+      # because the connector reads them as its defaults and a value it cannot
+      # receive is not a setting. An administrator's choice in the connector's
+      # configuration form still wins for every later scan (registry config takes
+      # precedence in `_capabilities`).
+      SHODAN_SCAN_SSL_TEXT: ${SHODAN_SCAN_SSL_TEXT:-true}
+      SHODAN_SCAN_HTTP_TITLE: ${SHODAN_SCAN_HTTP_TITLE:-true}
+      SHODAN_SCAN_FAVICON: ${SHODAN_SCAN_FAVICON:-true}
+      SHODAN_MIN_REQUEST_INTERVAL_SECONDS: ${SHODAN_MIN_REQUEST_INTERVAL_SECONDS:-1}
+      SHODAN_REQUEST_TIMEOUT_SECONDS: ${SHODAN_REQUEST_TIMEOUT_SECONDS:-30}
+    depends_on:
+      backend:
+        condition: service_healthy
+    logging: *default-logging
+    networks:
+      - opendrp-connectors
+
+  connector-hibp:
+    build:
+      context: .
+      dockerfile: ./connectors/hibp/Dockerfile
+    image: ${OPENDRP_IMAGE_PREFIX:-ghcr.io/opendrp/opendrp}/connector-hibp:${OPENDRP_VERSION:-latest}
+    container_name: opendrp-connector-hibp
+    restart: on-failure:10
+    mem_limit: 512m
+    cpus: "0.75"
+    pids_limit: 128
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    environment:
+      CORE_URL: http://backend:8000
+      CONNECTOR_NAME: hibp
+      CONNECTOR_TYPE: breaches
+      # Own credential — see CONNECTOR_TOKEN_DNSTWIST above.
+      #   make connector-token NAME=hibp TYPE=breaches
+      CONNECTOR_JOB_TYPE: breaches.hibp
+      CONNECTOR_FINDING_KIND: breach
+      CONNECTOR_ASSET_TYPES: email_account,domain
+      CONNECTOR_TOKEN: ${CONNECTOR_TOKEN_HIBP:-}
+      HIBP_API_KEY: ${HIBP_API_KEY:?Set HIBP_API_KEY in .env}
+      POLL_INTERVAL_SEC: "5"
+    depends_on:
+      backend:
+        condition: service_healthy
+    logging: *default-logging
+    networks:
+      - opendrp-connectors
+
+  # ---------------------------------------------------------------------------
+  # Frontend — React 18 SPA (Vite build → Nginx)
+  # ---------------------------------------------------------------------------
+  frontend:
+    image: ${OPENDRP_IMAGE_PREFIX:-ghcr.io/opendrp/opendrp}/frontend:${OPENDRP_VERSION:-latest}
+    build:
+      context: .
+      dockerfile: ./frontend/Dockerfile
+      args:
+        VITE_API_BASE_URL: /api/v1
+        VITE_CANONICAL_ORIGIN: ${CANONICAL_ORIGIN:-}
+        # The release the bundle announces. Pinned alongside the image tag in
+        # release.yml, so an instance built from a tag reports that tag.
+        VITE_APP_VERSION: ${OPENDRP_VERSION:-0.1.0}
+    container_name: opendrp-frontend
+    restart: unless-stopped
+    mem_limit: 256m
+    cpus: "0.5"
+    pids_limit: 128
+    # The same HSTS settings the API reads, from the same variables: the
+    # entrypoint renders them into an include (docker/nginx/hsts.sh) and
+    # validates the result with `nginx -t` before the server starts, so a value
+    # nginx cannot parse is a container that says why rather than one that
+    # serves without the header.
+    environment:
+      HSTS_ENABLED: ${HSTS_ENABLED:-false}
+      HSTS_MAX_AGE: ${HSTS_MAX_AGE:-31536000}
+      HSTS_INCLUDE_SUBDOMAINS: ${HSTS_INCLUDE_SUBDOMAINS:-false}
+    ports:
+      - "${FRONTEND_PORT:-127.0.0.1:3000}:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:80/ >/dev/null 2>&1 || curl -fsS http://localhost:80/ >/dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    logging: *default-logging
+    # Edge network only: nginx serves the SPA and proxies /api to the backend by
+    # service name, and a compromised web server has nothing to do on the data
+    # or connector networks.
+    networks:
+      - opendrp-edge
+
+  # ---------------------------------------------------------------------------
+  # Backup (PROFILE: backup) — pg_dump + report-store archive
+  # ---------------------------------------------------------------------------
+  # Not started by `docker compose up`: backups belong on the operator's clock,
+  # not silently attached to every `up`. Both entry points run the same script:
+  #
+  #   make backup                              # single pass, then exit
+  #   docker compose --profile backup up -d backup   # loop, every BACKUP_INTERVAL_SEC
+  #
+  # A `postgres:17-alpine` image rather than a custom one: pg_dump refuses to dump
+  # a newer server, and pinning the client to the server's major version is what
+  # guarantees the archive can be read back by the instance it came from.
+  backup:
+    image: postgres:17-alpine
+    container_name: opendrp-backup
+    profiles: ["backup"]
+    restart: unless-stopped
+    mem_limit: 512m
+    cpus: "0.5"
+    pids_limit: 128
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    command: ["sh", "/backup-scripts/backup.sh"]
+    environment:
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGUSER: ${POSTGRES_USER:?Set POSTGRES_USER in .env}
+      PGPASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      PGDATABASE: ${POSTGRES_DB:?Set POSTGRES_DB in .env}
+      BACKUP_DIR: /backups
+      BACKUP_KEEP: ${BACKUP_KEEP:-14}
+      BACKUP_INTERVAL_SEC: ${BACKUP_INTERVAL_SEC:-86400}
+      REPORTS_DIR: /reports
+    volumes:
+      # The dumps are the whole point, so they go to the host rather than into a
+      # volume: an operator must be able to copy them offsite without knowing how
+      # Docker stores volumes.
+      - ./backups:/backups
+      # Read-only: the archiver never writes to the report store.
+      - reports_store:/reports:ro
+      # Maintenance tooling, mounted rather than baked into an image. Read-only,
+      # and the container runs with all capabilities dropped.
+      - ./scripts:/backup-scripts:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      # A backup service that quietly stopped running is the classic way a
+      # recovery fails, and Docker would happily report the container as healthy
+      # while nothing was being written. This fails when no dump was produced
+      # recently — set BACKUP_MAX_AGE_MIN above BACKUP_INTERVAL_SEC / 60.
+      test: ["CMD-SHELL", "find /backups -maxdepth 1 -name 'opendrp-*.dump' -mmin -${BACKUP_MAX_AGE_MIN:-1560} 2>/dev/null | grep -q . || exit 1"]
+      interval: 30m
+      timeout: 10s
+      retries: 3
+      start_period: 10m
+    logging: *default-logging
+    networks:
+      - opendrp-net
+
+# ==============================================================================
+# Networks & Volumes
+# ==============================================================================
+# Three networks instead of one, carved out of the address space the operator
+# already sets (OPENDRP_NETWORK_SUBNET, which stays the parent range named by
+# TRUSTED_PROXY_IPS):
+#
+#   opendrp-edge        frontend ↔ backend            (the internet-facing hop)
+#   opendrp-net         backend, workers, PostgreSQL, Redis
+#   opendrp-connectors  backend ↔ connector containers
+#
+# The point is not defence in depth for its own sake: connectors are, by this
+# platform's own design, code it did not write, and they are attached to the
+# network that holds a broker able to execute tasks and a database with every
+# finding in it. Splitting the networks means a rogue or exploited connector
+# has the API token it was given and nothing else. The three subnets must lie
+# inside OPENDRP_NETWORK_SUBNET; the application checks that at startup rather
+# than letting a mis-set range silently produce unreadable audit entries.
+networks:
+  opendrp-net:
+    driver: bridge
+    name: opendrp-net
+    ipam:
+      config:
+        - subnet: ${OPENDRP_DATA_SUBNET:-172.18.20.0/24}
+  opendrp-edge:
+    driver: bridge
+    name: opendrp-edge
+    ipam:
+      config:
+        - subnet: ${OPENDRP_EDGE_SUBNET:-172.18.10.0/24}
+  opendrp-connectors:
+    driver: bridge
+    name: opendrp-connectors
+    ipam:
+      config:
+        - subnet: ${OPENDRP_CONNECTOR_SUBNET:-172.18.30.0/24}
+
+volumes:
+  postgres_data:
+    name: opendrp-postgres-data
+  redis_data:
+    name: opendrp-redis-data
+  # Generated reports, the Celery Beat schedule file and the connector
+  # heartbeat scratch space. Named rather than bind-mounted so the API container
+  # never writes into the checkout; the development overlay rebinds it to
+  # ./reports_store.
+  reports_store:
+    name: opendrp-reports-store

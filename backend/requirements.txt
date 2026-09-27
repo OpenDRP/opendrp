@@ -1,0 +1,78 @@
+# ==============================================================================
+# OpenDRP Backend Python Dependencies — runtime only
+# ==============================================================================
+# Test, lint and type-check tooling lives in requirements-dev.txt so it is never
+# installed into the production image: a shipped container has no reason to
+# carry a test framework or a type checker, and every extra package in the image
+# is extra attack surface.
+#
+# Install for local development with:  pip install -r requirements-dev.txt
+# ==============================================================================
+
+# --- Web Framework -----------------------------------------------------------
+# FastAPI 0.135 is the first release that accepts Starlette 1.x, and Starlette
+# before 1.3.1 carries fourteen advisories (PYSEC-2026-1941/1943/161/2280/2281/
+# 248/249) that the security job flags on every push. Both are pinned exactly:
+# Starlette is a shipped runtime dependency even though it arrives transitively.
+fastapi==0.141.1
+starlette==1.6.0
+uvicorn[standard]==0.30.6
+# 0.0.9 is affected by CVE-2024-53981 (DoS) and by the 2026 path-traversal and
+# header-parsing issues fixed in 0.0.22. Reachable: the login endpoint parses
+# form data through this library.
+python-multipart==0.0.32
+gunicorn==23.0.0
+
+# --- Database ----------------------------------------------------------------
+sqlalchemy==2.0.35
+asyncpg==0.29.0
+psycopg2-binary==2.9.9
+alembic==1.13.2
+
+# --- Data Validation ---------------------------------------------------------
+pydantic==2.9.2
+pydantic-settings==2.5.2
+email-validator==2.2.0
+
+# --- Security & Auth ---------------------------------------------------------
+# PyJWT replaced python-jose: 3.3.0 carries CVE-2024-33663 (algorithm confusion)
+# and CVE-2024-33664 (JWE decompression DoS), and a September 2026 advisory still
+# covers releases up to 3.5.0. passlib was dropped as well — it is unmaintained
+# and required a monkeypatch of a private hook to work with current bcrypt.
+PyJWT[crypto]==2.14.0
+bcrypt==5.0.0
+cryptography==50.0.1
+qrcode==8.2
+
+# --- HTTP Clients (async) ----------------------------------------------------
+httpx==0.27.2
+aiodns==3.2.0
+# 4.5.0 is affected by CVE-2025-48945.
+pycares==4.9.0
+
+# --- Task Queue --------------------------------------------------------------
+celery[redis]==5.4.0
+redis==5.0.8
+
+# --- Templates & Rendering ---------------------------------------------------
+# 3.1.4 is affected by CVE-2024-56201 and CVE-2024-56326 (sandbox escape).
+jinja2==3.1.6
+
+# --- PDF Generation ----------------------------------------------------------
+fpdf2==2.8.1
+
+# --- Threat Intelligence -----------------------------------------------------
+mmh3==4.1.0
+python-whois==0.9.4
+dnspython==2.6.1
+
+# --- CLI & Configuration -----------------------------------------------------
+typer==0.12.5
+# 1.0.1 is affected by PYSEC-2026-2270.
+python-dotenv==1.2.2
+
+# --- Resilience --------------------------------------------------------------
+tenacity==9.0.0
+
+# --- Structured Logging ------------------------------------------------------
+structlog==24.4.0

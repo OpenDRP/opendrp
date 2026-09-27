@@ -1,0 +1,131 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+# Build artefacts are scoped to the Python tree on purpose. A bare `lib/` used to
+# match frontend/src/lib as well, which silently kept fifteen frontend source
+# files out of the repository and broke the published build. Keep these rules
+# anchored so they cannot swallow source directories elsewhere.
+backend/build/
+backend/develop-eggs/
+backend/dist/
+backend/downloads/
+backend/eggs/
+backend/.eggs/
+backend/lib/
+backend/lib64/
+backend/parts/
+backend/sdist/
+backend/var/
+backend/wheels/
+backend/*.egg-info/
+/.installed.cfg
+*.egg
+poetry.lock
+
+# Virtual Environment
+venv/
+env/
+.venv/
+.env
+.env.*
+*.env
+!.env.example
+!.env.*.example
+backend/.deps/
+
+# Local/internal files and secrets
+.freebuff/
+AGENTS.md
+**/AGENTS.md
+.secrets/
+secrets/
+credentials/
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+*.secret
+*.credentials
+
+# Celery Beat persistent schedule
+celerybeat-schedule
+celerybeat-schedule*
+
+# Database / Storage
+*.db
+*.sqlite
+file:*
+_tmp_*
+*.tmp
+*.bak
+*.orig
+reports_store/*
+!reports_store/.gitkeep
+*.pdf
+
+# Backup artefacts (`make backup`). Dumps contain the full asset inventory,
+# findings and audit trail in the clear, so they must never be committed — and
+# they must live somewhere the operator can copy offsite.
+backups/
+*.dump
+reports-*.tgz
+
+# Exported audit streams (`verify_audit_chain --ndjson`). A newline-delimited
+# export of the audit trail is the complete record of who did what, from which
+# address and when, with the hashes that make it verifiable — the single most
+# sensitive file this platform can write to disk, and the easiest to commit by
+# accident, because the documented workflow is "export it, then check it".
+*.ndjson
+
+# Node
+node_modules/
+dist/
+dist-ssr/
+*.local
+.vite/
+*.tsbuildinfo
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Docker volumes and local overrides
+postgres_data/
+redis_data/
+volumes/
+docker-compose.override.yml
+docker-compose.local.yml
+
+# IDE / OS
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Alembic
+alembic/versions/*.pyc
+alembic/versions/__pycache__/
+
+# Coverage / Testing
+.pytest_cache/
+.coverage
+# Written by the critical-coverage gate (Makefile + CI), never committed.
+coverage-critical.json
+htmlcov/
+.tox/
+.ruff_cache/
+.mypy_cache/
+
+# Logs
+logs/
+*.log
+
+# Accidental Windows device-name files
+nul
+**/nul

@@ -1,0 +1,117 @@
+# Dependency update automation.
+#
+# The backend and frontend dependency sets are pinned exactly so builds are
+# reproducible; that only stays safe if someone is told when a pin becomes
+# vulnerable. `security` in ci.yml fails on known advisories, and this file
+# keeps the pins from drifting out of date in the first place.
+#
+# Review noise is the thing to manage here:
+#
+#   * patch and minor updates are grouped into one pull request per ecosystem;
+#   * major updates are ignored, because every one of them is a migration —
+#     react-router 7, TypeScript 7, the Vite plugin line, ruff 0.16, a new Node
+#     or nginx base image — and should be scheduled deliberately instead of
+#     arriving as a surprise pull request alongside a dozen others;
+#   * security advisories are still raised immediately, majors included, and
+#     `.github/workflows/ci.yml` fails the build when a shipped dependency is
+#     known-vulnerable.
+version: 2
+
+updates:
+  # Backend Python dependencies (single requirements.txt drives the image build).
+  - package-ecosystem: pip
+    directory: /backend
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - backend
+    groups:
+      backend-python:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+    ignore:
+      - dependency-name: "*"
+        update-types:
+          - version-update:semver-major
+
+  # Frontend dependencies; package-lock.json is committed and CI uses `npm ci`.
+  - package-ecosystem: npm
+    directory: /frontend
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - frontend
+    groups:
+      frontend-npm:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+    ignore:
+      - dependency-name: "*"
+        update-types:
+          - version-update:semver-major
+
+  # Base images for the API image and the nginx-served SPA.
+  - package-ecosystem: docker
+    directory: /backend
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - docker
+    groups:
+      backend-images:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+    ignore:
+      - dependency-name: "*"
+        update-types:
+          - version-update:semver-major
+
+  - package-ecosystem: docker
+    directory: /frontend
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - docker
+    groups:
+      frontend-images:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+    ignore:
+      - dependency-name: "*"
+        update-types:
+          - version-update:semver-major
+
+  # Workflow actions are pinned by tag, so their own updates need watching too.
+  # Action majors are usually a one-line change, so they stay in the group.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - ci
+    groups:
+      github-actions:
+        patterns:
+          - "*"

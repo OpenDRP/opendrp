@@ -1,0 +1,28 @@
+# ==============================================================================
+# OpenDRP Backend — development and CI dependencies
+# ==============================================================================
+# Install with:  pip install -r requirements-dev.txt
+#
+# These packages are deliberately kept out of requirements.txt so the production
+# image stays minimal. CI installs this file instead of the runtime one.
+# ==============================================================================
+
+-r requirements.txt
+
+# --- Testing -----------------------------------------------------------------
+# NOTE: pytest 8.3.2 is reported by pip-audit under PYSEC-2026-1845 (fixed in
+# 9.0.3). It is a test runner and is never shipped, so the finding is recorded
+# here rather than acted on immediately: pytest 9 also requires moving
+# pytest-asyncio to the 1.x line, which reshapes the async fixtures this suite
+# relies on. Schedule that migration separately; the production dependency gate
+# in ci.yml covers shipped packages only.
+pytest==8.3.2
+pytest-asyncio==0.24.0
+pytest-httpx==0.31.0
+pytest-cov==6.0.0
+anyio==4.6.2.post1
+aiosqlite==0.20.0
+
+# --- Static analysis ---------------------------------------------------------
+ruff==0.6.5
+mypy==1.11.2

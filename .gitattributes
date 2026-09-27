@@ -1,0 +1,33 @@
+# Line endings -----------------------------------------------------------------
+#
+# The runtime is Linux even when the repository is cloned on Windows: Compose
+# files, Dockerfiles, the Makefile and Nginx configuration are consumed inside
+# containers. With `core.autocrlf=true` (a common Windows default) a checkout
+# rewrites them to CRLF, which breaks Dockerfile line continuations and shell
+# snippets. Normalising to LF in the working tree keeps one checkout valid on
+# both platforms.
+* text=auto eol=lf
+
+# Shell scripts are executed inside the Linux containers. A CRLF checkout makes
+# the kernel reject the shebang ("bad interpreter: /bin/sh^"), which on Windows
+# only shows up at container start.
+*.sh text eol=lf
+
+# Binaries: never normalise, never diff as text.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.svg text eol=lf
+*.pdf binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.eot binary
+*.zip binary
+*.gz binary
+*.tar binary
+
+# Keep diffs readable.
+frontend/package-lock.json linguist-generated=true

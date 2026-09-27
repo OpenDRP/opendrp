@@ -1,0 +1,64 @@
+# ==============================================================================
+# Two-API-replica scenario — `make verify-replicas`
+# ==============================================================================
+# Layered on the production file set, never on the development overlay:
+#
+#     docker compose -f docker-compose.yml -f docker-compose.replicas.yml up -d
+#     docker compose -f docker-compose.yml -f docker-compose.replicas.yml \
+#       --profile verify run --rm --no-deps replica-check
+#
+# What this demonstrates is the platform's only real scaling claim: that the API
+# is stateless and two replicas behind a load balancer share everything that
+# matters (PostgreSQL for durable state, Redis for the queue). It is checked by
+# scripts/verify_replicas.py, which signs in against one replica and then uses
+# that session against the other.
+#
+# Two properties of the base file assume a single API container, and both are
+# deliberate there — a stable name is what makes `docker compose exec backend`
+# predictable in every document, and the published port is why nothing reaches
+# the API except through the reverse proxy in production. Compose refuses to run
+# two replicas while either is set, so the `!reset` tags below release them.
+# `!reset` needs Docker Compose v2.24 or newer.
+#
+# Note that the API containers migrate their own schema at startup
+# (backend/scripts/migrate.py) under a PostgreSQL advisory lock, which is what
+# makes two replicas starting at the same instant safe in the first place.
+services:
+  backend:
+    # `!reset null` / `!reset []` rather than a bare `!reset`: the Compose merge
+    # specification requires a value for the tag, even though it is ignored, and
+    # these two spellings also say at a glance what the result is.
+    container_name: !reset null
+    ports: !reset []
+    deploy:
+      # Honoured by `docker compose up` (not only by Swarm) since Compose v2.20.
+      replicas: 2
+
+  # Not started by `up`: this service exists to be `run`, once, and its exit code
+  # is the result of the scenario. Kept out of the default service set by a
+  # profile so that `up -d` does not quietly execute it.
+  replica-check:
+    image: python:3.12-slim
+    container_name: opendrp-replica-check
+    profiles: ["verify"]
+    restart: "no"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    depends_on:
+      backend:
+        condition: service_healthy
+    volumes:
+      - ./scripts:/scripts:ro
+    environment:
+      REPLICA_HOST: backend
+      REPLICA_PORT: "8000"
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+    command: ["python", "/scripts/verify_replicas.py"]
+    networks:
+      - opendrp-net

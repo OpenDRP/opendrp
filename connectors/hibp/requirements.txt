@@ -1,0 +1,3 @@
+opendrp-connector-sdk @ file:///opt/sdk
+httpx==0.27.2
+structlog==24.4.0

@@ -1,0 +1,71 @@
+name: Bug report
+description: Report a defect in the platform, a connector, or the documentation
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. Two requests before you start:
+
+        * **Do not report security vulnerabilities here.** Use the private
+          channel described in [SECURITY.md](../blob/main/SECURITY.md).
+        * **Redact secrets.** Provider API keys, connector tokens, JWT secrets
+          and database passwords must not appear in this issue, and neither
+          should real customer domains or email addresses if you can avoid it.
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+      description: The value reported by `GET /api/v1/health`, or the commit SHA you are running.
+      placeholder: "0.1.0 / 2bc8e4b"
+    validations:
+      required: true
+  - type: dropdown
+    id: deployment
+    attributes:
+      label: How is the stack deployed?
+      options:
+        - Docker Compose, the installation (make up)
+        - Docker Compose, the tooling stack (make up-tools)
+        - Kubernetes or another orchestrator
+        - Other (describe in the steps below)
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: The observed behaviour, and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Include the role you were signed in as (admin / analyst / viewer / connector).
+      placeholder: |
+        1. Sign in as ...
+        2. Open ...
+        3. See ...
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs or audit records
+      description: |
+        Paste the failing request's JSON log line if you have it. It carries a
+        `request_id` in `details`; quoting that id is often enough on its own.
+        Redact secrets before pasting.
+      render: text
+    validations:
+      required: false
+  - type: checkboxes
+    id: confirmations
+    attributes:
+      label: Confirmations
+      options:
+        - label: I have searched existing issues for this problem.
+          required: true
+        - label: This report contains no secrets or personal data.
+          required: true

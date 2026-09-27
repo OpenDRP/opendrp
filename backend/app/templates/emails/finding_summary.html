@@ -1,0 +1,66 @@
+{% extends "emails/base.html" %}
+{#- One batch of findings, for one channel. The fields are the module's own
+    declared ones, so this template knows no threat type by name: it lays out
+    whatever the findings carry. -#}
+{% block content %}
+  <div>
+    {% if badge_class %}
+    <span class="{{ badge_class }}">{{ module_label }}</span>
+    {% else %}
+    <span style="display: inline-block; background-color: #e0e7ff; color: #3730a3; padding: 4px 10px; border-radius: 9999px; font-size: 12px; font-weight: 600;">{{ module_label }}</span>
+    {% endif %}
+  </div>
+
+  <h2 style="margin: 12px 0 4px;">
+    {{ total }} new finding{% if total != 1 %}s{% endif %}
+  </h2>
+  <p style="margin: 0 0 20px; color: #6b7280; font-size: 13px;">
+    {{ title }}
+  </p>
+
+  <table class="alert-table">
+    <tr>
+      <th style="width: 38%;">Job</th>
+      <td class="mono">{{ job_id }}</td>
+    </tr>
+    {% if included < total %}
+    <tr>
+      <th>Included here</th>
+      <td>The first {{ included }} of {{ total }} findings — the rest are in the platform.</td>
+    </tr>
+    {% endif %}
+    {% for name, summary in groups %}
+    <tr>
+      <th>{{ name }}</th>
+      <td>{{ summary }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+
+  {% if rows %}
+  <table class="alert-table">
+    <thead>
+      <tr>
+        <th style="width: 32px;">#</th>
+        {% for column in columns %}
+        <th>{{ column }}</th>
+        {% endfor %}
+      </tr>
+    </thead>
+    <tbody>
+      {% for row in rows %}
+      <tr>
+        <td>{{ loop.index }}</td>
+        {% for value in row %}
+        <td class="mono">{{ value }}</td>
+        {% endfor %}
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+
+  {% if dashboard_url %}
+  <a class="btn" href="{{ dashboard_url }}">Open in OpenDRP</a>
+  {% endif %}
+{% endblock %}

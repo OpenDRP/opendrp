@@ -1,0 +1,122 @@
+# ==============================================================================
+# Tooling overlay (source mounts and test tooling)
+# ==============================================================================
+# Layered on top of docker-compose.yml by the Makefile targets:
+#
+#     make up-tools   # docker compose -f docker-compose.yml -f docker-compose.dev.yml up
+#     make up         # docker compose -f docker-compose.yml up  -- the installation
+#
+# This file is *not* an installation shape. `make up` is the installation, and it
+# is the only one: there is nothing here to deploy, and the test and lint targets
+# are the only things that name this file.
+#
+# The file is *not* named docker-compose.override.yml on purpose. Compose loads a
+# file with that name automatically, and .gitignore reserves it for a developer's
+# own uncommitted tweaks — so a committed overlay under that name would silently
+# follow a bare `docker compose up` into a deployment. Naming it explicitly keeps
+# "the development stack" and "the production stack" two distinct commands whose
+# file sets cannot drift.
+#
+# The base file describes how the platform is meant to run in production: no host
+# paths mounted into the API container, no test tooling in the image, read-only
+# root filesystem, unprivileged user.
+#
+# Everything here is a deliberate downgrade of one production property, and each
+# one is annotated with which property and why.
+# ==============================================================================
+
+services:
+  backend:
+    # Use a distinct tag so the dev image (with pytest/ruff/mypy) cannot be
+    # overwritten by the production image built for Celery services. Both shapes
+    # otherwise share the same image name and parallel Compose builds race to
+    # publish whichever variant finishes last.
+    image: ${OPENDRP_IMAGE_PREFIX:-ghcr.io/opendrp/opendrp}/backend-dev:${OPENDRP_VERSION:-latest}
+    build:
+      args:
+        # The Makefile targets (`make test-backend`, `make lint-backend`,
+        # `make mypy-backend`) run pytest, ruff and mypy inside this container.
+        # The shipped image deliberately ships none of them.
+        INSTALL_DEV_REQUIREMENTS: "true"
+    # The source tree is mounted so an edit is picked up without a rebuild, and
+    # read-write so the coverage and typecheck targets can write their reports
+    # next to the code they describe. A writable application tree inside the API
+    # container is exactly what the production file avoids — and why this stays
+    # out of it.
+    volumes:
+      - ./backend:/app
+      # Read-only, and for the test-suite only: tests/test_connector_sdk_contract.py
+      # imports the connector SDK from the checkout. The connectors themselves run
+      # in their own containers and never see the core's source.
+      - ./connectors:/connectors:ro
+      # Same idea, same reason. The repository-level gates and the setup wizard are
+      # covered by this suite, which resolves them from `parents[2]` of tests/ --
+      # `/` in this container. Each is mounted read-only at the path the tests
+      # expect, and the checkout root is deliberately *not* mounted: `.env` lives
+      # there, and the API container has no business being able to read it.
+      - ./scripts:/scripts:ro
+      - ./setup.py:/setup.py:ro
+      - ./.env.example:/.env.example:ro
+      # The portability gate scans the documentation as well: README and docs/
+      # are mounted whole (never the checkout root) so its test can run here
+      # too. `./connectors` above already covers connectors/README.md.
+      - ./README.md:/README.md:ro
+      - ./docs:/docs:ro
+      # The HSTS entrypoint fragment, the server block and the frontend
+      # Dockerfile: tests/test_hsts_rendering.py renders the include and
+      # tests/test_hsts_wiring.py reads the configuration as text, because a
+      # deployment setting that nothing renders is a control that only looks
+      # like one. Read-only: nothing here writes to it.
+      - ./docker:/docker:ro
+      - ./frontend/Dockerfile:/frontend/Dockerfile:ro
+      # The installation shape is asserted rather than described:
+      # tests/test_single_installation_shape.py reads the Makefile's targets and the
+      # operator documentation, so both are mounted read-only as well.
+      - ./Makefile:/Makefile:ro
+      - ./CONTRIBUTING.md:/CONTRIBUTING.md:ro
+      # The repository-level environment gate resolves its checkout root as `/`
+      # inside this test container. Mount the Compose inputs there as read-only
+      # so the shipped-configuration test checks the real files, not an empty
+      # synthetic root.
+      - ./docker-compose.yml:/docker-compose.yml:ro
+      - ./docker-compose.dev.yml:/docker-compose.dev.yml:ro
+      - ./docker-compose.replicas.yml:/docker-compose.replicas.yml:ro
+      # Keep generated PDFs on the host while developing, so they are easy to
+      # open and easy to delete.
+      - ./reports_store:/workspace/reports_store
+    read_only: false
+
+  celery-worker:
+    image: ${OPENDRP_IMAGE_PREFIX:-ghcr.io/opendrp/opendrp}/backend-dev:${OPENDRP_VERSION:-latest}
+    build:
+      args:
+        # Keep the development image consistent across backend and Celery
+        # services. They intentionally share one image tag; without this
+        # override, a parallel build can let the production worker image win and
+        # leave pytest/ruff/mypy unavailable in the backend container.
+        INSTALL_DEV_REQUIREMENTS: "true"
+    volumes:
+      - ./backend:/app
+      - ./reports_store:/workspace/reports_store
+    read_only: false
+
+  celery-beat:
+    image: ${OPENDRP_IMAGE_PREFIX:-ghcr.io/opendrp/opendrp}/backend-dev:${OPENDRP_VERSION:-latest}
+    build:
+      args:
+        INSTALL_DEV_REQUIREMENTS: "true"
+    volumes:
+      - ./backend:/app
+      - ./reports_store:/workspace/reports_store
+    read_only: false
+
+  backup:
+    # The base file archives the named volume. In development the report store is
+    # the ./reports_store directory, so point the archiver at the same place the
+    # running stack writes to; without this, `make backup` would faithfully
+    # archive an empty volume.
+    #
+    # Volumes merge by container path, so this replaces the base file's
+    # `reports_store:/reports:ro` rather than adding a second mount.
+    volumes:
+      - ./reports_store:/reports:ro

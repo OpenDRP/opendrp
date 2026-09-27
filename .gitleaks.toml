@@ -1,0 +1,46 @@
+# Secret-scanning configuration for gitleaks (see .github/workflows/ci.yml).
+#
+# The default rule set is used unchanged; this file only carves out the places
+# where a *fixture* looks like a credential. Every entry below exists because the
+# value it matches is generated for a test run or written into a template, and
+# every entry is scoped as narrowly as it can be: a path allowlist where the
+# whole directory is synthetic, and an exact-value allowlist everywhere else.
+#
+# What is deliberately NOT here: any allowlist of a rule, an entropy threshold or
+# a whole file category that could hide a real key. If a new fixture trips the
+# scan, add its literal value here with a reason — do not widen a pattern.
+
+# Fixture trees whose entire purpose is to hold fake credentials: test fixtures
+# are checked in so the suite is reproducible, and none of these values can
+# authenticate against anything.
+[[allowlists]]
+description = "Synthetic credentials in the test suite and the .env template"
+paths = [
+  '''^backend/tests/.*''',
+  '''^\.env\.example$''',
+  '''^docs/.*\.md$''',
+]
+
+# Values passed through CI environment for the compose, integration and backup
+# jobs. They are literals in the workflow files (which is the point — a workflow
+# that reads its fixtures from secrets cannot be reviewed), so they are allowlisted
+# by their exact shape rather than by allowlisting the workflow files themselves.
+[[allowlists]]
+description = "CI fixture credentials, by value"
+regexTarget = "match"
+regexes = [
+  # e.g. ci-jwt-secret-that-is-longer-than-32-characters, ci-shodan-key,
+  # ci-dnstwist-connector-token, ci-postgres-password
+  '''ci-[a-z-]*(secret|token|key|password)[a-z0-9-]*''',
+  # The database the integration and backup jobs create.
+  '''integration-password''',
+  # Placeholder Fernet keys: base64 of a sentence, not of 32 random bytes. They
+  # are the documented default in .env.example, and the API refuses to start in
+  # production with one.
+  '''Z0FBQUFBQ[A-Za-z0-9_=-]+''',
+  # HIBP's integration key, quoted in the README, connectors/README.md and
+  # .env.example so an operator can validate a new installation without a HIBP
+  # subscription. It is not a credential: HIBP serves fixture breaches to it and
+  # nothing else, and it is published in HIBP's own documentation.
+  '''00000000000000000000000000000000''',
+]

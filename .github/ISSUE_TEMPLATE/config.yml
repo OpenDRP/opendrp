@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/OpenDRP/opendrp/security/advisories/new
+    about: Private channel for vulnerabilities. Please do not open a public issue.
+  - name: Question or deployment help
+    url: https://github.com/OpenDRP/opendrp/discussions
+    about: Ask about running, upgrading or troubleshooting a deployment.
+  - name: Contributing guide
+    url: https://github.com/OpenDRP/opendrp/blob/main/CONTRIBUTING.md
+    about: How to set up the development stack and what a change should contain.

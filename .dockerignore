@@ -1,0 +1,68 @@
+# Git metadata and internal agent files
+.git/
+.gitignore
+.freebuff/
+AGENTS.md
+**/AGENTS.md
+
+# Environment secrets
+.env
+.env.*
+*.env
+!.env.example
+!.env.*.example
+
+# Private key and credential artifacts
+.secrets/
+secrets/
+credentials/
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+*.secret
+*.credentials
+
+# Python
+backend/__pycache__/
+backend/.pytest_cache/
+backend/.deps/
+backend/.coverage
+**/__pycache__/
+**/*.py[cod]
+*.py[cod]
+
+# Node / Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/dist-ssr/
+frontend/.vite/
+
+# Database & Storage
+*.db
+*.sqlite
+celerybeat-schedule*
+reports_store/*
+!reports_store/.gitkeep
+file:*
+_tmp_*
+*.tmp
+*.bak
+*.orig
+
+# Reports and logs
+*.pdf
+*.log
+logs/
+
+# Exported audit streams: the whole audit trail, in the clear, in one file. The
+# backend and connector images are built from the repository root.
+*.ndjson
+
+# Backup artefacts: full database dumps and report archives. The frontend image
+# is built from the repository root, so without these rules a local `make backup`
+# would put an unencrypted copy of the platform's data into an image layer.
+backups/
+*.dump
+reports-*.tgz

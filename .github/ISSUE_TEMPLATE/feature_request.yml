@@ -1,0 +1,55 @@
+name: Feature request
+description: Propose a capability the platform should have
+labels: ["enhancement", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The most useful feature requests describe the **operator problem** rather
+        than a specific implementation. This platform is deliberately small and
+        self-hosted, so "what would this let you stop doing by hand?" is the part
+        that gets read first.
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What are you unable to do today, and what is the consequence?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you would like to see
+      description: A sketch is enough. If it changes a documented interface, say so.
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Core platform (API, auth, inventory, audit, reports)
+        - Connectors and data sources
+        - Frontend
+        - Deployment, backups, observability
+        - Documentation
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you considered
+      description: Including "nothing, we would keep doing it manually" — that is a useful answer.
+    validations:
+      required: false
+  - type: textarea
+    id: cost
+    attributes:
+      label: Ongoing cost
+      description: |
+        Does this add a paid third-party subscription, a new container, or a new
+        background task? The project targets small companies, so a new recurring
+        cost is part of the design, not an implementation detail.
+    validations:
+      required: false
