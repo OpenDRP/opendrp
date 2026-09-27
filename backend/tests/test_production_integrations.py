@@ -183,7 +183,7 @@ class TestPostgreSQLProductionBoundary:
                 await verify.execute(select(Job).where(Job.id.in_(job_ids)))
             ).scalars().all()
             assert {row.status for row in rows} == {"running"}
-            assert {row.params["claimed_by"] for row in rows} == set(names)
+            assert {row.claimed_by_connector for row in rows} == set(names)
             await verify.execute(delete(Job).where(Job.id.in_(job_ids)))
             await verify.execute(delete(Connector).where(Connector.id.in_(connector_ids)))
             await verify.commit()
@@ -245,7 +245,7 @@ class TestPostgreSQLProductionBoundary:
                 await verify.execute(select(Job).where(Job.id.in_(job_ids)))
             ).scalars().all()
             assert {row.status for row in rows} == {"running"}
-            assert {row.params["claimed_by"] for row in rows} == set(names)
+            assert {row.claimed_by_connector for row in rows} == set(names)
             await verify.execute(delete(Job).where(Job.id.in_(job_ids)))
             await verify.execute(delete(Connector).where(Connector.id.in_(connector_ids)))
             await verify.commit()
@@ -276,6 +276,8 @@ class TestPostgreSQLProductionBoundary:
                 AlertDelivery(
                     job_id=job.id,
                     threat_type="phishing",
+                    channel="email",
+                    target=f"integration-{suffix}@example.test",
                     payload={"phishing_domain": f"{index}-{suffix}.example"},
                     status=AlertDeliveryStatus.pending,
                     next_attempt_at=datetime.now(timezone.utc),

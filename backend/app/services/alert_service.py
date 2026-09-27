@@ -69,7 +69,8 @@ _MAX_BREAKDOWN_VALUES = 4
 _OMISSION_NOTE_RESERVE = 64
 #: Hosts whose "link" would point at the reader's own machine rather than at
 #: this installation.
-_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "0.0.0.0"})
+# B104 is about binding a listener, not rejecting a URL host supplied as input.
+_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "0.0.0.0"})  # nosec B104
 #: The finding list a delivered message links to, per threat type. A module
 #: declared at runtime has its own page, named by its registry id.
 _FINDING_PATHS = {"phishing": "/phishing", "breach": "/breaches"}
@@ -309,7 +310,7 @@ class AlertService:
         msg["Subject"] = subject
         # Was `settings.__version__` behind a hasattr check: Settings has no such
         # attribute, so every alert ever sent announced itself as OpenDRP/1.0.0
-        # while the platform is 0.1.0. The version lives in app/__init__.py.
+        # while the platform was 0.1.0. The version lives in app/__init__.py.
         msg["X-Mailer"] = f"OpenDRP/{__version__}"
         msg.set_content(plain_body or "OpenDRP alert notification.")
         msg.add_alternative(html_body, subtype="html")

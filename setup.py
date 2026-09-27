@@ -34,7 +34,7 @@ Usage
     python setup.py --check               # audit an existing .env, change nothing
     python setup.py --repair              # fill only the gaps (placeholders, empties)
     python setup.py --force               # rotate secrets, keeping the old ones valid
-    python setup.py --non-interactive --public-url https://drp.example.com --version 0.1.0
+    python setup.py --non-interactive --public-url https://drp.example.com --version 0.1.1
 
 Interactive runs ask only what has no safe default: the release to run (offered
 as the version this checkout declares), the public URL the UI is served from,
@@ -1126,9 +1126,9 @@ def wizard(answers: Answers) -> Answers:
         validate=lambda value: (
             None
             if SEMVER_RE.match(value)
-            else "use a pinned semantic version such as 0.1.0; `latest` is not allowed"
+            else "use a pinned semantic version such as 0.1.1; `latest` is not allowed"
         ),
-        hint="e.g. 0.1.0",
+        hint="e.g. 0.1.1",
     ).lstrip("vV")
     answers.explicit.add("OPENDRP_VERSION")
 
@@ -1619,7 +1619,7 @@ def parse_args(argv: Optional[Sequence[str]]) -> argparse.Namespace:
         "--version",
         dest="release_version",
         default=None,
-        help="pinned production release version, for example 0.1.0",
+        help="pinned production release version, for example 0.1.1",
     )
     parser.add_argument(
         "--connectors",

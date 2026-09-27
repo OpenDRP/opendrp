@@ -705,7 +705,7 @@ services:
         VITE_CANONICAL_ORIGIN: ${CANONICAL_ORIGIN:-}
         # The release the bundle announces. Pinned alongside the image tag in
         # release.yml, so an instance built from a tag reports that tag.
-        VITE_APP_VERSION: ${OPENDRP_VERSION:-0.1.0}
+        VITE_APP_VERSION: ${OPENDRP_VERSION:-0.1.1}
     container_name: opendrp-frontend
     restart: unless-stopped
     mem_limit: 256m

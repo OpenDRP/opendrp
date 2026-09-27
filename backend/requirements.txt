@@ -53,6 +53,9 @@ pycares==4.9.0
 # --- Task Queue --------------------------------------------------------------
 celery[redis]==5.4.0
 redis==5.0.8
+# msgpack is used by Kombu's serializer and must include the fix for
+# GHSA-6v7p-g79w-8964 (fixed in 1.2.1).
+msgpack==1.2.1
 
 # --- Templates & Rendering ---------------------------------------------------
 # 3.1.4 is affected by CVE-2024-56201 and CVE-2024-56326 (sandbox escape).

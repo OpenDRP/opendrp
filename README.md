@@ -296,7 +296,7 @@ reads `<placeholder>` as input redirection.
 6. Open the UI at <http://localhost:3000>, sign in with that address and the
    temporary password, and complete the steps the page asks for.
 
-The public `v0.1.0` branch is the reviewed source snapshot for version 0.1.0 (it is a branch, not a release tag). The initial publication does not include a `v0.1.0` tag or prebuilt GHCR images; the quick start builds images from source. For a later tagged release, `OPENDRP_VERSION` must be pinned to that release; `latest` is rejected by the setup checks and by the application.
+The initial source snapshot was published as `v0.1.0`. The security-fixed patch candidate is version `0.1.1`; its tag and container images will be available after the release is published. For a tagged release, set `OPENDRP_VERSION` to the released version. The setup checks and application reject the moving `latest` tag in production.
 
 The public health endpoint is:
 
