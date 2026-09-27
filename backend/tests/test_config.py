@@ -7,7 +7,7 @@ from app.core.config import Settings, _parse_cors_origins
 #: the tests below fail only for the reason each one is about.
 _PRODUCTION = {
     "APP_ENV": "production",
-    "OPENDRP_VERSION": "0.1.0",
+    "OPENDRP_VERSION": "0.1.1",
     "JWT_SECRET_KEY": "j" * 48,
     "ENCRYPTION_KEY": "Zm9yLXRlc3Qtb25seS1mZXJuZXQta2V5LXZhbHVlLXBhZGRlZA==",
     "AUTH_COOKIE_SECURE": True,
@@ -30,7 +30,7 @@ def test_production_requires_a_pinned_release_version():
 
 
 def test_production_accepts_a_pinned_release_version():
-    assert _production(OPENDRP_VERSION="0.1.0").OPENDRP_VERSION == "0.1.0"
+    assert _production(OPENDRP_VERSION="0.1.1").OPENDRP_VERSION == "0.1.1"
 
 
 

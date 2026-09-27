@@ -45,6 +45,7 @@ ARG INSTALL_DEV_REQUIREMENTS=false
 RUN python -m venv /opt/venv && \
     . /opt/venv/bin/activate && \
     pip install --upgrade pip && \
+    pip install --no-cache-dir setuptools==84.0.0 && \
     pip install --no-cache-dir -r requirements.txt && \
     if [ "$INSTALL_DEV_REQUIREMENTS" = "true" ]; then \
         echo "[builder] installing dev requirements (test/lint tooling)"; \
@@ -82,10 +83,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     fonts-dejavu \
     libpq5 \
+  && apt-get upgrade -y --no-install-recommends \
   && rm -rf /var/lib/apt/lists/*
 
+# pip embeds an SBOM of its vendored tools which can misreport old versions of
+# packages in the environment. Drop that metadata from both the base interpreter
+# and the copied venv so image scanners inspect the installed distributions.
 # Copy venv from builder
 COPY --from=builder /opt/venv /opt/venv
+RUN find /usr/local/lib/python3.12/site-packages /opt/venv/lib/python3.12/site-packages \
+      -path '*/pip/_vendor/bom.cdx.json' -delete
 
 # Copy application source
 COPY . /app/

@@ -67,7 +67,7 @@ ENV VITE_CANONICAL_ORIGIN=${VITE_CANONICAL_ORIGIN}
 # it, which is what makes a screenshot usable in a bug report. Defaulted to the
 # in-tree version rather than left unset, so a development build does not claim
 # to be a release it is not.
-ARG VITE_APP_VERSION=0.1.0
+ARG VITE_APP_VERSION=0.1.1
 ENV VITE_APP_VERSION=${VITE_APP_VERSION}
 ENV NODE_ENV=production
 
@@ -114,7 +114,11 @@ RUN set -euo pipefail; \
   ls -la dist;
 
 # ---- Stage 2: Runtime — Nginx serve SPA + reverse-proxy /api → backend ------
-FROM nginx:1.27-alpine AS runtime
+FROM nginx:1.29.8-alpine3.23 AS runtime
+
+# Keep packages in the base image current with security updates published for
+# this Alpine branch after the upstream nginx image was built.
+RUN apk upgrade --no-cache
 
 # Copy global nginx.conf (worker tuning, gzip, logging)
 COPY ./docker/nginx/nginx.conf /etc/nginx/nginx.conf

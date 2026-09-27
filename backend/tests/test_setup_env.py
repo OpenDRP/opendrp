@@ -93,7 +93,7 @@ def _public_args() -> list:
         "--public-url",
         "https://drp.example.com",
         "--version",
-        "0.1.0",
+        "0.1.1",
         "--connectors",
         "dnstwist",
     ]
@@ -297,7 +297,7 @@ def test_a_key_the_template_does_not_carry_is_appended_and_marked(tmp_path: Path
     """An older .env gains a newer setting, with a note saying where it came from."""
     target = tmp_path / ".env"
     target.write_text(
-        "APP_ENV=production\nOPENDRP_VERSION=0.1.0\n"
+        "APP_ENV=production\nOPENDRP_VERSION=0.1.1\n"
         "JWT_SECRET_KEY=REPLACE_ME\nCORS_ORIGINS=[\"http://localhost:3000\"]\n",
         encoding="utf-8",
     )
@@ -438,7 +438,7 @@ def test_a_dry_run_writes_nothing(tmp_path: Path) -> None:
 
 def test_a_run_without_a_public_url_is_refused(tmp_path: Path) -> None:
     """Nothing is guessed: a wrong origin is a UI that refuses every request."""
-    assert _run(_fresh_copy(tmp_path), "--version", "0.1.0") == 2
+    assert _run(_fresh_copy(tmp_path), "--version", "0.1.1") == 2
 
 
 def test_the_wizard_writes_the_one_installation_shape(tmp_path: Path) -> None:
@@ -454,7 +454,7 @@ def test_the_wizard_writes_the_one_installation_shape(tmp_path: Path) -> None:
 
     assert values["APP_ENV"] == "production"
     assert values["AUTH_COOKIE_SECURE"] == "true"
-    assert values["OPENDRP_VERSION"] == "0.1.0"
+    assert values["OPENDRP_VERSION"] == "0.1.1"
     # Empty, not a development origin. A canonical origin sends a browser that
     # reached the SPA under some other origin to that one - and a release built
     # with `http://localhost:3000` sends every real user to their own machine.
@@ -478,13 +478,13 @@ def test_a_localhost_public_url_is_accepted_and_a_public_http_one_is_refused(
     """
     local = tmp_path / "local.env"
     local.write_text(TEMPLATE.read_text(encoding="utf-8"), encoding="utf-8")
-    assert _run(local, "--public-url", "http://localhost:3000", "--version", "0.1.0") == 0
+    assert _run(local, "--public-url", "http://localhost:3000", "--version", "0.1.1") == 0
     assert _values(local)["CORS_ORIGINS"] == '["http://localhost:3000"]'
 
     public = tmp_path / "public.env"
     public.write_text(TEMPLATE.read_text(encoding="utf-8"), encoding="utf-8")
     assert (
-        _run(public, "--public-url", "http://drp.example.com", "--version", "0.1.0") == 2
+        _run(public, "--public-url", "http://drp.example.com", "--version", "0.1.1") == 2
     )
     # The refusal names the way forward, and leaves the target untouched: a
     # rejected run must not write half an installation.
@@ -521,7 +521,7 @@ def test_repair_moves_a_development_file_to_the_installation_shape(
     target = tmp_path / ".env"
     target.write_text(
         "APP_ENV=development\n"
-        "OPENDRP_VERSION=0.1.0\n"
+        "OPENDRP_VERSION=0.1.1\n"
         "AUTH_COOKIE_SECURE=false\n"
         'CORS_ORIGINS=["https://drp.example.com"]\n'
         "CANONICAL_ORIGIN=http://localhost:3000\n"
@@ -654,7 +654,7 @@ def test_validate_mirrors_the_configuration_validators() -> None:
     """A compact statement of the rules, so a change to them is a deliberate edit."""
     good: Dict[str, Optional[str]] = {
         "APP_ENV": "production",
-        "OPENDRP_VERSION": "0.1.0",
+        "OPENDRP_VERSION": "0.1.1",
         "POSTGRES_PASSWORD": setup_wizard.generate_secret("POSTGRES_PASSWORD"),
         "REDIS_PASSWORD": setup_wizard.generate_secret("REDIS_PASSWORD"),
         "JWT_SECRET_KEY": setup_wizard.generate_secret("JWT_SECRET_KEY"),

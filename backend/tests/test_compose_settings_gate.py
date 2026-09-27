@@ -62,7 +62,7 @@ gate = _load(_GATE, "opendrp_test_check_compose_settings")
 #: the gate does not require Compose to pass it.
 _PRODUCTION: dict[str, str] = {
     "APP_ENV": "production",
-    "OPENDRP_VERSION": "0.1.0",
+    "OPENDRP_VERSION": "0.1.1",
     "JWT_SECRET_KEY": "j" * 48,
     "ENCRYPTION_KEY": "Zm9yLXRlc3Qtb25seS1mZXJuZXQta2V5LXZhbHVlLXBhZGRlZA==",
     "AUDIT_CHAIN_KEYS": "chain-key-for-tests-only-" * 3,
@@ -73,7 +73,7 @@ _PRODUCTION: dict[str, str] = {
 
 
 def _service(name: str, environment: dict[str, str]) -> str:
-    lines = [f"  {name}:", "    image: opendrp/backend:0.1.0", "    environment:"]
+    lines = [f"  {name}:", "    image: opendrp/backend:0.1.1", "    environment:"]
     lines.extend(f"      {key}: {value}" for key, value in environment.items())
     return "\n".join(lines) + "\n"
 

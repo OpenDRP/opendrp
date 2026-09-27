@@ -8,4 +8,4 @@ Three copies of a version string is how a running instance reports a version
 that was never released.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"

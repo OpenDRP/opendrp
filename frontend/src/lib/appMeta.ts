@@ -7,5 +7,5 @@
  */
 export const APP_NAME = "OpenDRP";
 export const APP_TAGLINE = "Digital Risk Protection Platform";
-export const APP_VERSION: string = import.meta.env.VITE_APP_VERSION || "0.1.0";
+export const APP_VERSION: string = import.meta.env.VITE_APP_VERSION || "0.1.1";
 export const APP_TITLE = `${APP_NAME} — ${APP_TAGLINE}`;

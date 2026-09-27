@@ -167,7 +167,7 @@ class TestProductionValidationOfPreviousKeys:
     def _production(self, **overrides) -> Settings:
         values = {
             "APP_ENV": "production",
-            "OPENDRP_VERSION": "0.1.0",
+            "OPENDRP_VERSION": "0.1.1",
             "JWT_SECRET_KEY": NEW_SECRET,
             "ENCRYPTION_KEY": NEW_KEY,
             "AUTH_COOKIE_SECURE": True,

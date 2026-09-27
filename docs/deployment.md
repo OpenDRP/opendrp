@@ -18,22 +18,20 @@ docker compose version
 
 ## 1. Prepare the checkout and version
 
-For the initial public publication, check out the reviewed `v0.1.0` source branch. It is a branch, not a Git tag; no release images are published yet. The installation command below builds the images from source. Once a tagged release is published, use that tag and its pinned images instead of a moving branch.
+The original release tag `v0.1.0` is preserved. A security-fixed patch candidate, `v0.1.1`, is being prepared; do not use that version until its GitHub Release and GHCR images have been published. For an available production release, check out its tag and pin the same version in `.env`:
 
 ```text
 git clone https://github.com/OpenDRP/opendrp.git
 cd opendrp
-git checkout v0.1.0
+git checkout <released-tag>
 ```
-
-Set the exact release in `.env`:
 
 ```dotenv
 APP_ENV=production
-OPENDRP_VERSION=0.1.0
+OPENDRP_VERSION=<released-version>
 ```
 
-`OPENDRP_VERSION` is required in production and must be a semantic version. The application refuses an empty value or `latest`.
+`OPENDRP_VERSION` is required in production and must be a semantic version. The application refuses an empty value or `latest`. For a published release, `make pull-prod` pulls the matching GHCR images; source builds are available through `make up`.
 
 One installation runs one release: this value is the image tag every service is built or pulled as, and the version the UI reports. The wizard offers the version this checkout declares (`backend/app/__init__.py`, the same string `/api/v1/health` answers) because `make up` builds the images from that tree; naming a different one is how `make pull-prod` runs a published tag instead. Keep the two equal: Settings reports `OPENDRP_VERSION` while the health endpoint reports the running code's version, so a file that disagrees has one installation displaying two versions. `python setup.py --check` reports that difference as a note.
 
@@ -42,7 +40,7 @@ One installation runs one release: this value is the image tag every service is 
 Run the wizard interactively:
 
 ```text
-python setup.py --public-url https://drp.example.com --version 0.1.0
+python setup.py --public-url https://drp.example.com --version 0.1.1
 ```
 
 On Windows, use `py -3 setup.py` if `python` is not the Python 3 launcher. The wizard uses only the Python standard library. It generates database, JWT, encryption and audit-chain secrets with the operating system CSPRNG, and it writes one shape of file: the production one. No flag selects another, because an installation that differs from the one users reach is not one worth checking.
@@ -83,7 +81,7 @@ says that on purpose.
 For a non-interactive installation, the same values come from flags:
 
 ```text
-python setup.py --non-interactive --public-url https://drp.example.com --version 0.1.0 --connectors dnstwist,hibp --mfa
+python setup.py --non-interactive --public-url https://drp.example.com --version 0.1.1 --connectors dnstwist,hibp --mfa
 ```
 
 `--version` may be omitted: the version this checkout declares is used, and a

@@ -309,7 +309,7 @@ class AlertService:
         msg["Subject"] = subject
         # Was `settings.__version__` behind a hasattr check: Settings has no such
         # attribute, so every alert ever sent announced itself as OpenDRP/1.0.0
-        # while the platform is 0.1.0. The version lives in app/__init__.py.
+        # while the platform was 0.1.0. The version lives in app/__init__.py.
         msg["X-Mailer"] = f"OpenDRP/{__version__}"
         msg.set_content(plain_body or "OpenDRP alert notification.")
         msg.add_alternative(html_body, subtype="html")

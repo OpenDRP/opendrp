@@ -57,8 +57,8 @@ A useful report contains:
 
 ## Supported versions
 
-The initial public publication has no tagged releases yet. The `v0.1.0` branch
-is the source snapshot for that version; `main` is the supported development
+The initial public source snapshot is `v0.1.0`; the `v0.1.1` patch is being
+prepared and is not yet a published release. `main` is the supported development
 branch. Fixes are published on `main`, and reports against older commits may be
 answered with "please retry on `main`".
 

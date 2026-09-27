@@ -17,7 +17,7 @@ body:
     attributes:
       label: Version or commit
       description: The value reported by `GET /api/v1/health`, or the commit SHA you are running.
-      placeholder: "0.1.0 / 2bc8e4b"
+      placeholder: "0.1.1 / 2bc8e4b"
     validations:
       required: true
   - type: dropdown

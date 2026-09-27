@@ -9,6 +9,14 @@ The version in `backend/app/__init__.py` is the single source of truth;
 `scripts/check_version_consistency.py` fails the build if this file disagrees
 with it.
 
+## [0.1.1] - Unreleased
+
+### Security
+
+- Upgrade backend `msgpack` to a fixed version and pin fixed `setuptools`, resolving GHSA-6v7p-g79w-8964 and CVE-2025-47273. Remove pip's stale bundled SBOM from the runtime image so image scans report the installed package versions.
+- Move the frontend runtime to a current Nginx image based on Alpine 3.23, bringing its bundled system libraries up to patched versions and addressing the HIGH/CRITICAL findings from the 0.1.0 image scan.
+
+
 ## [0.1.0] - 2026-09-27
 
 First release. A self-hosted Digital Risk Protection platform: a stateless FastAPI core
