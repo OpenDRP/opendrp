@@ -9,9 +9,9 @@ packages = [{ include = "app" }]
 [tool.poetry.dependencies]
 python = "^3.12"
 fastapi = "^0.115.0"
-uvicorn = { extras = ["standard"], version = "^0.30.6" }
+uvicorn = { extras = ["standard"], version = ">=0.30.6,<0.54.0" }
 sqlalchemy = "^2.0.35"
-asyncpg = "^0.29.0"
+asyncpg = ">=0.29,<0.32"
 alembic = "^1.13.2"
 pydantic = "^2.9.2"
 pydantic-settings = "^2.5.2"
@@ -31,16 +31,16 @@ aiodns = "^3.2.0"
 cryptography = "^50.0.1"
 qrcode = "^8.2"
 email-validator = "^2.2.0"
-typer = "^0.12.5"
+typer = ">=0.12.5,<0.28.0"
 python-dotenv = "^1.0.1"
 tenacity = "^9.0.0"
 structlog = "^24.4.0"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.3.2"
-pytest-asyncio = "^0.24.0"
-pytest-httpx = "^0.31.0"
-ruff = "^0.6.5"
+pytest-asyncio = ">=0.24,<0.27"
+pytest-httpx = ">=0.31,<0.35"
+ruff = ">=0.6.5,<0.17.0"
 mypy = "^1.11.2"
 
 [build-system]

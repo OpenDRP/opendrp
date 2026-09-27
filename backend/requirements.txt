@@ -15,7 +15,7 @@
 # 248/249) that the security job flags on every push. Both are pinned exactly:
 # Starlette is a shipped runtime dependency even though it arrives transitively.
 fastapi==0.141.1
-starlette==1.6.0
+starlette==1.7.0
 uvicorn[standard]==0.30.6
 # 0.0.9 is affected by CVE-2024-53981 (DoS) and by the 2026 path-traversal and
 # header-parsing issues fixed in 0.0.22. Reachable: the login endpoint parses
@@ -24,58 +24,58 @@ python-multipart==0.0.32
 gunicorn==23.0.0
 
 # --- Database ----------------------------------------------------------------
-sqlalchemy==2.0.35
+sqlalchemy==2.0.54
 asyncpg==0.29.0
-psycopg2-binary==2.9.9
-alembic==1.13.2
+psycopg2-binary==2.9.13
+alembic==1.20.0
 
 # --- Data Validation ---------------------------------------------------------
-pydantic==2.9.2
-pydantic-settings==2.5.2
-email-validator==2.2.0
+pydantic==2.13.5
+pydantic-settings==2.15.0
+email-validator==2.3.0
 
 # --- Security & Auth ---------------------------------------------------------
 # PyJWT replaced python-jose: 3.3.0 carries CVE-2024-33663 (algorithm confusion)
 # and CVE-2024-33664 (JWE decompression DoS), and a September 2026 advisory still
 # covers releases up to 3.5.0. passlib was dropped as well — it is unmaintained
 # and required a monkeypatch of a private hook to work with current bcrypt.
-PyJWT[crypto]==2.14.0
+PyJWT[crypto]==2.15.0
 bcrypt==5.0.0
 cryptography==50.0.1
 qrcode==8.2
 
 # --- HTTP Clients (async) ----------------------------------------------------
 httpx==0.27.2
-aiodns==3.2.0
+aiodns==3.6.1
 # 4.5.0 is affected by CVE-2025-48945.
-pycares==4.9.0
+pycares==4.11.0
 
 # --- Task Queue --------------------------------------------------------------
-celery[redis]==5.4.0
-redis==5.0.8
+celery[redis]==5.6.3
+redis==5.3.1
 # msgpack is used by Kombu's serializer and must include the fix for
 # GHSA-6v7p-g79w-8964 (fixed in 1.2.1).
-msgpack==1.2.1
+msgpack==1.2.2
 
 # --- Templates & Rendering ---------------------------------------------------
 # 3.1.4 is affected by CVE-2024-56201 and CVE-2024-56326 (sandbox escape).
 jinja2==3.1.6
 
 # --- PDF Generation ----------------------------------------------------------
-fpdf2==2.8.1
+fpdf2==2.8.8
 
 # --- Threat Intelligence -----------------------------------------------------
 mmh3==4.1.0
-python-whois==0.9.4
-dnspython==2.6.1
+python-whois==0.9.6
+dnspython==2.8.0
 
 # --- CLI & Configuration -----------------------------------------------------
 typer==0.12.5
 # 1.0.1 is affected by PYSEC-2026-2270.
-python-dotenv==1.2.2
+python-dotenv==1.2.3
 
 # --- Resilience --------------------------------------------------------------
-tenacity==9.0.0
+tenacity==9.1.4
 
 # --- Structured Logging ------------------------------------------------------
 structlog==24.4.0
