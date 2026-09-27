@@ -9,7 +9,7 @@ The version in `backend/app/__init__.py` is the single source of truth;
 `scripts/check_version_consistency.py` fails the build if this file disagrees
 with it.
 
-## [0.1.0] - unreleased
+## [0.1.0] - 2026-09-27
 
 First release. A self-hosted Digital Risk Protection platform: a stateless FastAPI core
 that owns asset inventory, threat findings, jobs, alerting, reporting and an audit trail,
