@@ -20,7 +20,9 @@ pytest==8.3.2
 pytest-asyncio==0.24.0
 pytest-httpx==0.31.0
 pytest-cov==6.0.0
-anyio==4.6.2.post1
+# 4.6.2.post1 is affected by GHSA-82r6-8w77-94w6 (critical, TLS hostname
+# spoofing via IDNA 2003) and GHSA-5p39-cfhj-2xmp; both fixed in 4.14.2.
+anyio==4.14.2
 aiosqlite==0.20.0
 
 # --- Static analysis ---------------------------------------------------------
