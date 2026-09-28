@@ -89,11 +89,15 @@ def _public_args() -> list:
     No flag selects a shape, so the helper supplies exactly what `parse_args`
     cannot guess: the public URL and the release version.
     """
+    # The checkout's own version, not a literal: `--check` compares the file
+    # against `backend/app/__init__.py`, so a literal that lags a release bump
+    # turns "no findings" into a version note (which is how this helper broke
+    # the moment 0.1.2 was cut).
     return [
         "--public-url",
         "https://drp.example.com",
         "--version",
-        "0.1.1",
+        setup_wizard.checkout_version(),
         "--connectors",
         "dnstwist",
     ]
@@ -454,7 +458,7 @@ def test_the_wizard_writes_the_one_installation_shape(tmp_path: Path) -> None:
 
     assert values["APP_ENV"] == "production"
     assert values["AUTH_COOKIE_SECURE"] == "true"
-    assert values["OPENDRP_VERSION"] == "0.1.1"
+    assert values["OPENDRP_VERSION"] == setup_wizard.checkout_version()
     # Empty, not a development origin. A canonical origin sends a browser that
     # reached the SPA under some other origin to that one - and a release built
     # with `http://localhost:3000` sends every real user to their own machine.
