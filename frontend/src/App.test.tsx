@@ -1,5 +1,5 @@
 import { act, render, screen } from "@testing-library/react";
-import { MemoryRouter, Outlet } from "react-router-dom";
+import { MemoryRouter, Outlet } from "react-router";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import App from "@/App";
 import { useAuthStore } from "@/store/auth";

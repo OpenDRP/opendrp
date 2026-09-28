@@ -9,6 +9,18 @@ The version in `backend/app/__init__.py` is the single source of truth;
 `scripts/check_version_consistency.py` fails the build if this file disagrees
 with it.
 
+## [0.1.2] - Unreleased
+
+### Security
+
+- Make `requirements*.txt` the single source of truth for Python dependencies: the Poetry dependency tables in `backend/pyproject.toml` resolved a different tree than the image ships (fastapi `^0.115` pulled an old Starlette while `requirements.txt` pinned 1.6.x), so every Dependabot alert described packages the production image never contained. A new `repo-hygiene` gate (`scripts/check_dependency_sources.py`) fails the build if the declarations drift apart again or a pin stops being exact.
+- Close every open critical/high/medium dependency finding: `pycares` 4.5.0 → 4.9.0 in the DNSTwist connector (GHSA-5qpg-rh4j-qp35), dev-only `anyio` → 4.14.2 (GHSA-82r6-8w77-94w6, TLS hostname spoofing), `react-router` 6.30 → 7.18 (GHSA-wrjc-x8rr-h8h6, GHSA-337j-9hxr-rhxg), the `vite`/`esbuild` toolchain → vite 7.3.6 + esbuild 0.28 (dev-server advisories with no 5.x backport), `vitest` → 4.1.11 (GHSA-5xrq-8626-4rwp), and `pytest` → 9.0.3 with `pytest-asyncio` 1.x (GHSA-6w46-j5rx-g56g). `pip-audit` and `npm audit` now report zero known vulnerabilities for runtime and development sets alike.
+- Stabilise the frontend build chain: `tailwindcss`/`@tailwindcss/vite` leave the `4.0.0-beta` line for stable 4.3.
+
+### Changed
+
+- Remove the unused `pytest-httpx` dev dependency instead of forcing a runtime `httpx` bump: the suite mocks HTTP through `httpx.MockTransport` and `ASGITransport` directly.
+
 ## [0.1.1] - 2026-09-27
 
 ### Security

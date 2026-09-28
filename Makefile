@@ -1,4 +1,4 @@
-.PHONY: help setup check-env up up-tools pull-prod down destroy logs build ps seed-demo shell-backend shell-frontend test-backend test-backend-fast test-backend-integration test-backend-critical-coverage tools-check check-backend-migrations check-compose check-commands check-frontend-spa migrate connector-token connector-token-rotate connector-tokens backup backup-verify restore verify-audit-chain typecheck-backend lint-backend mypy-backend restart health verify-replicas clean
+.PHONY: help setup check-env up up-tools pull-prod down destroy logs build ps seed-demo shell-backend shell-frontend test-backend test-backend-fast test-backend-integration test-backend-critical-coverage tools-check check-backend-migrations check-compose check-commands check-deps check-frontend-spa migrate connector-token connector-token-rotate connector-tokens backup backup-verify restore verify-audit-chain typecheck-backend lint-backend mypy-backend restart health verify-replicas clean
 
 .DEFAULT_GOAL := help
 
@@ -77,6 +77,7 @@ help:
 	@echo "  check-compose   Fail if a service loses its healthcheck, log bound or network split"
 	@echo "  check-env       Fail if .env.example and the Compose files disagree about a setting"
 	@echo "  check-commands  Fail if a documented command needs a shell-specific line continuation"
+	@echo "  check-deps      Fail if dependency declarations drift apart from requirements*.txt"
 	@echo "  check-frontend-spa  Fail if Nginx can redirect an SPA route to a static directory"
 	@echo "  test-backend-critical-coverage  Enforce coverage for security/connector modules"
 	@echo "  typecheck-backend  Compile-time bytecode check (compileall over app scripts tests)"
@@ -103,6 +104,9 @@ check-env:
 # shipped in the quick start and failed on the first Windows install.
 check-commands:
 	@python scripts/check_portable_commands.py
+
+check-deps:
+	@python scripts/check_dependency_sources.py
 
 # A failed `up` is the least diagnosable moment in this project: Compose prints
 # `dependency failed to start: container opendrp-backend is unhealthy`, which

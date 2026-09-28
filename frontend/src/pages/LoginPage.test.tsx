@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter } from "react-router";
 import type { User } from "@/types/api";
 
 const { loginMock, toastMock } = vi.hoisted(() => ({ loginMock: vi.fn(), toastMock: vi.fn() }));

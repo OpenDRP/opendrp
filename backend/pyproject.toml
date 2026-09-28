@@ -1,47 +1,29 @@
+# ==============================================================================
+# OpenDRP Backend — package metadata and tool configuration
+# =============================================================================
+# Dependencies deliberately do NOT live here. `requirements.txt` (runtime) and
+# `requirements-dev.txt` (test/lint tooling) are the single source of truth:
+# they carry the exact pins the Docker build installs and Dependabot monitors.
+# An earlier copy of this file declared Poetry dependency ranges that resolved a
+# different tree than the image shipped (fastapi ^0.115 pulled an old Starlette
+# while requirements.txt pinned 1.6.x), so every advisory Dependabot reported
+# described a package the production image never contained — and the pins that
+# mattered were invisible to it.
+#
+# `scripts/check_dependency_sources.py` (CI job `repo-hygiene`) fails the build
+# if dependency tables reappear here or if a requirements pin is not exact.
+#
+# The `[tool.poetry]` table is kept for `version` only: it is one of the three
+# version readings `scripts/check_version_consistency.py` compares.
+# ==============================================================================
+
 [tool.poetry]
 name = "opendrp-backend"
-version = "0.1.1"
+version = "0.1.2"
 description = "OpenDRP — Digital Risk Protection & Brand Protection Platform Backend"
 authors = ["OpenDRP Team <opendrp@localhost>"]
 readme = "README.md"
 packages = [{ include = "app" }]
-
-[tool.poetry.dependencies]
-python = "^3.12"
-fastapi = "^0.115.0"
-uvicorn = { extras = ["standard"], version = "^0.30.6" }
-sqlalchemy = "^2.0.35"
-asyncpg = "^0.29.0"
-alembic = "^1.13.2"
-pydantic = "^2.9.2"
-pydantic-settings = "^2.5.2"
-PyJWT = { extras = ["crypto"], version = "^2.14.0" }
-bcrypt = "^5.0.0"
-python-multipart = "^0.0.32"
-httpx = "^0.27.2"
-celery = { extras = ["redis"], version = "^5.4.0" }
-redis = "^5.0.8"
-msgpack = "^1.2.1"
-jinja2 = "^3.1.6"
-fpdf2 = "^2.8.1"
-mmh3 = "^4.1.0"
-python-whois = "^0.9.4"
-dnspython = "^2.6.1"
-aiodns = "^3.2.0"
-cryptography = "^50.0.1"
-qrcode = "^8.2"
-email-validator = "^2.2.0"
-typer = "^0.12.5"
-python-dotenv = "^1.0.1"
-tenacity = "^9.0.0"
-structlog = "^24.4.0"
-
-[tool.poetry.group.dev.dependencies]
-pytest = "^8.3.2"
-pytest-asyncio = "^0.24.0"
-pytest-httpx = "^0.31.0"
-ruff = "^0.6.5"
-mypy = "^1.11.2"
 
 [build-system]
 requires = ["poetry-core"]

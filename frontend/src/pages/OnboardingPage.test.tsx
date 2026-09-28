@@ -32,7 +32,7 @@ vi.mock("@/lib/api", () => ({
 
 vi.mock("@/components/ui/use-toast", () => ({ toast: toastMock }));
 
-vi.mock("react-router-dom", () => ({
+vi.mock("react-router", () => ({
   useNavigate: () => navigateMock,
 }));
 

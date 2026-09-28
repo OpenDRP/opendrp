@@ -1,5 +1,5 @@
 import { useEffect } from "react";
-import { Routes, Route, Navigate, useLocation, useNavigate } from "react-router-dom";
+import { Routes, Route, Navigate, useLocation, useNavigate } from "react-router";
 import { AppLayout } from "@/components/Layout/AppLayout";
 import { RequireAuth } from "@/components/Auth/RequireAuth";
 import { useAuthStore } from "@/store/auth";

@@ -446,6 +446,12 @@ jobs:
         run: python3 scripts/check_portable_commands.py
       - name: Fail if the setup wizard does not parse
         run: python3 -m compileall -q setup.py
+      # requirements*.txt are the single source of truth for Python
+      # dependencies. A second declaration (the old Poetry tables) resolved a
+      # different tree than the image shipped, so Dependabot's alerts described
+      # packages the production image never contained.
+      - name: Fail if dependency declarations drift apart
+        run: python3 scripts/check_dependency_sources.py
       # Three files carry the platform version. A release tagged from a commit
       # that disagrees with itself produces images reporting a version no
       # release note describes, and the moment to notice that is now.
