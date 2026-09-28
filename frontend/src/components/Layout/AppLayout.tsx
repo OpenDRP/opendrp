@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, useCallback } from "react";
-import { NavLink, Outlet, useLocation, useNavigate } from "react-router-dom";
+import { NavLink, Outlet, useLocation, useNavigate } from "react-router";
 import {
   LayoutDashboard, ListTree, ShieldAlert, AlertTriangle,
   FileBarChart, Settings2, LogOut, ShieldCheck, Users, Menu, X, Boxes, KeyRound

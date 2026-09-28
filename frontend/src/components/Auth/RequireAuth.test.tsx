@@ -1,6 +1,6 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import { render, screen } from "@testing-library/react";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter } from "react-router";
 import { RequireAuth } from "@/components/Auth/RequireAuth";
 import { useAuthStore } from "@/store/auth";
 import type { User } from "@/types/api";

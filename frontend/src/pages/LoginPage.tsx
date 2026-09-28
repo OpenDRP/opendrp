@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { useNavigate, useLocation, Navigate } from "react-router-dom";
+import { useNavigate, useLocation, Navigate } from "react-router";
 import { ShieldCheck, Eye, EyeOff, Loader2 } from "lucide-react";
 import { describeApiError } from "@/lib/api";
 import { APP_NAME, APP_TAGLINE } from "@/lib/appMeta";
