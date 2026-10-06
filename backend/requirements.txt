@@ -39,7 +39,7 @@ email-validator==2.2.0
 # and CVE-2024-33664 (JWE decompression DoS), and a September 2026 advisory still
 # covers releases up to 3.5.0. passlib was dropped as well — it is unmaintained
 # and required a monkeypatch of a private hook to work with current bcrypt.
-PyJWT[crypto]==2.14.0
+PyJWT[crypto]==2.15.0
 bcrypt==5.0.0
 cryptography==50.0.1
 qrcode==8.2
