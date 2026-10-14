@@ -21,7 +21,7 @@ Concretely, this means:
 | `backend` (FastAPI/uvicorn) | container stdout | one JSON object per line (structlog), except uvicorn's own access/error lines, which are plain text |
 | `backend` → audit | container stdout **and** `drp_audit_logs` | JSON with exactly five fields (below) |
 | `celery-worker`, `celery-beat` | container stdout | same JSON shape via structlog; Celery's own lines are plain text |
-| `connector-*` | container stdout | one JSON object per line (`CONNECTOR_LOG_LEVEL`, default `INFO`) |
+| `connector-*` | container stdout | one JSON object per line; `CONNECTOR_LOG_LEVEL` is read by the connector SDK, but neither it nor `LOG_LEVEL` is in `.env.example` or passed to a connector container by Compose, so every connector line is `INFO` until an operator sets the variable on the service itself |
 | `frontend` (nginx) | container stdout | plain text, `log_format main` |
 
 What the Docker daemon keeps on the host is
@@ -60,8 +60,9 @@ Two properties are enforced by tests rather than by convention:
 background tasks), and in that case `ip_address` carries an `internal:` prefix
 naming the producer (`internal:celery-beat`, `internal:celery`).
 
-Three keys inside `details` belong to the hash chain rather than to the caller,
-and `verify_audit_chain --ndjson` checks a stream using them:
+Four keys inside `details` are reserved — a caller cannot set them, and the writer
+rewrites them after the entry is built. Three belong to the hash chain, and
+`verify_audit_chain --ndjson` checks a stream using them:
 
 | Key | What it is |
 |---|---|
@@ -74,6 +75,34 @@ recomputes it, which is why they can live in `details` without breaking the five
 fields. The database row carries the same values in columns (`entry_hash`,
 `prev_hash`, `key_id`), so the two copies of one event can be compared without
 guessing which key was in force at the time.
+
+The fourth reserved key is `audit_persisted`: the transport marker that says
+whether the database copy of this event was written. The stdout line always
+carries it and the database row never does — it is stripped from the canonical
+payload so a caller cannot forge it — so a line reading `"audit_persisted":
+false` is the signature of an audit write that failed, which is exactly the case
+the trail must not lose. One further key is added for the writer's own use on an
+event a person caused: `actor_email` snapshots the actor's address as it stood
+at the time, and the audit API reports `actor_identity_source: "snapshot"` for a
+row that carries it, which is what keeps a trail readable after an account is
+renamed or deleted.
+
+## Mutations that cannot be recorded are refused
+
+Security-critical asset and user-account mutations commit together with the audit row that records them. On the user lifecycle, the required actions are `user.created`, `user.updated`, `user.password_reset`, `user.locked`/`user.unlocked`, `user.mfa.reset`, and `user.deleted`; the account/session state and the corresponding required audit rows share a transaction. User update details record safe before/after values for changed email, full name, role, rate limit, and active status, but never the supplied password, password hash, TOTP secret, or recovery codes. Asset create/update/delete and observation promotion are also fail-closed audit writes. If a required audit row cannot be written, the mutation is rolled back and the caller is told:
+
+```json
+{"detail": "The audit trail could not record this change, so it was not applied. Retry shortly.", "code": "audit_unavailable"}
+```
+
+The response is `503` with `Retry-After: 5`, which is worth alerting on for the
+same reason `audit.chain.broken` is: it means the platform refused to act rather
+than acting without evidence, and a sustained run of it means the audit sink (or
+the transaction) is failing. Reads are unaffected — `asset.list` and `asset.view`
+stay best-effort background writes, because a read is not a change to the evidence
+base. Transactional audit stdout events are emitted only after the owning transaction commits; rollback discards the pending export as well. Authentication likewise does not return an access token or set refresh/CSRF cookies unless the refresh-family row has been durably saved. Session-family persistence failure rolls back and returns a retryable `503` with `Retry-After: 5`, without creating a client-side partial session. The login-success audit event is emitted after session issuance succeeds; it is not a substitute for the durable family row.
+
+For a user update that also resets a password, the trail contains the separate `user.password_reset` event and a `user.updated` summary; only the target identity, changed field names and safe before/after values are recorded. Password material and MFA secrets are excluded. Read events remain best-effort and do not make a read fail when audit persistence is unavailable.
 
 ## Correlation
 
@@ -111,6 +140,37 @@ Job summaries distinguish a valid empty provider response from `skipped`,
 `partial`, and provider error details. Investigate the job's `result_summary`,
 `error_message`, connector health, and correlation id together; an empty findings
 table alone is not evidence that the monitored environment is clean.
+
+## Report generation lifecycle
+
+A report generation attempt updates the report row and its linked `report.generate`
+Job together. On a retryable rendering error (`TimeoutError`, `ConnectionError`,
+or `OSError`) while Celery retries remain, both return to `pending`; the worker
+raises Celery's retry signal and records `report.generate.retry`. On a permanent
+error or after retries are exhausted, the report becomes `failed`, the Job becomes
+`error`, and `report.generate.failed` is recorded. On success, the report becomes
+`completed` and its Job becomes `success` in the same database transaction.
+
+The report outcome audit intent is committed transactionally through an outbox,
+then appended to the signed audit chain. If audit persistence is temporarily
+unavailable, the intent remains in the outbox with retry scheduling; the retention
+worker retries delivery. Search for `report.generate.retry`,
+`report.generate.completed` and `report.generate.failed` with `details.report_id`
+and `details.job_id`. These lifecycle records deliberately omit user email and
+PDF contents; retry events include the attempt number and error type, while
+completed events include duration and bounded-row totals. This is a delivery
+guarantee within the database/outbox recovery path, not a claim that Celery broker
+redelivery or worker-loss behavior has been exercised in a production integration
+test.
+
+A task redelivered after completion is idempotent only when its expected artifact
+exists in the configured report store; otherwise generation is attempted again.
+Operators should correlate the report outcome with the Job state and artifact
+availability rather than infer completion from a Celery task log alone.
+
+The current acceptance status, including the retry-exhaustion and
+worker-redelivery scenarios that remain unverified, is tracked in
+[production-readiness.md](production-readiness.md).
 
 ## Shipping to a SIEM
 
@@ -202,6 +262,7 @@ endpoints = ["https://elastic.example:9200"]
 |---|---|---|
 | `drp_audit_logs` (evidence in the product) | 365 days | `AUDIT_RETENTION_DAYS` (`0` = keep forever) |
 | Generated PDFs in the report store | 365 days | `REPORT_RETENTION_DAYS` (`0` = keep forever) |
+| Terminal alert deliveries and processed ingestion events | 90 days | `ALERT_HISTORY_RETENTION_DAYS` (`0` = keep them too). The setting is not in `.env.example`, so it is set on the process that needs it |
 | `drp_refresh_families` (sessions that ended) | `JWT_REFRESH_TOKEN_EXPIRE_DAYS` after the session ended, and only after its tokens expire | `JWT_REFRESH_TOKEN_EXPIRE_DAYS` (minimum one day; a live session is never a candidate) |
 | Container stdout | 10 MB × 5 per service | `x-logging` anchor in `docker-compose.yml` |
 | SIEM index | your policy | your index lifecycle policy |
@@ -210,7 +271,13 @@ The nightly sweep (`purge_expired_data`, 04:15 UTC) deletes the database rows an
 their PDFs in bounded batches, and removes session rows whose tokens have already
 expired — a session row is what turns a replay of a signed-out refresh token into
 `family_revoked` rather than a silent `family_not_found`, so it is kept exactly as
-long as that distinction can be made. It records one `audit.retention.purged` row
+long as that distinction can be made. The same sweep purges the alert history:
+deliveries that reached a terminal state (`sent`, `failed`, `cancelled`) and
+ingestion events whose processing finished, each older than
+`ALERT_HISTORY_RETENTION_DAYS` (90 days by default). A delivery that is still
+pending, delivering or ambiguous is never a candidate, so the cleanup cannot
+delete work the platform still owes, and the recipient and occurrence identities
+that pace and deduplicate alerts stay behind. It records one `audit.retention.purged` row
 when it removes anything, including whether it hit its batch cap and therefore had
 more to do. A run that deletes nothing writes no row: an audit trail that records
 daily no-ops teaches its readers to ignore it.
@@ -256,10 +323,116 @@ recent history without a round trip to the SIEM.
 |---|---|
 | `GET /api/v1/health` | the API process is up; deliberately dependency-free |
 | `GET /api/v1/ready` | PostgreSQL and Redis are reachable |
-| `GET /api/v1/connectors/health` | connector liveness; `CONNECTOR_HEALTH_STALE_AFTER_SECONDS` (default 120) bounds silence |
+| `GET /api/v1/connectors/health` | connector liveness; `CONNECTOR_HEALTH_STALE_AFTER_SECONDS` (default 120) bounds silence. The `health` and `online` fields use the same UTC heartbeat threshold; stored naive timestamps are interpreted as UTC. |
 | `docker compose ps` | container healthchecks: `backend`/`frontend` by HTTP, `celery-worker` by broker round trip, `celery-beat` and the connectors by liveness file, `backup` by dump age |
 | `audit.retention.purged` with `truncated: true` | the sweep is not keeping up; raise `RETENTION_MAX_BATCHES_PER_RUN` or shorten retention |
 | `GET /api/v1/audit/integrity` | where the chain stands: retained vs signed rows, `last_verified_seq`, `last_verified_at`, `retired_through_seq`. Admin-only, and a *status* read: the nightly task is what performs the pass, `make verify-audit-chain` is what performs one now |
+| `GET /api/v1/metrics` | the same signals as numbers a scraper can alert on, plus this replica's request counters. Off (404) until `METRICS_TOKEN` is set — see [Metrics](#metrics) |
+
+Alert-channel health probes are on-demand connectivity/credential checks, not proof
+that a user notification was delivered. Disabled channels are not contacted and
+return `last_checked_at: null`. SMTP checks use a fixed pool of four workers and
+bound both admission wait and probe wait. Saturated admission returns `degraded`
+(busy); a synchronous socket timeout returns `failed`, and its worker slot remains
+occupied until the socket call exits. This keeps repeated requests from growing an
+unbounded thread backlog.
+
+The dashboard's `active_threats_7d` KPI counts active/investigating phishing and
+breach findings created within the last seven days, excluding resolved findings.
+Its 30-day timeline groups by UTC calendar date and fills dates with no findings.
+Connector health treats stored naive timestamps as UTC and applies the configured
+staleness threshold consistently to its `health` and `online` fields.
+
+## Metrics
+
+`GET /api/v1/metrics` answers Prometheus text exposition format
+(`text/plain; version=0.0.4`). It is the endpoint an alert is written against;
+the health endpoints above answer "is it up", and these answer "is it keeping
+up", which is the question that goes unanswered until a person notices.
+
+The endpoint is **off until you turn it on**. With `METRICS_TOKEN` empty it
+answers `404` rather than `403`: an installation that scrapes nothing publishes
+nothing about its backlog, its connectors or how far its audit chain has been
+verified, and a `403` would still confirm the route exists. Set a random token in
+`.env` (32 characters or more; production refuses anything shorter) and present
+it as `X-Metrics-Token`, or as `Authorization: Bearer <token>` so Prometheus's own
+`authorization` block works:
+
+```yaml
+# prometheus.yml
+scrape_configs:
+  - job_name: opendrp
+    metrics_path: /api/v1/metrics
+    scrape_interval: 30s
+    static_configs:
+      - targets: ["127.0.0.1:8000"]   # the API's published address
+    authorization:
+      type: Bearer
+      credentials_file: /etc/prometheus/opendrp-metrics-token
+```
+
+By hand, and what a runbook check looks like in a terminal:
+
+```sh
+curl -fsS -H "X-Metrics-Token: $METRICS_TOKEN" http://127.0.0.1:8000/api/v1/metrics
+```
+
+### What is exported
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `opendrp_build_info{version,environment}` | gauge | the running build; always `1` |
+| `opendrp_process_start_time_seconds`, `opendrp_process_uptime_seconds` | gauge | how long this replica has been up |
+| `opendrp_http_requests_in_flight` | gauge | requests being handled right now |
+| `opendrp_http_requests_total{method,status_class}` | counter | requests handled, by method and `2xx`/`5xx` class |
+| `opendrp_http_request_duration_seconds_sum{status_class}`, `..._count{status_class}` | counter | total and number of timed requests; the average is the first divided by the second |
+| `opendrp_alert_deliveries{status}` | gauge | delivery rows by `pending`/`delivering`/`sent`/`failed`/`ambiguous`/`cancelled` |
+| `opendrp_alert_deliveries_oldest_pending_seconds` | gauge | age of the oldest delivery still waiting |
+| `opendrp_alert_recipients_held`, `opendrp_alert_recipient_hold_oldest_seconds` | gauge | recipients held after a delivery whose acceptance is unknown |
+| `opendrp_connectors_enabled`, `opendrp_connectors_disabled` | gauge | connector registry state |
+| `opendrp_connector_silence_seconds{connector}` | gauge | seconds since that connector last reported; `-1` means it never has |
+| `opendrp_jobs{status}` | gauge | jobs by `pending`/`running`/`success`/`partial`/`error`/`cancelled`/`skipped` |
+| `opendrp_jobs_oldest_running_seconds` | gauge | age of the oldest running job |
+| `opendrp_audit_chain_retained_rows`, `opendrp_audit_chain_committed_seq`, `opendrp_audit_chain_retired_through_seq` | gauge | how much audit history is local, and how far it has been signed and retired |
+| `opendrp_audit_chain_last_verified_seq`, `opendrp_audit_chain_last_verified_timestamp_seconds` | gauge | the last verification pass; `0` seconds means never |
+| `opendrp_audit_chain_verification_failure_seq` | gauge | position of the last failed verification; `0` means none recorded |
+| `opendrp_audit_persistence_degraded` | gauge | `1` while this replica refuses mutating traffic because an audit write failed |
+
+The request counters are **per replica** and reset when it restarts, which is why
+they are the only families here that do; a restart reads as a counter reset on a
+dashboard, and `rate()` handles that. Every other value is read from the database
+on each scrape, so all replicas report the same number. Labels come from the
+platform's own enumerations and from connector *names* (a registered connector is
+a bounded, reviewable set); no request value — an address, a finding title, a
+path — ever becomes a label.
+
+The families that can be absent are absent deliberately:
+`opendrp_jobs_oldest_running_seconds` does not exist while nothing is running, and
+neither does `opendrp_alert_deliveries_oldest_pending_seconds` when the queue is
+empty. A rule written as `> 300` therefore stays quiet, where a `0` would have
+been indistinguishable from "just queued".
+
+### Thresholds worth alerting on
+
+Stated with the shipped defaults; each one names what to look at next, because an
+alert that does not is an alert that gets muted.
+
+| Alert | Expression | What it means, and what to do |
+|---|---|---|
+| A delivery nobody can call | `opendrp_alert_deliveries{status="ambiguous"} > 0` for 15m | A send whose acceptance is unknown is holding that recipient. Reconcile it against the provider's log, then release the recipient from the alerts view (`docs/alerts-settings-operations.md`); the hold would otherwise end by itself after `ALERT_RECIPIENT_HOLD_SECONDS` |
+| The queue is not draining | `opendrp_alert_deliveries_oldest_pending_seconds > 300` | `celery-worker-alerts` or `celery-beat` is not running: the scheduler is what enqueues the drain. `docker compose ps`, then that worker's logs |
+| A recipient is held | `opendrp_alert_recipients_held > 0` | Notifications are not reaching that recipient. Same reconciliation as the row above |
+| A connector went quiet | `opendrp_connector_silence_seconds > 2 * CONNECTOR_HEALTH_STALE_AFTER_SECONDS` (240s at the default 120) | That container is not reporting: restarts, credential or network. It is excluded from scans while silent, so the coverage gap is real |
+| A job is stuck | `opendrp_jobs_oldest_running_seconds > 2 * CONNECTOR_JOB_LEASE_SECONDS` (360s at the default 180) | The lease should have been reclaimed; check `connectors/jobs` for the job and the worker's log. `opendrp_jobs{status="error"}` climbing alongside it says the retries are being exhausted |
+| Scans are failing | `increase(opendrp_jobs{status="error"}[1h]) > 0` | A provider, a credential or a network path. The job summary names the provider's own error |
+| The API is failing | `rate(opendrp_http_requests_total{status_class="5xx"}[5m]) > 0` | Correlate by `X-Request-ID` with the log stream; a `database_busy` body means the statement timeout, which `DB_STATEMENT_TIMEOUT_MS` bounds |
+| Verification stopped | `time() - opendrp_audit_chain_last_verified_timestamp_seconds > 50h` | The nightly integrity task is not running (it runs every 24h). Run `make verify-audit-chain` and find out why the schedule stopped |
+| The chain failed verification | `opendrp_audit_chain_verification_failure_seq > 0` | Treat as a security incident, not an operations one: read `audit.chain.broken` for `first_broken_seq` and `reason`, and compare that position against this SIEM index's copy of the stream before touching the database |
+| Mutations are being refused | `opendrp_audit_persistence_degraded == 1` | This replica answered `503 audit_unavailable`: audit writes are failing, so it deliberately refuses changes it cannot record. Check database connectivity and the `audit.db_error` lines |
+
+The audit-chain rows are the ones to write first. Everything else degrades the
+platform's answers; a chain that stopped being verified is the platform's answers
+becoming unverifiable.
 
 ## Suggested detections
 
