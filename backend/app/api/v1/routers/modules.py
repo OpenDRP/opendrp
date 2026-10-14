@@ -17,7 +17,7 @@ import uuid
 from datetime import datetime, timezone
 
 import structlog
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, Query, Request
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -31,7 +31,7 @@ from app.api.deps import (
 from app.core.audit import AuditLogger
 from app.core.exceptions import BadRequestException, NotFoundException
 from app.models import Finding
-from app.schemas.common import PaginatedResponse
+from app.schemas.common import MAX_PAGE_SIZE, PaginatedResponse
 from app.schemas.module import (
     FindingOut,
     FindingUpdateRequest,
@@ -91,6 +91,7 @@ async def declare_module(
         dedup_fields=payload.dedup_fields,
         title_field=payload.title_field,
         asset_types=payload.asset_types,
+        commit=False,
     )
     await AuditLogger.emit(
         db,
@@ -103,7 +104,10 @@ async def declare_module(
             "fields": sorted(spec.fields),
             "dedup_fields": list(spec.dedup_fields),
         },
+        require_persistence=True,
+        commit=False,
     )
+    await db.commit()
     return ModuleOut(**spec.to_public_dict())
 
 
@@ -126,17 +130,20 @@ async def update_module(
     spec = await require_module(db, module_id)
     if payload.label is not None or payload.description is not None:
         spec = await update_module_metadata(
-            db, module_id, label=payload.label, description=payload.description
+            db, module_id, label=payload.label, description=payload.description, commit=False
         )
     if payload.enabled is not None:
-        spec = await set_module_enabled(db, module_id, enabled=payload.enabled)
+        spec = await set_module_enabled(db, module_id, enabled=payload.enabled, commit=False)
     await AuditLogger.emit(
         db,
         action="module.updated",
         ip_address=extract_ip(request),
         user_id=user.id,
         details={"module": spec.id, "enabled": spec.enabled, "label": spec.label},
+        require_persistence=True,
+        commit=False,
     )
+    await db.commit()
     return ModuleOut(**spec.to_public_dict())
 
 
@@ -144,16 +151,18 @@ async def update_module(
 async def list_findings(
     request: Request,
     module: str | None = None,
-    page: int = 1,
-    size: int = 50,
+    # Declared, not clamped: every other list endpoint refuses a page it cannot
+    # serve, and this one used to silently answer a request for 100 000 rows with
+    # 200 — a client that trusted its own request would under-read the result set
+    # and never be told. The published schema now carries the same bound.
+    page: int = Query(1, ge=1),
+    size: int = Query(50, ge=1, le=MAX_PAGE_SIZE),
     db: AsyncSession = Depends(get_db),
     user=Depends(require_viewer_plus),
 ):
     """Findings stored generically, newest first, optionally for one module."""
     from math import ceil
 
-    size = max(1, min(size, 200))
-    page = max(1, page)
     stmt = select(Finding)
     count_stmt = select(func.count(Finding.id))
     if module:
@@ -208,8 +217,7 @@ async def update_finding(
     previous = row.status
     if previous != payload.status:
         row.status = payload.status
-        await db.commit()
-        await db.refresh(row)
+        await db.flush()
         await AuditLogger.emit(
             db,
             action="finding.status_update",
@@ -221,5 +229,8 @@ async def update_finding(
                 "from": previous,
                 "to": payload.status,
             },
+            require_persistence=True,
+            commit=False,
         )
+        await db.commit()
     return FindingOut.model_validate(row)

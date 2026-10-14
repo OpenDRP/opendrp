@@ -290,7 +290,15 @@ class TestApiSurface:
             ],
         )
         assert resp.status_code == 200, resp.text
-        assert resp.json() == {"accepted": 1, "rejected": 0}
+        assert resp.json() == {
+            "received": 1,
+            "created": 1,
+            "updated": 0,
+            "unchanged": 0,
+            "accepted": 1,
+            "rejected": 0,
+            "errors": [],
+        }
 
         row = (
             await db_session.execute(

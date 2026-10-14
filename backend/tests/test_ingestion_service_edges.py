@@ -29,11 +29,14 @@ from sqlalchemy import select
 
 from app.models.connector import Connector
 from app.models.breach import Breach
+from app.models.job import Job
 from app.models.phishing import PhishingDomain
+from app.models.source_observation import SourceObservation
 from app.services.ingestion_service import (
     ingest_phishing_finding,
     _MAX_FINDINGS_PER_BATCH,
     ingest_breach_finding,
+    ingest_exposure,
     ingest_findings,
 )
 
@@ -439,17 +442,9 @@ async def test_parse_date_epoch_fallback_on_none(db_session, breaches_connector,
 async def test_ingest_phishing_duplicate_rejected_without_alert(
     db_session, phishing_connector, monkeypatch
 ):
-    """Unique(phishing_domain): duplicate skips quietly and never alerts."""
-    calls: list[dict] = []
+    """A duplicate succeeds as unchanged and never creates a second outbox event."""
+    from app.models import IngestionEvent
 
-    async def _recording_alert(*args, **kwargs):
-        calls.append({})
-        return None
-
-    monkeypatch.setattr(
-        "app.services.ingestion_service.AlertDeliveryService.enqueue",
-        _recording_alert,
-    )
     first = await ingest_phishing_finding(
         db_session, phishing_connector, {"phishing_domain": "dup.example.com"}
     )
@@ -457,7 +452,8 @@ async def test_ingest_phishing_duplicate_rejected_without_alert(
         db_session, phishing_connector, {"phishing_domain": "dup.example.com"}
     )
     assert first is True and second is False
-    assert len(calls) == 1, "duplicate must not fan out an alert"
+    events = list((await db_session.execute(select(IngestionEvent).where(IngestionEvent.kind == "notification"))).scalars())
+    assert len(events) == 1
     assert await _count(db_session, PhishingDomain) == 1
 
 
@@ -465,17 +461,7 @@ async def test_ingest_phishing_duplicate_rejected_without_alert(
 async def test_ingest_breach_via_batch_entry_alerts_once_per_finding(
     db_session, breaches_connector, monkeypatch
 ):
-    """Batch entry passes findings through and enqueues one alert per finding."""
-    calls: list[dict] = []
-
-    async def _recording_alert(*args, **kwargs):
-        calls.append({})
-        return None
-
-    monkeypatch.setattr(
-        "app.services.ingestion_service.AlertDeliveryService.enqueue",
-        _recording_alert,
-    )
+    """Batch entry creates one durable notification event per new breach."""
     accepted, rejected = await ingest_findings(
         db_session,
         connector=breaches_connector,
@@ -489,7 +475,9 @@ async def test_ingest_breach_via_batch_entry_alerts_once_per_finding(
         connector_type="breaches",
     )
     assert (accepted, rejected) == (2, 1)
-    assert len(calls) == 2
+    from app.models import IngestionEvent
+    events = list((await db_session.execute(select(IngestionEvent).where(IngestionEvent.kind == "notification"))).scalars())
+    assert len(events) == 2
 
 
 @pytest.mark.asyncio
@@ -618,28 +606,28 @@ async def test_ingest_serializes_attribute_values_the_payload_can_carry(
 
 
 @pytest.mark.asyncio
-async def test_phishing_db_failure_returns_false(
+async def test_phishing_db_failure_propagates_to_caller(
     db_session, phishing_connector, monkeypatch
 ):
-    """Generic commit errors are swallowed: finding rejected, no raise."""
+    """Ingestion leaves the transaction to its caller and must not hide DB errors."""
     from unittest.mock import AsyncMock
 
     monkeypatch.setattr(
         "app.services.ingestion_service.AlertDeliveryService.enqueue", _no_alert
     )
-    original_commit = db_session.commit
-    db_session.commit = AsyncMock(side_effect=RuntimeError("db gone"))
+    original_flush = db_session.flush
+    db_session.flush = AsyncMock(side_effect=RuntimeError("db gone"))
     try:
-        ok = await ingest_phishing_finding(
-            db_session, phishing_connector, {"phishing_domain": "dbfail.example.com"}
-        )
+        with pytest.raises(RuntimeError, match="db gone"):
+            await ingest_phishing_finding(
+                db_session, phishing_connector, {"phishing_domain": "dbfail.example.com"}
+            )
     finally:
-        db_session.commit = original_commit
-    assert ok is False
+        db_session.flush = original_flush
 
 
 @pytest.mark.asyncio
-async def test_breach_db_failure_returns_false(
+async def test_breach_db_failure_propagates_to_caller(
     db_session, breaches_connector, monkeypatch
 ):
     from unittest.mock import AsyncMock
@@ -647,17 +635,17 @@ async def test_breach_db_failure_returns_false(
     monkeypatch.setattr(
         "app.services.ingestion_service.AlertDeliveryService.enqueue", _no_alert
     )
-    original_commit = db_session.commit
-    db_session.commit = AsyncMock(side_effect=RuntimeError("db gone"))
+    original_flush = db_session.flush
+    db_session.flush = AsyncMock(side_effect=RuntimeError("db gone"))
     try:
-        ok = await ingest_breach_finding(
-            db_session,
-            breaches_connector,
-            {"breach_name": "DbFailB", "matched_domain": "dbfail.example.com"},
-        )
+        with pytest.raises(RuntimeError, match="db gone"):
+            await ingest_breach_finding(
+                db_session,
+                breaches_connector,
+                {"breach_name": "DbFailB", "matched_domain": "dbfail.example.com"},
+            )
     finally:
-        db_session.commit = original_commit
-    assert ok is False
+        db_session.flush = original_flush
 
 
 @pytest.mark.asyncio
@@ -708,7 +696,9 @@ async def test_ingest_awaits_the_queue_handoff(
     )
     assert ok is True
 
-    assert handed_off == ["phishing", "breach"]
+    assert handed_off == []
+    from app.models import IngestionEvent
+    assert len(list((await db_session.execute(select(IngestionEvent))).scalars())) == 3
 
 
 @pytest.mark.asyncio
@@ -729,6 +719,90 @@ async def test_breach_alert_fanout_failure_does_not_fail_ingestion(
         {"breach_name": "AlertFailB", "matched_domain": "alertfail.example.com"},
     )
     assert ok is True
+
+
+# ---------------------------------------------------------------------------
+# The exposure asset comparison
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_exposure_finding_survives_a_non_canonical_stored_asset(db_session):
+    """An asset entered in another spelling must not discard a correct finding.
+
+    The scan parameters carry every monitored asset exactly as the operator stored
+    it (``Asset.asset_value``, delivered verbatim by ``_active_asset_snapshot``),
+    so ``jobs.params`` can hold ``Example.COM.`` or an expanded IPv6 address while
+    the source reports the canonical name back. Comparing those two spellings
+    directly refused the finding as ``unrelated_asset``, failed the job and stored
+    nothing — the finding was lost, not reported. The rejection itself has to
+    survive the fix, which is what the last assertion pins.
+    """
+    from sqlalchemy import func
+
+    connector = Connector(
+        name=f"conn-exposure-{uuid.uuid4().hex[:8]}",
+        connector_type="exposure",
+        status="enabled",
+        default_job_type="exposure.netlas",
+    )
+    db_session.add(connector)
+    await db_session.flush()
+    job = Job(
+        job_type="exposure.netlas",
+        status="running",
+        title="exposure snapshot",
+        params={
+            "domains": ["Example.COM.", "other.example.net"],
+            "ips": ["2001:DB8::1"],
+        },
+    )
+    db_session.add(job)
+    await db_session.commit()
+
+    async def _stored():
+        return int(
+            (
+                await db_session.execute(
+                    select(func.count()).select_from(SourceObservation)
+                )
+            ).scalar_one()
+            or 0
+        )
+
+    # The domain: stored mixed-case with a trailing dot, reported canonically.
+    assert await ingest_exposure(
+        db_session,
+        connector,
+        {"subject": "WWW.Example.com.", "matched_asset": "example.com", "port": 443},
+        connector_name=connector.name,
+        job_id=job.id,
+    )
+    assert await _stored() == 1
+
+    # The address: stored in its expanded form, reported in its compressed one.
+    assert await ingest_exposure(
+        db_session,
+        connector,
+        {
+            "subject": "2001:db8:0:0:0:0:0:1",
+            "matched_asset": "2001:db8::1",
+            "port": 80,
+        },
+        connector_name=connector.name,
+        job_id=job.id,
+    )
+    assert await _stored() == 2
+
+    # A finding about an asset the scan never covered is still refused.
+    assert not await ingest_exposure(
+        db_session,
+        connector,
+        {"subject": "foreign.example.net", "matched_asset": "example.net", "port": 443},
+        connector_name=connector.name,
+        job_id=job.id,
+    )
+    assert await _stored() == 2
 
 
 # ---------------------------------------------------------------------------

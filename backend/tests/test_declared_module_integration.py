@@ -12,8 +12,9 @@ RBAC, because that is where a declaration can be abused.
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from sqlalchemy import select
 
-from app.models import Finding
+from app.models import Finding, IngestionEvent
 from app.services.connector_credentials import ConnectorCredentials
 from app.services.connector_service import ConnectorService
 
@@ -208,27 +209,31 @@ class TestDeclaredModuleWork:
         assert body["params"]["emails"] == []
         assert "domains" in body["params"]
 
-        with patch(
-            "app.services.ingestion_service.AlertDeliveryService.enqueue",
-            new_callable=AsyncMock,
-        ) as alert:
-            resp = await client.post(
-                f"/api/v1/connectors/me/findings/{body['job_id']}",
-                headers=_submitting(headers, body),
-                json=[
-                    {
-                        "repository": "github.com/acme/app",
-                        "file_path": "src/config.py",
-                        "secret_kind": "aws_access_key",
-                        "lines": 3,
-                        "first_seen": "2026-02-01",
-                        "tags": ["prod"],
-                        "attributes": {"commit": "abc123"},
-                    }
-                ],
-            )
+        resp = await client.post(
+            f"/api/v1/connectors/me/findings/{body['job_id']}",
+            headers=_submitting(headers, body),
+            json=[
+                {
+                    "repository": "github.com/acme/app",
+                    "file_path": "src/config.py",
+                    "secret_kind": "aws_access_key",
+                    "lines": 3,
+                    "first_seen": "2026-02-01",
+                    "tags": ["prod"],
+                    "attributes": {"commit": "abc123"},
+                }
+            ],
+        )
         assert resp.status_code == 200, resp.text
-        assert resp.json() == {"accepted": 1, "rejected": 0}
+        assert resp.json() == {
+            "received": 1,
+            "created": 1,
+            "updated": 0,
+            "unchanged": 0,
+            "accepted": 1,
+            "rejected": 0,
+            "errors": [],
+        }
 
         # The module's declaration is the wire contract: an undeclared key
         # refuses the batch outright instead of being stored or dropped.    
@@ -256,11 +261,18 @@ class TestDeclaredModuleWork:
         assert row.payload["attributes"] == {"commit": "abc123"}
 
         # The alert path is the module's own declaration, not a template per
-        # vendor: label plus the fields the module declared. It goes through the
-        # durable queue, so a provider outage cannot fail an accepted finding.
-        alert.assert_awaited()
-        details = alert.await_args.kwargs
-        assert details["threat_type"] == "module:code_leak"
+        # vendor: label plus the fields the module declared. Ingestion records a
+        # durable notification event in the finding's own transaction, so neither
+        # a provider outage nor a worker restart can lose an accepted alert.
+        notifications = list(
+            (
+                await db_session.execute(
+                    select(IngestionEvent).where(IngestionEvent.kind == "notification")
+                )
+            ).scalars()
+        )
+        assert notifications
+        assert all(event.module == "module:code_leak" for event in notifications)
 
     @pytest.mark.asyncio
     async def test_a_resubmission_is_deduplicated_by_the_declared_fields(
@@ -291,8 +303,26 @@ class TestDeclaredModuleWork:
                 headers=_submitting(headers, work),
                 json=[finding],
             )
-        assert first.json() == {"accepted": 1, "rejected": 0}
-        assert second.json() == {"accepted": 0, "rejected": 1}  # same dedup key
+        assert first.json() == {
+            "received": 1,
+            "created": 1,
+            "updated": 0,
+            "unchanged": 0,
+            "accepted": 1,
+            "rejected": 0,
+            "errors": [],
+        }
+        # The same dedup key is a refresh, not a rejection: the batch is accepted
+        # and nothing new is created.
+        assert second.json() == {
+            "received": 1,
+            "created": 0,
+            "updated": 0,
+            "unchanged": 1,
+            "accepted": 1,
+            "rejected": 0,
+            "errors": [],
+        }
 
     @pytest.mark.asyncio
     async def test_findings_of_a_declared_module_are_listed_by_module(

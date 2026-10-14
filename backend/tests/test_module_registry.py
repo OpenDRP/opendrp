@@ -87,9 +87,11 @@ class TestBuiltinModules:
         """A migration is replayed verbatim; drift here would split deployments.
 
         The migration must not import application code (it describes its own
-        revision), so the two copies are compared instead of shared. Every key is
-        compared, ``storage`` included: the baseline is the state the whole chain
-        ended in, so there is no later revision left for it to defer to.
+        revision), so the two copies are compared instead of shared. Every module
+        this release ships has to be in the baseline, and every key is compared,
+        ``storage`` included: the baseline is the only revision there is, so a
+        module it omits is a module no fresh installation has, and a module it
+        adds is a row whose finding kind, adapter and table nothing else declares.
 
         ``storage.adapter`` is the reason this test earns its place. It is not
         decoration — ``ingestion_service._NATIVE_INGESTORS`` dispatches on it, so a
@@ -104,20 +106,32 @@ class TestBuiltinModules:
 
         assert set(seeded) == set(declared)
         for module_id, row in declared.items():
+            # Equal in both directions: a key the application declares and the
+            # baseline omits, and one it seeds that the application cannot read,
+            # are both drift.
+            assert set(seeded[module_id]) == set(row), f"{module_id} keys drifted"
             for key, value in row.items():
                 assert seeded[module_id][key] == value, f"{module_id}.{key} drifted"
+            # Every built-in module writes into its own table through its own
+            # adapter; the module identifier is not a table name.
+            storage = seeded[module_id]["storage"]
+            assert storage["kind"] == "table"
+            assert storage["adapter"] == row["storage"]["adapter"]
         # Named for what it stores, not for the first source that filled it.
         assert seeded["breaches"]["storage"]["table"] == "drp_breaches"
+        assert seeded["dns"]["storage"]["table"] == "dns_security_observations"
 
     @pytest.mark.asyncio
     async def test_builtin_modules_are_available_to_the_core(self, db_session):
         specs = await load_modules(db_session)
-        assert {"phishing", "breaches"} <= set(specs)
+        assert {"phishing", "breaches", "dns", "exposure"} <= set(specs)
         assert specs["phishing"].finding_kind == "phishing"
         assert specs["breaches"].finding_kind == "breach"
+        assert specs["dns"].finding_kind == "dns_observation"
         # The built-in modules keep their own write adapters.
         assert specs["phishing"].adapter == "phishing"
         assert specs["breaches"].adapter == "breach"
+        assert specs["dns"].adapter == "dns_observation"
         assert specs["phishing"].storage_kind == "table"
         assert all(spec.builtin for spec in specs.values())
 
