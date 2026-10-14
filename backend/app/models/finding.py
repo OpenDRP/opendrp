@@ -42,7 +42,10 @@ class Finding(Base, UUIDMixin, TimestampMixin):
     #: Human-readable headline for lists and alerts (the module's title field).
     title: Mapped[str] = mapped_column(String(512), nullable=False)
     #: Asset the finding was matched against, when the module declares one.
-    matched_asset: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    #: Indexed: it is the only column an asset-scoped read filters on (WI-15).
+    matched_asset: Mapped[str | None] = mapped_column(
+        String(512), nullable=True, index=True
+    )
     status: Mapped[str] = mapped_column(String(50), default="active", nullable=False, index=True)
     #: The validated payload: declared fields plus the source's own attributes.
     payload: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)

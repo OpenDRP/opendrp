@@ -1,6 +1,7 @@
 from typing import Optional
 
-from sqlalchemy import Boolean, Integer, String
+from sqlalchemy import Boolean, CheckConstraint, Integer, String
+
 from sqlalchemy.dialects.postgresql import JSON
 from sqlalchemy.ext.hybrid import hybrid_property
 from sqlalchemy.orm import Mapped, mapped_column
@@ -11,6 +12,11 @@ from app.core.database import Base, TimestampMixin, UUIDMixin
 
 class SystemSettings(Base, UUIDMixin, TimestampMixin):
     __tablename__ = "system_settings"
+    __table_args__ = (CheckConstraint("singleton_key = 1", name="ck_system_settings_singleton"),)
+
+    singleton_key: Mapped[int] = mapped_column(Integer, default=1, server_default="1", unique=True, nullable=False)
+    version: Mapped[int] = mapped_column(Integer, default=1, server_default="1", nullable=False)
+    __mapper_args__ = {"version_id_col": version}
 
     # Provider credentials belong to connector containers and are intentionally
     # not part of the core settings model.
@@ -42,6 +48,10 @@ class SystemSettings(Base, UUIDMixin, TimestampMixin):
     # JSON: {"days": [0-6 (0=Sun)], "hour": 0-23, "minute": 0-59} in UTC.
     schedule_phishing: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     schedule_breaches: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    schedule_dns_security: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    schedule_exposure: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    # Generic module-id -> UTC schedule map for modules declared at runtime.
+    schedules: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
     # NOTE: the ``X_decrypted`` hybrid_property + setter pairs below reuse the
     # property name for the setter decorator by design (SQLAlchemy's standard

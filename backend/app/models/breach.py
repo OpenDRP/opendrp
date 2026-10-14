@@ -24,11 +24,12 @@ class Breach(Base, UUIDMixin, TimestampMixin):
 
     __tablename__ = "drp_breaches"
     __table_args__ = (
-        UniqueConstraint("breach_name", "matched_email", name="uq_breach_email"),
+        UniqueConstraint("source_id", "breach_name", "matched_email", name="uq_breach_email"),
         # Domain scans may return several affected aliases for one domain and
         # breach. Only domain-only findings use the domain fallback key.
         Index(
             "uq_breach_domain_only",
+            "source_id",
             "breach_name",
             "matched_domain",
             unique=True,
@@ -37,6 +38,9 @@ class Breach(Base, UUIDMixin, TimestampMixin):
         ),
     )
 
+    source_id: Mapped[str] = mapped_column(
+        String(100), nullable=False, default="unattributed"
+    )
     breach_name: Mapped[str] = mapped_column(String(255), nullable=False)
     title: Mapped[str] = mapped_column(String(255), nullable=False)
     domain: Mapped[str] = mapped_column(String(255), nullable=False)

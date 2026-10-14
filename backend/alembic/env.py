@@ -1,5 +1,4 @@
 import asyncio
-import os
 from logging.config import fileConfig
 
 from alembic import context
@@ -7,7 +6,7 @@ from sqlalchemy import engine_from_config, pool
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from app.core.config import settings
-from app.core.database import Base
+from app.core.database import Base, migration_server_settings
 from app.models import *  # noqa: F401, F403
 
 config = context.config
@@ -62,12 +61,25 @@ async def run_migrations_online() -> None:
     configuration = config.get_section(config.config_ini_section) or {}
     configuration["sqlalchemy.url"] = _get_async_url()
 
+    # The revision itself runs on this connection, so it is the one that must not
+    # wait forever behind another session's lock: `lock_timeout` turns that wait
+    # into an error that names it, and the statement bound is deliberately off
+    # (see `migration_server_settings`). Only PostgreSQL gets them — a SQLite URL
+    # has no `server_settings`, and this engine is built for whichever database
+    # the caller configured.
+    connect_args = (
+        {"server_settings": migration_server_settings()}
+        if _get_async_url().startswith(("postgresql+asyncpg://", "postgres+asyncpg://"))
+        else {}
+    )
+
     connectable = AsyncEngine(
         engine_from_config(
             configuration,
             prefix="sqlalchemy.",
             poolclass=pool.NullPool,
             future=True,
+            connect_args=connect_args,
         )
     )
 

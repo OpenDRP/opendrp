@@ -12,7 +12,9 @@ class PhishingDomain(Base, UUIDMixin, TimestampMixin):
     phishing_domain: Mapped[str] = mapped_column(
         String(512), unique=True, nullable=False, index=True
     )
-    matched_asset: Mapped[str] = mapped_column(String(512), nullable=False)
+    #: Indexed because every asset-scoped read — the "asset → findings" view
+    #: (WI-12), the cascade, orphan cleanup — filters on this column (WI-15).
+    matched_asset: Mapped[str] = mapped_column(String(512), nullable=False, index=True)
     ip_address: Mapped[str | None] = mapped_column(String(255), nullable=True)
     web_ports: Mapped[str | None] = mapped_column(String(255), nullable=True)
     detection_source: Mapped[str] = mapped_column(String(100), nullable=False)
