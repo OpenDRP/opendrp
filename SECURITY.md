@@ -113,9 +113,11 @@ with `pip install --require-hashes`, so a substituted package fails the build
 instead of being installed quietly. The frontend is locked by
 `frontend/package-lock.json` and built with `npm ci`. Regenerate a lock with
 `python scripts/lock_requirements.py <file>`, check one without writing it with
-`--check`, and note that `scripts/check_dependency_sources.py` fails a shipped
-pin that carries no hash — `backend/requirements-dev.txt` is pinned to exact
-versions and deliberately carries no digests, because no image installs it.
+`--check`. Both shipped manifests carry a digest for every pin, and two gates keep
+it that way: `scripts/check_dependency_sources.py` fails a shipped pin that
+carries no hash, and `backend/tests/test_lock_requirements_gate.py` fails a
+manifest whose resolution leaves a package undeclared or repeats a pin the file
+it includes already makes.
 
 **Base images are moving tags, deliberately.** The Dockerfiles use
 `python:3.12-slim`, `node:20-alpine` and `nginx:1.29.8-alpine3.23`, and

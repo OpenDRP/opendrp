@@ -39,7 +39,8 @@ Browser
                          |
                          +-- PostgreSQL 17 (SQLAlchemy async + asyncpg pool)
                          +-- Redis 7 (Celery broker, rate-limit and admission counters)
-                         +-- Celery worker (reports, alert delivery, retention)
+                         +-- Celery worker (reports, enrichment, retention, schedules, integrity)
+                         +-- Celery alerts worker (the delivery queue: alerts, expiry checks)
                          +-- Celery Beat (one-minute scan scheduler)
 
 connector-phishing-dnstwist  --> core connector API (module: phishing)
@@ -133,6 +134,7 @@ Netlas is available as an opt-in connector/module combination behind the `netlas
 - PDF report generation through Celery.
 - Structured JSON audit events on stdout (exactly `timestamp`, `user_id`, `action`, `ip_address`, `details`) plus a persistent audit record, both carrying the request's `X-Request-ID` for correlation across HTTP, Celery and the SIEM.
 - Security headers, input validation, parameterized SQLAlchemy queries, refresh-token rotation, login rate limiting, and bounded outbound alert checks.
+- **A metrics scrape endpoint**: `GET /api/v1/metrics` publishes the platform's own health as numbers in the Prometheus text exposition format — alert-queue backlog and the age of its oldest row, recipients still held after an ambiguous delivery, connector silence, job states, and where the audit chain stands. It answers `404` — not `403` — until `METRICS_TOKEN` is set, and a refused scrape is logged rather than written into the audit chain, because a scrape every fifteen seconds would be 5 700 audit rows a day about a read of aggregate counts.
 - **Data retention and backups**: a nightly sweep of audit history and generated reports, and `make backup` / `backup-verify` / `restore` — the restore path runs in CI on every push.
 
 ## Prerequisites
@@ -367,8 +369,9 @@ Non-production API documentation is available at `/api/docs`, `/api/redoc`, and 
 | `backend` | — | FastAPI platform core and REST API. |
 | `postgres` | — | PostgreSQL 17 application database. |
 | `redis` | — | Celery broker, plus the counters behind login throttling, provider admission and the short-lived scheduler guards. |
-| `celery-worker` | — | Background report generation, alert delivery, enrichment, retention, schedule dispatch and audit-chain verification tasks. |
-| `celery-beat` | — | One-minute scheduler for database-configured scan schedules and the alert-delivery drain. |
+| `celery-worker` | — | Background report generation, WHOIS enrichment, retention, schedule dispatch and audit-chain verification tasks. |
+| `celery-worker-alerts` | — | The durable alert-delivery queue and the daily expiry check, one delivery group at a time, with a 45-second stop grace so a send in flight finishes. |
+| `celery-beat` | — | One-minute scheduler for database-configured scan schedules; it enqueues the 15-second delivery drain and the daily expiry check into the `alerts` queue. |
 | `connector-phishing-dnstwist` | — | Phishing connector for DNSTwist. |
 | `connector-phishing-shodan` | `shodan` | Phishing connector for Shodan. |
 | `connector-breaches-hibp` | `hibp` | Breaches connector for HIBP. |
@@ -424,6 +427,8 @@ Groups worth knowing about:
 - `SHODAN_API_KEY`, `HIBP_API_KEY`, `DNS_SECURITY_CTLOGS_API_TOKEN`, and `DNS_SECURITY_VT_API_KEY` are supplied only to their matching connector containers, and the Netlas and endpoint workers read `NETLAS_API_TOKEN` and `SHODAN_API_KEY` the same way, beside their own `CONNECTOR_TOKEN_NETLAS_*` and `CONNECTOR_TOKEN_EXPOSURE_*` credentials. A provider key can also live in the core instead of the environment: an administrator stores one per source account (`PUT /api/v1/connectors/accounts/{account_id}/api-key`), it is encrypted with `ENCRYPTION_KEY`, returned only as a masked hint, and handed to the connector bound to that account at `GET /api/v1/connectors/me/credential`. DNS resolver settings and the explicit VT noncommercial acknowledgement are documented in the [DNS environment table](docs/dns-security.md#2-configure-the-provider-environment).
 - `ALERT_HEALTH_CHECK_TIMEOUT_SECONDS` bounds alert-channel health checks. Finding alerts use the durable delivery queue: `ALERT_DELIVERY_TIMEOUT_SECONDS` bounds one SMTP/Telegram attempt, `ALERT_DELIVERY_MAX_ATTEMPTS` and `ALERT_DELIVERY_RETRY_BASE_SECONDS` control transient retries, `ALERT_AGGREGATION_DELAY_SECONDS` groups findings until a connector job is terminal, and `ALERT_RECIPIENT_HOLD_SECONDS` is how long a send whose acceptance is unknown keeps its recipient out of the queue. `ALERT_MAX_FINDINGS_PER_MESSAGE` and `ALERT_MAX_TELEGRAM_MESSAGE_LENGTH` bound notification size.
 - Shodan capability fallbacks: `SHODAN_SCAN_SSL_TEXT`, `SHODAN_SCAN_HTTP_TITLE`, and `SHODAN_SCAN_FAVICON`. These reach the connector and apply until an administrator changes the capability in its configuration form; the registry value then takes precedence for every later scan. Connector-scoped settings are namespaced after their connector, because `.env` is one namespace shared by every service (`scripts/check_env_template.py` enforces it).
+
+- `METRICS_TOKEN` is what creates the scrape endpoint — with it unset, `GET /api/v1/metrics` answers `404` — and a scraper presents it as `X-Metrics-Token: …` or `Authorization: Bearer …`. `MIGRATION_LOCK_TIMEOUT_MS` bounds how long the startup migration waits behind another session's open transaction; `MIGRATION_STATEMENT_TIMEOUT_MS` stays `0` on purpose, because the baseline's index builds are legitimately the longest statement the platform runs. Thresholds and a scrape configuration are in [docs/observability.md](docs/observability.md).
 
 The application rejects shipped or placeholder-like JWT, Fernet, database-password, and connector-token values in production. Never use development defaults in production.
 
@@ -603,10 +608,10 @@ they have their own administrator-only orphan cleanup.
 
 ```text
 docker compose -f docker-compose.yml ps
-docker compose -f docker-compose.yml logs --tail=200 backend celery-worker celery-beat
+docker compose -f docker-compose.yml logs --tail=200 backend celery-worker celery-worker-alerts celery-beat
 ```
 
-Confirm that the backend, the worker, beat and the enabled connectors are healthy,
+Confirm that the backend, the workers, beat and the enabled connectors are healthy,
 and read jobs and alert deliveries that failed or keep retrying in the UI. `make ps`
 and `make health` are the same two checks with less typing.
 
@@ -666,21 +671,23 @@ identity: only the stored digest authorizes anything.
 ### Alert delivery will not go out
 
 Finding alerts are persisted before delivery, and **the queue is drained by a
-scheduled task, not by the API**: `deliver-pending-alerts-every-15-seconds` runs in
-the `celery-beat` container, so a scheduler that is not running looks exactly like a
-quiet installation — rows accumulate as `pending` and nothing is delivered. Check
-it first:
+scheduled task, not by the API**: `celery-beat` enqueues
+`deliver-pending-alerts-every-15-seconds` into the `alerts` queue, and
+`celery-worker-alerts` is the container that executes it. A scheduler that is not
+running looks exactly like a quiet installation — rows accumulate as `pending` and
+nothing is delivered — and so does a delivery worker that is down while beat keeps
+filling its queue. Check both:
 
 ```text
-docker compose -f docker-compose.yml ps celery-beat
-docker compose -f docker-compose.yml logs --tail=50 celery-beat
+docker compose -f docker-compose.yml ps celery-beat celery-worker-alerts
+docker compose -f docker-compose.yml logs --tail=50 celery-beat celery-worker-alerts
 ```
 
 A scheduler that cannot start prints the `Settings` validation error that stopped
 it, and no regular expression is needed to read it. Once it is healthy the backlog
 is delivered as bounded aggregated messages, one per job, finding type and channel.
 When a provider is unavailable: confirm the connector job and its correlation ID,
-check SMTP or Telegram health in **Settings**, check the worker's health and logs,
+check SMTP or Telegram health in **Settings**, check the workers' health and logs,
 confirm the queue moves again once the provider recovers, and do not press `Rescan`
 to compensate — scans and delivery are separate durable workflows.
 
@@ -868,7 +875,7 @@ change, second-factor enrolment with one-time recovery codes, session listing an
 revocation, and its recent security activity, described in words rather than as
 action codes.
 
-Most views use `YYYY-MM-DD HH:mm:ss`; DNS observation expiry currently uses the browser's locale/time zone. Schedule inputs are UTC.
+Every instant the UI shows is the stored UTC instant, rendered without the reader's locale (`frontend/src/lib/datetime.ts`), and a page that displays one carries the time-zone hint; `frontend/src/lib/timezoneContract.test.ts` holds that rule for the whole UI. Schedule inputs are UTC.
 
 ## API overview
 
@@ -927,7 +934,9 @@ and the local procedure are in
 [docs/production-readiness.md](docs/production-readiness.md#reproducing-the-measurements)).
 It is the only job that builds images, so it is the slowest.
 
-A `repo-hygiene` job runs the repository gates: `scripts/check_tracked_sources.py` fails when an ignore rule keeps source files out of the repository — an over-broad `lib/` pattern once hid `frontend/src/lib` from the published tree while every local command still passed — and `scripts/check_portable_commands.py` fails when a documented command needs a shell-specific line continuation, which is how the quick start's administrator step broke on its first Windows install.
+A `repo-hygiene` job runs the repository gates where the checkout is complete: `scripts/check_tracked_sources.py` fails when an ignore rule keeps source files out of the repository — an over-broad `lib/` pattern once hid `frontend/src/lib` from the published tree while every local command still passed; `scripts/check_portable_commands.py` fails when a documented command needs a shell-specific line continuation, which is how the quick start's administrator step broke on its first Windows install; `scripts/check_compose_healthchecks.py` compares the per-service limits documented in `docs/configuration.md` with the Compose file, row by row; `scripts/check_env_template.py` fails when a documented setting never reaches a container or a variable Compose reads is undocumented; `scripts/check_frontend_spa.py` fails when an SPA route can collide with a static directory; `scripts/check_dependency_sources.py` fails when a dependency declaration drifts from `requirements*.txt`; `scripts/check_version_consistency.py` fails when the platform's version statements disagree with each other; `scripts/check_docs_consistency.py` fails on a relative link that no longer resolves or a page nothing reaches; and `scripts/check_withdrawn_providers.py` fails when a provider this project removed reappears in the source or the documentation.
+
+The rest of the workflow covers the same ground from other angles: the `frontend` job runs the SPA suite with its coverage floors and a production build; `production-integration` runs the PostgreSQL-only suites and the migration round trip against a real database; `compose` validates the two-replica file set without starting it; `release-image-coverage` resolves every Compose profile and fails if an image the stack can ask for is not one the release publishes; `secrets` scans the whole history with gitleaks (`.gitleaks.toml` allowlists test fixtures by path and nothing else); and `codeql` starts analysing the day the repository is public, because it needs GitHub Advanced Security while it is private.
 
 Known deferred findings, tracked rather than ignored:
 
@@ -1019,7 +1028,7 @@ The reference schema is in [docs/db.sql](docs/db.sql). The application is migrat
 alembic upgrade head
 ```
 
-or use `make migrate`. Do not treat `docs/db.sql` as a replacement for Alembic migrations.
+or use `make migrate`. A database an earlier build of this repository created already holds this schema: `python -m scripts.migrate` — which the API container's entrypoint runs — records the baseline revision instead of creating anything, while `alembic stamp` cannot, because stamp resolves the recorded revision before it writes. Take a verified backup first and treat that upgrade as a maintenance window; the procedure is in [docs/upgrading.md](docs/upgrading.md). Do not treat `docs/db.sql` as a replacement for Alembic migrations.
 
 ## Security
 

@@ -20,7 +20,7 @@ Concretely, this means:
 |---|---|---|
 | `backend` (FastAPI/uvicorn) | container stdout | one JSON object per line (structlog), except uvicorn's own access/error lines, which are plain text |
 | `backend` → audit | container stdout **and** `drp_audit_logs` | JSON with exactly five fields (below) |
-| `celery-worker`, `celery-beat` | container stdout | same JSON shape via structlog; Celery's own lines are plain text |
+| `celery-worker`, `celery-worker-alerts`, `celery-beat` | container stdout | same JSON shape via structlog; Celery's own lines are plain text |
 | `connector-*` | container stdout | one JSON object per line; `CONNECTOR_LOG_LEVEL` is read by the connector SDK, but neither it nor `LOG_LEVEL` is in `.env.example` or passed to a connector container by Compose, so every connector line is `INFO` until an operator sets the variable on the service itself |
 | `frontend` (nginx) | container stdout | plain text, `log_format main` |
 
@@ -324,7 +324,7 @@ recent history without a round trip to the SIEM.
 | `GET /api/v1/health` | the API process is up; deliberately dependency-free |
 | `GET /api/v1/ready` | PostgreSQL and Redis are reachable |
 | `GET /api/v1/connectors/health` | connector liveness; `CONNECTOR_HEALTH_STALE_AFTER_SECONDS` (default 120) bounds silence. The `health` and `online` fields use the same UTC heartbeat threshold; stored naive timestamps are interpreted as UTC. |
-| `docker compose ps` | container healthchecks: `backend`/`frontend` by HTTP, `celery-worker` by broker round trip, `celery-beat` and the connectors by liveness file, `backup` by dump age |
+| `docker compose ps` | container healthchecks: `backend`/`frontend` by HTTP, `celery-worker` and `celery-worker-alerts` by broker round trip, `celery-beat` and the connectors by liveness file, `backup` by dump age |
 | `audit.retention.purged` with `truncated: true` | the sweep is not keeping up; raise `RETENTION_MAX_BATCHES_PER_RUN` or shorten retention |
 | `GET /api/v1/audit/integrity` | where the chain stands: retained vs signed rows, `last_verified_seq`, `last_verified_at`, `retired_through_seq`. Admin-only, and a *status* read: the nightly task is what performs the pass, `make verify-audit-chain` is what performs one now |
 | `GET /api/v1/metrics` | the same signals as numbers a scraper can alert on, plus this replica's request counters. Off (404) until `METRICS_TOKEN` is set — see [Metrics](#metrics) |

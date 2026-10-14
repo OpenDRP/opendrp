@@ -50,7 +50,7 @@ npm run build          # typecheck + production build
 
 CI runs these gates and both test suites on every push and pull request, with two
 exceptions: `make seed-demo` and `make verify-replicas` are local diagnostics, and
-the compose job validates the two-replica file set's shape without starting it.
+the `compose` job validates the two-replica file set's shape without starting it.
 Running the rest locally first is the fastest way to get a change merged, and it
 is the only way to see the failures that CI reports as a fenced log block.
 
@@ -141,7 +141,7 @@ without it mis-attributes coverage in async handlers and understates the result.
 | `make test-backend-fast` | Backend suite without the `integration` marker | yes |
 | `make test-backend-integration` | Real PostgreSQL and Redis boundary tests, inside Compose | yes |
 | `make test-backend-critical-coverage` | Per-module coverage floors for the security- and connector-critical modules | yes |
-| `make lint-backend` | Ruff over `app`, `scripts` and `tests` | yes |
+| `make lint-backend` | Ruff over `app`, `alembic`, `scripts`, `tests` and the connector tree | yes |
 | `make mypy-backend` | The mypy ratchet gate (`scripts/check_mypy_baseline.py`) | yes |
 | `make typecheck-backend` | Compile-time bytecode check (`compileall` over `app`, `scripts`, `tests`) | yes |
 
@@ -178,7 +178,7 @@ container, so their equivalents start with
 | `make shell-backend` | `docker compose exec backend /bin/bash` |
 | `make connector-tokens` | `docker compose exec -T backend python -m scripts.manage_connector_tokens list` |
 | `make up-tools` | `docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --build` (tooling, not an installation) |
-| `make lint-backend` | `docker compose -f docker-compose.yml -f docker-compose.dev.yml exec -T backend ruff check app scripts tests` |
+| `make lint-backend` | `docker compose -f docker-compose.yml -f docker-compose.dev.yml exec -T backend ruff check app alembic scripts tests ../connectors ../scripts ../setup.py` |
 | `make typecheck-backend` | `docker compose -f docker-compose.yml -f docker-compose.dev.yml exec -T backend python -m compileall -q app scripts tests` |
 | `make mypy-backend` | `docker compose -f docker-compose.yml -f docker-compose.dev.yml exec -T backend python scripts/check_mypy_baseline.py` |
 | `make check-backend-migrations` | `docker compose exec -T backend sh -c 'python scripts/check_migrations.py && python -m scripts.check_schema_drift'` |
