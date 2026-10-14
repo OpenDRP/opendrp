@@ -17,6 +17,7 @@ functional test:
 from __future__ import annotations
 
 import sqlite3
+from pathlib import Path
 
 import pytest
 from fastapi import FastAPI
@@ -27,7 +28,11 @@ from sqlalchemy.exc import TimeoutError as SQLAlchemyPoolTimeout
 from sqlalchemy.pool import QueuePool
 
 from app.core.config import Settings
-from app.core.database import engine_kwargs, postgres_connect_args
+from app.core.database import (
+    engine_kwargs,
+    migration_server_settings,
+    postgres_connect_args,
+)
 from app.core.exceptions import (
     _is_database_timeout,
     register_exception_handlers,
@@ -130,6 +135,71 @@ class TestEngineOptions:
         options = engine_kwargs("sqlite+aiosqlite:///./test.sqlite3")
         assert "server_settings" not in options.get("connect_args", {})
         assert "pool_size" not in options
+
+
+class TestMigrationLimits:
+    """A-20: the migration's own connection, which the app's limits never reached.
+
+    `alembic/env.py` builds its engine from the URL and the ini file, not from
+    `engine_kwargs`, so the migration ran with whatever the server's defaults are
+    — and on a deployment where those defaults bound nothing, an `ALTER TABLE`
+    waiting behind another session's open transaction blocked the startup
+    migration while the container reported only "unhealthy". These assertions
+    hold the bound in place on both sides: it is set, it follows the settings,
+    and it is deliberately *not* the application's pair.
+    """
+
+    def test_the_lock_bound_is_set_and_the_statement_bound_is_off(self):
+        settings = migration_server_settings()
+        assert int(settings["lock_timeout"]) > 0
+        # 0 is PostgreSQL's "no limit", and it is the default on purpose: the
+        # baseline's index builds are legitimately long.
+        assert settings["statement_timeout"] == "0"
+
+    def test_the_migration_bounds_are_their_own_settings(self):
+        custom = Settings(
+            MIGRATION_LOCK_TIMEOUT_MS=1234,
+            MIGRATION_STATEMENT_TIMEOUT_MS=0,
+            DB_LOCK_TIMEOUT_MS=5,
+            DB_STATEMENT_TIMEOUT_MS=30,
+        )
+        assert migration_server_settings(custom)["lock_timeout"] == "1234"
+        bounded = Settings(MIGRATION_STATEMENT_TIMEOUT_MS=900_000)
+        assert migration_server_settings(bounded)["statement_timeout"] == "900000"
+        # The application's 5s lock bound would be wrong for an upgrade and its
+        # 30s statement bound would fail the documented maintenance window, which
+        # is why these are separate settings rather than shared ones.
+        assert migration_server_settings(custom)["lock_timeout"] != str(
+            custom.DB_LOCK_TIMEOUT_MS
+        )
+
+    def test_zero_is_the_only_value_that_means_forever(self):
+        waiting = migration_server_settings(Settings(MIGRATION_LOCK_TIMEOUT_MS=0))
+        assert waiting["lock_timeout"] == "0"
+
+    def test_both_migration_entry_points_carry_the_bounds(self):
+        """A bound on one path and not the other is a bound the platform lacks.
+
+        `env.py` runs the revision and `scripts/migrate.py` opens the connection
+        that holds the advisory lock. The first must carry both bounds; the second
+        carries the statement bound only — it waits for the migration slot by
+        design (`tests/test_migrate_lock.py`), and `lock_timeout` is exactly what
+        would abandon that wait.
+        """
+        env_source = (Path(__file__).resolve().parents[1] / "alembic/env.py").read_text(
+            encoding="utf-8"
+        )
+        migrate_source = (
+            Path(__file__).resolve().parents[1] / "scripts/migrate.py"
+        ).read_text(encoding="utf-8")
+
+        assert "migration_server_settings()" in env_source
+        assert "connect_args=connect_args" in env_source
+        assert "MIGRATION_STATEMENT_TIMEOUT_MS" in migrate_source
+        assert "-c statement_timeout=" in migrate_source
+        # The lock bound is deliberately absent from the script: the connection it
+        # opens exists to wait for the migration slot.
+        assert "lock_timeout=" not in migrate_source
 
 
 class TestTimeoutClassification:

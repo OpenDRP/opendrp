@@ -160,6 +160,98 @@ def _keywords(node: ast.Call) -> dict[str, ast.AST]:
     return {keyword.arg: keyword.value for keyword in node.keywords if keyword.arg}
 
 
+def _target_names(target: ast.AST) -> set[str]:
+    """Names assigned by a simple or unpacked assignment target."""
+    if isinstance(target, ast.Name):
+        return {target.id}
+    if isinstance(target, (ast.Tuple, ast.List)):
+        return set().union(*(_target_names(item) for item in target.elts))
+    return set()
+
+
+def _column_calls(
+    expression: ast.AST,
+    *,
+    function: ast.FunctionDef,
+    use_node: ast.AST,
+    parents: dict[ast.AST, ast.AST],
+    resolving: frozenset[str] = frozenset(),
+) -> list[ast.Call]:
+    """Resolve Column calls, including a loop variable over a literal tuple.
+
+    Alembic migrations commonly build a tuple of ``sa.Column`` values and add
+    each one in a loop. The call to ``op.add_column`` then receives a ``Name``,
+    rather than the ``Column`` AST node itself. Resolve that name only when its
+    local assignment or enclosing loop iterable can be read statically; the
+    caller reports an unresolved name instead of silently omitting schema.
+    """
+    if isinstance(expression, ast.Call) and _call_name(expression) == _COLUMN_CALL:
+        return [expression]
+    if isinstance(expression, (ast.Tuple, ast.List)):
+        return [
+            column
+            for item in expression.elts
+            for column in _column_calls(
+                item,
+                function=function,
+                use_node=use_node,
+                parents=parents,
+                resolving=resolving,
+            )
+        ]
+    if not isinstance(expression, ast.Name) or expression.id in resolving:
+        return []
+
+    name = expression.id
+    ancestor = parents.get(use_node)
+    while ancestor is not None and ancestor is not function:
+        if isinstance(ancestor, (ast.For, ast.AsyncFor)) and name in _target_names(ancestor.target):
+            if use_node in ancestor.orelse:
+                return []
+            return _column_calls(
+                ancestor.iter,
+                function=function,
+                use_node=ancestor,
+                parents=parents,
+                resolving=resolving | _target_names(ancestor.target),
+            )
+        ancestor = parents.get(ancestor)
+
+    assignments: list[tuple[int, ast.AST, ast.AST]] = []
+    for node in ast.walk(function):
+        if isinstance(node, ast.Assign):
+            targets = node.targets
+            value = node.value
+        elif isinstance(node, ast.AnnAssign):
+            targets = [node.target]
+            value = node.value
+        else:
+            continue
+        if value is not None and node.lineno < use_node.lineno and any(
+            name in _target_names(target) for target in targets
+        ):
+            ancestor = parents.get(node)
+            inactive_branch = False
+            while ancestor is not None and ancestor is not function:
+                if isinstance(ancestor, (ast.If, ast.IfExp)) and node in ancestor.body:
+                    inactive_branch = True
+                    break
+                ancestor = parents.get(ancestor)
+            if not inactive_branch:
+                assignments.append((node.lineno, node, value))
+
+    if not assignments:
+        return []
+    _, assignment, value = max(assignments, key=lambda item: item[0])
+    return _column_calls(
+        value,
+        function=function,
+        use_node=assignment,
+        parents=parents,
+        resolving=resolving | {name},
+    )
+
+
 def _column_effects(
     function: ast.FunctionDef, filename: str
 ) -> tuple[list[_Effect], list[str]]:
@@ -172,6 +264,11 @@ def _column_effects(
     """
     positioned: list[tuple[int, _Effect]] = []
     failures: list[str] = []
+    parents = {
+        child: parent
+        for parent in ast.walk(function)
+        for child in ast.iter_child_nodes(parent)
+    }
 
     for node in ast.walk(function):
         method = _operation(node)
@@ -196,8 +293,21 @@ def _column_effects(
             if "column" in keywords:
                 candidates.append(keywords["column"])
             for candidate in candidates:
-                if isinstance(candidate, ast.Call) and _call_name(candidate) == _COLUMN_CALL:
-                    name = _column_name(candidate, filename, failures)
+                columns = _column_calls(
+                    candidate,
+                    function=function,
+                    use_node=node,
+                    parents=parents,
+                )
+                if not columns:
+                    failures.append(
+                        f"{filename}: the column passed to op.add_column() at line "
+                        f"{node.lineno} is not statically readable — pass a literal "
+                        f"sa.Column(...) or iterate a literal tuple/list of columns"
+                    )
+                    continue
+                for column in columns:
+                    name = _column_name(column, filename, failures)
                     if name:
                         positioned.append((node.lineno, _Effect("add", table, name)))
         elif method == "drop_column":

@@ -1,4 +1,4 @@
-.PHONY: help setup check-env up up-tools pull-prod down destroy logs build ps seed-demo shell-backend shell-frontend test-backend test-backend-fast test-backend-integration test-backend-critical-coverage tools-check check-backend-migrations check-compose check-commands check-deps check-frontend-spa migrate connector-token connector-token-rotate connector-tokens backup backup-verify restore verify-audit-chain typecheck-backend lint-backend mypy-backend restart health verify-replicas clean
+.PHONY: help setup check-env check-docs up up-tools pull-prod down destroy logs build ps seed-demo shell-backend shell-frontend test-backend test-backend-fast test-backend-integration test-backend-critical-coverage tools-check check-backend-migrations check-compose check-commands check-deps check-providers check-frontend-spa migrate connector-token connector-token-rotate connector-tokens backup backup-verify restore verify-audit-chain typecheck-backend lint-backend mypy-backend restart health verify-replicas clean
 
 .DEFAULT_GOAL := help
 
@@ -78,6 +78,8 @@ help:
 	@echo "  check-env       Fail if .env.example and the Compose files disagree about a setting"
 	@echo "  check-commands  Fail if a documented command needs a shell-specific line continuation"
 	@echo "  check-deps      Fail if dependency declarations drift apart from requirements*.txt"
+	@echo "  check-docs      Fail if a relative link, an unreachable page or a migration reference is wrong"
+	@echo "  check-providers Fail if a withdrawn provider reappears in source or docs"
 	@echo "  check-frontend-spa  Fail if Nginx can redirect an SPA route to a static directory"
 	@echo "  test-backend-critical-coverage  Enforce coverage for security/connector modules"
 	@echo "  typecheck-backend  Compile-time bytecode check (compileall over app scripts tests)"
@@ -108,6 +110,20 @@ check-commands:
 check-deps:
 	@python scripts/check_dependency_sources.py
 
+# The documentation tree is navigation, and navigation fails silently: a renamed
+# page leaves a link that still reads as an instruction, a page nothing links to
+# cannot be told from a live runbook, and a migration named in prose is a claim
+# about the schema. All three shipped here, so all three are checked.
+check-docs:
+	@python scripts/check_docs_consistency.py
+
+# Withdrawn providers leave two kinds of remainder that no other check sees: a
+# filter entry no connector can produce, and a page that documents a provider the
+# platform does not ship. Both survived a removal an operator had already been
+# told about, so the decision is enforced here. The names are in the gate itself.
+check-providers:
+	@python scripts/check_withdrawn_providers.py .
+
 # A failed `up` is the least diagnosable moment in this project: Compose prints
 # `dependency failed to start: container opendrp-backend is unhealthy`, which
 # names the *blocked* service and not the reason, and the actual traceback is one
@@ -131,7 +147,7 @@ up:
 		done; \
 		echo ""; \
 		echo "    The entrypoint runs with set -e, so the last [OpenDRP] line names the failing step."; \
-		echo "    docs/operations.md, Troubleshooting, has the triage for an unhealthy container."; \
+		echo "    README.md (Operations) has the triage for an unhealthy container."; \
 		exit 1; \
 	}
 
@@ -201,8 +217,15 @@ test-backend-fast: tools-check
 # destructive Alembic round-trip stays in CI with its own throwaway database.
 # REQUIRE_INTEGRATION=1 makes missing connection env a hard error rather than
 # a skip, so this target cannot silently pass without exercising PostgreSQL.
+#
+# The two PostgreSQL-only suites are part of it. They used to be the tests
+# nobody ran: each skipped itself without `INTEGRATION_MIGRATION_DATABASE_URL`,
+# and no job provided one, so their subject (a row lock the sweep needs, the
+# correlated EXISTS behind `has_findings`) had no gate anywhere. This target
+# points them at the live migrated database, and CI runs them against the one
+# its own migration step left behind.
 test-backend-integration: tools-check
-	$(TOOLS) exec -T backend sh -c 'COVERAGE_CORE=sysmon REQUIRE_INTEGRATION=1 INTEGRATION_DATABASE_URL=$$DATABASE_URL INTEGRATION_REDIS_URL=$$REDIS_URL python -m pytest -q tests/test_production_integrations.py'
+	$(TOOLS) exec -T backend sh -c 'COVERAGE_CORE=sysmon REQUIRE_INTEGRATION=1 INTEGRATION_DATABASE_URL=$$DATABASE_URL INTEGRATION_MIGRATION_DATABASE_URL=$$DATABASE_URL INTEGRATION_REDIS_URL=$$REDIS_URL python -m pytest -q tests/test_production_integrations.py tests/test_asset_involvement_postgres.py tests/test_dns_expiry_postgres.py'
 
 # Both halves of "is the schema what the code expects": the revision *graph*
 # (single head, ancestry, table names that exist by then) and the *models*
@@ -211,8 +234,11 @@ test-backend-integration: tools-check
 check-backend-migrations:
 	$(COMPOSE) exec -T backend sh -c 'python scripts/check_migrations.py && python -m scripts.check_schema_drift'
 
+# The module list is asked for rather than written here a second time: the gate
+# that reads the report is the one that names the modules, so a module added to
+# it is measured by this target too.
 test-backend-critical-coverage: tools-check
-	$(TOOLS) exec -T backend sh -c 'COVERAGE_CORE=sysmon python -m pytest -q --cov=app.core.security --cov=app.core.crypto --cov=app.api.deps --cov=app.services.connector_manifest --cov=app.services.connector_service --cov=app.services.connector_credentials --cov=app.services.module_registry --cov=app.services.ingestion_service --cov=app.core.request_rate_limit --cov=app.services.alert_service --cov=app.services.alert_delivery_service --cov=app.tasks.alert_tasks --cov=app.api.v1.routers.alerts --cov=app.core.health --cov=app.tasks.report_tasks --cov=app.services.phishing.whois_service --cov-report=json:coverage-critical.json --cov-report=term-missing tests/ && python scripts/check_critical_coverage.py coverage-critical.json'
+	$(TOOLS) exec -T backend sh -c 'COVERAGE_CORE=sysmon python -m pytest -q $$(python scripts/check_critical_coverage.py --cov-args) --cov-report=json:coverage-critical.json --cov-report=term-missing tests/ && python scripts/check_critical_coverage.py coverage-critical.json'
 
 migrate:
 	$(COMPOSE) exec -T backend alembic upgrade head
@@ -222,9 +248,31 @@ migrate:
 # checkout is one command rather than copy-pasting a secret by hand. The token is
 # printed as well, because the plaintext is shown exactly once and never stored.
 #
-# Usage: make connector-token NAME=dnstwist TYPE=phishing
-#        make connector-token-rotate NAME=dnstwist
-CONNECTOR_TOKEN_VAR = CONNECTOR_TOKEN_$(shell echo $(NAME) | tr '[:lower:]-' '[:upper:]_')
+# NAME is the connector's own name — its `CONNECTOR_NAME`, and the suffix of its
+# Compose service: `phishing-dnstwist`, `dns-rdap`, `exposure-netlas-endpoints`.
+# The `.env` variable the credential fills predates that naming scheme, so the pair
+# is listed rather than derived: `CONNECTOR_TOKEN_$(NAME)` is a variable no container
+# reads, and a connector that starts without its credential fails as an
+# unauthenticated worker rather than as an error here. An input that is not listed is
+# still accepted and gets the derived name, which is what a locally added connector
+# with a matching variable wants.
+#
+# Usage: make connector-token NAME=phishing-dnstwist TYPE=phishing
+#        make connector-token-rotate NAME=phishing-dnstwist
+CONNECTOR_CREDENTIALS = \
+	phishing-dnstwist=CONNECTOR_TOKEN_DNSTWIST \
+	phishing-shodan=CONNECTOR_TOKEN_SHODAN \
+	phishing-netlas=CONNECTOR_TOKEN_NETLAS_PHISHING \
+	breaches-hibp=CONNECTOR_TOKEN_HIBP \
+	dns-netlas=CONNECTOR_TOKEN_NETLAS_DNS_SECURITY \
+	dns-rdap=CONNECTOR_TOKEN_DNS_RDAP \
+	dns-resolver=CONNECTOR_TOKEN_DNS_RESOLVER \
+	dns-ctlogs=CONNECTOR_TOKEN_DNS_CTLOGS \
+	dns-virustotal=CONNECTOR_TOKEN_DNS_VIRUSTOTAL \
+	exposure-netlas=CONNECTOR_TOKEN_NETLAS_EXPOSURE \
+	exposure-netlas-endpoints=CONNECTOR_TOKEN_EXPOSURE_NETLAS_ENDPOINTS \
+	exposure-shodan-endpoints=CONNECTOR_TOKEN_EXPOSURE_SHODAN_ENDPOINTS
+CONNECTOR_TOKEN_VAR = $(shell for pair in $(CONNECTOR_CREDENTIALS); do case "$$pair" in "$(NAME)="*) found="$${pair#*=}";; esac; done; echo "$${found:-CONNECTOR_TOKEN_$$(echo "$(NAME)" | tr '[:lower:]-' '[:upper:]_')}")
 
 connector-token:
 	@test -n "$(NAME)" || (echo "Usage: make connector-token NAME=<connector> TYPE=<module>" && exit 2)
@@ -266,8 +314,11 @@ typecheck-backend: tools-check
 mypy-backend: tools-check
 	$(TOOLS) exec -T backend python scripts/check_mypy_baseline.py
 
+# The same scope the `backend` job lints, so a file the container skips is a file
+# nobody lints: `../connectors` and the rest resolve to the read-only mounts the
+# tooling overlay places at `/`.
 lint-backend: tools-check
-	$(TOOLS) exec -T backend ruff check app scripts tests
+	$(TOOLS) exec -T backend ruff check app alembic scripts tests ../connectors ../scripts ../setup.py
 
 check-compose:
 	python scripts/check_compose_healthchecks.py docker-compose.yml
@@ -291,12 +342,15 @@ backup-verify:
 	$(COMPOSE) run --rm backup sh /backup-scripts/verify_restore.sh
 
 # Destructive by design: refuses without CONFIRM_RESTORE=yes, refuses while any
-# other client is connected, and takes a safety copy first. Stop the writers:
-#   docker compose -f docker-compose.yml stop backend celery-worker celery-beat connector-dnstwist connector-shodan connector-hibp
+# other client is connected, and takes a safety copy first. The two switches are
+# forwarded into the container with `-e`: a container gets the environment its
+# service declares, not the shell it was started from, so a variable set only on
+# the command line would never reach the script that reads it. Stop the writers:
+#   docker compose -f docker-compose.yml stop backend celery-worker celery-beat connector-phishing-dnstwist connector-phishing-shodan connector-breaches-hibp
 #   make restore FILE=backups/opendrp-20260913T041500Z.dump
 restore:
 	@test -n "$(FILE)" || (echo "Usage: make restore FILE=<dump>  (CONFIRM_RESTORE=yes is demanded by the script)" && exit 2)
-	$(COMPOSE) run --rm backup \
+	$(COMPOSE) run --rm -e CONFIRM_RESTORE -e RESTORE_SKIP_SAFETY_COPY backup \
 		sh /backup-scripts/restore.sh /backups/$(notdir $(FILE))
 
 # --- Audit integrity ----------------------------------------------------------

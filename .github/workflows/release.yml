@@ -32,7 +32,7 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: Existing version tag to publish (for example, v0.1.1)
+        description: Existing version tag to publish (for example, v0.2.0)
         required: true
         type: string
 
@@ -59,6 +59,11 @@ jobs:
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.12"
+      - name: Fail if Compose images are missing from the release matrix
+        run: |
+          set -euo pipefail
+          docker compose --profile '*' --env-file .env.example -f docker-compose.yml config --format json > /tmp/opendrp-compose-release.json
+          python scripts/check_release_images.py /tmp/opendrp-compose-release.json
       - name: Fail if app, pyproject and CHANGELOG disagree
         run: python scripts/check_version_consistency.py
       - id: version
@@ -126,6 +131,19 @@ jobs:
           - image: connector-hibp
             context: .
             dockerfile: ./connectors/hibp/Dockerfile
+          - image: connector-dns-security
+            context: .
+            dockerfile: ./connectors/dns_security/Dockerfile
+          - image: connector-intelligence
+            context: .
+            dockerfile: ./connectors/intelligence/Dockerfile
+          # One image serves both endpoint workers (`connector-exposure-netlas-endpoints`
+          # and `connector-exposure-shodan-endpoints`); without it here the release
+          # publishes every other image and silently not this one, and those two
+          # services cannot be pulled from the tag they name.
+          - image: connector-exposure-endpoints
+            context: .
+            dockerfile: ./connectors/exposure_endpoints/Dockerfile
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:

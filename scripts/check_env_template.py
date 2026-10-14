@@ -96,6 +96,12 @@ HOST_ONLY_VARS: Dict[str, str] = {
 #: that connector's name. Each needs a reason, because the alternative reading —
 #: "we forgot" — is what rule 5 exists to catch. Keep it as short as you can.
 CONNECTOR_SHARED_VARS: Dict[str, str] = {
+    **{
+        name: "Provider-account namespace shared by the intelligence workers; never a core setting."
+        for name in (
+            "NETLAS_API_TOKEN",
+        )
+    },
     "DNS_NAMESERVERS": (
         "a resolver list, not a capability: the name says what it does, no "
         "connector owns the `DNS_` namespace, and the connector-specific "
@@ -333,8 +339,10 @@ def analyse(
 
     for name in sorted(active):
         # Rule 2 — the template defines it, nothing consumes it.
-        consumed = name in compose or name in settings or re.search(
-            rf"\b{re.escape(name)}\b", source
+        consumed = (
+            name in compose
+            or name in settings
+            or re.search(rf"\b{re.escape(name)}\b", source)
         )
         if not consumed:
             findings.append(
@@ -369,7 +377,9 @@ def analyse(
 
     # Rule 5 — a connector-scoped setting has to be namespaced.
     for name in sorted(documented):
-        if name in CONNECTOR_SHARED_VARS or name.startswith(CONNECTOR_PROTOCOL_PREFIXES):
+        if name in CONNECTOR_SHARED_VARS or name.startswith(
+            CONNECTOR_PROTOCOL_PREFIXES
+        ):
             continue
         if not re.search(rf"\b{re.escape(name)}\b", connector_source):
             continue
@@ -423,7 +433,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    root = Path(args.root).resolve() if args.root else Path(__file__).resolve().parents[1]
+    root = (
+        Path(args.root).resolve() if args.root else Path(__file__).resolve().parents[1]
+    )
     template = Path(args.template).resolve() if args.template else root / ".env.example"
     settings_file = (
         Path(args.settings).resolve()
@@ -441,7 +453,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"unreadable input: {path}", file=sys.stderr)
         return 2
 
-    findings = analyse(template, compose_files, [root / p for p in SOURCE_ROOTS], settings_file)
+    findings = analyse(
+        template, compose_files, [root / p for p in SOURCE_ROOTS], settings_file
+    )
 
     if not findings:
         print(

@@ -17,7 +17,10 @@ rather than trusted:
 
 The script is run with `sh`, the way the image runs it. A tiny `nginx` test stub
 accepts only `nginx -t`, so a runner's globally installed nginx cannot make these
-tests depend on its config or permissions; the directive syntax is asserted here
+tests depend on its config or permissions; the stub is written to a directory that
+is verified to execute files, because the platform's own Compose hardening mounts
+`/tmp` as `rw,noexec,nosuid` (`docker-compose.yml`) and the tooling container
+inherits it; the directive syntax is asserted here
 as text. What loads the rendered include inside a real container is covered by
 `tests/test_hsts_wiring.py` (the configuration contract) and by the end-to-end
 verification in `docs/deployment.md`.
@@ -34,6 +37,7 @@ from typing import Tuple
 import pytest
 
 from app.core.config import Settings
+from tests.stub_bin import path as _path_with_nginx_stub
 
 _ROOT = Path(__file__).resolve().parents[2]
 _SCRIPT = _ROOT / "docker/nginx/hsts.sh"
@@ -63,17 +67,11 @@ def _render(tmp_path: Path, *arguments: str, **environment: str) -> Tuple[subpro
     """
     include = tmp_path / "hsts.inc"
     env = {key: value for key, value in os.environ.items() if not key.startswith("HSTS_")}
-    # Some hosted runners install nginx globally. Put a strict stub first so the
-    # script's optional `nginx -t` can never inspect runner config or permissions.
-    test_bin = tmp_path / "bin"
-    test_bin.mkdir(exist_ok=True)
-    nginx_stub = test_bin / "nginx"
-    nginx_stub.write_text(
-        '#!/bin/sh\n[ "$#" -eq 1 ] && [ "$1" = "-t" ] || exit 2\n',
-        encoding="utf-8",
-    )
-    nginx_stub.chmod(0o755)
-    env["PATH"] = os.pathsep.join((str(test_bin), os.environ.get("PATH", "")))
+    # Some hosted runners install nginx globally, so a strict stub goes first: the
+    # script's optional `nginx -t` must never inspect this machine's configuration or
+    # permissions. The stub lives where it can be executed, which is not necessarily
+    # where pytest put `tmp_path` — see `tests/stub_bin.py`.
+    env["PATH"] = _path_with_nginx_stub()
     env.update(environment)
     result = subprocess.run(
         ["sh", str(_SCRIPT), *arguments, str(include)],

@@ -51,7 +51,11 @@ if _MISSING:
     )
 
 _VARIABLES = ("HSTS_ENABLED", "HSTS_MAX_AGE", "HSTS_INCLUDE_SUBDOMAINS")
-_INCLUDE = "include /etc/nginx/hsts.inc;"
+#: The include the server blocks carry. A glob rather than a literal path: the
+#: rendered file lives on a tmpfs (the root filesystem is read-only), so an image
+#: whose entrypoint never ran has no file there, and a literal include would make
+#: nginx refuse to start instead of serving without the header.
+_INCLUDE = "include /tmp/opendrp/hsts/*.inc;"
 
 
 def _text(path: Path) -> str:
@@ -205,10 +209,14 @@ def test_the_frontend_image_installs_and_runs_the_fragment() -> None:
     dockerfile = _text(_FRONTEND_DOCKERFILE)
 
     assert "COPY ./docker/nginx/hsts.sh /docker-entrypoint.d/" in dockerfile
-    assert re.search(r"chmod 0755 /docker-entrypoint\.d/\S+hsts\.sh", dockerfile)
-    # A default so the configuration parses in the built image and in any start
-    # that bypasses the entrypoint; the entrypoint overwrites it.
-    assert "/etc/nginx/hsts.inc" in dockerfile
+    # The fragment renders into a writable tmpfs, so the image must not try to
+    # bake a default at that path — a tmpfs would hide it — and the include has
+    # to be a glob for the same reason.
+    assert "chmod 0755" in dockerfile
+    chmod_block = dockerfile[dockerfile.index("chmod 0755"):]
+    assert "/docker-entrypoint.d/40-opendrp-hsts.sh" in chmod_block
+    assert "/tmp/opendrp/hsts/" in dockerfile
+    assert "/etc/nginx/hsts.inc" not in dockerfile
     # The path the include names, so a rename cannot half-happen.
     assert _INCLUDE in _text(_NGINX)
 

@@ -19,7 +19,7 @@
 
 [tool.poetry]
 name = "opendrp-backend"
-version = "0.1.2"
+version = "0.2.0"
 description = "OpenDRP — Digital Risk Protection & Brand Protection Platform Backend"
 authors = ["OpenDRP Team <opendrp@localhost>"]
 readme = "README.md"

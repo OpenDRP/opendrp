@@ -29,6 +29,13 @@ poetry.lock
 venv/
 env/
 .venv/
+# Any interpreter directory whose name begins with `.venv` — `.venv313`,
+# `.venv-alerts`, `.venv-verify`. `scripts/check_tracked_sources.py` fails the
+# build when an ignore rule hides source, and it failed here for the opposite
+# reason: a developer's local environment under a name these rules did not know
+# was reported as an unignored file inside the checkout, so a red `repo-hygiene`
+# job had nothing to do with the change being tested. One glob covers the family.
+**/.venv*/
 .env
 .env.*
 *.env
@@ -50,6 +57,11 @@ credentials/
 *.pfx
 *.secret
 *.credentials
+
+# Internal documentation (audit records, remediation plans, internal state).
+# These are reproducible records for the team that owns the repository, not
+# committed product docs. Put anything you would not publish in the handbook here.
+docs/internal/
 
 # Celery Beat persistent schedule
 celerybeat-schedule
@@ -81,17 +93,17 @@ reports-*.tgz
 # accident, because the documented workflow is "export it, then check it".
 *.ndjson
 
-# Node
-node_modules/
-dist/
-dist-ssr/
-*.local
-.vite/
+# Node / Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/dist-ssr/
+frontend/.vite/
 *.tsbuildinfo
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
+*.local
 
 # Docker volumes and local overrides
 postgres_data/
@@ -115,6 +127,11 @@ alembic/versions/__pycache__/
 # Coverage / Testing
 .pytest_cache/
 .coverage
+# `npm run test:coverage` — the frontend job in CI — writes its HTML and lcov
+# report here. The `frontend/dist/` entries above cover the build output, not the
+# report, so without this line a coverage run leaves a directory that a broad
+# `git add` would commit.
+frontend/coverage/
 # Written by the critical-coverage gate (Makefile + CI), never committed.
 coverage-critical.json
 htmlcov/
@@ -129,3 +146,8 @@ logs/
 # Accidental Windows device-name files
 nul
 **/nul
+
+# Windows copy/corrupt artefacts (failed copy operations leave empty dirs with ;X suffix)
+# Example: .env.example;C, README.md;C — these are empty directories from interrupted copies
+*;C
+**/*;C

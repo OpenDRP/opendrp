@@ -41,7 +41,11 @@ jobs:
         # The repository-level gates and the setup wizard live outside this
         # working directory (scripts/ and the checkout root) and are linted with
         # the same default configuration, so a root script cannot rot unlinted.
-        run: ruff check app scripts tests ../scripts ../setup.py
+        # Every connector and the Alembic tree are included for the same reason: a
+        # worker image and a migration that runs inside the API container are
+        # shipped code, and either one added outside this line would be linted
+        # nowhere at all (the dead `import os` in `alembic/env.py` was).
+        run: ruff check app alembic scripts tests ../connectors ../scripts ../setup.py
       - name: Check Alembic revision graph structure
         # Instant and database-free: exactly one head, intact ancestry, and no
         # silently empty downgrade() that would make rollback impossible.
@@ -85,24 +89,11 @@ jobs:
           DATABASE_URL: sqlite+aiosqlite:///./ci-critical-coverage.sqlite3
           REDIS_URL: redis://127.0.0.1:6379/0
           COVERAGE_CORE: sysmon
+        # The module list is not repeated here: it is asked for, so this run
+        # and the gate that reads its report cannot describe different sets.
         run: >-
           python -m pytest -q
-          --cov=app.core.security
-          --cov=app.core.crypto
-          --cov=app.api.deps
-          --cov=app.services.connector_manifest
-          --cov=app.services.connector_service
-          --cov=app.services.connector_credentials
-          --cov=app.services.module_registry
-          --cov=app.services.ingestion_service
-          --cov=app.core.request_rate_limit
-          --cov=app.services.alert_service
-          --cov=app.services.alert_delivery_service
-          --cov=app.tasks.alert_tasks
-          --cov=app.api.v1.routers.alerts
-          --cov=app.core.health
-          --cov=app.tasks.report_tasks
-          --cov=app.services.phishing.whois_service
+          $(python scripts/check_critical_coverage.py --cov-args)
           --cov-report=json:coverage-critical.json
           --cov-report=term-missing
       - name: Validate per-module critical coverage thresholds
@@ -228,6 +219,33 @@ jobs:
           ENCRYPTION_KEY: NL_l17EbsITJOFSTSHqPXiEL7wWO-GUYc1V1esmo2Gk=
         run: alembic upgrade head
 
+      # The PostgreSQL-only suites. They assert what SQLite cannot host — a row
+      # lock that makes two concurrent expiry sweeps queue one alert, and the
+      # correlated `EXISTS` behind the `has_findings` filter — and they used to be
+      # the tests nobody ran: each skips itself without a dedicated database, and
+      # no job ever provided one, so the properties they check had no gate at all.
+      # They run here because this is the step that leaves a migrated database in
+      # place, and `REQUIRE_INTEGRATION=1` makes a database that is missing a
+      # failure instead of the skip that read as success.
+      - name: Run the PostgreSQL-only module tests
+        env:
+          APP_ENV: integration
+          TESTING: "0"
+          DATABASE_URL: postgresql+asyncpg://opendrp:integration-password@127.0.0.1:5432/opendrp_migrations
+          INTEGRATION_DATABASE_URL: postgresql+asyncpg://opendrp:integration-password@127.0.0.1:5432/opendrp_migrations
+          INTEGRATION_MIGRATION_DATABASE_URL: postgresql+asyncpg://opendrp:integration-password@127.0.0.1:5432/opendrp_migrations
+          REDIS_URL: redis://:ci-redis-password@127.0.0.1:6379/0
+          INTEGRATION_REDIS_URL: redis://:ci-redis-password@127.0.0.1:6379/0
+          JWT_SECRET_KEY: ci-integration-jwt-secret-that-is-longer-than-32-characters
+          ENCRYPTION_KEY: NL_l17EbsITJOFSTSHqPXiEL7wWO-GUYc1V1esmo2Gk=
+          REQUIRE_INTEGRATION: "1"
+        run: >-
+          python -m pytest -q
+          tests/test_asset_involvement_postgres.py tests/test_dns_expiry_postgres.py
+          -m integration --junitxml=postgres-only.xml
+      - name: Verify the PostgreSQL-only suites actually ran
+        run: python scripts/check_integration_ran.py postgres-only.xml --min-passed 2
+
       # The dump and the restore both run inside postgres:17-alpine rather than
       # in the runner's own shell: pg_dump refuses to dump a newer server, and
       # the runner's client major version is not ours to choose.
@@ -351,6 +369,16 @@ jobs:
       - name: Typecheck and build frontend
         run: npm run build
 
+  release-image-coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Resolve every Compose profile and verify release image coverage
+        run: |
+          set -euo pipefail
+          docker compose --profile '*' --env-file .env.example -f docker-compose.yml config --format json > /tmp/opendrp-compose-release.json
+          python scripts/check_release_images.py /tmp/opendrp-compose-release.json
+
   compose:
     runs-on: ubuntu-latest
     env:
@@ -419,6 +447,118 @@ jobs:
           print("replica shape: OK - API container name and published port are released, replicas=2")
           PY
 
+  # The journey no other job takes: a real installation, a scan, a finding and
+  # the alert queue. Every other job stops at a boundary -- the backend suite runs
+  # the core against SQLite, the frontend suite mocks the API, and the Compose jobs
+  # prove the stack *parses*. Nothing else proves that the pieces an operator
+  # strings together still meet: that a queued scan becomes a stored finding, that
+  # the finding reaches the alert queue, and that the audit trail holds the path.
+  #
+  # It builds the installation from this checkout and drives it through the
+  # documented interfaces (operator JWT, connector token, metrics token), which is
+  # what makes it slow: this is the only job that builds images. That cost buys the
+  # one property a green test suite could not state before -- the product works
+  # when it is assembled.
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Write the installation's configuration
+        # The stack refuses to start without a generated configuration, and the
+        # wizard is the same one an operator runs; a defective wizard therefore
+        # fails this job too. `--non-interactive` writes `.env` with fresh secrets.
+        run: python3 setup.py --non-interactive --public-url http://127.0.0.1
+      - name: Turn the metrics scrape on for this run
+        # The alert-queue assertion reads the queue back the way an operator's
+        # monitoring does, through `/api/v1/metrics`, and that endpoint does not
+        # exist until `METRICS_TOKEN` is set. Appended before the stack is raised,
+        # because the API container reads it from `.env` at start.
+        run: |
+          TOKEN=$(python3 -c "import secrets; print(secrets.token_hex(24))")
+          printf '\n# The end-to-end run reads the alert queue back through the scrape endpoint.\nMETRICS_TOKEN=%s\n' "$TOKEN" >> .env
+      - name: Raise the stack
+        # Only the services this journey needs. Both workers are started, because
+        # the alert dispatcher runs on the `alerts` queue: a stack without that
+        # worker queues notifications nothing drains, and the journey would fail
+        # at its last assertion for a reason that is not a product defect. The
+        # connector containers are deliberately absent -- the smoke *is* the
+        # connector, which is what keeps the run independent of any provider.
+        run: docker compose up -d --build postgres redis backend celery-worker celery-worker-alerts celery-beat frontend
+      - name: Wait for the API and the frontend to answer
+        run: |
+          set -euo pipefail
+          for url in http://127.0.0.1:8000/api/v1/ready http://127.0.0.1:3000/; do
+            for attempt in $(seq 1 60); do
+              if curl -fsS --max-time 10 "$url" > /dev/null; then
+                echo "$url answers"
+                break
+              fi
+              if [ "$attempt" = 60 ]; then
+                echo "$url never answered" >&2
+                docker compose logs --no-color --tail=100 backend frontend celery-worker-alerts >&2
+                exit 1
+              fi
+              sleep 5
+            done
+          done
+      - name: Create the run's administrator
+        env:
+          E2E_ADMIN_EMAIL: e2e-smoke@example.com
+          E2E_ADMIN_PASSWORD: E2eSmokePass!2345
+        run: |
+          docker compose exec -T backend python -m scripts.manage_admin create -e "$E2E_ADMIN_EMAIL" -p "$E2E_ADMIN_PASSWORD"
+          # `create` marks the account as owing a password change of its own, which
+          # is right for an account a human will use and wrong for a run with no
+          # human in it. The account is created per job on a throwaway database.
+          docker compose exec -T backend python -m scripts.manage_admin onboarding-off -e "$E2E_ADMIN_EMAIL"
+      - name: Run the end-to-end smoke
+        env:
+          E2E_ADMIN_EMAIL: e2e-smoke@example.com
+          E2E_ADMIN_PASSWORD: E2eSmokePass!2345
+          E2E_FRONTEND_URL: http://127.0.0.1:3000
+        run: |
+          set -euo pipefail
+          # The token the stack was raised with, read from the file the run wrote.
+          # Exported rather than written to `$GITHUB_ENV`, because this step is the
+          # only consumer and `$GITHUB_ENV` applies to the *next* step.
+          E2E_METRICS_TOKEN="$(grep -E '^METRICS_TOKEN=' .env | cut -d= -f2-)"
+          export E2E_METRICS_TOKEN
+          python3 scripts/e2e_smoke.py
+      - name: Install the browser the second half of the journey drives
+        # Playwright is not a dependency of the platform, so it is installed the way
+        # the security job installs pip-audit: as the instrument this step needs. The
+        # image an operator runs never carries a browser.
+        run: |
+          set -euo pipefail
+          python3 -m pip install --upgrade playwright
+          python3 -m playwright install --with-deps chromium
+      - name: Drive the same installation through a real browser
+        # The smoke asserts the interfaces; this asserts what an operator's browser
+        # does with them -- the sign-in form, the HttpOnly session cookie, the newest
+        # finding as a rendered row, and a sign-out that revokes the token server
+        # side. It runs after the smoke on purpose: the finding it renders is the one
+        # the smoke has just written, and with no finding in the listing it fails
+        # rather than passing on an empty table. A failing step prints the page's own
+        # text and the browser's console, because a screenshot nobody can download
+        # from a runner is not a report.
+        env:
+          E2E_FRONTEND_URL: http://127.0.0.1:3000
+          E2E_ADMIN_EMAIL: e2e-smoke@example.com
+          E2E_ADMIN_PASSWORD: E2eSmokePass!2345
+        run: python3 scripts/e2e_browser.py
+      - name: Prove the audit chain over everything the run wrote
+        # The smoke's last claim is that the path it took is accountable, and the
+        # browser run adds its own sign-in, listing and sign-out rows. This is the
+        # chain check itself, over everything those two put in the trail.
+        run: docker compose exec -T backend python -m scripts.verify_audit_chain
+      - name: Print the stack's logs when a step failed
+        if: failure()
+        run: docker compose logs --no-color --tail=200
+      - name: Tear the stack down
+        if: always()
+        run: docker compose down -v
+
   # Repository hygiene. An over-broad ignore rule removes source from a clone
   # without failing anything locally, which is how frontend/src/lib was once
   # excluded from the repository by a bare `lib/` Python pattern.
@@ -428,7 +568,12 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Fail if ignore rules exclude source files
         run: python3 scripts/check_tracked_sources.py .
-      - name: Fail if any service loses its healthcheck, log bound or network split
+      # The same gate also compares the resource table in docs/configuration.md
+      # against the limits this file sets, row by row: the table told an operator
+      # that PostgreSQL had 1 GB when Compose gave it 1.5, and listed eight
+      # services out of fourteen. Capacity planned from that page is planned for
+      # a stack that does not start.
+      - name: Fail if a service loses its healthcheck, hardening, log bound or network split, or if the documented limits disagree with Compose
         run: python3 scripts/check_compose_healthchecks.py docker-compose.yml
       - name: Fail if SPA routes can collide with static directories
         run: python3 scripts/check_frontend_spa.py
@@ -457,6 +602,18 @@ jobs:
       # release note describes, and the moment to notice that is now.
       - name: Fail if the platform version disagrees with itself
         run: python3 scripts/check_version_consistency.py
+      # Documentation is a tree an operator navigates, and two of the three ways
+      # it rots are invisible in a rendered page: a relative link that points at
+      # a renamed file, and a page no index reaches. The third is a migration
+      # reference that names a revision the chain no longer ends at.
+      - name: Fail if the documentation tree stops holding together
+        run: python3 scripts/check_docs_consistency.py
+      # Half of a provider removal is invisible: source lists in the frontend
+      # kept offering providers no connector could produce, and a module page
+      # kept advertising one as optional. Neither is a syntax error, so only a
+      # check that knows the decision can catch it. The names are in the gate.
+      - name: Fail if a withdrawn provider reappears
+        run: python3 scripts/check_withdrawn_providers.py .
 
   # Secret scanning over the full history, not just the working tree: a key that
   # was committed once and "removed" in a later commit is still in every clone.
@@ -537,8 +694,7 @@ jobs:
           python -m pip install --upgrade bandit
           bandit --quiet \
             --severity-level medium --confidence-level medium \
-            -r app ../connectors/base ../connectors/dnstwist \
-               ../connectors/shodan ../connectors/hibp
+            -r app ../connectors
         working-directory: backend
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:

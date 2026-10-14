@@ -3,6 +3,14 @@
 pytest-cov's ``--cov-fail-under`` applies to the combined report. This small
 CI gate closes that loophole by reading the JSON report and checking every
 required source file independently.
+
+The module list is also the list the runs measure: ``--cov-args`` prints the
+``--cov=`` flags for `THRESHOLDS`, and CI and the Makefile call it instead of
+carrying a second copy. Two lists drift, and the way this gate fails when they
+do is the worst kind — the report holds no entry for a module the gate names,
+so the job reports a missing measurement while the coverage it asked about was
+fine. A release shipped exactly that, and the second and third copies are gone:
+adding a module here now measures it as well.
 """
 
 from __future__ import annotations
@@ -49,6 +57,19 @@ THRESHOLDS: dict[str, float] = {
     # WHOIS is an untrusted external API; its parsing/error branches must stay
     # covered because enrichment feeds the phishing findings.
     "app/services/phishing/whois_service.py": 80.0,
+    # The next five were the gap the audit named: they sat outside every
+    # per-module gate while the aggregate floor hid them, and each is a place
+    # where a regression costs data or quota rather than a wrong pixel. The
+    # matcher decides which asset a finding belongs to (and a bug there is a
+    # finding attributed to the wrong customer), the scan admission decides how
+    # much work a scan may start, the quota service decides how many provider
+    # requests an account may spend, retention is the only code that deletes
+    # history, and the integrity pass is what reads the audit chain.
+    "app/services/asset_matching.py": 90.0,
+    "app/services/scan_admission.py": 90.0,
+    "app/tasks/retention_tasks.py": 80.0,
+    "app/services/provider_quota.py": 75.0,
+    "app/tasks/integrity_tasks.py": 70.0,
 }
 
 
@@ -83,8 +104,23 @@ def check_report(report_path: Path) -> list[str]:
 
 
 def main(argv: list[str]) -> int:
+    if argv == ["--cov-args"]:
+        # What a run needs to measure every module this gate checks. Printed for
+        # a shell to substitute, so the flags stay in one place. Dotted module
+        # names, which is the spelling `pytest-cov` documents, not the file path
+        # `THRESHOLDS` is keyed by.
+        print(
+            " ".join(
+                "--cov=" + module.removesuffix(".py").replace("/", ".")
+                for module in THRESHOLDS
+            )
+        )
+        return 0
     if len(argv) != 1:
-        print("usage: python scripts/check_critical_coverage.py COVERAGE_JSON")
+        print(
+            "usage: python scripts/check_critical_coverage.py [--cov-args] "
+            "COVERAGE_JSON"
+        )
         return 2
     report_path = Path(argv[0])
     if not report_path.is_file():

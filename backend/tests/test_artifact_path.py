@@ -9,6 +9,7 @@ three callers that depend on it agreeing with itself.
 from __future__ import annotations
 
 import uuid
+from pathlib import Path
 
 import pytest
 
@@ -123,6 +124,13 @@ class TestClassification:
         artifact_path(report_id).write_bytes(b"%PDF-1.7")
         assert resolve_artifact(artifact_filename(report_id)) is not None
         assert resolve_artifact("never-written.pdf") is None
+
+    def test_production_image_restricts_report_store_permissions(self):
+        backend_root = Path(__file__).resolve().parents[1]
+        dockerfile = (backend_root / "Dockerfile").read_text(encoding="utf-8")
+
+        assert "chmod 0700 /workspace/reports_store" in dockerfile
+        assert "USER opendrp" in dockerfile
 
 
 class TestAuditDetails:

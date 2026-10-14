@@ -1,6 +1,6 @@
 #!/bin/sh
 # ------------------------------------------------------------------------------
-# OpenDRP frontend — render /etc/nginx/hsts.inc from the deployment's settings
+# OpenDRP frontend — render the HSTS include from the deployment's settings
 # ------------------------------------------------------------------------------
 # Nginx cannot read an environment variable, and `add_header` is not conditional
 # on anything: a directive is either in the configuration or absent. So the three
@@ -26,7 +26,7 @@
 # see .env.example.
 #
 # Usage:  hsts.sh [--check] [OUTPUT]
-#   OUTPUT  include to write (default: /etc/nginx/hsts.inc)
+#   OUTPUT  include to write (default: /tmp/opendrp/hsts/hsts.inc)
 #   --check  report whether HSTS would be enabled (exit 0 = yes, 1 = no), write
 #            nothing - this is what `make evidence`-style diagnostics and the
 #            test suite use.
@@ -37,7 +37,11 @@
 set -eu
 
 CHECK_ONLY=0
-OUTPUT="/etc/nginx/hsts.inc"
+# Under /tmp on purpose: the frontend container's root filesystem is read-only
+# (`read_only: true` in docker-compose.yml), and a tmpfs is the only writable
+# place it has. The server blocks include `/tmp/opendrp/hsts/*.inc`, a glob, so
+# an image whose entrypoint never ran still parses and simply sends no header.
+OUTPUT="/tmp/opendrp/hsts/hsts.inc"
 for argument in "$@"; do
     case "$argument" in
         --check) CHECK_ONLY=1 ;;
@@ -45,6 +49,11 @@ for argument in "$@"; do
         *) OUTPUT="$argument" ;;
     esac
 done
+
+# Created here rather than baked into the image: a tmpfs mount hides whatever
+# the image put at this path, so a directory that is not made at start would
+# make the redirect below fail instead of writing the include.
+mkdir -p "$(dirname "$OUTPUT")"
 
 HSTS_ENABLED="${HSTS_ENABLED:-false}"
 HSTS_MAX_AGE="${HSTS_MAX_AGE:-31536000}"
