@@ -15,8 +15,10 @@ async def deliver_pending_alerts_task(self=None, *, max_groups: int = 20) -> dic
     from app.core.database import AsyncSessionLocal
     from app.services.alert_delivery_service import AlertDeliveryService
 
-    summary = {"groups": 0, "sent": 0, "retry": 0, "failed": 0, "findings": 0}
+    summary = {"groups": 0, "sent": 0, "retry": 0, "failed": 0, "cancelled": 0, "ambiguous": 0, "findings": 0}
     async with AsyncSessionLocal() as db:
+        from app.services.ingestion_events import dispatch_notification_events
+        await dispatch_notification_events(db)
         service = AlertDeliveryService(db)
         for _ in range(max_groups):
             result = await service.process_one_group(
@@ -31,3 +33,23 @@ async def deliver_pending_alerts_task(self=None, *, max_groups: int = 20) -> dic
             if key in summary:
                 summary[key] += 1
     return summary
+
+
+@celery_app.task(name="process_enrichment_events", ignore_result=True)
+@async_task
+async def process_enrichment_events_task(self=None):
+    from app.core.database import AsyncSessionLocal
+    from app.services.ingestion_events import enrich_one_event
+    async with AsyncSessionLocal() as db:
+        return {"processed": await enrich_one_event(db)}
+
+
+@celery_app.task(name="check_dns_expiry_alerts", ignore_result=True)
+@async_task
+async def check_dns_expiry_alerts_task(self=None) -> dict:
+    from app.core.database import AsyncSessionLocal
+    from app.services.dns_expiry_service import queue_expiry_alerts
+
+    async with AsyncSessionLocal() as db:
+        count = await queue_expiry_alerts(db)
+    return {"queued": count}

@@ -14,7 +14,11 @@ import httpx
 import structlog
 from jinja2 import Environment, FileSystemLoader
 from sqlalchemy.ext.asyncio import AsyncSession
-from tenacity import RetryCallState, retry, retry_if_exception_type, stop_after_attempt
+from tenacity import RetryCallState
+from types import SimpleNamespace
+from concurrent.futures import ThreadPoolExecutor
+
+from app.services.alert_content import fact_text, safe_snapshot, telegram_parts
 
 from app.core.safe_errors import sanitize_external_error
 
@@ -51,6 +55,31 @@ def _alert_retry_wait(state: RetryCallState) -> float:
     return min(max(settings.ALERT_DELIVERY_RETRY_BASE_SECONDS * (2**attempt), 1.0), 30.0)
 
 
+class AlertDeliveryAmbiguousError(RuntimeError):
+    """Provider acceptance is unknown; operator reconciliation is required."""
+
+
+class AlertDeliveryCancelledError(RuntimeError):
+    """The configured destination no longer permits this queued delivery."""
+
+
+_SMTP_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="alert-smtp")
+_SMTP_SLOTS = __import__("threading").BoundedSemaphore(4)
+
+
+async def bounded_smtp(operation):
+    if not _SMTP_SLOTS.acquire(blocking=False):
+        raise AlertDeliveryTransientError("SMTP workers are busy")
+    future = _SMTP_EXECUTOR.submit(operation)
+    future.add_done_callback(lambda done: _SMTP_SLOTS.release())
+    try:
+        await asyncio.wait_for(asyncio.shield(asyncio.wrap_future(future)), settings.ALERT_DELIVERY_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError as exc:
+        # The slot remains occupied until the thread actually exits. Do not start
+        # another attempt: cancellation cannot establish provider non-acceptance.
+        raise AlertDeliveryAmbiguousError("SMTP deadline exceeded; acceptance unknown") from exc
+
+
 class AlertDeliveryPermanentError(RuntimeError):
     """A configuration or provider rejection that must not be retried."""
 
@@ -73,7 +102,7 @@ _OMISSION_NOTE_RESERVE = 64
 _LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "0.0.0.0"})  # nosec B104
 #: The finding list a delivered message links to, per threat type. A module
 #: declared at runtime has its own page, named by its registry id.
-_FINDING_PATHS = {"phishing": "/phishing", "breach": "/breaches"}
+_FINDING_PATHS = {"phishing": "/phishing", "breach": "/breaches", "dns": "/dns-security", "dns_security": "/dns-security"}
 _BADGE_CLASSES = {"phishing": "badge-phishing", "breach": "badge-breach"}
 
 
@@ -228,7 +257,7 @@ def _plain_text(notification: _Notification) -> str:
     if notification.rows:
         lines.append("")
         for index, row in enumerate(notification.rows, start=1):
-            facts = "  ".join(f"{name}={_clip(value)}" for name, value in row.items())
+            facts = "  ".join(f"{name}={fact_text(value)}" for name, value in row.items())
             lines.append(f"{index:>3}. {facts}")
     if notification.link:
         lines.extend(["", f"Open in OpenDRP: {notification.link}"])
@@ -236,8 +265,10 @@ def _plain_text(notification: _Notification) -> str:
 
 
 class AlertService:
-    def __init__(self, db: AsyncSession):
+    def __init__(self, db: AsyncSession, *, user_id=None, ip_address="internal:alert-service"):
         self.db = db
+        self.user_id = user_id
+        self.ip_address = ip_address
 
     jinja_env: Environment = Environment(
         loader=FileSystemLoader("app/templates"),
@@ -254,26 +285,30 @@ class AlertService:
         return tpl.render(**ctx)
 
     async def _get_settings(self):
+        snapshot = getattr(self, "_settings_snapshot", None)
+        if snapshot is not None:
+            return snapshot
         return await SettingsService(self.db).get_singleton()
+
+    async def detach_settings(self, row=None):
+        row = row or await self._get_settings()
+        names = ("smtp_host", "smtp_port", "smtp_security_mode", "smtp_user", "smtp_password_decrypted", "smtp_from_email_decrypted", "telegram_bot_token_decrypted", "alert_recipient_email_decrypted", "email_alerts_enabled", "telegram_alerts_enabled", "alert_email_user_ids", "telegram_chat_ids")
+        self._settings_snapshot = SimpleNamespace(**{name: getattr(row, name, None) for name in names})
+        await self.db.commit()
+        return self._settings_snapshot
 
     async def _audit_alert(self, *, action: str, channel: str, details: dict) -> None:
         try:
             await AuditLogger.emit_background(
                 self.db,
                 action=action,
-                ip_address="internal:alert-service",
-                user_id=None,
+                ip_address=self.ip_address,
+                user_id=self.user_id,
                 details={"channel": channel, **details},
             )
         except Exception:
             pass
 
-    @retry(
-        retry=retry_if_exception_type(AlertDeliveryTransientError),
-        stop=stop_after_attempt(settings.ALERT_DELIVERY_MAX_ATTEMPTS),
-        wait=_alert_retry_wait,
-        reraise=True,
-    )
     async def _send_email_smtp(
         self,
         *,
@@ -283,6 +318,8 @@ class AlertService:
         plain_body: str | None = None,
     ) -> bool:
         s = await self._get_settings()
+        if getattr(self, "_settings_snapshot", None) is None:
+            s = await self.detach_settings(s)
         if not s.smtp_host:
             return False
         # The destination policy, before the connection. Alert delivery runs in
@@ -290,7 +327,7 @@ class AlertService:
         # can reach a cloud host's metadata endpoint — so "the SMTP host from the
         # settings page" must not be an operator-chosen route into either.
         try:
-            ensure_allowed(s.smtp_host, port=int(s.smtp_port or 0))
+            addresses = await asyncio.to_thread(ensure_allowed, s.smtp_host, port=int(s.smtp_port or 0))
         except OutboundBlocked as blocked:
             log.warning(
                 "outbound_blocked",
@@ -302,7 +339,7 @@ class AlertService:
                 channel="email",
                 details={"operation": "alert_email", **blocked.as_audit_details()},
             )
-            return False
+            raise AlertDeliveryPermanentError("SMTP destination refused") from blocked
         from_addr = s.smtp_from_email_decrypted or s.smtp_user or "opendrp@localhost"
         msg = EmailMessage()
         msg["From"] = from_addr
@@ -320,15 +357,18 @@ class AlertService:
             mode = (configured_mode or ("ssl" if s.smtp_port == 465 else "starttls")).lower()
             if mode not in {"starttls", "ssl", "plain"}:
                 raise AlertDeliveryPermanentError("smtp security mode is invalid")
+            if mode == "plain" and s.smtp_user and s.smtp_password_decrypted:
+                raise AlertDeliveryPermanentError("SMTP credentials require TLS")
+            from app.core.outbound import pinned_smtp_class
             if mode == "ssl":
-                connection = smtplib.SMTP_SSL(
+                connection = pinned_smtp_class(smtplib.SMTP_SSL, addresses, implicit_tls=True)(
                     s.smtp_host,
                     s.smtp_port,
                     context=ssl.create_default_context(),
                     timeout=settings.ALERT_DELIVERY_TIMEOUT_SECONDS,
                 )
             else:
-                connection = smtplib.SMTP(
+                connection = pinned_smtp_class(smtplib.SMTP, addresses)(
                     s.smtp_host,
                     s.smtp_port,
                     timeout=settings.ALERT_DELIVERY_TIMEOUT_SECONDS,
@@ -342,20 +382,17 @@ class AlertService:
                     server.login(s.smtp_user, s.smtp_password_decrypted)
                 server.send_message(msg)
 
-        loop = asyncio.get_running_loop()
         try:
-            await asyncio.wait_for(
-                loop.run_in_executor(None, _send_sync),
-                timeout=settings.ALERT_DELIVERY_TIMEOUT_SECONDS,
-            )
-        except asyncio.TimeoutError as exc:
-            raise AlertDeliveryTransientError("smtp delivery timed out") from exc
+            await bounded_smtp(_send_sync)
         except smtplib.SMTPAuthenticationError as exc:
             raise AlertDeliveryPermanentError("smtp authentication failed") from exc
         except (smtplib.SMTPRecipientsRefused, smtplib.SMTPSenderRefused) as exc:
             raise AlertDeliveryPermanentError("smtp recipient or sender rejected") from exc
+        except smtplib.SMTPResponseException as exc:
+            error = AlertDeliveryPermanentError if exc.smtp_code >= 500 else AlertDeliveryTransientError
+            raise error(f"SMTP {exc.smtp_code}") from exc
         except (smtplib.SMTPException, OSError, ssl.SSLError) as exc:
-            raise AlertDeliveryTransientError(
+            raise AlertDeliveryAmbiguousError(
                 f"smtp {type(exc).__name__}"
             ) from exc
         log.info("alert_email_sent", to=to, subject=subject)
@@ -366,12 +403,6 @@ class AlertService:
         )
         return True
 
-    @retry(
-        retry=retry_if_exception_type(AlertDeliveryTransientError),
-        stop=stop_after_attempt(settings.ALERT_DELIVERY_MAX_ATTEMPTS),
-        wait=_alert_retry_wait,
-        reraise=True,
-    )
     async def _send_telegram(self, text: str, parse_mode: str = "HTML", chat_id: str | None = None) -> bool:
         """Send to exactly one chat, named by the caller.
 
@@ -382,6 +413,8 @@ class AlertService:
         alert anyway.
         """
         s = await self._get_settings()
+        if getattr(self, "_settings_snapshot", None) is None:
+            s = await self.detach_settings(s)
         token = s.telegram_bot_token_decrypted
         chat = chat_id
         if not token or not chat:
@@ -412,8 +445,10 @@ class AlertService:
                     client.post(url, json=payload),
                     timeout=settings.ALERT_DELIVERY_TIMEOUT_SECONDS,
                 )
+            except (httpx.ConnectTimeout, httpx.ConnectError) as exc:
+                raise AlertDeliveryTransientError("telegram connection unavailable") from exc
             except (asyncio.TimeoutError, httpx.TimeoutException, httpx.NetworkError) as exc:
-                raise AlertDeliveryTransientError("telegram delivery temporarily unavailable") from exc
+                raise AlertDeliveryAmbiguousError("Telegram response lost; provider acceptance unknown") from exc
             if r.status_code != 200:
                 status = int(r.status_code)
                 if status == 429 or status >= 500 or status in {408}:
@@ -424,7 +459,11 @@ class AlertService:
                             retry_delay = float(retry_after)
                         except (TypeError, ValueError):
                             retry_delay = None
-                    suffix = f" retry_after={retry_after}" if retry_after else ""
+                    try:
+                        retry_delay = max(float(r.json().get("parameters", {}).get("retry_after", 0)), retry_delay or 0) or None
+                    except (TypeError, ValueError, AttributeError):
+                        pass
+                    suffix = f" retry_after={retry_delay}" if retry_delay else ""
                     raise AlertDeliveryTransientError(f"TG {status}{suffix}", retry_after=retry_delay)
                 raise AlertDeliveryPermanentError(
                     f"telegram HTTP {status}: {self._telegram_provider_error(r)[0]}"
@@ -497,16 +536,22 @@ class AlertService:
         if not chats:
             raise BadRequestException("No Telegram chat IDs configured")
 
+        await self.detach_settings(s)
         results: list[dict] = []
+        deadline = asyncio.get_running_loop().time() + settings.ALERT_HEALTH_CHECK_TIMEOUT_SECONDS
         async with httpx.AsyncClient(timeout=settings.ALERT_HEALTH_CHECK_TIMEOUT_SECONDS) as client:
             for chat in chats:
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    results.append({"chat_id": chat, "ok": False, "error_code": "deadline_exceeded", "error": "Overall validation deadline exceeded"})
+                    continue
                 try:
-                    response = await client.get(
+                    response = await asyncio.wait_for(client.get(
                         f"https://{TELEGRAM_API_HOST}/bot{token}/getChat",
                         params={"chat_id": chat},
-                    )
+                    ), remaining)
                     results.append(self._telegram_chat_result(chat, response))
-                except (httpx.HTTPError, OSError):
+                except (httpx.HTTPError, OSError, asyncio.TimeoutError):
                     results.append({
                         "chat_id": chat,
                         "ok": False,
@@ -523,6 +568,7 @@ class AlertService:
 
     async def send_test_telegram(self, s, chat_id: str | None = None) -> dict:
         """Validate chats first, then send only to chats Telegram can access."""
+        deadline = asyncio.get_running_loop().time() + settings.ALERT_HEALTH_CHECK_TIMEOUT_SECONDS
         validation = await self.validate_telegram_chats(s, chat_id)
         token = validate_telegram_token(s.telegram_bot_token_decrypted)
         text = (
@@ -537,8 +583,12 @@ class AlertService:
                     results.append(validation_result)
                     continue
                 chat = validation_result["chat_id"]
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    results.append({"chat_id": chat, "ok": False, "error_code": "deadline_exceeded", "error": "Overall test deadline exceeded"})
+                    continue
                 try:
-                    response = await client.post(
+                    response = await asyncio.wait_for(client.post(
                         f"https://{TELEGRAM_API_HOST}/bot{token}/sendMessage",
                         json={
                             "chat_id": chat,
@@ -546,13 +596,13 @@ class AlertService:
                             "parse_mode": "HTML",
                             "disable_web_page_preview": True,
                         },
-                    )
+                    ), remaining)
                     if response.status_code == 200:
                         results.append({"chat_id": chat, "ok": True})
                     else:
                         code, message = self._telegram_provider_error(response)
                         results.append({"chat_id": chat, "ok": False, "error_code": code, "error": message})
-                except (httpx.HTTPError, OSError):
+                except (httpx.HTTPError, OSError, asyncio.TimeoutError):
                     results.append({
                         "chat_id": chat,
                         "ok": False,
@@ -702,20 +752,30 @@ class AlertService:
         bounded: list[dict],
         job_id,
         link: str | None,
+        total_count: int | None = None,
     ) -> _Notification:
         """Turn one queued batch into the neutral shape every channel renders."""
         rows: list[dict[str, str]] = []
         counted: dict[str, list[str]] = {}
         for item in bounded:
-            row, groups = self._facts(threat_type, item)
-            rows.append(row)
+            safe_item = safe_snapshot(item)
+            row, groups = self._facts(threat_type, safe_item)
+            if item.get("finding_id") and threat_type in {"phishing", "breach"}:
+                origin_link = self._platform_link(threat_type)
+                if origin_link:
+                    from uuid import UUID
+                    row["Finding link"] = f"{origin_link}?finding_id={UUID(str(item['finding_id']))}"
+            for name, value in safe_item.items():
+                if name not in {"phishing_domain", "matched_asset", "detection_source", "breach_name", "matched_email", "matched_domain", "domain", "fields", "title"}:
+                    row[name] = fact_text(value)
+            rows.append({name: fact_text(value) for name, value in row.items()})
             for group_label, value in groups.items():
                 counted.setdefault(group_label, []).append(_clip(value, _BREAKDOWN_CHARS))
         return _Notification(
             label=label,
             subject=subject,
             job_id=str(job_id) if job_id else "unrecorded",
-            total=len(findings),
+            total=total_count if total_count is not None else len(findings),
             included=len(bounded),
             rows=rows,
             groups=[(name, _counted(values)) for name, values in counted.items()],
@@ -741,6 +801,13 @@ class AlertService:
         error text is sanitized before logging.
         """
         s = await self._get_settings()
+        allowed_email = await self._resolve_email_recipients(s) if channel == "email" else []
+        allowed_chats = self._resolve_telegram_chats(s) if channel == "telegram" else []
+        if target and not (target.lower() in {value.lower() for value in allowed_email} if channel == "email" else target in allowed_chats):
+            raise AlertDeliveryCancelledError("Destination disabled or removed")
+        if not target and not (allowed_email or allowed_chats):
+            raise AlertDeliveryCancelledError("No enabled destination")
+        s = await self.detach_settings(s)
         email_recipients = (
             [target]
             if channel == "email" and target
@@ -755,13 +822,15 @@ class AlertService:
             if channel == "telegram"
             else []
         )
-        bounded = findings[: settings.ALERT_MAX_FINDINGS_PER_MESSAGE]
+        bounded = findings
         total = len(findings)
         label = (
             "Phishing"
             if threat_type == "phishing"
-            else "Credential breach"
+            else            "Credential breach"
             if threat_type == "breach"
+            else "DNS Security"
+            if threat_type in {"dns", "dns_security"}
             else threat_type.removeprefix("module:")
         )
         subject = f"[OpenDRP Alert] {label}: {_plural(total, 'new finding')}"
@@ -804,14 +873,13 @@ class AlertService:
                     failures.append(RuntimeError("email provider did not accept the message"))
             except Exception as exc:
                 failures.append(exc)
-        telegram_text = _telegram_text(notification)
         for chat in telegram_chats:
             try:
-                delivered = await self._send_telegram(telegram_text, chat_id=chat)
-                if delivered:
-                    sent += 1
-                else:
-                    failures.append(RuntimeError("Telegram provider did not accept the message"))
+                for telegram_text in telegram_parts(notification, settings.ALERT_MAX_TELEGRAM_MESSAGE_LENGTH):
+                    delivered = await self._send_telegram(telegram_text, chat_id=chat)
+                    if not delivered:
+                        raise AlertDeliveryPermanentError("Telegram provider did not accept the message")
+                sent += 1
             except Exception as exc:
                 failures.append(exc)
         configured = len(email_recipients) + len(telegram_chats)
@@ -825,7 +893,7 @@ class AlertService:
                 channel=channel,
                 details={"threat_type": threat_type, "job_id": str(job_id) if job_id else None, "count": total, "error": error},
             )
-            raise RuntimeError(error)
+            raise failures[-1] if failures else AlertDeliveryTransientError(error)
         await self._audit_alert(
             action="alert.dispatch.success",
             channel=channel,

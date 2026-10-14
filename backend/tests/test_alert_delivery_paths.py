@@ -79,7 +79,7 @@ class _RecordingSmtp:
 @pytest.fixture
 def service():
     """An AlertService whose settings and audit sink are both replaceable."""
-    svc = AlertService(MagicMock())
+    svc = AlertService(AsyncMock())
     svc._audit_alert = AsyncMock()
     return svc
 
@@ -253,7 +253,7 @@ class TestTelegramDelivery:
         # Call the undecorated coroutine: the retry wrapper would sleep between
         # attempts, and the point here is the raised error, not the backoff.
         with pytest.raises(RuntimeError, match="TG 502"):
-            await AlertService._send_telegram.__wrapped__(service, "hi", chat_id="-100")
+            await service._send_telegram("hi", chat_id="-100")
 
         service._audit_alert.assert_not_awaited()
 

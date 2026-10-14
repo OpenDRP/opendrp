@@ -163,7 +163,7 @@ async def test_due_retry_is_not_claimed_before_next_attempt(db_session, alerts_c
 
 
 @pytest.mark.asyncio
-async def test_stale_delivery_lock_is_reclaimed(db_session, alerts_configured):
+async def test_stale_delivery_lock_is_ambiguous_not_replayed(db_session, alerts_configured):
     job = await _job(db_session)
     service = AlertDeliveryService(db_session)
     row = await service.enqueue(
@@ -175,10 +175,10 @@ async def test_stale_delivery_lock_is_reclaimed(db_session, alerts_configured):
     await db_session.commit()
 
     claimed = await service.claim_group()
-    assert [item.id for item in claimed] == [row.id]
+    assert claimed == []
     stored = await db_session.get(AlertDelivery, row.id)
-    assert stored.status == AlertDeliveryStatus.delivering
-    assert stored.attempts == 1
+    assert stored.status == AlertDeliveryStatus.ambiguous
+    assert stored.attempts == 0
 
 
 @pytest.mark.asyncio

@@ -16,8 +16,10 @@ may be a provider outage.
 
 from __future__ import annotations
 
+import asyncio
 import smtplib
 import ssl
+import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -25,6 +27,11 @@ import httpx
 import pytest
 
 from app.api.v1.routers import alerts
+
+
+@pytest.fixture(autouse=True)
+def pinned_transport_mock(monkeypatch):
+    monkeypatch.setattr("app.core.outbound.pinned_smtp_class", lambda base, addresses, **kwargs: base)
 
 
 def _settings(**overrides) -> SimpleNamespace:
@@ -178,6 +185,59 @@ class TestSmtpProbe:
         assert "OSError" in result.message
 
 
+class TestBoundedSmtpProbe:
+    @pytest.mark.asyncio
+    async def test_timed_out_probe_keeps_its_slot_until_the_worker_exits(self, monkeypatch):
+        entered = threading.Event()
+        release = threading.Event()
+
+        def _blocking(_settings):
+            entered.set()
+            release.wait(timeout=2)
+            return alerts.ProbeResult("healthy", "done", 1)
+
+        monkeypatch.setattr(alerts, "_smtp_probe", _blocking)
+        initial_slots = alerts._SMTP_PROBE_MAX_WORKERS
+        try:
+            result = await alerts._bounded_smtp_probe(_settings(), timeout=0.02)
+            assert result.health == "failed"
+            assert "timed out" in result.message
+            assert entered.wait(timeout=1)
+            assert alerts._SMTP_PROBE_SLOTS._value == initial_slots - 1
+        finally:
+            release.set()
+        for _ in range(100):
+            if alerts._SMTP_PROBE_SLOTS._value == initial_slots:
+                break
+            await asyncio.sleep(0.01)
+        assert alerts._SMTP_PROBE_SLOTS._value == initial_slots
+
+    @pytest.mark.asyncio
+    async def test_probe_admission_is_bounded_when_slots_are_occupied(self, monkeypatch):
+        entered = threading.Event()
+        release = threading.Event()
+        initial_slots = alerts._SMTP_PROBE_MAX_WORKERS
+        workers = []
+
+        def _blocking(_settings):
+            entered.set()
+            release.wait(timeout=2)
+            return alerts.ProbeResult("healthy", "done", 1)
+
+        monkeypatch.setattr(alerts, "_smtp_probe", _blocking)
+        try:
+            for _ in range(initial_slots):
+                workers.append(asyncio.create_task(alerts._bounded_smtp_probe(_settings(), timeout=0.5)))
+            assert await asyncio.to_thread(entered.wait, 1)
+            rejected = await alerts._bounded_smtp_probe(_settings(), timeout=0.02)
+            assert rejected.health == "degraded"
+            assert "busy" in rejected.message
+            assert alerts._SMTP_PROBE_SLOTS._value == 0
+        finally:
+            release.set()
+            await asyncio.gather(*workers)
+
+
 class TestTelegramConfiguration:
     def test_a_token_and_at_least_one_chat(self):
         assert alerts._telegram_configured(
@@ -325,7 +385,8 @@ class TestAlertHealthEndpoint:
         assert items["telegram"]["health"] == "disabled"
         assert items["email"]["message"] == "Email alerts are disabled"
         assert items["email"]["configured"] is False
-        assert items["email"]["last_checked_at"]
+        assert items["email"]["last_checked_at"] is None
+        assert items["telegram"]["last_checked_at"] is None
         # A switched-off channel is never dialled: probing it could block the
         # endpoint for the full SMTP timeout and still report "disabled".
         assert probed == []
@@ -364,6 +425,8 @@ class TestAlertHealthEndpoint:
         assert items["email"]["latency_ms"] == 30
         assert items["telegram"]["health"] == "degraded"
         assert items["telegram"]["configured"] is True
+        assert items["email"]["last_checked_at"]
+        assert items["telegram"]["last_checked_at"]
 
     @pytest.mark.asyncio
     async def test_a_refused_destination_is_audited_as_a_security_event(
