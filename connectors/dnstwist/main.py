@@ -23,7 +23,7 @@ if sys.platform != "win32":
 import aiodns
 import structlog
 
-from opendrp_connector import ConnectorBase
+from opendrp_connector import ConnectorBase, ConnectorPreflightError
 from opendrp_connector.network import is_safe_external_ip
 
 log = structlog.get_logger()
@@ -54,6 +54,65 @@ _DEFAULT_NAMESERVERS: list[str] = []
 # connector forever.
 _DNSTWIST_SUBPROCESS_TIMEOUT = float(os.environ.get("DNSTWIST_TIMEOUT_SECONDS", "120"))
 
+#: The DNSTwist CLI release this connector is written against. The images pin it
+#: (`dnstwist=0~20250130-1`, whose CLI answers ``dnstwist 20250130``), so the pin
+#: and this line are one decision written twice; `tests/test_dnstwist_cli_version.py`
+#: is where they meet, and `verify_cli_version()` is what makes a mismatch loud.
+_EXPECTED_DNSTWIST_VERSION = "20250130"
+#: How long the version probe may take. A ``dnstwist`` that will not answer at all
+#: is as much a mismatch as a wrong number.
+_DNSTWIST_VERSION_TIMEOUT = 15.0
+
+
+class DnstwistVersionMismatch(ConnectorPreflightError):
+    """The installed CLI is not the one this connector was written against.
+
+    A preflight refusal rather than a per-job ``partial``: the JSON field names, the
+    fuzzer vocabulary and the resolved-address dictionary are all properties of the
+    CLI, so a different release can return fewer look-alikes for the same domain —
+    and a scan that quietly reports fewer is indistinguishable from a domain that
+    has none. Raised before the connector registers, so the container exits non-zero
+    with one instruction instead of failing every job with the same cause.
+    """
+
+
+async def installed_cli_version() -> str | None:
+    """The release ``dnstwist --version`` reports, or ``None`` if it will not run.
+
+    The CLI answers ``dnstwist 20250130`` and exits 0; the last whitespace-separated
+    token is the release, which is also the upstream version the Debian package
+    ``0~20250130-1`` is derived from.
+    """
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "dnstwist",
+            "--version",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+    except OSError:
+        return None
+    try:
+        stdout, _ = await asyncio.wait_for(
+            proc.communicate(), timeout=_DNSTWIST_VERSION_TIMEOUT
+        )
+    except asyncio.CancelledError:
+        proc.kill()
+        await proc.wait()
+        raise
+    except Exception:
+        # A timeout lands here too: a CLI that cannot answer is a mismatch.
+        try:
+            proc.kill()
+            await proc.wait()
+        except Exception:
+            pass
+        return None
+    if proc.returncode != 0:
+        return None
+    text = stdout.decode(errors="ignore").strip()
+    return text.split()[-1] if text else None
+
 
 class DNSTwistConnector(ConnectorBase):
     def __init__(self) -> None:
@@ -77,6 +136,27 @@ class DNSTwistConnector(ConnectorBase):
         """Per-domain counters: permutations seen, permutations that resolved to
         a public address, and findings the core stored."""
         return {"candidates": 0, "resolved": 0, "stored": 0}
+
+    async def preflight(self) -> None:
+        """Refuse to start against a DNSTwist that is not the pinned one.
+
+        Runs once before registration, so a container built with a different CLI
+        never claims work at all: no job can be reported as ``partial`` (or, worse,
+        as a clean scan) by a scanner that is not the one this code was written for.
+        """
+        installed = await installed_cli_version()
+        if installed == _EXPECTED_DNSTWIST_VERSION:
+            return
+        raise DnstwistVersionMismatch(
+            f"the dnstwist CLI in this container reports "
+            f"'{installed or 'no version (it did not run)'}', but this connector "
+            f"is written against {_EXPECTED_DNSTWIST_VERSION}. The image pins "
+            f"dnstwist=0~{_EXPECTED_DNSTWIST_VERSION}-1; rebuild the connector "
+            f"from this checkout (`docker compose build connector-phishing-dnstwist`) "
+            f"instead of running it against a system dnstwist, and change "
+            f"_EXPECTED_DNSTWIST_VERSION together with that pin if the upgrade "
+            f"is deliberate."
+        )
 
     async def run_scan(self, work: dict) -> tuple[list[dict], dict]:
         domains: list[str] = work.get("params", {}).get("domains") or []
@@ -160,7 +240,7 @@ class DNSTwistConnector(ConnectorBase):
             stdout, stderr = await asyncio.wait_for(
                 proc.communicate(), timeout=_DNSTWIST_SUBPROCESS_TIMEOUT
             )
-        except asyncio.TimeoutError:
+        except (asyncio.TimeoutError, asyncio.CancelledError) as cancellation:
             try:
                 if sys.platform != "win32" and getattr(proc, "pid", None):
                     _os.killpg(proc.pid, _os.SIGKILL)
@@ -171,6 +251,8 @@ class DNSTwistConnector(ConnectorBase):
                 # The process may have exited between timeout and termination.
                 # The timeout itself remains a provider error either way.
                 pass
+            if isinstance(cancellation, asyncio.CancelledError):
+                raise
             self._last_domain_error = True
             log.warning("dnstwist_timeout", domain=domain, timeout=_DNSTWIST_SUBPROCESS_TIMEOUT)
             return tally

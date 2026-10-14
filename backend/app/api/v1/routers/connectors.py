@@ -17,8 +17,8 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 import structlog
-from fastapi import APIRouter, Body, Depends, Header, Query, Request, Response
-from pydantic import BaseModel, Field, ValidationError, field_validator
+from fastapi import APIRouter, Body, Depends, Header, HTTPException, Query, Request, Response
+from pydantic import BaseModel, Field, StrictBool, StrictInt, ValidationError, field_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import extract_ip, get_db, require_admin, require_viewer_plus
@@ -30,7 +30,7 @@ from app.core.exceptions import (
     UnauthorizedException,
 )
 from app.models import Connector
-from app.schemas.common import PaginatedResponse
+from app.schemas.common import MAX_PAGE_SIZE, PaginatedResponse
 from app.schemas.connector import MAX_FINDINGS_PER_BATCH
 from app.schemas.job import JobResponse
 from app.services.connector_manifest import (
@@ -45,7 +45,7 @@ from app.services.connector_credentials import (
     connector_name_from_token,
 )
 from app.services.connector_service import ConnectorService, normalize_connector_name
-from app.services.module_registry import load_modules
+from app.services.module_registry import load_modules, require_enabled_module
 
 log = structlog.get_logger()
 
@@ -122,7 +122,7 @@ async def require_connector(
             claimed = normalize_connector_name(x_connector_name)
         except BadRequestException:
             claimed = ""
-        if claimed and claimed != connector.name:
+        if claimed and claimed != connector.name and claimed not in (connector.aliases or []):
             raise ForbiddenException("Connector token does not belong to that connector")
     await credentials.touch_last_used(connector)
     return connector
@@ -149,6 +149,7 @@ class ConnectorRegisterRequest(BaseModel):
     name: str = Field(min_length=1, max_length=100)
     connector_type: str = Field(min_length=1, max_length=32)
     api_version: str = Field(min_length=1, max_length=32)
+    protocol_version: int = Field(default=2, ge=2, le=2)
     info: dict[str, str] | None = None
     #: Job type this connector alone claims, e.g. ``phishing.dnstwist``.
     default_job_type: str = Field(min_length=3, max_length=50)
@@ -170,6 +171,8 @@ class ConnectorRegisterRequest(BaseModel):
 class ConnectorWorkResponse(BaseModel):
     job_id: str
     lease_token: str | None = None
+    lease_seconds: int = 180
+    protocol_version: int = 2
     job_type: str
     connector: str
     module: str | None = None
@@ -234,6 +237,11 @@ class ConnectorOut(BaseModel):
     #: Credential state. The digest is deliberately absent: only the public
     #: prefix travels, so an operator can tell *which* token is in use without
     #: being handed material they could authenticate with.
+    provider: str | None = None
+    source_account_id: uuid.UUID | None = None
+    quota_group: str | None = None
+    readiness: dict | None = None
+    last_success_at: datetime | None = None
     has_token: bool = False
     token_prefix: str | None = None
     token_created_at: datetime | None = None
@@ -279,6 +287,11 @@ def _connector_out(conn: Connector, specs: dict[str, ModuleSpec]) -> ConnectorOu
         info=conn.info,
         created_at=conn.created_at,
         updated_at=conn.updated_at,
+        provider=conn.provider,
+        source_account_id=conn.source_account_id,
+        quota_group=conn.quota_group,
+        readiness=conn.readiness,
+        last_success_at=conn.last_success_at,
         has_token=conn.has_token,
         token_prefix=conn.token_prefix,
         token_created_at=conn.token_created_at,
@@ -305,7 +318,7 @@ async def register_connector(
     rewrite another connector's registry row — and registration upserts by name,
     so the payload name must match the credential before anything is written.
     """
-    if normalize_connector_name(payload.name) != caller.name:
+    if normalize_connector_name(payload.name) != caller.name and normalize_connector_name(payload.name) not in (caller.aliases or []):
         raise ForbiddenException("Connector token does not belong to that connector")
     svc = ConnectorService(db)
     conn = await svc.register(
@@ -337,6 +350,77 @@ async def register_connector(
     return _connector_out(conn, await load_modules(db))
 
 
+class SourceReadiness(BaseModel):
+    model_config = {"extra": "forbid"}
+    credentials_configured: bool
+    credential_state: str = Field(default="unknown", pattern="^(unknown|valid|invalid|unsupported)$")
+    provider_error: str | None = Field(default=None, pattern="^(invalid_credentials|ip_restricted|access_denied|credits_exhausted|rate_limited|provider_application_error|provider_rejected_request|network_or_invalid_response|http_[0-9]{3})$", max_length=64)
+    capabilities: list[str] = Field(default_factory=list, max_length=32)
+    operations: list[str] = Field(default_factory=list, max_length=32)
+
+    @field_validator("capabilities", "operations")
+    @classmethod
+    def _namespaced_identifiers(cls, values):
+        import re
+        if any(not re.fullmatch(r"[a-z][a-z0-9_.-]{0,63}", value) for value in values):
+            raise ValueError("Invalid capability or operation identifier")
+        return list(dict.fromkeys(values))
+
+
+@router.post("/me/readiness")
+async def source_readiness(payload: SourceReadiness, db: AsyncSession = Depends(get_db), caller: Connector = Depends(require_connector)):
+    # A later readiness heartbeat must not erase a recent actionable provider
+    # error until a successful provider request clears it explicitly.
+    incoming = payload.model_dump()
+    previous_error = (caller.readiness or {}).get("provider_error")
+    if incoming["provider_error"] is None and previous_error and payload.credential_state != "valid":
+        incoming["provider_error"] = previous_error
+    incoming["checked_at"] = datetime.now(timezone.utc).isoformat()
+    caller.readiness = incoming
+    await db.commit()
+    return {"status": "ok", "enabled": caller.is_enabled}
+
+
+@router.post("/me/quota/provider")
+async def provider_reservation(job_id: uuid.UUID, x_connector_lease: str = Header(..., min_length=16, max_length=64), bucket: str = Query("search", pattern=r"^[a-z][a-z0-9_.-]{0,63}$"), db: AsyncSession = Depends(get_db), caller: Connector = Depends(require_connector)):
+    from app.services.provider_quota import reserve
+    await require_enabled_module(db, caller.connector_type)
+    job = await ConnectorService(db)._owned_job(caller, job_id, lease_token=x_connector_lease)
+    return await reserve(db, caller, bucket, job=job)
+
+
+@router.get("/me/control")
+async def source_control(db: AsyncSession = Depends(get_db), caller: Connector = Depends(require_connector)):
+    modules = await load_modules(db)
+    spec = modules.get(caller.connector_type)
+    return {"enabled": caller.is_enabled and bool(spec and spec.enabled), "config": caller.config or {}}
+
+
+@router.get("/me/credential", response_model=dict)
+async def connector_credential(request: Request, response: Response, db: AsyncSession = Depends(get_db), caller: Connector = Depends(require_connector)):
+    """The provider key bound to this connector's account, for its own use only.
+
+    The response is never cacheable. Each disclosure is audited by connector and
+    account, never by value.
+    """
+    from app.services.source_accounts import api_key_for_connector
+    response.headers["Cache-Control"] = "no-store"
+    api_key = await api_key_for_connector(db, caller)
+    if api_key is None:
+        return {"configured": False}
+    await AuditLogger.emit(db, action="connector.credential.read", ip_address=extract_ip(request), user_id=None, details={"connector_id": str(caller.id), "account_id": str(caller.source_account_id)})
+    await db.commit()
+    return {"configured": True, "api_key": api_key}
+
+
+@router.post("/me/quota/virustotal", response_model=dict)
+async def reserve_virustotal_request(
+    caller: Connector = Depends(require_connector),
+):
+    """Atomically reserve one public VT request against replica-shared quotas."""
+    raise HTTPException(410, "Reserve quota through the lease-bound /me/quota/provider endpoint")
+
+
 @router.get("/me/work", response_model=ConnectorWorkResponse | None)
 async def get_work(
     db: AsyncSession = Depends(get_db),
@@ -355,10 +439,11 @@ async def get_work(
     return ConnectorWorkResponse(
         job_id=str(job.id),
         lease_token=job.lease_token,
+        lease_seconds=settings.CONNECTOR_JOB_LEASE_SECONDS,
         job_type=job.job_type,
         connector=conn.name,
         module=conn.connector_type,
-        config=conn.config or {},
+        config=(job.params if isinstance(job.params, dict) else {}).get("config_snapshot", conn.config or {}),
         # Claim flow always stores a dict under params; a JSON list payload
         # is not representable in the work response schema.
         params=job.params if isinstance(job.params, dict) else None,
@@ -395,7 +480,7 @@ async def submit_findings(
     # manifest says which finding kind it emits, so the core never infers the
     # schema from the connector's identity — and never calls provider code.
     specs = await load_modules(db)
-    manifest = _manifest_of(conn, specs)
+    manifest = (job.params if isinstance(job.params, dict) else {}).get("manifest_snapshot") or _manifest_of(conn, specs)
     module_spec = specs.get(manifest["module"])
     finding_adapter = finding_adapter_for(module_spec) if module_spec is not None else None
     if module_spec is None or finding_adapter is None:
@@ -413,7 +498,7 @@ async def submit_findings(
     # Snapshot scalar metadata before ingestion commits can expire ORM state.
     conn_name = conn.name
     conn_kind = manifest["finding_kind"]
-    accepted, rejected = await ingest_findings(
+    result = await ingest_findings(
         db,
         connector=conn,
         job_id=job.id,
@@ -423,6 +508,9 @@ async def submit_findings(
         finding_kind=conn_kind,
         module_spec=module_spec,
     )
+    accepted, rejected = result.accepted, result.rejected
+    # Audit failure must not roll back an already acknowledged ingestion batch.
+    await db.commit()
     await AuditLogger.emit_background(
         db,
         action="connector.findings.ingested",
@@ -431,7 +519,7 @@ async def submit_findings(
         details={"connector": conn_name, "job_id": str(job_id), "accepted": accepted, "rejected": rejected},
     )
     await db.commit()
-    return {"accepted": accepted, "rejected": rejected}
+    return result.payload()
 
 
 @router.post("/me/complete/{job_id}", response_model=dict)
@@ -506,15 +594,21 @@ async def connector_health(
             health = "failed"
         elif not conn.last_seen_at:
             health = "unknown"
-        elif now - conn.last_seen_at > stale_after:
-            health = "degraded"
         else:
-            health = "healthy"
+            last_seen = conn.last_seen_at
+            if last_seen.tzinfo is None:
+                # SQLite hands back naive datetimes for a timezone-aware
+                # column. They are stored as UTC instants.
+                last_seen = last_seen.replace(tzinfo=timezone.utc)
+            else:
+                last_seen = last_seen.astimezone(timezone.utc)
+            health = "degraded" if now - last_seen > stale_after else "healthy"
         items.append({
             "name": conn.name,
             "connector_type": conn.connector_type,
             "status": conn.status,
             "health": health,
+            "online": ConnectorService.is_online(conn),
             "last_seen_at": conn.last_seen_at,
             "last_error": conn.last_error if is_admin else None,
             "info": {
@@ -573,7 +667,7 @@ async def list_modules(
 async def connector_jobs(
     request: Request,
     page: int = Query(1, ge=1),
-    size: int = Query(50, ge=1, le=200),
+    size: int = Query(50, ge=1, le=MAX_PAGE_SIZE),
     db: AsyncSession = Depends(get_db),
 ):
     from math import ceil
@@ -606,14 +700,17 @@ async def update_connector_status(
     db: AsyncSession = Depends(get_db),
     user=Depends(require_admin),
 ):
-    conn = await ConnectorService(db).set_status(connector_id, payload.status)
+    conn = await ConnectorService(db).set_status(connector_id, payload.status, commit=False)
     await AuditLogger.emit(
         db,
         action="connector.status.updated",
         ip_address=extract_ip(request),
         user_id=user.id,
         details={"connector": conn.name, "status": conn.status},
+        require_persistence=True,
+        commit=False,
     )
+    await db.commit()
     return _connector_out(conn, await load_modules(db))
 
 
@@ -636,20 +733,111 @@ async def update_connector_config(
     # holds no per-vendor settings model.
     specs = await load_modules(db)
     validated = validate_connector_config(_manifest_of(conn_obj, specs), payload)
-    conn = await ConnectorService(db).set_config(connector_id, validated)
+    conn = await ConnectorService(db).set_config(connector_id, validated, commit=False)
     await AuditLogger.emit(
         db,
         action="connector.config.updated",
         ip_address=extract_ip(request),
         user_id=user.id,
         details={"connector": conn.name, "config": sorted(conn.config or {})},
+        require_persistence=True,
+        commit=False,
     )
+    await db.commit()
     return _connector_out(conn, await load_modules(db))
 
 
 # ---------------------------------------------------------------------------
 # Credential provisioning (admin/JWT)
 # ---------------------------------------------------------------------------
+
+
+class SourceAccountRequest(BaseModel):
+    model_config = {"extra": "forbid"}
+    source_id: str = Field(min_length=1, max_length=32, pattern=r"^[a-z][a-z0-9_-]{0,31}$")
+    name: str = Field(min_length=1, max_length=64, pattern=r"^[a-z0-9][a-z0-9_-]{0,63}$")
+    credential_ref: str | None = Field(default=None, max_length=128, pattern=r"^[A-Z][A-Z0-9_]{0,127}$")
+
+
+class SourceAccountPolicyRequest(BaseModel):
+    model_config = {"extra": "forbid"}
+    approved: StrictBool
+    requests_per_minute: StrictInt = Field(ge=1, le=600)
+    daily_budget: StrictInt = Field(ge=1, le=100000)
+
+@router.get("/accounts", dependencies=[Depends(require_admin)])
+async def list_source_accounts(db: AsyncSession = Depends(get_db)):
+    from sqlalchemy import select
+    from app.models.source_account import SourceAccount
+    rows = list((await db.execute(select(SourceAccount).order_by(SourceAccount.source_id, SourceAccount.name))).scalars())
+    return [{"id": row.id, "source_id": row.source_id, "name": row.name, "credential_ref": row.credential_ref, "policy": row.policy, "access_state": row.access_state, "has_api_key": bool(row.api_key_encrypted), "api_key_hint": row.api_key_hint} for row in rows]
+
+
+@router.post("/accounts")
+async def create_source_account(payload: SourceAccountRequest, request: Request, db: AsyncSession = Depends(get_db), user=Depends(require_admin)):
+    from app.services.source_accounts import provision_account
+    account, created, credential_ref_updated = await provision_account(db, **payload.model_dump())
+    if created or credential_ref_updated:
+        await AuditLogger.emit(db, action="source_account.provisioned" if created else "source_account.credential_ref.updated", ip_address=extract_ip(request), user_id=user.id, details={"account_id": str(account.id), "source_id": account.source_id, "credential_ref_set": bool(account.credential_ref)})
+    await db.commit()
+    return {"id": account.id}
+
+
+@router.patch("/accounts/{account_id}/policy")
+async def update_account_policy(account_id: uuid.UUID, payload: SourceAccountPolicyRequest, request: Request, db: AsyncSession = Depends(get_db), user=Depends(require_admin)):
+    from app.services.source_accounts import approve_policy
+    account = await approve_policy(
+        db, account_id, payload.model_dump(exclude_none=True)
+    )
+    await AuditLogger.emit(db, action="source_account.policy.updated", ip_address=extract_ip(request), user_id=user.id, details={"account_id": str(account.id), "policy": account.policy})
+    await db.commit()
+    return {"id": account.id, "policy": account.policy}
+
+
+class SourceAccountApiKeyRequest(BaseModel):
+    model_config = {"extra": "forbid"}
+    api_key: str = Field(min_length=1, max_length=512, pattern=r"^[\x21-\x7e]+$")
+
+
+def _api_key_state(account) -> dict:
+    return {"id": account.id, "has_api_key": bool(account.api_key_encrypted), "api_key_hint": account.api_key_hint}
+
+
+@router.put("/accounts/{account_id}/api-key")
+async def set_source_account_api_key(account_id: uuid.UUID, payload: SourceAccountApiKeyRequest, request: Request, db: AsyncSession = Depends(get_db), user=Depends(require_admin)):
+    from app.services.source_accounts import set_api_key
+    account = await set_api_key(db, account_id, payload.api_key)
+    await AuditLogger.emit(db, action="source_account.api_key.updated", ip_address=extract_ip(request), user_id=user.id, details={"account_id": str(account.id), "source_id": account.source_id, "api_key_hint": account.api_key_hint})
+    await db.commit()
+    return _api_key_state(account)
+
+
+@router.delete("/accounts/{account_id}/api-key")
+async def clear_source_account_api_key(account_id: uuid.UUID, request: Request, db: AsyncSession = Depends(get_db), user=Depends(require_admin)):
+    from app.services.source_accounts import clear_api_key
+    account = await clear_api_key(db, account_id)
+    await AuditLogger.emit(db, action="source_account.api_key.cleared", ip_address=extract_ip(request), user_id=user.id, details={"account_id": str(account.id), "source_id": account.source_id})
+    await db.commit()
+    return _api_key_state(account)
+
+
+@router.patch("/{connector_id}/account")
+async def bind_source_account(connector_id: uuid.UUID, account_id: uuid.UUID, request: Request, db: AsyncSession = Depends(get_db), user=Depends(require_admin)):
+    from app.models.source_account import SourceAccount
+    conn, account = await db.get(Connector, connector_id), await db.get(SourceAccount, account_id)
+    if conn is None or account is None:
+        raise BadRequestException("Connector or account not found")
+    if conn.provider and conn.provider != account.source_id:
+        raise BadRequestException("Account provider mismatch")
+    if not conn.provider and conn.name not in {"netlas"}:
+        raise BadRequestException("Account provider cannot be inferred for this connector")
+    if conn.source_account_id != account.id:
+        conn.provider, conn.source_account_id, conn.quota_group = account.source_id, account.id, account.name
+    else:
+        return _connector_out(conn, await load_modules(db))
+    await AuditLogger.emit(db, action="connector.account.bound", ip_address=extract_ip(request), user_id=user.id, details={"connector_id": str(conn.id), "account_id": str(account.id)})
+    await db.commit()
+    return _connector_out(conn, await load_modules(db))
 
 
 class ConnectorProvisionRequest(BaseModel):

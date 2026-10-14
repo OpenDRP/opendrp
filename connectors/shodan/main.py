@@ -31,6 +31,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import os
+import re
 import time
 from email.utils import parsedate_to_datetime
 from datetime import datetime, timezone
@@ -50,6 +51,11 @@ _SHODAN_MAX_RETRIES = 2
 _SHODAN_DEFAULT_MIN_INTERVAL = 1.0
 _SHODAN_DEFAULT_TIMEOUT = 30.0
 _SHODAN_MAX_RETRY_DELAY = 30.0
+#: A keyword carrying one of these cannot be quoted into a Shodan phrase: the
+#: platform validates the same set at the edge (``KEYWORD_MAX_LENGTH`` and
+#: ``_KEYWORD_FORBIDDEN_RE`` in ``app/schemas/asset.py``), and this connector
+#: still refuses such a value so a scan can never widen an operator's query.
+_UNQUOTABLE_KEYWORD_RE = re.compile(r'["\\\x00-\x1f]')
 _FAVICON_FETCH_TIMEOUT = 10.0
 _FAVICON_MAX_BYTES = 2 * 1024 * 1024  # a favicon larger than 2 MB is suspicious
 #: How many same-host redirects a favicon lookup may follow. ``/favicon.ico``
@@ -88,6 +94,12 @@ class ShodanConnector(ConnectorBase):
     # ------------------------------------------------------------------
     # Capabilities: registry config (from work payload) wins over env.
     # ------------------------------------------------------------------
+
+    async def register(self) -> None:
+        await super().register()
+        await self._request("POST", "/api/v1/connectors/me/readiness", json={
+            "credentials_configured": bool(self.api_key), "credential_state": "unknown",
+            "capabilities": ["certificate", "title", "favicon"], "operations": ["search"]})
 
     def _capabilities(self, config: dict) -> dict[str, bool]:
         return {
@@ -143,6 +155,7 @@ class ShodanConnector(ConnectorBase):
                 for attempt in range(_SHODAN_MAX_RETRIES + 1):
                     try:
                         await self._pace_provider_request()
+                        await self.reserve_provider_request("search")
                         r = await client.get(self.API, params=params, headers=self.HEADERS)
                         retryable = r.status_code == 429 or 500 <= r.status_code < 600
                         if retryable and attempt < _SHODAN_MAX_RETRIES:
@@ -250,16 +263,18 @@ class ShodanConnector(ConnectorBase):
         capability_results: dict[str, dict] = {}
         saved = 0
 
+        ssl_queries, ssl_skipped = self._keyword_queries("ssl", kw_domains)
+        title_queries, title_skipped = self._keyword_queries("http.title", kw_titles)
+        skipped_keywords = sorted(set(ssl_skipped) | set(title_skipped))
+
         if caps["scan_ssl_text"]:
             run_caps.append("ssl")
             capability_results["ssl"] = await self._keyword_capability(
                 job_id=job_id,
                 source="shodan_ssl",
-                queries=[
-                    (f'ssl:"{self._keyword_value(item)}"', self._keyword_value(item))
-                    for item in kw_domains
-                ],
+                queries=ssl_queries,
                 exclude=exclude,
+                skipped=ssl_skipped,
             )
             saved += capability_results["ssl"]["stored"]
 
@@ -268,11 +283,9 @@ class ShodanConnector(ConnectorBase):
             capability_results["title"] = await self._keyword_capability(
                 job_id=job_id,
                 source="shodan_title",
-                queries=[
-                    (f'http.title:"{self._keyword_value(item)}"', self._keyword_value(item))
-                    for item in kw_titles
-                ],
+                queries=title_queries,
                 exclude=exclude,
+                skipped=title_skipped,
             )
             saved += capability_results["title"]["stored"]
 
@@ -296,6 +309,9 @@ class ShodanConnector(ConnectorBase):
             "capabilities_run": run_caps,
             "capability_results": capability_results,
             "new_discovered": saved,
+            # Keywords the provider grammar cannot carry are named here rather
+            # than silently dropped: a scan that skipped one is not "clean".
+            "skipped_keywords": skipped_keywords,
             "status": "partial" if self._provider_errors else "success",
             "provider_errors": sorted(set(self._provider_errors)),
         }
@@ -315,6 +331,35 @@ class ShodanConnector(ConnectorBase):
         if isinstance(item, dict):
             return str(item.get("value") or "")
         return str(item)
+
+    @staticmethod
+    def _query_phrase(value: str) -> str | None:
+        """A quoted provider phrase, or ``None`` when the keyword cannot be quoted.
+
+        Shodan's query language has no escape for a double quote inside a
+        phrase, so ``evil" -host:owned.example`` would end the phrase there and
+        append filters of its own to the operator's query (AST-30). Refusing the
+        phrase is the only safe answer; the caller reports which keyword it was.
+        """
+        value = value.strip()
+        if not value or _UNQUOTABLE_KEYWORD_RE.search(value):
+            return None
+        return f'"{value}"'
+
+    @classmethod
+    def _keyword_queries(cls, field: str, items: list) -> tuple[list[tuple[str, str]], list[str]]:
+        """Build ``<field>:"<keyword>"`` queries plus the keywords left out."""
+        queries: list[tuple[str, str]] = []
+        skipped: list[str] = []
+        for item in items:
+            value = cls._keyword_value(item).strip()
+            phrase = cls._query_phrase(value)
+            if phrase is None:
+                if value:
+                    skipped.append(value)
+                continue
+            queries.append((f"{field}:{phrase}", value))
+        return queries, sorted(skipped)
 
     @staticmethod
     def _empty_tally() -> dict:
@@ -340,6 +385,7 @@ class ShodanConnector(ConnectorBase):
         source: str,
         queries: list[tuple[str, str]],
         exclude: set[str],
+        skipped: list[str] | None = None,
     ) -> dict:
         """Run one ``<field>:"<keyword>"`` capability and report its outcome.
 
@@ -350,6 +396,7 @@ class ShodanConnector(ConnectorBase):
         single submit at the end.
         """
         tally = self._empty_tally()
+        tally["skipped"] = sorted(skipped) or None
         batch: list[dict] = []
         for query, matched in queries:
             matches = await self._search(query, exclude)

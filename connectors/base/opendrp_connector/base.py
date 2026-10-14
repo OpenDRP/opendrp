@@ -107,7 +107,17 @@ def configure_connector_logging() -> None:
         # to stdout and needs no handler and no level arithmetic to be correct.
         wrapper_class=structlog.make_filtering_bound_logger(level),
         logger_factory=structlog.PrintLoggerFactory(),
-        cache_logger_on_first_use=True,
+        # Deliberately not ``cache_logger_on_first_use``: that flag is process
+        # global, and it hard-caches *every* logger bound while a connector runs,
+        # not just this module's. Embedded in the core — which is exactly what
+        # this repository's connector tests do, and what any future in-process
+        # use would do — it left the core's audit logger bound to the connector's
+        # chain for the rest of the process, so audit lines came out in the
+        # connector's shape (``event`` and ``level`` beside the five published
+        # fields) instead of the contract in ``docs/description.md``, and no
+        # later reconfiguration could undo it. One object per log call is cheap
+        # next to the HTTP request that follows it.
+        cache_logger_on_first_use=False,
     )
 
 SDK_VERSION = "1.2.0"
@@ -149,6 +159,18 @@ class ConnectorCredentialError(RuntimeError):
             f"the environment it was created with."
         )
         self.status_code = status_code
+
+
+class ConnectorPreflightError(RuntimeError):
+    """A startup check failed: this connector cannot run jobs correctly here.
+
+    Fatal by design, like ``ConnectorCredentialError``. The alternative — start
+    anyway and mark each job ``partial`` — is the failure mode this exists to
+    remove: for a scanner, "I could not run my tool" and "I found nothing" must not
+    look the same in the job history. The message carries the fix; the process
+    exits non-zero so the container's restart policy and `docker compose ps`
+    surface the misconfiguration instead of a quiet stream of empty scans.
+    """
 
 
 class ConnectorBase:
@@ -200,6 +222,9 @@ class ConnectorBase:
         #: ``(job_id, lease_token)`` of the scan being executed. The token is
         #: part of the claim, never absent: every job-scoped call proves it.
         self._active_job: tuple[str, str] | None = None
+        self._lease_deadline: float | None = None
+        self._lease_lost = False
+        self._scan_task: asyncio.Task | None = None
         #: The declaration this connector registers with, validated once here so
         #: a missing job type fails at start-up instead of restart-looping
         #: against the core.
@@ -335,6 +360,7 @@ class ConnectorBase:
             "name": self.name,
             "connector_type": self.connector_type,
             "api_version": self.api_version,
+            "protocol_version": 2,
             "info": {
                 "version": self.api_version,
                 "python": sys.version.split()[0],
@@ -375,12 +401,28 @@ class ConnectorBase:
         the core with 403 — both fail here, before a request is sent.
         """
         job, lease_token = self._active_job or ("", "")
+        if self._lease_lost or (self._lease_deadline is not None and time.monotonic() >= self._lease_deadline):
+            raise ConnectorAPIError(403, "local job lease expired; stop work")
         if not lease_token or job != job_id:
             raise ConnectorAPIError(
                 0,
                 f"no active lease for job {job_id}; poll for work before reporting on it",
             )
         return lease_token
+
+    async def reserve_virustotal_request(self) -> None:
+        """Reserve a globally shared public VT quota slot before each request."""
+        if not self._active_job:
+            raise ConnectorAPIError(403, "Active lease required for provider quota")
+        await self.reserve_provider_request("lookup")
+
+    async def reserve_provider_request(self, bucket: str = "search") -> None:
+        if not self._active_job:
+            raise ConnectorAPIError(403, "Active lease required for provider quota")
+        job_id = self._active_job[0]
+        await self._request("POST", "/api/v1/connectors/me/quota/provider",
+                            params={"job_id": job_id, "bucket": bucket},
+                            headers={"X-Connector-Lease": self._lease_for(job_id)})
 
     async def submit_findings(self, job_id: str, findings: list[dict]) -> dict:
         if not findings:
@@ -391,7 +433,12 @@ class ConnectorBase:
             headers={"X-Connector-Lease": self._lease_for(job_id)},
             json=findings,
         )
-        return resp.json()
+        result = resp.json()
+        if result.get("rejected", 0):
+            raise ConnectorAPIError(422, "core rejected connector observations")
+        if result.get("accepted") != len(findings):
+            raise ConnectorAPIError(502, "core returned inconsistent ingestion counts")
+        return result
 
     async def complete(self, job_id: str, summary: dict) -> None:
         await self._request_with_retry(
@@ -440,13 +487,21 @@ class ConnectorBase:
                 await asyncio.wait_for(self._stop.wait(), timeout=interval)
             except asyncio.TimeoutError:
                 try:
+                    renewed_from = time.monotonic()
                     await self._request(
                         "POST",
                         "/api/v1/connectors/me/heartbeat",
                         json={"job_id": job_id, "lease_token": lease_token},
                     )
+                    self._lease_deadline = renewed_from + getattr(self, "_lease_seconds", 180)
                 except Exception as exc:
                     log.warning("connector_job_heartbeat_failed", job_id=job_id, err=str(exc)[:200])
+                    if (isinstance(exc, ConnectorAPIError) and exc.status_code in (401, 403, 404, 409)) or time.monotonic() >= (self._lease_deadline or 0):
+                        self._lease_lost = True
+                        task = getattr(self, "_scan_task", None)
+                        if task:
+                            task.cancel()
+                        return
 
     # ------------------------------------------------------------------
     # Hook for subclasses — the actual scan
@@ -475,8 +530,10 @@ class ConnectorBase:
                 0, f"work payload for job {job_id} carries no lease token"
             )
         self._active_job = (job_id, lease_token)
-        heartbeat_task = asyncio.create_task(self._job_heartbeat_loop(job_id, lease_token))
-        try:
+        self._lease_seconds = float(work.get("lease_seconds", 180))
+        self._lease_deadline = time.monotonic() + self._lease_seconds
+        self._lease_lost = False
+        async def execute_and_publish():
             findings, summary = await self.run_scan(work)
             if findings:
                 result = await self.submit_findings(job_id, findings)
@@ -485,15 +542,40 @@ class ConnectorBase:
             summary.setdefault("duration_sec", round(time.monotonic() - started, 1))
             await self.complete(job_id, summary)
             log.info("connector_job_completed", job_id=job_id, summary=summary)
+
+        async def lease_watchdog():
+            while self._active_job and not self._lease_lost:
+                delay = (self._lease_deadline or 0) - time.monotonic()
+                if delay <= 0:
+                    self._lease_lost = True
+                    if self._scan_task:
+                        self._scan_task.cancel()
+                    return
+                await asyncio.sleep(min(delay, 0.25))
+
+        scan_task = asyncio.create_task(execute_and_publish())
+        self._scan_task = scan_task
+        heartbeat_task = asyncio.create_task(self._job_heartbeat_loop(job_id, lease_token))
+        watchdog_task = asyncio.create_task(lease_watchdog())
+        try:
+            await scan_task
+        except asyncio.CancelledError:
+            if getattr(self, "_lease_lost", False):
+                log.warning("connector_job_lease_lost", job_id=job_id)
+            else:
+                raise
         except Exception as exc:
             log.error("connector_job_failed", job_id=job_id, err=str(exc)[:500])
-            await self.report_failure(job_id, f"{type(exc).__name__}: {exc}")
+            if not self._lease_lost and time.monotonic() < (self._lease_deadline or 0):
+                await self.report_failure(job_id, f"{type(exc).__name__}: {exc}")
         finally:
+            scan_task.cancel()
             heartbeat_task.cancel()
-            try:
-                await heartbeat_task
-            except asyncio.CancelledError:
-                pass
+            watchdog_task.cancel()
+            await asyncio.gather(scan_task, heartbeat_task, watchdog_task, return_exceptions=True)
+            self._scan_task = None
+            self._lease_deadline = None
+            self._lease_lost = False
             if self._active_job and self._active_job[0] == job_id:
                 self._active_job = None
 
@@ -533,12 +615,25 @@ class ConnectorBase:
             except asyncio.TimeoutError:
                 pass
 
+    async def preflight(self) -> None:
+        """Startup checks, run once before the connector registers or claims work.
+
+        A subclass overrides this to refuse to run against a component it cannot
+        work with — a tool of the wrong version, a missing binary — by raising
+        ``ConnectorPreflightError``. Deliberately before registration: a connector
+        that declares itself ready and then cannot scan is what an operator has to
+        discover from a job history rather than from the container log.
+        """
+        return None
+
     async def run_forever(self) -> None:
-        """Main loop: register, then poll-execute-heartbeat until stopped.
+        """Main loop: preflight, register, then poll-execute-heartbeat until stopped.
 
         Raises ``ConnectorCredentialError`` if the core rejects the credential:
         a revoked or rotated token cannot be repaired from inside the container.
+        Raises ``ConnectorPreflightError`` if a startup check refuses to run.
         """
+        await self.preflight()
         await self._register_or_fail()
         watchdog = asyncio.create_task(self._liveness_watchdog())
 
@@ -636,7 +731,7 @@ class ConnectorBase:
         self.install_signal_handlers()
         try:
             asyncio.run(_runner())
-        except ConnectorCredentialError as exc:
+        except (ConnectorCredentialError, ConnectorPreflightError) as exc:
             # Fail loudly with the one instruction that fixes it; the container
             # exits non-zero so orchestrators surface the misconfiguration.
             print(f"[FATAL] {exc}", file=sys.stderr)

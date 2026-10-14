@@ -404,6 +404,29 @@ class TestWork:
         assert resp.status_code == 403
 
     @pytest.mark.asyncio
+    async def test_readiness_accepts_safe_provider_error_and_preserves_until_success(self, client, db_session):
+        conn = await ConnectorService(db_session).register(
+            name="netlas", connector_type="exposure", default_job_type="exposure.netlas"
+        )
+        headers = await _auth(db_session, "netlas", "exposure")
+        readiness_url = "/api/v1/connectors/me/readiness"
+        base = {"credentials_configured": True, "credential_state": "unknown", "capabilities": ["ip"]}
+
+        blocked = await client.post(readiness_url, headers=headers, json={**base, "provider_error": "ip_restricted"})
+        assert blocked.status_code == 200
+        await db_session.refresh(conn)
+        invalid = await client.post(readiness_url, headers=headers, json={**base, "provider_error": "token=secret"})
+        assert invalid.status_code == 422
+        assert conn.readiness["provider_error"] == "ip_restricted"
+
+        # An ordinary heartbeat must not erase a failure; a success state does.
+        await client.post(readiness_url, headers=headers, json=base)
+        await db_session.refresh(conn)
+        assert conn.readiness["provider_error"] == "ip_restricted"
+        await client.post(readiness_url, headers=headers, json={**base, "credential_state": "valid"})
+        await db_session.refresh(conn)
+        assert conn.readiness["provider_error"] is None
+
     async def test_work_without_any_credential_401(self, client):
         assert (await client.get("/api/v1/connectors/me/work")).status_code == 401
 
@@ -435,14 +458,22 @@ class TestWork:
         work = await client.get("/api/v1/connectors/me/work", headers=await _auth(db_session, "dnstwist", "phishing"))
         assert work.status_code == 204
 
-        # Re-enable: the pending job becomes claimable again.
+        # Re-enabling never resurrects cancelled work.
         await client.patch(
             f"/api/v1/connectors/{conn.id}/status",
             headers=auth_headers_admin,
             json={"status": "enabled"},
         )
         work2 = await client.get("/api/v1/connectors/me/work", headers=await _auth(db_session, "dnstwist", "phishing"))
-        assert work2.status_code == 200
+        assert work2.status_code == 204
+        from sqlalchemy import select
+        from app.models import Job
+        cancelled = (await db_session.execute(select(Job).where(Job.job_type == "phishing.dnstwist"))).scalar_one()
+        assert cancelled.status == "cancelled" and cancelled.finished_at is not None
+        await svc.enqueue_module_scan(connector_type="phishing", created_by=None, title="New scan")
+        fresh = await client.get("/api/v1/connectors/me/work", headers=await _auth(db_session, "dnstwist", "phishing"))
+        assert fresh.status_code == 200
+        assert fresh.json()["job_id"] != str(cancelled.id)
 
 
 # ---------------------------------------------------------------------------
@@ -509,10 +540,7 @@ class TestFindings:
 
         domain = f"evil-{uuid.uuid4().hex[:8]}.com"
         with patch(
-            "app.services.ingestion_service.AlertDeliveryService.enqueue",
-            new_callable=AsyncMock,
-        ), patch(
-            "app.services.phishing.whois_service.WhoisService.enrich",
+            "app.services.ingestion_events.AlertDeliveryService.enqueue",
             new_callable=AsyncMock,
         ):
             resp = await client.post(
@@ -530,7 +558,7 @@ class TestFindings:
                 ],
             )
         assert resp.status_code == 200
-        assert resp.json() == {"accepted": 1, "rejected": 0}
+        assert resp.json() == {"received": 1, "created": 1, "updated": 0, "unchanged": 0, "accepted": 1, "rejected": 0, "errors": []}
 
         row = (
             await db_session.execute(
@@ -540,12 +568,9 @@ class TestFindings:
         assert row is not None
         assert row.detection_source == "dnstwist"
 
-        # Duplicate domain is silently rejected through the same endpoint.
+        # Changed evidence refreshes the existing candidate without rejection.
         with patch(
-            "app.services.ingestion_service.AlertDeliveryService.enqueue",
-            new_callable=AsyncMock,
-        ), patch(
-            "app.services.phishing.whois_service.WhoisService.enrich",
+            "app.services.ingestion_events.AlertDeliveryService.enqueue",
             new_callable=AsyncMock,
         ):
             resp2 = await client.post(
@@ -556,7 +581,7 @@ class TestFindings:
                 },
                 json=[{"phishing_domain": domain, "matched_asset": "example.com"}],
             )
-        assert resp2.json() == {"accepted": 0, "rejected": 1}
+        assert resp2.json() == {"received": 1, "created": 0, "updated": 1, "unchanged": 0, "accepted": 1, "rejected": 0, "errors": []}
 
     @pytest.mark.asyncio
     async def test_findings_ingest_breach_batch(self, client, db_session):
@@ -570,7 +595,7 @@ class TestFindings:
 
         suffix = uuid.uuid4().hex[:6]
         with patch(
-            "app.services.ingestion_service.AlertDeliveryService.enqueue",
+            "app.services.ingestion_events.AlertDeliveryService.enqueue",
             new_callable=AsyncMock,
         ):
             resp = await client.post(
@@ -590,7 +615,7 @@ class TestFindings:
                 ],
             )
         assert resp.status_code == 200
-        assert resp.json() == {"accepted": 1, "rejected": 1}
+        assert resp.json() == {"received": 2, "created": 1, "updated": 0, "unchanged": 0, "accepted": 1, "rejected": 1, "errors": [{"index": 1, "code": "invalid_observation", "retryable": False}]}
 
         row = (
             await db_session.execute(

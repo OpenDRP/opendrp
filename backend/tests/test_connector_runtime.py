@@ -252,6 +252,24 @@ class TestHibpConnector:
         assert summary["skipped"] == "HIBP_API_KEY not configured"
 
 
+def _leased(connector):
+    """Arm a claimed job before a provider request is exercised.
+
+    The core keys provider quota to the job a connector claimed, so every
+    provider call is made under a lease: without one the connector refuses the
+    request itself, before it is sent. That refusal is a behavior of its own
+    (covered by the SDK contract tests); these tests are about what happens after
+    a request is allowed, so they arm a lease and stub the reservation call so it
+    succeeds without a core.
+    """
+    connector._active_job = ("job-search", "lease-search")
+    connector._min_request_interval = 0
+    connector._request = AsyncMock(
+        return_value=httpx.Response(200, json={"reserved": True})
+    )
+    return connector
+
+
 class TestShodanConnector:
     def test_capabilities_prefer_registry_values_and_use_env_fallbacks(self, connector_env):
         connector = ShodanConnector()
@@ -264,7 +282,7 @@ class TestShodanConnector:
 
     @pytest.mark.asyncio
     async def test_search_paginates_and_excludes_owned_hosts(self, connector_env, monkeypatch):
-        connector = ShodanConnector()
+        connector = _leased(ShodanConnector())
         responses = [
             {"matches": [{"ip_str": "203.0.113.10", "domains": ["owned.example"]}] * 100},
             {"matches": [{"ip_str": "198.51.100.20", "domains": ["found.example"]}]},
@@ -301,8 +319,7 @@ class TestShodanConnector:
 
     @pytest.mark.asyncio
     async def test_search_retries_rate_limit_using_retry_after(self, connector_env, monkeypatch):
-        connector = ShodanConnector()
-        connector._min_request_interval = 0
+        connector = _leased(ShodanConnector())
         responses = []
 
         class FakeResponse:
@@ -335,8 +352,7 @@ class TestShodanConnector:
 
     @pytest.mark.asyncio
     async def test_search_classifies_timeout_without_failing_the_job(self, connector_env, monkeypatch):
-        connector = ShodanConnector()
-        connector._min_request_interval = 0
+        connector = _leased(ShodanConnector())
         class FakeClient:
             async def __aenter__(self):
                 return self
@@ -351,7 +367,7 @@ class TestShodanConnector:
 
     @pytest.mark.asyncio
     async def test_search_provider_error_returns_empty(self, connector_env, monkeypatch):
-        connector = ShodanConnector()
+        connector = _leased(ShodanConnector())
 
         class FakeResponse:
             status_code = 401
@@ -412,6 +428,48 @@ class TestShodanConnector:
         assert connector._search.await_args.args[0].startswith("http.favicon.hash:")
         submitted = connector.submit_findings.await_args.args[1]
         assert submitted[0]["detection_source"] == "shodan_favicon"
+
+    @pytest.mark.asyncio
+    async def test_an_unquotable_keyword_is_skipped_and_reported(self, connector_env, monkeypatch):
+        """AST-30: Shodan has no escape for a quote inside a phrase.
+
+        Interpolating ``acme" -host:owned.example`` straight into the query would
+        close the phrase there and append filters of its own — the operator's
+        scan would search whatever the keyword asked for. The connector refuses
+        the phrase and says which keyword it refused.
+        """
+        connector = ShodanConnector()
+        connector.api_key = "valid"
+        connector._search = AsyncMock(return_value=[])
+        connector.submit_findings = AsyncMock(return_value={"accepted": 0})
+
+        _, summary = await connector.run_scan(
+            {
+                "job_id": "job-1",
+                "config": {"scan_ssl_text": True, "scan_http_title": True, "scan_favicon": False},
+                "params": {
+                    "keyword_domains": [
+                        {"value": 'acme" -host:owned.example', "type": "keyword_domain"},
+                        {"value": "acme.example", "type": "domain"},
+                    ],
+                    "keyword_titles": ['HIBP" OR http.title:"owned.example'],
+                },
+            }
+        )
+
+        assert summary["skipped_keywords"] == [
+            'HIBP" OR http.title:"owned.example',
+            'acme" -host:owned.example',
+        ]
+        assert summary["capability_results"]["ssl"]["queries"] == 1
+        assert summary["capability_results"]["ssl"]["skipped"] == ['acme" -host:owned.example']
+        assert summary["capability_results"]["title"]["queries"] == 0
+        assert summary["capability_results"]["title"]["skipped"] == [
+            'HIBP" OR http.title:"owned.example'
+        ]
+        queries = [call.args[0] for call in connector._search.await_args_list]
+        assert queries == ['ssl:"acme.example"']
+        assert all("owned.example" not in query for query in queries)
 
     @pytest.mark.asyncio
     async def test_scan_reports_what_each_capability_found(self, connector_env, monkeypatch):

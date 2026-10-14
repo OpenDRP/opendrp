@@ -10,13 +10,13 @@ SHA-256 digest, so a lost token is rotated, never recovered.
 Run INSIDE the backend container (so DB env and venv are wired correctly):
 
     # Bootstrap a connector for the first time (creates its registry row):
-    docker compose exec backend python -m scripts.manage_connector_tokens issue connector-hibp --type breaches --env CONNECTOR_TOKEN_HIBP
+    docker compose exec backend python -m scripts.manage_connector_tokens issue breaches-hibp --type breaches --env CONNECTOR_TOKEN_HIBP
 
     # Rotate a leaked credential (the previous token stops working immediately):
-    docker compose exec backend python -m scripts.manage_connector_tokens rotate connector-hibp --env CONNECTOR_TOKEN_HIBP
+    docker compose exec backend python -m scripts.manage_connector_tokens rotate breaches-hibp --env CONNECTOR_TOKEN_HIBP
 
     # Cut a connector off without deleting its history:
-    docker compose exec backend python -m scripts.manage_connector_tokens revoke connector-hibp
+    docker compose exec backend python -m scripts.manage_connector_tokens revoke breaches-hibp
 
     # See which connectors have credentials (prefixes only, never the secret):
     docker compose exec backend python -m scripts.manage_connector_tokens list
@@ -156,10 +156,10 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
-            "  python -m scripts.manage_connector_tokens issue connector-hibp "
+            "  python -m scripts.manage_connector_tokens issue breaches-hibp "
             "--type breaches --env CONNECTOR_TOKEN_HIBP\n"
-            "  python -m scripts.manage_connector_tokens rotate connector-hibp\n"
-            "  python -m scripts.manage_connector_tokens revoke connector-hibp\n"
+            "  python -m scripts.manage_connector_tokens rotate breaches-hibp\n"
+            "  python -m scripts.manage_connector_tokens revoke breaches-hibp\n"
             "  python -m scripts.manage_connector_tokens list\n"
         ),
     )

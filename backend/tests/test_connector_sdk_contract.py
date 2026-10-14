@@ -466,6 +466,52 @@ class TestExecuteJob:
         assert c.scans == 0
 
 
+class TestLeaseCancellation:
+    @pytest.mark.asyncio
+    async def test_local_deadline_cancels_scan_without_stale_reporting(self, connector):
+        cancelled = asyncio.Event()
+        async def scan(work):
+            try:
+                await asyncio.sleep(10)
+            finally:
+                cancelled.set()
+        connector.run_scan = scan
+        connector.complete = AsyncMock()
+        connector.report_failure = AsyncMock()
+        await asyncio.wait_for(connector._execute_job({"job_id": "lease-test", "lease_token": _LEASE, "lease_seconds": 0.02}), timeout=1)
+        assert cancelled.is_set()
+        connector.complete.assert_not_awaited()
+        connector.report_failure.assert_not_awaited()
+        assert connector._active_job is None
+        assert connector._scan_task is None
+
+    @pytest.mark.asyncio
+    async def test_local_deadline_also_cancels_submission(self, connector):
+        submitted = asyncio.Event()
+        cancelled = asyncio.Event()
+        connector.run_scan = AsyncMock(return_value=([{"phishing_domain": "bad.example.com"}], {}))
+        async def submit(job_id, findings):
+            submitted.set()
+            try:
+                await asyncio.sleep(10)
+            finally:
+                cancelled.set()
+        connector.submit_findings = submit
+        connector.complete = AsyncMock()
+        connector.report_failure = AsyncMock()
+        await asyncio.wait_for(connector._execute_job({"job_id": "lease-test", "lease_token": _LEASE, "lease_seconds": 0.02}), timeout=1)
+        assert submitted.is_set() and cancelled.is_set()
+        connector.complete.assert_not_awaited()
+        connector.report_failure.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_rejected_ingestion_cannot_be_reported_as_success(self, connector):
+        _claim(connector)
+        _mk_client(connector, lambda req: _ok({"accepted": 0, "rejected": 1}))
+        with pytest.raises(ConnectorAPIError, match="rejected"):
+            await connector.submit_findings("job-1", [{"phishing_domain": "bad.example.com"}])
+
+
 class TestRunForever:
     @pytest.mark.asyncio
     async def test_client_session_lazy_creation_and_reuse(self, connector):

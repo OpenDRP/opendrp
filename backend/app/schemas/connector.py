@@ -12,7 +12,7 @@ import ipaddress
 import json
 import re
 import uuid
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from typing import Annotated, Any
 
@@ -110,6 +110,9 @@ def sanitize_attributes(raw: Any, *, strict: bool = True) -> dict[str, Any]:
 _HOSTNAME_RE = re.compile(
     r"^(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,63}$"
 )
+_DNS_HOSTNAME_RE = re.compile(
+    r"^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$"
+)
 
 
 def _clean_text(value: str | None, *, field_name: str) -> str | None:
@@ -147,6 +150,13 @@ class PhishingFinding(ConnectorFindingBase):
     # publish a source label; ingestion defaults it to the authenticated name.
     detection_source: str | None = Field(default=None, max_length=100)
     original_domain: str | None = Field(default=None, max_length=512)
+    observed_at: datetime | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("metadata")
+    @classmethod
+    def validate_metadata(cls, value):
+        return sanitize_attributes(value, strict=True)
 
     @field_validator("phishing_domain")
     @classmethod
@@ -172,6 +182,113 @@ class PhishingFinding(ConnectorFindingBase):
         except ValueError as exc:
             raise ValueError("ip_address: invalid IP address") from exc
         return cleaned
+
+
+class DNSObservationPayload(ConnectorFindingBase):
+    """Small normalized record submitted by a DNS Security source connector."""
+
+    observation_type: str = Field(min_length=1, max_length=32)
+    subject: str = Field(min_length=1, max_length=253)
+    record_type: str | None = Field(default=None, max_length=16)
+    value: str | None = Field(default=None, max_length=1000)
+    expires_at: datetime | None = None
+    status: str = Field(default="current", max_length=16)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("observation_type")
+    @classmethod
+    def _valid_observation_type(cls, value: str) -> str:
+        allowed = {"dns_record", "rdap", "certificate", "certificate_check", "vt_subdomain", "vt_resolution", "hostname", "passive_dns"}
+        cleaned = value.strip().lower()
+        if cleaned not in allowed:
+            raise ValueError("unsupported DNS observation type")
+        return cleaned
+
+    @field_validator("subject")
+    @classmethod
+    def _valid_subject(cls, value: str) -> str:
+        cleaned = _clean_text(value, field_name="subject")
+        if cleaned is None:
+            raise ValueError("subject must not be empty")
+        try:
+            ipaddress.ip_address(cleaned)
+            return cleaned
+        except ValueError:
+            pass
+        try:
+            normalized = cleaned.rstrip(".").encode("idna").decode("ascii").lower()
+        except UnicodeError as exc:
+            raise ValueError("subject has invalid IDNA encoding") from exc
+        if len(normalized) > 253 or not _DNS_HOSTNAME_RE.fullmatch(normalized):
+            raise ValueError("subject must be a valid hostname or IP address")
+        return normalized
+
+    @field_validator("value")
+    @classmethod
+    def _valid_value(cls, value: str | None) -> str | None:
+        return _clean_text(value, field_name="value")
+
+    @field_validator("expires_at")
+    @classmethod
+    def _normalize_expiry_timezone(cls, value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
+        return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value
+
+    @field_validator("record_type")
+    @classmethod
+    def _valid_record_type(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        cleaned = value.strip().upper()
+        if cleaned not in {"A", "AAAA", "CNAME", "NS", "MX", "CAA", "SOA", "RDAP", "TXT"}:
+            raise ValueError("unsupported DNS record type")
+        return cleaned
+
+    @field_validator("status")
+    @classmethod
+    def _valid_status(cls, value: str) -> str:
+        cleaned = value.strip().lower()
+        if cleaned not in {"current", "historical", "expired", "unknown"}:
+            raise ValueError("unsupported DNS observation status")
+        return cleaned
+
+    @field_validator("metadata")
+    @classmethod
+    def _valid_metadata(cls, value: dict) -> dict:
+        cleaned = sanitize_attributes(value, strict=True)
+        if len(json.dumps(cleaned, separators=(",", ":"))) > 10_000:
+            raise ValueError("metadata payload is too large")
+        return cleaned
+
+
+class ExposureFinding(ConnectorFindingBase):
+    subject: str = Field(min_length=1, max_length=253)
+    matched_asset: str = Field(min_length=1, max_length=512)
+    hostname: str | None = Field(default=None, max_length=253)
+    port: StrictInt = Field(ge=1, le=65535)
+    transport: str = Field(default="tcp", pattern="^(tcp|udp)$")
+    protocol: str = Field(default="unknown", max_length=32)
+    observed_at: datetime | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("subject", "hostname")
+    @classmethod
+    def valid_subject(cls, value):
+        if value is None:
+            return value
+        from app.services.dns_security_service import normalize_subject
+        return normalize_subject(value)
+
+    @field_validator("matched_asset", "protocol")
+    @classmethod
+    def valid_text(cls, value):
+        return _clean_text(value, field_name="exposure")
+
+    @field_validator("metadata")
+    @classmethod
+    def valid_metadata(cls, value):
+        return sanitize_attributes(value, strict=True)
 
 
 class BreachFinding(ConnectorFindingBase):
