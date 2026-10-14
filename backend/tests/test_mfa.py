@@ -26,6 +26,7 @@ from app.core.audit import AUDIT_ALLOWED_ACTIONS
 from app.core.crypto import encrypt_value
 from app.core.security import hash_password
 from app.models.audit import AuditLog
+from app.models.token import RefreshTokenFamily
 from app.models.user import User, UserRole
 
 PASSWORD = "TestPass123!"
@@ -362,6 +363,17 @@ class TestAdministratorReset:
         self, client, test_admin, db_session, auth_headers_admin
     ):
         other = await _make_user_with_factor(db_session, "operator@example.com")
+        family = RefreshTokenFamily(
+            family_id=uuid.uuid4(),
+            user_id=other.id,
+            last_jti="old-jti",
+            revoked=False,
+        )
+        db_session.add(family)
+        other.mfa_recovery_codes = ["old-hash"]
+        other.mfa_failed_attempts = 4
+        other.mfa_locked_until = datetime.now(timezone.utc)
+        await db_session.commit()
 
         r = await client.post(f"/api/v1/users/{other.id}/mfa/reset", headers=auth_headers_admin)
         assert r.status_code == 200
@@ -380,6 +392,17 @@ class TestAdministratorReset:
         assert str(rows[-1].user_id) == str(test_admin.id)
         assert rows[-1].details["target_user_id"] == str(other.id)
         assert rows[-1].details["was_enabled"] is True
+        assert rows[-1].details["onboarding_required"] == ["mfa"]
+        assert rows[-1].entry_hash
+        assert other.mfa_recovery_codes is None
+        assert other.mfa_failed_attempts == 0
+        assert other.mfa_locked_until is None
+        await db_session.refresh(family)
+        assert family.revoked is True
+        assert family.revoked_reason == "mfa_reset"
+        assert rows[-1].details["refresh_families_revoked"] == 1
+        assert str(rows[-1].user_id) == str(test_admin.id)
+        assert rows[-1].details["target_user_id"] == str(other.id)
 
     @pytest.mark.anyio
     async def test_an_admin_cannot_clear_their_own_factor_over_the_api(

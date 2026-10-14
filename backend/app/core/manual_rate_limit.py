@@ -34,6 +34,11 @@ MANUAL_RATE_LIMIT_PREFIX = "rl:manual:"
 # Scope of the report module. Connector scopes use the connector name.
 SCOPE_REPORTS = "reports"
 
+#: Scope of inventory changes (asset creation and bulk import, WI-22). Its own
+#: scope, like reports: an operator who just imported an inventory must still be
+#: able to queue the scan that will monitor it.
+SCOPE_ASSETS = "assets"
+
 
 def manual_rate_limit_key(user_id: uuid.UUID | str, scope: str) -> str:
     return f"{MANUAL_RATE_LIMIT_PREFIX}{user_id}:{scope}"

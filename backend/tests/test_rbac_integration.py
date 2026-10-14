@@ -130,6 +130,29 @@ class TestAssetsRoleMatrix:
 
 
 @pytest.mark.anyio
+@pytest.mark.anyio
+class TestUserAdministrationRoleMatrix:
+    @pytest.mark.parametrize(
+        "method,path,json_body",
+        [
+            ("GET", "/api/v1/users", None),
+            ("GET", "/api/v1/users/brief", None),
+            ("GET", "/api/v1/users/00000000-0000-0000-0000-000000000001", None),
+            ("POST", "/api/v1/users", {"email": "rbac-new@example.com", "password": "StrongPass123!", "role": "viewer"}),
+            ("PUT", "/api/v1/users/00000000-0000-0000-0000-000000000001", {"role": "analyst"}),
+            ("PATCH", "/api/v1/users/00000000-0000-0000-0000-000000000001/toggle-active", None),
+            ("POST", "/api/v1/users/00000000-0000-0000-0000-000000000001/mfa/reset", None),
+            ("DELETE", "/api/v1/users/00000000-0000-0000-0000-000000000001", None),
+        ],
+    )
+    async def test_every_user_management_route_requires_admin(
+        self, client, method, path, json_body, auth_headers_analyst, auth_headers_viewer
+    ):
+        for headers in (auth_headers_analyst, auth_headers_viewer):
+            response = await client.request(method, path, json=json_body, headers=headers)
+            assert response.status_code == 403, f"{method} {path}: {response.text}"
+
+
 class TestReportDeleteAdminOnly:
     async def test_viewer_delete_report_is_403(self, client, auth_headers_viewer):
         import uuid

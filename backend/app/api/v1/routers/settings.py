@@ -87,21 +87,24 @@ async def update_settings(
     updated_fields = [
         k
         for k, v in raw_dump.items()
-        if not (
+        if k != "expected_version" and not (
             k in _ENCRYPTED_FIELDS
             and is_unchanged_masked_value(
                 v, getattr(s, _ENCRYPTED_FIELDS[k], None)
             )
         )
     ]
-    result = await service.update_settings(s, data)
+    result = await service.update_settings(s, data, commit=False)
     await AuditLogger.emit(
         db,
         action="settings.update",
         ip_address=extract_ip(request),
         user_id=user.id,
-        details={"updated_fields": updated_fields},
+        details={"updated_fields": updated_fields, "version": result.version},
+        require_persistence=True,
+        commit=False,
     )
+    await db.commit()
     return result
 
 
@@ -149,7 +152,7 @@ async def validate_telegram(
 
     s = await SettingsService(db).get_singleton()
     try:
-        result = await AlertService(db).validate_telegram_chats(s, req.chat_id)
+        result = await AlertService(db, user_id=user.id, ip_address=extract_ip(request)).validate_telegram_chats(s, req.chat_id)
     except Exception as e:
         await AuditLogger.emit(
             db,
@@ -174,14 +177,14 @@ async def send_test_telegram(
 
     s = await SettingsService(db).get_singleton()
     try:
-        result = await AlertService(db).send_test_telegram(s, req.chat_id)
+        result = await AlertService(db, user_id=user.id, ip_address=extract_ip(request)).send_test_telegram(s, req.chat_id)
     except Exception as e:
         await AuditLogger.emit(
             db,
             action="settings.test_telegram_failed",
             ip_address=extract_ip(request),
             user_id=user.id,
-            details={"chat_id": req.chat_id, "error": str(e)[:300]},
+            details={"chat_id": req.chat_id, "error": sanitize_external_error(e, limit=300)},
         )
         raise
     await AuditLogger.emit(

@@ -4,7 +4,6 @@ from datetime import datetime, timezone
 
 from fastapi import FastAPI, Request, status
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import select, text
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import Response
 
@@ -16,8 +15,8 @@ from app.core.config import settings
 from app.core.database import AsyncSessionLocal, engine
 from app.core.exceptions import register_exception_handlers
 from app.core.logging_config import configure_logging, get_logger
+from app.core.metrics import MetricsMiddleware
 from app.core.request_context import RequestContextMiddleware
-from app.models import SystemSettings
 
 # Before anything else in this process: a logger created before the handler is
 # installed writes to a logger that discards its records. Idempotent, so the
@@ -59,20 +58,10 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    async with engine.begin() as conn:
-        await conn.execute(text('CREATE EXTENSION IF NOT EXISTS "uuid-ossp"'))
-        await conn.commit()
-
+    # Schema/extensions belong to the migrator, not the runtime DB role.
+    from app.services.settings_service import SettingsService
     async with AsyncSessionLocal() as db:
-        settings_result = await db.execute(select(SystemSettings).limit(1))
-        existing_settings = settings_result.scalar_one_or_none()
-        if not existing_settings:
-            sys_settings = SystemSettings()
-            db.add(sys_settings)
-            await db.commit()
-            print("[startup] Created system_settings singleton")
-        else:
-            print("[startup] system_settings singleton already exists")
+        await SettingsService(db).get_singleton()
 
     os.makedirs(settings.REPORTS_STORE_DIR, exist_ok=True)
 
@@ -114,6 +103,12 @@ app.add_middleware(
     # So a browser client can read the id back off the response.
     expose_headers=["X-Request-ID"],
 )
+
+# Counts requests for `GET /api/v1/metrics`. Installed inside the request-context
+# middleware so a counted request is one that already has its correlation id, and
+# so a response the CORS layer rejects is still counted — it was a request this
+# replica handled, and a spike of refused cross-origin calls is worth seeing.
+app.add_middleware(MetricsMiddleware)
 
 # Added last, so it is the outermost middleware: a preflight or a request that
 # CORS rejects still carries an identifier in its response headers.

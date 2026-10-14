@@ -479,6 +479,10 @@ class TestPurgeExpiredSessions:
 
 
 class TestRetentionSweep:
+    @pytest.fixture(autouse=True)
+    def archive_storage(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(settings, "AUDIT_ARCHIVE_DIR", str(tmp_path))
+
     @pytest.mark.asyncio
     async def test_zero_days_keeps_the_audit_history(self, db_session, monkeypatch):
         monkeypatch.setattr(settings, "AUDIT_RETENTION_DAYS", 0)
@@ -554,5 +558,5 @@ class TestPurgeTask:
             None, functools.partial(purge_expired_data_task.run)
         )
 
-        assert set(summary) == {"drp_audit_logs", "reports", "drp_refresh_families"}
+        assert set(summary) == {"drp_audit_logs", "reports", "drp_refresh_families", "alert_deliveries", "ingestion_events"}
         json.dumps(summary)  # the Celery result must be JSON-serializable

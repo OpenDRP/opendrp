@@ -40,6 +40,65 @@ def async_task(func: Callable[..., Any]) -> Callable[..., Any]:
     return wrapper
 
 
+#: Tasks whose work can be executed a second time without a second effect, and
+#: which are therefore acknowledged *after* they finish. A worker that is killed
+#: mid-task (a deploy, an OOM kill, a lost broker connection) leaves the message
+#: unacknowledged, so the broker hands it to the next worker that asks instead of
+#: dropping it — which is the difference between work that is late and work that
+#: never happened at all.
+#:
+#: The list is per task rather than a global ``task_acks_late``, because a repeat
+#: is only safe where the task says so:
+#:
+#: * ``deliver_pending_alerts`` reclaims rows by lease and retries with bounded
+#:   backoff (see ``alert_delivery_service``), so a second run either takes over an
+#:   expired lease or finds nothing to do;
+#: * ``refresh_scan_schedules`` dedups every occurrence twice — a Redis guard held
+#:   for fifteen minutes and the durable ``schedule_occurrences`` key — so a
+#:   redelivery re-checks the same minutes and dispatches nothing;
+#: * ``purge_expired_data`` deletes rows past a cutoff in bounded batches: a
+#:   repeated sweep removes what is still expired and nothing else;
+#: * ``verify_audit_chain`` advances a cursor per chunk and resumes from it, so a
+#:   second pass re-verifies a range rather than double-counting it.
+#:
+#: Two tasks are deliberately absent. ``process_enrichment_events`` and
+#: ``check_dns_expiry_alerts`` write rows (an enrichment, a queued expiry alert)
+#: whose repeat is a second row rather than the same one, and both run on a timer
+#: that is far shorter than any outage — the next tick covers a killed run, so
+#: early acknowledgement costs a delay instead of a duplicate.
+_LATE_ACKNOWLEDGED_TASKS = (
+    "deliver_pending_alerts",
+    "refresh_scan_schedules",
+    "purge_expired_data",
+    "verify_audit_chain",
+)
+
+#: Alert delivery walks up to twenty groups (its own bound) at
+#: ``ALERT_DELIVERY_TIMEOUT_SECONDS`` each, so its limit has to be looser than a
+#: single attempt and tighter than the default for the rest of the platform.
+_ALERT_TASK_TIME_LIMIT = 300
+_ALERT_TASK_SOFT_TIME_LIMIT = 240
+
+#: The default for a task that declares nothing. A bound that is generous is
+#: still doing the job it exists for: without one, a task wedged inside a
+#: library call holds its worker for the life of the container, and with a
+#: single-task pool that is the whole background pipeline.
+_TASK_TIME_LIMIT = 1860
+_TASK_SOFT_TIME_LIMIT = 1800
+
+#: The report task declares its own limits next to its code (see
+#: ``app/tasks/report_tasks.py``) — the only place where the value of
+#: ``REPORT_GENERATION_TIMEOUT_SECONDS`` means anything — and the broker has to
+#: cover that class too, so the number is repeated here for the timeout below.
+_REPORT_TASK_TIME_LIMIT = settings.REPORT_GENERATION_TIMEOUT_SECONDS + 30
+
+#: How long the broker keeps an unacknowledged message before it offers it to
+#: another worker. It must exceed the longest task limit, or the broker starts
+#: redelivering work that is still running — the same message executed twice
+#: concurrently, which is worse than either outcome alone. The margin is what
+#: covers the time between the limit firing and the worker actually giving up.
+_VISIBILITY_TIMEOUT = max(_TASK_TIME_LIMIT, _REPORT_TASK_TIME_LIMIT) + 150
+
 _backend_url = settings.REDIS_URL.replace("/0", "/1", 1) if "/0" in settings.REDIS_URL else settings.REDIS_URL
 
 celery_app = Celery(
@@ -62,12 +121,54 @@ celery_app.conf.update(
     result_serializer="json",
     timezone="UTC",
     enable_utc=True,
+    worker_prefetch_multiplier=1,
+    broker_transport_options={"visibility_timeout": _VISIBILITY_TIMEOUT},
+    # A limit for every task, whether or not it declares one, plus the alert
+    # class's tighter pair and the late acknowledgement policy above. Expressed
+    # as annotations rather than on each decorator so that the policy for the
+    # whole platform is readable in one place and a new task cannot silently
+    # arrive without a bound.
+    task_soft_time_limit=_TASK_SOFT_TIME_LIMIT,
+    task_time_limit=_TASK_TIME_LIMIT,
+    task_annotations={
+        **{
+            name: {"acks_late": True, "reject_on_worker_lost": True}
+            for name in _LATE_ACKNOWLEDGED_TASKS
+            if name != "deliver_pending_alerts"
+        },
+        "deliver_pending_alerts": {
+            "acks_late": True,
+            "reject_on_worker_lost": True,
+            "soft_time_limit": _ALERT_TASK_SOFT_TIME_LIMIT,
+            "time_limit": _ALERT_TASK_TIME_LIMIT,
+        },
+        "check_dns_expiry_alerts": {
+            "soft_time_limit": _ALERT_TASK_SOFT_TIME_LIMIT,
+            "time_limit": _ALERT_TASK_TIME_LIMIT,
+        },
+    },
+    task_publish_retry=True,
+    task_publish_retry_policy={
+        "max_retries": settings.REPORT_ENQUEUE_MAX_RETRIES,
+        "interval_start": 0.2,
+        "interval_step": 0.5,
+        "interval_max": 2.0,
+    },
     beat_schedule={
         # Single lightweight tick: reads user-configured schedules from
         # system_settings and enqueues module scans when they match.
         "deliver-pending-alerts-every-15-seconds": {
             "task": "deliver_pending_alerts",
             "schedule": 15.0,
+            "options": {"queue": "alerts"},
+        },
+        "process-enrichment-events": {
+            "task": "process_enrichment_events", "schedule": 15.0,
+            "options": {"queue": "default"},
+        },
+        "check-dns-expiry-alerts-daily": {
+            "task": "check_dns_expiry_alerts",
+            "schedule": crontab(hour=5, minute=30),
             "options": {"queue": "alerts"},
         },
         "refresh-scan-schedules-every-minute": {
@@ -83,13 +184,11 @@ celery_app.conf.update(
             "schedule": crontab(hour=4, minute=15),
             "options": {"queue": "default"},
         },
-        # 04:45 UTC, after the sweep: the verification has to run *after* the
-        # retirement bookkeeping it depends on, or every night would report the
-        # previous night's legitimate deletion as a break. Incremental, so the
-        # cost is the night's new entries rather than the whole history.
+        # A bounded resumable full pass: one chunk per minute. Retirement
+        # cannot delete the part an active cycle has not verified yet.
         "verify-audit-chain-daily": {
             "task": "verify_audit_chain",
-            "schedule": crontab(hour=4, minute=45),
+            "schedule": 60.0,
             "options": {"queue": "default"},
         },
     },
@@ -98,6 +197,8 @@ celery_app.conf.update(
         # a Celery task at all: connector containers claim module jobs through
         # the HTTP work-poll protocol.
         "deliver_pending_alerts": {"queue": "alerts"},
+        "check_dns_expiry_alerts": {"queue": "alerts"},
+        "process_enrichment_events": {"queue": "default"},
         "generate_report": {"queue": "reports"},
         "refresh_scan_schedules": {"queue": "default"},
         "purge_expired_data": {"queue": "default"},

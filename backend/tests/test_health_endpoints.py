@@ -1,4 +1,5 @@
 import json
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from unittest.mock import AsyncMock, patch
@@ -26,6 +27,32 @@ async def test_connector_health_is_dynamic_and_secret_free(client, test_viewer, 
     assert item["health"] == "unknown"
     assert "config" not in item
     assert item["info"] == {"api_version": "1.0"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("naive", [True, False])
+async def test_connector_health_handles_recent_aware_and_naive_heartbeat(
+    client, auth_headers_viewer, db_session, naive
+):
+    last_seen = datetime.now(timezone.utc) - timedelta(seconds=5)
+    if naive:
+        last_seen = last_seen.replace(tzinfo=None)
+    conn = Connector(
+        name=f"recent-heartbeat-{naive}",
+        connector_type="phishing",
+        status="enabled",
+        default_job_type=f"phishing.recent-heartbeat-{naive}",
+        last_seen_at=last_seen,
+    )
+    db_session.add(conn)
+    await db_session.commit()
+
+    response = await client.get("/api/v1/connectors/health", headers=auth_headers_viewer)
+
+    assert response.status_code == 200, response.text
+    item = next(row for row in response.json()["items"] if row["name"] == conn.name)
+    assert item["health"] == "healthy"
+    assert item["online"] is True
 
 
 @pytest.mark.asyncio

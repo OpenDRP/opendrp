@@ -15,11 +15,18 @@ from app.api.deps import (
 )
 from app.core.audit import AuditLogger
 from app.core.exceptions import NotFoundException
+from app.services.asset_matching import (
+    POLICY_DISPLAY,
+    asset_key_variants,
+    asset_scope,
+    key_variants,
+    resolution_predicate,
+)
 from app.services.scan_admission import NoEnabledConnector, ScanAdmissionUnavailable, ScanAlreadyRunning
 from app.core.manual_rate_limit import enforce_manual_rate_limit
 from app.models.asset import Asset, AssetType
 from app.models.breach import Breach
-from app.schemas.common import PaginatedResponse
+from app.schemas.common import MAX_PAGE_SIZE, PaginatedResponse
 from app.schemas.phishing import ThreatStatus
 from app.schemas.breaches import (
     BreachListResponse,
@@ -43,45 +50,67 @@ class BreachStatusUpdate(BaseModel):
 async def _asset_matches_for_breaches(
     db: AsyncSession, breaches: list[Breach]
 ) -> dict[uuid.UUID, tuple[str, str]]:
-    """Resolve breach rows to currently configured monitored assets."""
-    candidates: set[str] = set()
-    for breach in breaches:
-        if breach.matched_domain:
-            candidates.add(str(breach.matched_domain).strip().lower())
-        if breach.matched_email:
-            email = str(breach.matched_email).strip().lower()
-            candidates.add(email)
-            if "@" in email:
-                candidates.add(email.rsplit("@", 1)[1])
-    if not candidates:
-        return {}
+    """Resolve breach rows to currently configured monitored assets.
 
-    result = await db.execute(
-        select(Asset).where(func.lower(Asset.asset_value).in_(candidates))
-    )
-    assets_by_value = {
-        str(asset.asset_value).strip().lower(): asset for asset in result.scalars().all()
-    }
-    resolved: dict[uuid.UUID, tuple[str, str]] = {}
-    for breach in breaches:
+    Uses the shared matching rule (``app.services.asset_matching``, WI-08) so a
+    breach is named by the same asset the destructive cascade and orphan cleanup
+    would link it to. Inactive assets still resolve: they explain why the finding
+    exists (``POLICY_DISPLAY``).
+    """
+    def _candidates(breach: Breach) -> list[tuple[str, str]]:
+        """Precedence: an exact *email-account* asset wins over the domain derived
+        from that same address. When both a mailbox and its parent domain are
+        monitored, the finding is about the mailbox, and naming the domain told the
+        analyst nothing about which account was exposed. The domain candidate is
+        still used when no email asset matches.
+        """
         email = str(breach.matched_email or "").strip()
         domain = str(breach.matched_domain or "").strip()
         inferred_domain = email.rsplit("@", 1)[1] if "@" in email else ""
-        # Precedence: an exact *email-account* asset wins over the domain
-        # derived from that same address. When both a mailbox and its parent
-        # domain are monitored, the finding is about the mailbox, and naming
-        # the domain told the analyst nothing about which account was exposed.
-        # The domain candidate is still used when no email asset matches.
-        for value, asset_type in (
-            (email, AssetType.email_account.value),
-            (domain or inferred_domain, AssetType.domain.value),
-        ):
-            asset = assets_by_value.get(value.lower()) if value else None
-            if asset is not None:
-                asset_type_value = getattr(asset.asset_type, "value", asset.asset_type)
-                if str(asset_type_value) == asset_type:
-                    resolved[breach.id] = (str(asset.asset_value), asset_type)
-                    break
+        candidates: list[tuple[str, str]] = []
+        if email:
+            candidates.extend(
+                (AssetType.email_account.value, key) for key in sorted(key_variants(email))
+            )
+        domain_value = domain or inferred_domain
+        if domain_value:
+            candidates.extend(
+                (AssetType.domain.value, key) for key in sorted(key_variants(domain_value))
+            )
+        return candidates
+
+    by_breach = {breach.id: _candidates(breach) for breach in breaches}
+    wanted = [candidate for candidates in by_breach.values() for candidate in candidates]
+    if not wanted:
+        return {}
+
+    result = await db.execute(
+        select(Asset.asset_type, Asset.asset_value).where(
+            resolution_predicate(wanted), *asset_scope(POLICY_DISPLAY)
+        )
+    )
+    assets = [
+        (
+            str(getattr(asset_type, "value", asset_type)),
+            str(asset_value),
+            asset_key_variants(asset_type, asset_value),
+        )
+        for asset_type, asset_value in result.all()
+    ]
+    resolved: dict[uuid.UUID, tuple[str, str]] = {}
+    for breach in breaches:
+        for asset_type, key in by_breach[breach.id]:
+            matched = next(
+                (
+                    candidate_value
+                    for candidate_type, candidate_value, variants in assets
+                    if candidate_type == asset_type and key in variants
+                ),
+                None,
+            )
+            if matched is not None:
+                resolved[breach.id] = (matched, asset_type)
+                break
     return resolved
 
 
@@ -109,8 +138,9 @@ def _breach_audit_snapshot(breach: Breach, breach_id: uuid.UUID) -> dict:
 async def list_breaches(
     request: Request,
     search: str | None = None,
+    finding_id: uuid.UUID | None = None,
     page: int = Query(1, ge=1),
-    size: int = Query(50, ge=1, le=200),
+    size: int = Query(50, ge=1, le=MAX_PAGE_SIZE),
     db: AsyncSession = Depends(get_db),
     user=Depends(require_viewer_plus),
 ):
@@ -119,6 +149,8 @@ async def list_breaches(
     count_stmt = select(func.count(Breach.id)).select_from(Breach)
 
     conditions = []
+    if finding_id is not None:
+        conditions.append(Breach.id == finding_id)
     if search:
         raw_search = search.strip()[:100]
         escaped = raw_search.replace("\\", "\\\\").replace("%", r"\%").replace("_", r"\_")
@@ -221,15 +253,17 @@ async def update_breach(
     if not breach:
         raise NotFoundException("Breach not found")
     breach.status = data.status
-    await db.commit()
-    await db.refresh(breach)
+    await db.flush()
     await AuditLogger.emit(
         db,
         action="breach.update",
         ip_address=extract_ip(request),
         user_id=user.id,
         details={"breach_id": str(breach_id), "changed_fields": ["status"]},
+        require_persistence=True,
+        commit=False,
     )
+    await db.commit()
     matched_assets = await _asset_matches_for_breaches(db, [breach])
     return _breach_payload(breach, matched_assets.get(breach.id))
 
@@ -356,12 +390,14 @@ async def delete_breach(
         raise NotFoundException("Breach not found")
     details = _breach_audit_snapshot(breach, breach_id)
     await db.delete(breach)
-    await db.commit()
     await AuditLogger.emit(
         db,
         action="breach.delete",
         ip_address=extract_ip(request),
         user_id=user.id,
         details=details,
+        require_persistence=True,
+        commit=False,
     )
+    await db.commit()
     return None

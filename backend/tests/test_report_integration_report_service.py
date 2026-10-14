@@ -10,6 +10,28 @@ from app.services.report_service import ReportService
 
 class TestReportServiceUnit:
     @pytest.mark.asyncio
+    async def test_passive_observations_are_included_in_pdf_and_truncation(self, db_session, tmp_path):
+        from app.services.source_observations import persist
+        from app.services.dns_security_service import ingest_dns_observations
+        await persist(db_session, module="exposure", source="netlas", finding={"subject": "www.example.com", "matched_asset": "example.com", "port": 443, "protocol": "https"})
+        await ingest_dns_observations(db_session, source="resolver", findings=[{"subject": "example.com", "observation_type": "dns_record", "record_type": "A", "value": "192.0.2.1"}])
+        service = ReportService(db_session)
+        data = await service.gather_report_data()
+        assert data["exposure"][0].source == "netlas"
+        assert data["dns"][0].value == "192.0.2.1"
+        assert data["truncation"]["sections"]["exposure"] == {
+            "total": 1,
+            "included": 1,
+            "limit": 5000,
+            "truncated": False,
+        }
+        assert data["snapshot_at"] == data["truncation"]["snapshot_at"]
+        path = tmp_path / "passive_inventory.pdf"
+        ReportService.generate_pdf_sync(str(path), data, "analyst@example.com")
+        assert path.read_bytes().startswith(b"%PDF-")
+        assert path.stat().st_size > 1000
+
+    @pytest.mark.asyncio
     async def test_gather_report_data_empty_db_returns_kpi_zeroes_assets_lists(self, db_session):
         from sqlalchemy import text
         from tests.conftest import safe_sql_identifier
@@ -28,9 +50,54 @@ class TestReportServiceUnit:
         assert data["kpi"]["total_phishing"] == 0
         assert data["kpi"]["total_breaches"] == 0
         assert isinstance(data["kpi"]["active_threats_7d"], int)
+        assert data["snapshot_at"]
+        assert set(data["truncation"]["sections"]) == {
+            "assets", "phishing", "breaches", "exposure", "dns"
+        }
+        assert all("limit" in section for section in data["truncation"]["sections"].values())
         assert data["assets"] == []
         assert data["assets_by_criticality"] == {}
         assert data["truncation"]["truncated"] is False
+
+    @pytest.mark.asyncio
+    async def test_section_limit_and_order_match_included_rows(self, db_session, monkeypatch):
+        from datetime import datetime, timedelta, timezone
+        from app.core.config import settings
+
+        monkeypatch.setattr(settings, "REPORT_MAX_ROWS", 100)
+        now = datetime.now(timezone.utc)
+        assets = [
+            Asset(
+                asset_type=AssetType.domain,
+                asset_value=f"limit-{uuid.uuid4().hex}.example",
+                criticality="medium",
+                is_active=(i % 2 == 0),
+            )
+            for i in range(103)
+        ]
+        db_session.add_all(assets)
+        db_session.add_all([
+            PhishingDomain(
+                phishing_domain=f"row-{i}-{uuid.uuid4().hex}.example",
+                matched_asset="example.com",
+                detection_source="test",
+                created_at=now - timedelta(seconds=i),
+            )
+            for i in range(503)
+        ])
+        await db_session.commit()
+
+        data = await ReportService(db_session).gather_report_data()
+
+        assert len(data["assets"]) == 100
+        assert data["truncation"]["sections"]["assets"] == {
+            "total": 103, "included": 100, "limit": 100, "truncated": True
+        }
+        assert len(data["phishing"]) == 100
+        assert data["truncation"]["sections"]["phishing"] == {
+            "total": 503, "included": 100, "limit": 100, "truncated": True
+        }
+        assert data["phishing"][0].created_at >= data["phishing"][-1].created_at
 
     @pytest.mark.asyncio
     async def test_gather_report_data_populated_matches_count(self, db_session):
@@ -82,12 +149,80 @@ class TestReportServiceUnit:
 
         data = await ReportService(db_session).gather_report_data()
         assert data["kpi"]["total_assets"] == 2
+        assert data["truncation"]["sections"]["assets"]["total"] == 2
         assert data["kpi"]["total_phishing"] == 1
         assert data["kpi"]["total_breaches"] == 1
         assert data["assets_by_criticality"].get("high") == 1
         assert data["assets_by_criticality"].get("medium") == 1
         assert data["phishing_by_source"]["dnstwist"] == 1
         assert data["truncation"]["truncated"] is False
+
+    @pytest.mark.asyncio
+    async def test_gather_rejects_uncommitted_caller_changes_without_discarding_them(self, db_session):
+        asset = Asset(
+            asset_type=AssetType.domain,
+            asset_value=f"uncommitted-{uuid.uuid4().hex}.example",
+            criticality="medium",
+            is_active=True,
+        )
+        db_session.add(asset)
+        with pytest.raises(RuntimeError, match="clean database session"):
+            await ReportService(db_session).gather_report_data()
+        assert asset in db_session.sync_session.new
+        await db_session.rollback()
+
+    @pytest.mark.asyncio
+    async def test_active_threat_kpi_matches_dashboard_status_and_window(self, db_session):
+        from datetime import datetime, timedelta, timezone
+
+        now = datetime.now(timezone.utc)
+        suffix = uuid.uuid4().hex
+        db_session.add_all([
+            PhishingDomain(
+                phishing_domain=f"active-{suffix}.example",
+                matched_asset="example.com",
+                detection_source="test",
+                status="active",
+                created_at=now - timedelta(days=1),
+            ),
+            PhishingDomain(
+                phishing_domain=f"investigating-{suffix}.example",
+                matched_asset="example.com",
+                detection_source="test",
+                status="investigating",
+                created_at=now - timedelta(days=2),
+            ),
+            PhishingDomain(
+                phishing_domain=f"resolved-{suffix}.example",
+                matched_asset="example.com",
+                detection_source="test",
+                status="resolved",
+                created_at=now - timedelta(days=1),
+            ),
+            PhishingDomain(
+                phishing_domain=f"old-{suffix}.example",
+                matched_asset="example.com",
+                detection_source="test",
+                status="active",
+                created_at=now - timedelta(days=8),
+            ),
+            Breach(
+                breach_name=f"active breach {suffix}", title="Active", domain="example.com",
+                breach_date=now.date(), matched_email="active@example.com", pwn_count=1,
+                status="active", created_at=now - timedelta(days=1),
+            ),
+            Breach(
+                breach_name=f"resolved breach {suffix}", title="Resolved", domain="example.com",
+                breach_date=now.date(), matched_email="resolved@example.com", pwn_count=1,
+                status="resolved", created_at=now - timedelta(days=1),
+            ),
+        ])
+        await db_session.commit()
+
+        data = await ReportService(db_session).gather_report_data()
+
+        assert data["kpi"]["active_threats_7d"] == 3
+        assert data["kpi"]["total_assets"] == 0
 
 
 class TestGenerateAndSave:
@@ -194,6 +329,36 @@ class TestGeneratePdfSync:
         assert size > 5000
         raw = out_path.read_bytes()
         assert raw.startswith(b"%PDF-1.")
+
+    def test_pdf_text_unicode_validation_refuses_unsupported_codepoints(self):
+        from types import SimpleNamespace
+        from app.services.report_service import _validate_pdf_text_unicode
+
+        with pytest.raises(ValueError, match="Unicode font is unavailable"):
+            _validate_pdf_text_unicode(
+                {"assets": [SimpleNamespace(asset_value="домен.example")], "phishing": [], "breaches": []},
+                "qa@example.com",
+            )
+
+    def test_pdf_text_validation_accepts_latin1_but_rejects_unsupported_unicode(self):
+        from types import SimpleNamespace
+        from app.services.report_service import _validate_pdf_text_unicode
+
+        _validate_pdf_text_unicode(
+            {"assets": [SimpleNamespace(asset_value="caf\u00e9.example")], "phishing": [], "breaches": []},
+            "analyst@example.com",
+        )
+        with pytest.raises(ValueError, match="Unicode font is unavailable"):
+            _validate_pdf_text_unicode(
+                {"assets": [SimpleNamespace(asset_value="\u0434\u043e\u043c\u0435\u043d.example")], "phishing": [], "breaches": []},
+                "analyst@example.com",
+            )
+
+    def test_unicode_font_discovery_accepts_windows_unicode_fonts(self, monkeypatch):
+        from app.services import report_service
+
+        monkeypatch.setattr(report_service.os.path, "isfile", lambda path: path == "C:/Windows/Fonts/arial.ttf")
+        assert report_service._find_unicode_pdf_font() == "C:/Windows/Fonts/arial.ttf"
 
     @pytest.mark.asyncio
     async def test_generate_pdf_populated_includes_opendrp_content(self, tmp_path, db_session):

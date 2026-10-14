@@ -1,4 +1,4 @@
-from app.schemas.common import MessageSchema, PaginatedResponse, PaginationParams
+from app.schemas.common import MessageSchema, PaginatedResponse
 from app.schemas.user import (
     AssetType,
     LoginRequest,
@@ -19,7 +19,6 @@ __all__ = [
     "LoginRequest",
     "TokenResponse",
     "RefreshTokenRequest",
-    "PaginationParams",
     "PaginatedResponse",
     "MessageSchema",
 ]

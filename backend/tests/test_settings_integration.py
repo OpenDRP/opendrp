@@ -12,6 +12,13 @@ from app.services.settings_service import SettingsService
 BASE = "http://test"
 
 
+@pytest.fixture(autouse=True)
+def pinned_transport_mock(monkeypatch):
+    # These tests mock smtplib constructors; pinning is covered separately using
+    # real SMTP classes and a fake socket, not by subclassing a MagicMock.
+    monkeypatch.setattr("app.core.outbound.pinned_smtp_class", lambda base, addresses, **kwargs: base)
+
+
 @pytest.fixture()
 async def client(db_session) -> AsyncGenerator[AsyncClient, None]:
     from app.api.deps import get_db

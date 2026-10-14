@@ -169,15 +169,6 @@ async def _issue_session(
         {**data, "family_id": refresh_fid},
         expires_delta=timedelta(minutes=settings.JWT_ACCESS_TOKEN_EXPIRE_MINUTES),
     )
-    response.set_cookie(
-        _REFRESH_COOKIE, refresh_token, httponly=True, secure=settings.AUTH_COOKIE_SECURE,
-        samesite="lax", max_age=settings.JWT_REFRESH_TOKEN_EXPIRE_DAYS * 24 * 60 * 60,
-        path="/api/v1/auth",
-    )
-    response.set_cookie(
-        _CSRF_COOKIE, secrets.token_urlsafe(32), httponly=False, secure=settings.AUTH_COOKIE_SECURE,
-        samesite="lax", max_age=settings.JWT_REFRESH_TOKEN_EXPIRE_DAYS * 24 * 60 * 60, path="/",
-    )
     db.add(
         RefreshTokenFamily(
             id=_uuid_mod.uuid4(),
@@ -190,8 +181,23 @@ async def _issue_session(
     )
     try:
         await db.commit()
-    except Exception:
+    except Exception as exc:
         await db.rollback()
+        raise HTTPException(
+            status_code=503,
+            detail="Session could not be persisted; sign-in was not completed",
+            headers={"Retry-After": "5"},
+        ) from exc
+
+    response.set_cookie(
+        _REFRESH_COOKIE, refresh_token, httponly=True, secure=settings.AUTH_COOKIE_SECURE,
+        samesite="lax", max_age=settings.JWT_REFRESH_TOKEN_EXPIRE_DAYS * 24 * 60 * 60,
+        path="/api/v1/auth",
+    )
+    response.set_cookie(
+        _CSRF_COOKIE, secrets.token_urlsafe(32), httponly=False, secure=settings.AUTH_COOKIE_SECURE,
+        samesite="lax", max_age=settings.JWT_REFRESH_TOKEN_EXPIRE_DAYS * 24 * 60 * 60, path="/",
+    )
 
     return (
         TokenResponse(
@@ -468,13 +474,9 @@ async def change_password(
     current_user.locked_until = None
 
     revoked = await revoke_refresh_families(db, current_user.id, reason="password_change")
-    try:
-        await db.commit()
-    except Exception:
-        await db.rollback()
-        raise
-
-    session, _refresh_fid = await _issue_session(response, current_user, db, now)
+    # The new credential, the sessions it signs out and the event that records
+    # both become durable in one commit: a password change nobody can find in the
+    # trail is not a change this platform is willing to make.
     await AuditLogger.emit(
         db, action="auth.password.changed", ip_address=ip, user_id=current_user.id,
         details={
@@ -482,7 +484,16 @@ async def change_password(
             "refresh_families_revoked": revoked,
             "was_required": was_required,
         },
+        require_persistence=True,
+        commit=False,
     )
+    try:
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        raise
+
+    session, _refresh_fid = await _issue_session(response, current_user, db, now)
     return session
 
 
@@ -576,14 +587,16 @@ async def revoke_session(
         family.revoked = True
         family.revoked_at = datetime.now(timezone.utc)
         family.revoked_reason = "user_revoked"
-        await db.commit()
         await AuditLogger.emit(
             db,
             action="auth.session.revoked",
             ip_address="authenticated-session",
             user_id=current_user.id,
             details={"family_id": str(family_id), "scope": "single"},
+            require_persistence=True,
+            commit=False,
         )
+        await db.commit()
     return None
 
 
@@ -611,14 +624,16 @@ async def revoke_other_sessions(
         family.revoked = True
         family.revoked_at = now
         family.revoked_reason = "user_revoked_others"
-    await db.commit()
     await AuditLogger.emit(
         db,
         action="auth.sessions.revoked_others",
         ip_address=extract_ip(request),
         user_id=current_user.id,
         details={"revoked_count": len(rows)},
+        require_persistence=True,
+        commit=False,
     )
+    await db.commit()
     return {"revoked": len(rows)}
 
 
@@ -678,8 +693,10 @@ async def rotate_recovery_codes(
     current_user.totp_last_used_step = step
     plain, hashed = _new_recovery_codes()
     current_user.mfa_recovery_codes = hashed
+    # The codes and the event that says they were replaced land together: the
+    # audit row is the only record that the previous set stopped working.
+    await AuditLogger.emit(db, action="auth.mfa.recovery_codes.rotated", ip_address=extract_ip(request), user_id=current_user.id, details={"count": len(plain)}, require_persistence=True, commit=False)
     await db.commit()
-    await AuditLogger.emit(db, action="auth.mfa.recovery_codes.rotated", ip_address=extract_ip(request), user_id=current_user.id, details={"count": len(plain)})
     return MfaRecoveryCodesResponse(codes=plain)
 
 
@@ -760,10 +777,18 @@ async def refresh_token(
     except (ValueError, TypeError):
         refuse("Invalid refresh token payload")
 
+    # Lock and refresh the family row before making any decision. Two replicas
+    # handling the same refresh token must not both observe the old last_jti and
+    # mint different successor tokens. PostgreSQL blocks the loser here until
+    # the winner commits, then populate_existing refreshes its in-memory identity
+    # map from the newly committed (revoked) row.
+    family_query = select(RefreshTokenFamily).where(
+        RefreshTokenFamily.family_id == family_uuid
+    )
+    if db.get_bind().dialect.name == "postgresql":
+        family_query = family_query.with_for_update()
     fam = (
-        await db.execute(
-            select(RefreshTokenFamily).where(RefreshTokenFamily.family_id == family_uuid)
-        )
+        await db.execute(family_query.execution_options(populate_existing=True))
     ).scalar_one_or_none()
 
     if fam is None:
@@ -789,18 +814,20 @@ async def refresh_token(
         refuse("Refresh token does not match user")
 
     if fam.last_jti and fam.last_jti != jti:
+        old_jti = fam.last_jti
         fam.revoked = True
         fam.revoked_at = now
         fam.revoked_reason = "reuse_detected"
-        try:
-            await db.commit()
-        except Exception:
-            await db.rollback()
+        # Revoking a family because it replayed an old token is itself a security
+        # decision; it is not allowed to persist unrecorded.
         await AuditLogger.emit(
             db, action="auth.refresh.failure", ip_address=ip, user_id=user_id,
             details={"reason": "reuse_detected", "family_id": family_id_str,
-                     "old_jti": fam.last_jti, "presented_jti": jti},
+                     "old_jti": old_jti, "presented_jti": jti},
+            require_persistence=True,
+            commit=False,
         )
+        await db.commit()
         refuse("Refresh token reuse detected; family revoked")
 
     data = {"sub": str(user.id), "role": str(user.role)}
@@ -808,6 +835,7 @@ async def refresh_token(
         {**data, "family_id": family_id_str},
         expires_delta=timedelta(minutes=settings.JWT_ACCESS_TOKEN_EXPIRE_MINUTES))
     new_refresh, new_refresh_expires, new_jti, _ = create_refresh_token(data, family_id=family_id_str)
+    user_response = UserResponse.model_validate(user)
     response.set_cookie(
         _REFRESH_COOKIE, new_refresh, httponly=True, secure=settings.AUTH_COOKIE_SECURE,
         samesite="lax", max_age=new_refresh_expires, path="/api/v1/auth",
@@ -818,21 +846,26 @@ async def refresh_token(
     )
     fam.last_jti = new_jti
     fam.last_issued_at = now
+    # The rotation and its event share one commit: a successor token that cannot
+    # be found in the trail must not be handed to the browser.
+    await AuditLogger.emit(
+        db, action="auth.refresh.success", ip_address=ip, user_id=user_id,
+        details={"family_id": family_id_str, "new_jti": new_jti},
+        require_persistence=True,
+        commit=False,
+    )
     try:
         await db.commit()
     except Exception:
         await db.rollback()
-
-    await AuditLogger.emit(
-        db, action="auth.refresh.success", ip_address=ip, user_id=user_id,
-        details={"family_id": family_id_str, "new_jti": new_jti},
-    )
+        # Never return a token that was not made current in durable storage.
+        raise HTTPException(status_code=503, detail="Refresh rotation could not be committed")
 
     return TokenResponse(
         access_token=access_token,
         token_type="bearer",
         expires_in=expires_in,
-        user=UserResponse.model_validate(user),
+        user=user_response,
     )
 
 
@@ -978,16 +1011,20 @@ async def setup_mfa(
     # real once a code generated from this secret has been verified.
     current_user.totp_enabled_at = None
     current_user.totp_last_used_step = None
+    # A pending enrolment secret is credential material; it becomes durable only
+    # together with the event that says enrolment was started.
+    await AuditLogger.emit(
+        db, action="auth.mfa.setup_started", ip_address=ip, user_id=current_user.id,
+        details={"email": current_user.email},
+        require_persistence=True,
+        commit=False,
+    )
     try:
         await db.commit()
     except Exception:
         await db.rollback()
         raise
 
-    await AuditLogger.emit(
-        db, action="auth.mfa.setup_started", ip_address=ip, user_id=current_user.id,
-        details={"email": current_user.email},
-    )
     return MfaSetupResponse(
         secret=secret,
         otpauth_uri=totp.provisioning_uri(
@@ -1076,12 +1113,9 @@ async def enable_mfa(
     # started and abandoned leaves it set, and the next sign-in asks again.
     was_required = current_user.must_enrol_mfa
     current_user.must_enrol_mfa = False
-    try:
-        await db.commit()
-    except Exception:
-        await db.rollback()
-        raise
-
+    # Enabling the factor and the recovery codes handed back are one change; the
+    # account must never be able to sign in with a factor the trail does not know
+    # about.
     await AuditLogger.emit(
         db, action="auth.mfa.enrolled", ip_address=ip, user_id=current_user.id,
         details={
@@ -1089,7 +1123,15 @@ async def enable_mfa(
             "enabled_at": enabled_at.isoformat(),
             "was_required": was_required,
         },
+        require_persistence=True,
+        commit=False,
     )
+    try:
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        raise
+
     return MfaEnableResponse(
         enabled=True,
         enabled_at=enabled_at,
@@ -1153,14 +1195,18 @@ async def disable_mfa(
     current_user.totp_last_used_step = None
     current_user.mfa_recovery_codes = None
     await _clear_mfa_failures(current_user, db)
+    # Removing a second factor is exactly the kind of change that must leave a
+    # trail; it is refused rather than applied unrecorded.
+    await AuditLogger.emit(
+        db, action="auth.mfa.disabled", ip_address=ip, user_id=current_user.id,
+        details={"email": current_user.email},
+        require_persistence=True,
+        commit=False,
+    )
     try:
         await db.commit()
     except Exception:
         await db.rollback()
         raise
 
-    await AuditLogger.emit(
-        db, action="auth.mfa.disabled", ip_address=ip, user_id=current_user.id,
-        details={"email": current_user.email},
-    )
     return MfaStatusResponse(enabled=False, enabled_at=None)

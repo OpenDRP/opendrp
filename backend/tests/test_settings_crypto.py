@@ -6,6 +6,11 @@ from app.schemas.settings import SystemSettingsUpdate
 from app.services.settings_service import SettingsService
 
 
+@pytest.fixture(autouse=True)
+def pinned_transport_mock(monkeypatch):
+    monkeypatch.setattr("app.core.outbound.pinned_smtp_class", lambda base, addresses, **kwargs: base)
+
+
 @pytest_asyncio.fixture
 async def settings_row(db_session):
     s = SystemSettings()

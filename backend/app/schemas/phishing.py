@@ -7,7 +7,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from app.schemas.common import PaginatedResponse
 
 ThreatStatus = Literal["active", "investigating", "resolved"]
-DetectionSource = Literal["dnstwist", "shodan_ssl", "shodan_title", "shodan_favicon"]
+DetectionSource = str
 
 
 class PhishingThreatBase(BaseModel):
@@ -15,7 +15,7 @@ class PhishingThreatBase(BaseModel):
     matched_asset: str = Field(..., max_length=512)
     ip_address: str | None = Field(None, max_length=255)
     web_ports: str | None = Field(None, max_length=255)
-    detection_source: DetectionSource = "dnstwist"
+    detection_source: DetectionSource = Field(default="dnstwist", max_length=100)
     original_domain: str | None = Field(None, max_length=512)
     whois_registrar: str | None = Field(None, max_length=255)
     whois_abuse_email: str | None = Field(None, max_length=255)

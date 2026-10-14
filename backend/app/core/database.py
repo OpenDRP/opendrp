@@ -48,6 +48,31 @@ def postgres_connect_args(settings_=settings) -> dict:
     return connect_args
 
 
+def migration_server_settings(settings_=settings) -> dict:
+    """Server-side bounds for the connection a schema migration runs on.
+
+    The values live in one place because the two migration entry points have to
+    agree: `alembic/env.py` (where the revision graph runs) passes them as
+    `server_settings`, and `scripts/migrate.py` renders the statement half into
+    its psycopg `options` and deliberately omits the lock half — that connection
+    waits for the migration slot by design. A bound only one of them carried
+    would be a bound the other path does not have, and the failure it prevents is
+    indistinguishable from a hung container: the API is started by the same
+    entrypoint that migrates, so a migration blocked on a lock reads as
+    "backend unhealthy" and nothing in the log names the wait.
+
+    ``statement_timeout`` is disabled (``0``) unless the operator set
+    ``MIGRATION_STATEMENT_TIMEOUT_MS``: the baseline builds its index families in
+    one transaction and on a populated database that build is legitimately long, so
+    inheriting the application's 30s bound would fail the documented maintenance
+    window instead of protecting it.
+    """
+    return {
+        "lock_timeout": str(int(settings_.MIGRATION_LOCK_TIMEOUT_MS)),
+        "statement_timeout": str(int(settings_.MIGRATION_STATEMENT_TIMEOUT_MS)),
+    }
+
+
 def engine_kwargs(url: str, settings_=settings) -> dict:
     """SQLAlchemy engine options for a database URL.
 

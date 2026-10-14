@@ -24,6 +24,7 @@ class BreachResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: uuid.UUID
+    source_id: str = "unattributed"
     breach_name: str
     title: str
     domain: str

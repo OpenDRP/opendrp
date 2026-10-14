@@ -17,7 +17,7 @@ from app.core.exceptions import NotFoundException
 from app.services.scan_admission import NoEnabledConnector, ScanAdmissionUnavailable, ScanAlreadyRunning
 from app.core.manual_rate_limit import enforce_manual_rate_limit
 from app.models import DrpPhishingDomain
-from app.schemas.common import PaginatedResponse
+from app.schemas.common import MAX_PAGE_SIZE, PaginatedResponse
 from app.schemas.phishing import (
     DetectionSource,
     PhishingListResponse,
@@ -32,11 +32,12 @@ router = APIRouter(prefix="/phishing", tags=["Phishing"])
 @router.get("/threats", response_model=PhishingListResponse)
 async def list_threats(
     request: Request,
+    finding_id: uuid.UUID | None = None,
     detection_source: DetectionSource | None = None,
     status: ThreatStatus | None = None,
     search: str | None = None,
     page: int = Query(1, ge=1),
-    size: int = Query(50, ge=1, le=200),
+    size: int = Query(50, ge=1, le=MAX_PAGE_SIZE),
     db: AsyncSession = Depends(get_db),
     user=Depends(require_viewer_plus),
 ):
@@ -44,6 +45,8 @@ async def list_threats(
     skip = (page - 1) * size
     q = select(D)
     w: list[ColumnElement[bool]] = []
+    if finding_id is not None:
+        w.append(D.id == finding_id)
     if detection_source:
         w.append(D.detection_source == detection_source)
     if status:
@@ -143,8 +146,7 @@ async def update_threat(
     changes = list(data.model_dump(exclude_unset=True).keys())
     for k, v in data.model_dump(exclude_unset=True).items():
         setattr(t, k, v)
-    await db.commit()
-    await db.refresh(t)
+    await db.flush()
     await AuditLogger.emit(
         db,
         action="phishing.threat.update",
@@ -154,7 +156,10 @@ async def update_threat(
             "threat_id": str(threat_id),
             "changed_fields": changes,
         },
+        require_persistence=True,
+        commit=False,
     )
+    await db.commit()
     return t
 
 
@@ -282,12 +287,14 @@ async def delete_threat(
         "detection_source": str(t.detection_source or ""),
     }
     await db.delete(t)
-    await db.commit()
     await AuditLogger.emit(
         db,
         action="phishing.threat.delete",
         ip_address=extract_ip(request),
         user_id=user.id,
         details=details,
+        require_persistence=True,
+        commit=False,
     )
+    await db.commit()
     return None

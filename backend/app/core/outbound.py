@@ -309,6 +309,32 @@ def ensure_allowed(host: str, *, port: int | None = None) -> tuple[str, ...]:
     return addresses
 
 
+def pinned_smtp_class(base, addresses, *, implicit_tls=False):
+    """Connect only to validated numeric addresses; TLS still verifies the host."""
+    class PinnedSMTP(base):
+        def _get_socket(self, host, port, timeout):
+            for address in addresses:
+                try:
+                    ipaddress.ip_address(address)
+                except ValueError as exc:
+                    raise OSError("SMTP DNS resolution unavailable") from exc
+            error = None
+            for address in addresses:
+                try:
+                    sock = socket.create_connection((address, port), timeout, self.source_address)
+                    if implicit_tls:
+                        try:
+                            sock = self.context.wrap_socket(sock, server_hostname=host)
+                        except BaseException:
+                            sock.close()
+                            raise
+                    return sock
+                except OSError as exc:
+                    error = exc
+            raise error or OSError("No validated SMTP address")
+    return PinnedSMTP
+
+
 def validate_telegram_token(value: str | None) -> str:
     """Return a usable Telegram bot token, or raise ``ValueError``.
 

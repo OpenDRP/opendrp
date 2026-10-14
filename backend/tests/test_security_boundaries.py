@@ -101,6 +101,29 @@ def test_extract_ip_ignores_forwarded_ip_from_untrusted_client():
     assert extract_ip(request) == "198.51.100.5"
 
 
+def test_extract_ip_does_not_believe_a_connector_network_address(monkeypatch):
+    """The connector network is the one part of the deployment we did not write.
+
+    Trusting its range is exactly what a connector would need to have its own
+    ``X-Forwarded-For`` entry win, and a forged client address is indistinguishable
+    from a real one once it is in the audit row. The edge, and only the edge, is
+    the hop in front of the API.
+    """
+    monkeypatch.setattr(
+        settings, "TRUSTED_PROXY_IPS", "127.0.0.1,::1,172.18.10.0/24"
+    )
+
+    forged = _request("172.18.30.7", {"x-forwarded-for": "203.0.113.9"})
+    assert extract_ip(forged) == "172.18.30.7"
+
+    # From the edge the same header is believed, and the client-supplied
+    # leftmost entry still loses to the hop nearest to us.
+    from_edge = _request(
+        "172.18.10.9", {"x-forwarded-for": "203.0.113.9, 198.51.100.7"}
+    )
+    assert extract_ip(from_edge) == "198.51.100.7"
+
+
 def test_extract_ip_without_request_is_unknown():
     assert extract_ip(None) == "unknown"
 

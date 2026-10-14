@@ -1,7 +1,7 @@
-"""Characterization tests: users router read, pagination and toggle paths.
+"""Regression tests: users router read, pagination, toggle, and admin invariant paths.
 
-Part of the safe-refactoring plan (Step 1). These tests pin the CURRENT
-behavior of endpoints that had no direct coverage:
+These tests cover the user-list read paths and admin invariants that must not
+regress:
 
 * ``GET /users/brief``        — admin-only active-user checklist payload.
 * ``GET /users``              — pagination, email search, ``users.list`` audit.
@@ -11,10 +11,8 @@ behavior of endpoints that had no direct coverage:
   ``user.unlocked`` audit events.
 * ``PUT`` / ``DELETE`` 404 branches for missing users.
 
-They must stay green before AND after the upcoming refactor; a failure means
-behavior changed. Coverage before this file (full-suite, sysmon): 68% for
-``app/api/v1/routers/users.py`` with 66-79, 94-115, 125-135, 187, 298-326,
-349 uncovered.
+The PostgreSQL-only concurrency test is skipped on SQLite because SQLite ignores
+``SELECT FOR UPDATE``; it must run against an isolated PostgreSQL ``*_test`` DB.
 """
 
 from __future__ import annotations
@@ -336,6 +334,63 @@ class TestToggleActive:
             f"/api/v1/users/{u.id}/toggle-active", headers=auth_headers_analyst
         )
         assert r.status_code == 403, r.text
+
+
+class TestLastAdminConcurrencyPostgres:
+    @pytest.mark.asyncio
+    async def test_concurrent_admin_membership_changes_keep_one_active_admin(
+        self, client, db_session, auth_headers_admin, test_admin
+    ):
+        if db_session.get_bind().dialect.name != "postgresql":
+            pytest.skip("last-admin serialization requires PostgreSQL row locks")
+
+        import asyncio
+        from httpx import ASGITransport, AsyncClient
+        from app.api import deps
+        from app.core import database
+        from app.main import app
+
+        # Keep the existing fixture admin as the one that must survive; one
+        # concurrent operation creates an admin while another tries demoting it.
+        original = db_session
+        sessions = []
+
+        async def isolated_db():
+            async with database.AsyncSessionLocal() as session:
+                sessions.append(session)
+                yield session
+
+        app.dependency_overrides[deps.get_db] = isolated_db
+        try:
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as race_client:
+                first_result, second_result = await asyncio.gather(
+                    race_client.post(
+                        "/api/v1/users",
+                        headers=auth_headers_admin,
+                        json={"email": "concurrent-new-admin@example.com", "password": PASSWORD, "role": "admin"},
+                    ),
+                    race_client.put(
+                        f"/api/v1/users/{test_admin.id}",
+                        headers=auth_headers_admin,
+                        json={"role": "viewer"},
+                    ),
+                )
+        finally:
+            app.dependency_overrides.pop(deps.get_db, None)
+            for session in sessions:
+                await session.close()
+
+        assert first_result.status_code == 201, first_result.text
+        assert second_result.status_code in {200, 409}, second_result.text
+        await original.refresh(test_admin)
+        admins = (
+            await original.execute(
+                select(User.id).where(User.role == "admin", User.is_active.is_(True))
+            )
+        ).scalars().all()
+        assert admins
+        if second_result.status_code == 200:
+            assert len(admins) == 1
 
 
 class TestUpdateDeleteNotFoundBranches:

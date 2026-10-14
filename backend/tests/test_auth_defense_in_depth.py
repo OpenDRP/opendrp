@@ -18,6 +18,7 @@ Everything here is pinned before any refactor of ``auth.py``.
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 
 import pytest
@@ -57,6 +58,27 @@ async def _last_refresh_failure_reason(db, reason: str) -> AuditLog | None:
         if row.details.get("reason") == reason:
             return row
     return None
+
+
+@pytest.mark.asyncio
+async def test_login_does_not_return_tokens_when_session_persistence_fails(
+    db_session, test_admin, monkeypatch
+):
+    from datetime import datetime, timezone
+    from fastapi import HTTPException, Response
+    from app.api.v1.routers.auth import _issue_session
+
+    async def fail_commit():
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(db_session, "commit", fail_commit)
+    response = Response()
+    with pytest.raises(HTTPException) as refused:
+        await _issue_session(response, test_admin, db_session, datetime.now(timezone.utc))
+
+    assert refused.value.status_code == 503
+    assert "set-cookie" not in response.headers
+    assert not (await db_session.execute(select(RefreshTokenFamily))).scalars().all()
 
 
 @pytest.mark.asyncio
@@ -181,6 +203,68 @@ async def test_refresh_family_of_another_user_401_family_not_revoked(
         )
     ).scalar_one()
     assert fam.revoked is False
+
+
+@pytest.mark.asyncio
+async def test_refresh_family_row_locking_serializes_concurrent_replays(
+    db_session, test_admin
+):
+    """PostgreSQL row locks make concurrent reuse a single-winner operation.
+
+    SQLite ignores SELECT FOR UPDATE, so its behavior cannot verify this race;
+    keep that limitation explicit instead of treating a SQLite run as proof.
+    """
+    if db_session.get_bind().dialect.name != "postgresql":
+        pytest.skip("concurrent refresh rotation requires PostgreSQL row locks")
+
+    from httpx import ASGITransport, AsyncClient
+
+    from app.api import deps
+    from app.core import database
+    from app.main import app
+
+    async def override_db():
+        async with database.AsyncSessionLocal() as session:
+            yield session
+
+    app.dependency_overrides[deps.get_db] = override_db
+    login = await _login_with_fresh_client(app, test_admin.email)
+    refresh = _refresh_from(login)
+
+    concurrent_sessions = []
+
+    async def concurrent_db():
+        async with database.AsyncSessionLocal() as session:
+            concurrent_sessions.append(session)
+            yield session
+
+    app.dependency_overrides[deps.get_db] = concurrent_db
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            first, second = await asyncio.gather(
+                client.post("/api/v1/auth/refresh", json={"refresh_token": refresh}),
+                client.post("/api/v1/auth/refresh", json={"refresh_token": refresh}),
+            )
+    finally:
+        app.dependency_overrides.pop(deps.get_db, None)
+        for session in concurrent_sessions:
+            await session.close()
+
+    assert sorted((first.status_code, second.status_code)) == [200, 401]
+    family = (
+        await db_session.execute(
+            select(RefreshTokenFamily).where(RefreshTokenFamily.user_id == test_admin.id)
+        )
+    ).scalar_one()
+    assert family.revoked is True
+    assert family.revoked_reason == "reuse_detected"
+
+
+async def _login_with_fresh_client(app, email: str):
+    from httpx import ASGITransport, AsyncClient
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        return await client.post("/api/v1/auth/login", json={"email": email, "password": PASSWORD})
 
 
 class TestRefreshCsrfCookieFlow:

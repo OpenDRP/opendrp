@@ -117,6 +117,7 @@ class Settings(BaseSettings):
     # Pinned image/release identifier. Production deployments must provide a
     # semantic version rather than the moving `latest` tag.
     OPENDRP_VERSION: str = Field(default="")
+    DNS_EXPIRY_MAX_AGE_HOURS: int = Field(default=48, ge=1, le=720)
     #: Minimum level for platform log records. Audit events ignore it: they are
     #: records rather than diagnostics, and no level setting may be able to stop
     #: the platform recording who deleted an asset. See core/logging_config.py.
@@ -170,12 +171,26 @@ class Settings(BaseSettings):
     ALERT_DELIVERY_RETRY_BASE_SECONDS: float = Field(default=2, ge=0.1, le=60)
     # Findings from one connector job wait briefly in the durable queue so the
     # worker can send one summary instead of one message per finding.
+    ALERT_RECIPIENT_INTERVAL_SECONDS: float = Field(default=1, ge=0, le=3600)
+    # How long a recipient stays held after a delivery whose outcome is unknown
+    # (a worker died mid-send, or an SMTP thread timed out). A timed-out thread
+    # may still have delivered, so retrying immediately would duplicate the
+    # notification; holding forever would silence that recipient for good, which
+    # is the failure this setting exists to bound. An operator may end the hold
+    # early from the alerts view once they have reconciled the ambiguity.
+    ALERT_RECIPIENT_HOLD_SECONDS: int = Field(default=900, ge=60, le=86400)
+    AUDIT_ARCHIVE_DIR: str = ""
+    AUDIT_RETENTION_HOLD: bool = False
+    ALERT_HISTORY_RETENTION_DAYS: int = Field(default=90, ge=0, le=3650)
     ALERT_AGGREGATION_DELAY_SECONDS: int = Field(default=10, ge=0, le=300)
     ALERT_MAX_FINDINGS_PER_MESSAGE: int = Field(default=50, ge=1, le=500)
     ALERT_MAX_TELEGRAM_MESSAGE_LENGTH: int = Field(default=3800, ge=500, le=4096)
     OUTBOUND_DNS_TIMEOUT_SECONDS: float = Field(default=3.0, ge=1, le=30)
     REPORT_MAX_ROWS: int = Field(default=5000, ge=100, le=50000)
     REPORT_GENERATION_TIMEOUT_SECONDS: int = Field(default=120, ge=10, le=1800)
+    REPORT_QUEUE_MAX_PENDING: int = Field(default=100, ge=1, le=10000)
+    REPORT_ENQUEUE_MAX_RETRIES: int = Field(default=2, ge=0, le=10)
+    REPORT_WORKER_CONCURRENCY: int = Field(default=2, ge=1, le=32)
 
     # Data retention. An audit table that receives a row per read is the fastest
     # growing object in the schema, and generated reports accumulate on disk
@@ -231,6 +246,38 @@ class Settings(BaseSettings):
     #: Shows up in ``pg_stat_activity``, which is how an operator finds out which
     #: container is holding the pool when the API is slow.
     DB_APPLICATION_NAME: str = Field(default="opendrp")
+
+    # --- Limits a schema migration runs under -------------------------------------
+    # A migration is the one process that changes the schema while the platform is
+    # still serving, so it is also the one most likely to wait on a lock: an
+    # ``ALTER TABLE`` behind an open transaction, or the baseline's index builds,
+    # which wait for every writer to finish. Without a bound that wait is invisible
+    # — the API container is simply unhealthy while `scripts.migrate` blocks, and
+    # the log names nothing — which is what these two settings close.
+    #
+    # They are deliberately *not* ``DB_LOCK_TIMEOUT_MS``/``DB_STATEMENT_TIMEOUT_MS``:
+    # the application's 5s lock bound is right for a request and wrong for an
+    # upgrade, and its 30s statement bound would fail the documented maintenance
+    # window on a populated database, where building the index families is the
+    # longest statement this platform ever runs.
+    #: How long a migration waits for a lock before failing with PostgreSQL's
+    #: ``lock_timeout`` error, which names the wait instead of looking like a hang.
+    #: 0 waits forever, which is what the bound exists to replace.
+    MIGRATION_LOCK_TIMEOUT_MS: int = Field(default=30000, ge=0, le=3600000)
+    #: How long one migration statement may run. 0 (the default) leaves it
+    #: unbounded on purpose: the index build in `docs/upgrading.md`'s maintenance
+    #: window is legitimate work, and an operator who wants it bounded sets this.
+    MIGRATION_STATEMENT_TIMEOUT_MS: int = Field(default=0, ge=0, le=86400000)
+
+    # --- Metrics -------------------------------------------------------------------
+    # The scrape token for `GET /api/v1/metrics`, presented as `X-Metrics-Token`.
+    # Empty — the default — means the endpoint does not exist: it answers 404, and
+    # nothing about the installation's backlog, connectors or audit position is
+    # published to whoever asks. Set it to enable scraping; the value is a
+    # credential like any other, which is why the production validator below
+    # refuses a short or placeholder one. Generate with:
+    #   python -c "import secrets; print(secrets.token_urlsafe(32))"
+    METRICS_TOKEN: str = Field(default="")
 
     UVICORN_WORKERS: int = Field(default=1, ge=1, le=32)
     # Never trust forwarded headers from arbitrary clients. In deployments with
@@ -444,6 +491,65 @@ class Settings(BaseSettings):
                     f"Set OPENDRP_NETWORK_SUBNET and the three subnet variables to "
                     f"one consistent set (see .env.example and docker-compose.yml)."
                 )
+
+        # Trusting a network means believing the addresses it puts in
+        # ``X-Forwarded-For``, so the trust list may name the edge — the only hop
+        # in front of the API — and nothing else of the deployment's own space.
+        # The connector network exists precisely to hold code this platform did
+        # not write (see docker-compose.yml), and the data network holds the API's
+        # own siblings; either one trusted means a container in it can attribute
+        # its actions to any address it likes. The parent range is refused for the
+        # same reason and because naming it is how the connector subnet starts
+        # being trusted by accident, which is the defect this check closes.
+        internal: list[tuple[str, object]] = []
+        for field_name, value in (
+            ("OPENDRP_DATA_SUBNET", self.OPENDRP_DATA_SUBNET),
+            ("OPENDRP_CONNECTOR_SUBNET", self.OPENDRP_CONNECTOR_SUBNET),
+        ):
+            try:
+                internal.append(
+                    (field_name, ipaddress.ip_network(str(value).strip(), strict=False))
+                )
+            except ValueError:
+                continue  # already reported by the loop above
+
+        for item in str(self.TRUSTED_PROXY_IPS).split(","):
+            entry = item.strip()
+            if not entry:
+                continue
+            try:
+                trusted = ipaddress.ip_network(entry, strict=False)
+            except ValueError:
+                continue  # a single address, or a value `extract_ip` ignores
+            for field_name, network in internal:
+                try:
+                    overlapped = trusted.overlaps(network)  # type: ignore[arg-type]
+                except TypeError:  # an IPv4 entry beside an IPv6 range
+                    overlapped = False
+                if overlapped:
+                    raise ValueError(
+                        f"TRUSTED_PROXY_IPS contains {trusted}, which covers "
+                        f"{field_name} ({network}): a container in that network "
+                        f"could then write any address it liked into the audit "
+                        f"trail. Trust loopback and OPENDRP_EDGE_SUBNET only."
+                    )
+            # The parent range is refused when an entry *contains* it. Overlap is
+            # the wrong question here: the edge subnet lives inside the parent by
+            # design, so the shipped value overlaps it and trusting the edge is
+            # the intended configuration.
+            try:
+                too_broad = trusted.supernet_of(parent)  # type: ignore[arg-type]
+            except TypeError:
+                too_broad = False
+            if too_broad:
+                raise ValueError(
+                    f"TRUSTED_PROXY_IPS contains {trusted}, which spans "
+                    f"OPENDRP_NETWORK_SUBNET ({parent}) and therefore every "
+                    f"container in the deployment, connectors included: a "
+                    f"container in any of those networks could then write any "
+                    f"address it liked into the audit trail. Trust loopback and "
+                    f"OPENDRP_EDGE_SUBNET only."
+                )
         return self
 
     @model_validator(mode="after")
@@ -524,6 +630,15 @@ class Settings(BaseSettings):
             )
         if not self.AUTH_COOKIE_SECURE:
             raise ValueError("AUTH_COOKIE_SECURE must be true in production")
+        # Metrics are optional: an installation that does not scrape them leaves
+        # the token empty and the endpoint absent. A token that *is* set is a
+        # shared credential with read access to the platform's operational
+        # picture, so it is held to the same bar as the other secrets here.
+        if self.METRICS_TOKEN:
+            if len(self.METRICS_TOKEN) < 32:
+                raise ValueError("METRICS_TOKEN must contain at least 32 characters")
+            if _looks_like_shipped_secret(self.METRICS_TOKEN):
+                raise ValueError("METRICS_TOKEN must not be a placeholder value")
         if not self.TRUSTED_PROXY_IPS.strip():
             raise ValueError("TRUSTED_PROXY_IPS must be explicit in production")
         if self.UVICORN_FORWARDED_ALLOW_IPS.strip() == "*":

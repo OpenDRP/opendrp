@@ -89,7 +89,7 @@ class TestTestEmailEndpoint:
     ):
         await _seed_email_settings(db_session)
 
-        with patch("app.services.settings_service.smtplib.SMTP") as mock_cls:
+        with patch("app.services.settings_service.smtplib.SMTP") as mock_cls, patch("app.core.outbound.pinned_smtp_class", side_effect=lambda base, addresses, **kwargs: base):
             instance = MagicMock()
             mock_cls.return_value.__enter__.return_value = instance
             r = await client.post(

@@ -125,7 +125,47 @@ class TestDashboardStats:
         assert kpi["total_assets"] == 3
         assert kpi["total_phishing"] == 5
         assert kpi["total_breaches"] == 2
-        assert kpi["active_threats_7d"] == 3
+        # Includes active phishing and breach findings created in the last 7 days.
+        assert kpi["active_threats_7d"] == 4
+
+    @pytest.mark.asyncio
+    async def test_active_threats_7d_excludes_resolved_and_older_findings(
+        self, client, auth_headers_viewer, db_session
+    ):
+        await _seed_dashboard(db_session)
+        now = datetime.now(timezone.utc)
+        suffix = uuid.uuid4().hex[:8]
+        db_session.add(
+            PhishingDomain(
+                id=uuid.uuid4(),
+                phishing_domain=f"resolved-{suffix}.example",
+                matched_asset="resolved.example",
+                detection_source="dnstwist",
+                status="resolved",
+                created_at=now - timedelta(days=2),
+            )
+        )
+        db_session.add(
+            Breach(
+                id=uuid.uuid4(),
+                breach_name=f"ResolvedBreach-{suffix}",
+                title="Resolved breach",
+                domain="resolved.example",
+                breach_date=now.date(),
+                pwn_count=1,
+                matched_email=f"resolved-{suffix}@example.com",
+                status="resolved",
+                created_at=now - timedelta(days=2),
+            )
+        )
+        await db_session.commit()
+
+        response = await client.get(
+            "/api/v1/dashboard/stats", headers=auth_headers_viewer
+        )
+
+        assert response.status_code == 200, response.text
+        assert response.json()["kpi"]["active_threats_7d"] == 4
 
     @pytest.mark.asyncio
     async def test_stats_by_criticality_breakdown(
@@ -178,7 +218,14 @@ class TestDashboardStats:
         assert first_entry["date"] != last_entry["date"]
         total_ph = sum(t["phishing"] for t in tl)
         total_hb = sum(t["breaches"] for t in tl)
-        assert total_ph + total_hb >= 0
+        # The seed has four phishing findings and two breach matches in the
+        # window. This verifies actual database-date grouping, not only shape.
+        assert total_ph == 4
+        assert total_hb == 2
+        yesterday = (datetime.now(timezone.utc).date() - timedelta(days=1)).isoformat()
+        yesterday_row = next(row for row in tl if row["date"] == yesterday)
+        assert yesterday_row["phishing"] == 1
+        assert yesterday_row["breaches"] == 1
 
     @pytest.mark.asyncio
     async def test_stats_viewer_plus_401_no_bearer(

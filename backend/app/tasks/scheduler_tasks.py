@@ -7,8 +7,9 @@ double-firing within the same minute (e.g. after a beat restart).
 """
 
 import secrets
+import asyncio
 from contextvars import ContextVar
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import structlog
 
@@ -21,6 +22,8 @@ log = structlog.get_logger()
 MODULE_TASKS = {
     "schedule_phishing": [("connector_type", "phishing")],
     "schedule_breaches": [("connector_type", "breaches")],
+    "schedule_dns_security": [("connector_type", "dns")],
+    "schedule_exposure": [("connector_type", "exposure")],
 }
 
 _schedule_cache: dict = {"data": None, "ts": 0.0}
@@ -72,11 +75,11 @@ def _acquire_dedup(module: str, now: datetime) -> str | None:
 
     client = None
     try:
-        client = redis_lib.Redis.from_url(core_settings.REDIS_URL, decode_responses=True)
+        client = redis_lib.Redis.from_url(core_settings.REDIS_URL, decode_responses=True, socket_connect_timeout=2, socket_timeout=2)
         key = _redis_dedup_key(module, now)
         token = secrets.token_urlsafe(24)
         # SET with NX: only the first caller within this minute wins.
-        acquired = client.set(key, token, nx=True, ex=90)
+        acquired = client.set(key, token, nx=True, ex=900)
         return token if acquired else None
     except Exception as exc:
         # Fail closed when Redis is unavailable: do not dispatch a scan without
@@ -99,6 +102,12 @@ def _try_acquire_dedup(module: str, now: datetime) -> bool:
     return token is not None
 
 
+def _acquire_with_token(module: str, now: datetime) -> tuple[bool, str | None]:
+    _dedup_token.set(None)
+    acquired = _try_acquire_dedup(module, now)
+    return acquired, _dedup_token.get()
+
+
 def _release_dedup(module: str, now: datetime, token: str | None = None) -> None:
     """Release a guard only when this scheduler still owns it.
 
@@ -111,7 +120,7 @@ def _release_dedup(module: str, now: datetime, token: str | None = None) -> None
 
     client = None
     try:
-        client = redis_lib.Redis.from_url(core_settings.REDIS_URL, decode_responses=True)
+        client = redis_lib.Redis.from_url(core_settings.REDIS_URL, decode_responses=True, socket_connect_timeout=2, socket_timeout=2)
         key = _redis_dedup_key(module, now)
         if token is None:
             log.warning("schedule_dedup_release_without_token", module=module)
@@ -147,10 +156,20 @@ async def _load_schedules() -> dict:
 
     async with AsyncSessionLocal() as db:
         row = (await db.execute(select(SystemSettings).limit(1))).scalar_one_or_none()
+        from app.models import Module
+        modules = set((await db.execute(select(Module.id).where(Module.enabled.is_(True)))).scalars().all())
+        schedules = {module_id: spec for module_id, spec in (row.schedules or {}).items() if module_id in modules} if row else {}
         data = {
             "schedule_phishing": dict(row.schedule_phishing) if row and row.schedule_phishing else None,
             "schedule_breaches": dict(row.schedule_breaches) if row and row.schedule_breaches else None,
+            "schedule_dns_security": dict(row.schedule_dns_security) if row and row.schedule_dns_security else None,
+            "schedule_exposure": dict(row.schedule_exposure) if row and row.schedule_exposure else None,
+            "schedules": schedules,
         }
+        for module_id in modules - {"phishing", "breaches", "dns", "exposure"}:
+            schedules.setdefault(module_id, None)
+        for module_id, spec in schedules.items():
+            data[f"schedule_module:{module_id}"] = spec
     _schedule_cache["data"] = data
     _schedule_cache["ts"] = now_ts
     return data
@@ -163,13 +182,22 @@ async def refresh_scan_schedules_task(self=None, _now: datetime | None = None) -
     now = _now or datetime.now(timezone.utc)
     schedules = await _load_schedules()
     fired: list[str] = []
-    for module, tasks in MODULE_TASKS.items():
+    scheduled_modules = list(MODULE_TASKS.items())
+    dynamic = schedules.get("schedules") or {}
+    if isinstance(dynamic, dict):
+        for module_id, spec in dynamic.items():
+            module_key = f"schedule_module:{module_id}"
+            scheduled_modules.append((module_key, [("connector_type", str(module_id))]))
+            schedules[module_key] = spec
+    occurrences = [(module, tasks, now.replace(second=0, microsecond=0) - timedelta(minutes=delay)) for module, tasks in scheduled_modules for delay in range(10)]
+    for module, tasks, occurrence in occurrences:
         spec = schedules.get(module)
-        if not spec or not schedule_matches(spec, now):
+        if not spec or not schedule_matches(spec, occurrence):
+            continue
+        if module.startswith("schedule_module:") and schedules.get("schedules", {}).get(module.removeprefix("schedule_module:")) is None:
             continue
         _dedup_token.set(None)
-        acquired = _try_acquire_dedup(module, now)
-        token = _dedup_token.get()
+        acquired, token = await asyncio.to_thread(_acquire_with_token, module, occurrence)
         if not acquired:
             log.info("schedule_already_fired", module=module, at=now.isoformat())
             continue
@@ -180,37 +208,37 @@ async def refresh_scan_schedules_task(self=None, _now: datetime | None = None) -
             from app.services.connector_service import ConnectorService
 
             async with AsyncSessionLocal() as db:
-                jobs = await ConnectorService(db).enqueue_module_scan(
+                result = await ConnectorService(db).enqueue_ready_sources(
                     connector_type=connector_type,
                     created_by=None,
                     title=f"Scheduled {connector_type} scan",
-                    params={"trigger": "scheduled"},
+                    params={"trigger": "scheduled", "scheduled_at": occurrence.isoformat()},
                 )
+                jobs = result["job_ids"]
+                if not jobs:
+                    await asyncio.to_thread(_release_dedup, module, occurrence, token)
                 from app.core.audit import AuditLogger
 
                 await AuditLogger.emit(
                     db,
-                    action=(
-                        "phishing.scan.scheduled"
-                        if connector_type == "phishing"
-                        else "breach.scan.scheduled"
-                    ),
+                    action="source.scan.queued",
                     ip_address="internal:celery-beat",
                     user_id=None,
                     details={
                         "connector_type": connector_type,
-                        "job_ids": [str(job.id) for job in jobs],
-                        "scheduled_at": now.isoformat(),
+                        "job_ids": jobs,
+                        "sources": result["sources"],
+                        "scheduled_at": occurrence.isoformat(),
                     },
                 )
-            fired.extend(f"{connector_type}:{j.id}" for j in jobs)
+            fired.extend(f"{connector_type}:{job_id}" for job_id in jobs)
         except Exception as e:
             # The lock only means dispatch was attempted. If enqueue failed
             # before returning jobs, release it so a later beat tick can retry.
             # Once jobs were created, retain the lock even if a later audit
             # operation fails; releasing it would permit duplicate dispatch.
             if not jobs:
-                _release_dedup(module, now, token)
+                await asyncio.to_thread(_release_dedup, module, occurrence, token)
             log.error("schedule_enqueue_failed", module=module, err=str(e)[:200])
         log.info("scheduled_scan_fired", module=module, tasks=fired)
     return {"fired": fired, "checked_at": now.isoformat()}

@@ -24,27 +24,60 @@ async def dashboard_stats(
     total_ph = (await db.execute(select(func.count(P.id)))).scalar_one()
     total_hb = (await db.execute(select(func.count(H.id)))).scalar_one()
     seven = now - timedelta(days=7)
-    act7d = (await db.execute(select(func.count(P.id)).where(P.created_at >= seven))).scalar_one()
+    open_statuses = ("active", "investigating")
+    active_phishing = (
+        await db.execute(
+            select(func.count(P.id)).where(
+                P.created_at >= seven,
+                P.status.in_(open_statuses),
+            )
+        )
+    ).scalar_one()
+    active_breaches = (
+        await db.execute(
+            select(func.count(H.id)).where(
+                H.created_at >= seven,
+                H.status.in_(open_statuses),
+            )
+        )
+    ).scalar_one()
+    active_threats_7d = int(active_phishing or 0) + int(active_breaches or 0)
 
     # One aggregate query replaces the former 60 per-day count queries. The
     # calendar is completed in Python so days with no findings remain visible.
+    # SQLite must receive DATE(timestamp) directly: CAST(timestamp AS DATE)
+    # converts an ISO timestamp to an integer year and shifts it to a bogus day.
+    # PostgreSQL's timezone() makes the grouping explicitly UTC regardless of
+    # the connection's session timezone.
+    dialect = db.get_bind().dialect.name
+    from sqlalchemy import ColumnElement
+    phishing_day: ColumnElement
+    breach_day: ColumnElement
+    if dialect == "sqlite":
+        phishing_day = func.date(P.created_at)
+        breach_day = func.date(H.created_at)
+    else:
+        phishing_day = cast(func.timezone("UTC", P.created_at), Date)
+        breach_day = cast(func.timezone("UTC", H.created_at), Date)
+
     start_date = (now - timedelta(days=29)).date()
+    timeline_start = datetime.combine(start_date, datetime.min.time(), tzinfo=timezone.utc)
     timeline_rows = await db.execute(
         select(
-            func.date(cast(P.created_at, Date)).label("day"),
+            phishing_day.label("day"),
             func.count(P.id).label("phishing"),
             literal_column("0").label("breaches"),
         )
-        .where(P.created_at >= datetime.combine(start_date, datetime.min.time(), tzinfo=timezone.utc))
-        .group_by(func.date(cast(P.created_at, Date)))
+        .where(P.created_at >= timeline_start)
+        .group_by(phishing_day)
         .union_all(
             select(
-                func.date(cast(H.created_at, Date)).label("day"),
+                breach_day.label("day"),
                 literal_column("0").label("phishing"),
                 func.count(H.id).label("breaches"),
             )
-            .where(H.created_at >= datetime.combine(start_date, datetime.min.time(), tzinfo=timezone.utc))
-            .group_by(func.date(cast(H.created_at, Date)))
+            .where(H.created_at >= timeline_start)
+            .group_by(breach_day)
         )
     )
     totals_by_day: dict[str, dict[str, int]] = {}
@@ -74,7 +107,7 @@ async def dashboard_stats(
             "total_assets": int(total_assets),
             "total_phishing": int(total_ph),
             "total_breaches": int(total_hb),
-            "active_threats_7d": int(act7d),
+            "active_threats_7d": active_threats_7d,
         },
     )
 
@@ -83,7 +116,7 @@ async def dashboard_stats(
             "total_assets": total_assets,
             "total_phishing": total_ph,
             "total_breaches": total_hb,
-            "active_threats_7d": act7d,
+            "active_threats_7d": active_threats_7d,
         },
         "timeline": timeline,
         "phishing_by_source": phishing_by_source,

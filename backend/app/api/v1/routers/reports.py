@@ -1,10 +1,11 @@
+import asyncio
 import math
 import os
 import uuid
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from sqlalchemy import func, orm, select
+from sqlalchemy import delete, func, orm, select, true
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import (
@@ -13,6 +14,7 @@ from app.api.deps import (
     require_admin,
     require_viewer_plus,
 )
+from app.core.config import settings
 from app.core.artifact_path import (
     REASON_NOT_A_NAME,
     REASON_OUTSIDE_STORE,
@@ -25,9 +27,10 @@ from app.core.exceptions import NotFoundException
 from app.core.logging_config import get_logger
 from app.core.manual_rate_limit import SCOPE_REPORTS, enforce_manual_rate_limit
 from app.core.request_context import request_id_header
-from app.models import Report
-from app.schemas.common import PaginatedResponse
+from app.models import Report, ReportArtifactCleanup
+from app.schemas.common import MAX_PAGE_SIZE, PaginatedResponse
 from app.schemas.report import ReportCreate, ReportListResponse, ReportResponse
+
 
 router = APIRouter(prefix="/reports", tags=["Reports"])
 
@@ -48,6 +51,7 @@ async def generate_report(
     db: AsyncSession = Depends(get_db),
     u=Depends(require_viewer_plus),
 ):
+    from app.models import ReportQueueControl
     from app.models.job import JobType
     from app.services.job_service import JobService
     from app.tasks.report_tasks import generate_report_task
@@ -61,6 +65,31 @@ async def generate_report(
         action="report.generate",
         ip_address=extract_ip(request),
     )
+
+    # The singleton is inserted by the additive migration. A no-op conflict
+    # update obtains PostgreSQL's row lock without taking SQLite's database-wide
+    # write lock (SQLite serializes the following transaction itself).
+    from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+    from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+    def queue_lock_statement():
+        if db.get_bind().dialect.name == "sqlite":
+            return sqlite_insert(ReportQueueControl)
+        return pg_insert(ReportQueueControl)
+    await db.execute(
+        queue_lock_statement()
+        .values(id=1, touched_at=datetime.now(timezone.utc))
+        .on_conflict_do_update(
+            index_elements=[ReportQueueControl.id],
+            set_={"touched_at": datetime.now(timezone.utc)},
+        )
+    )
+    pending_count = int((await db.execute(
+        select(func.count(Report.id)).where(Report.status.in_(("pending", "generating")))
+    )).scalar_one())
+    if pending_count >= settings.REPORT_QUEUE_MAX_PENDING:
+        await db.rollback()
+        raise HTTPException(status_code=429, detail="Report queue is full; try again later")
 
     name = data_in.report_name or f"OpenDRP Report {datetime.now(timezone.utc).strftime('%Y-%m-%d %H%M UTC')}"
     r = Report(report_name=name, created_by=u.id, file_path="", status="pending")
@@ -119,27 +148,67 @@ async def generate_report(
             status_code=503,
             detail="Report queue is temporarily unavailable; the report job was marked failed",
         )
-    return {"status": "scheduled", "report_id": str(r.id), "estimated_seconds": 15, "job_id": str(job_id)}
+    return {"status": "scheduled", "queue_state": "queued", "report_id": str(r.id), "job_id": str(job_id)}
 
 
 @router.get("", response_model=ReportListResponse)
 async def list_reports(
     request: Request,
     page: int = Query(1, ge=1),
-    size: int = Query(50, ge=1, le=200),
+    size: int = Query(50, ge=1, le=MAX_PAGE_SIZE),
     db: AsyncSession = Depends(get_db),
     user=Depends(require_viewer_plus),
 ):
     skip = (page - 1) * size
-    q = select(Report).options(orm.joinedload(Report.created_by_user)).order_by(Report.created_at.desc(), Report.id.desc())
-    items = list((await db.execute(q.offset(skip).limit(size))).scalars().unique().all())
-    total = (await db.execute(select(func.count(Report.id)))).scalar_one()
+    visible_reports = Report.status != "deleted"
+    page_rows = (
+        select(Report.id.label("id"), Report.created_at.label("created_at"))
+        .where(visible_reports)
+        .order_by(Report.created_at.desc(), Report.id.desc())
+        .offset(skip)
+        .limit(size)
+        .cte("report_page")
+    )
+    report_count = (
+        select(func.count(Report.id).label("total"))
+        .where(visible_reports)
+        .cte("report_count")
+    )
+    # Both page rows and total are evaluated by one statement/snapshot. The
+    # count CTE is the preserved left side so an out-of-range page still returns
+    # its real total with an empty item list.
+    result_rows = (
+        await db.execute(
+            select(Report, report_count.c.total)
+            .select_from(
+                report_count.outerjoin(page_rows, true()).outerjoin(
+                    Report, Report.id == page_rows.c.id
+                )
+            )
+            .options(orm.joinedload(Report.created_by_user))
+            .order_by(
+                page_rows.c.created_at.desc().nulls_last(),
+                page_rows.c.id.desc().nulls_last(),
+            )
+        )
+    ).unique().all()
+    total = int(result_rows[0][1]) if result_rows else 0
+    items = [row[0] for row in result_rows if row[0] is not None]
     items_dto = []
     for r in items:
         dto = ReportResponse.model_validate(r, from_attributes=True)
         dto.created_by_email = r.created_by_user.email if r.created_by_user else None
-        dto.file_available = resolve_artifact(r.file_path) is not None
         items_dto.append(dto)
+    # realpath/is_file may touch a slow or network-mounted volume. Keep those
+    # bounded checks off the async event loop; the list page is capped at 200.
+    availability = await asyncio.gather(
+        *(
+            asyncio.to_thread(resolve_artifact, report.file_path)
+            for report in items
+        )
+    )
+    for dto, artifact in zip(items_dto, availability):
+        dto.file_available = artifact is not None
     pages = math.ceil(total / size) if size > 0 else 0
     await AuditLogger.emit_background(
         db,
@@ -161,7 +230,7 @@ async def download_report(
     from fastapi.responses import FileResponse
     from app.models import Report
 
-    r = (await db.execute(select(Report).where(Report.id == report_id))).scalar_one_or_none()
+    r = (await db.execute(select(Report).where(Report.id == report_id, Report.status != "deleted"))).scalar_one_or_none()
     if not r or r.status != "completed" or not r.file_path:
         raise NotFoundException("Report file not found or not ready")
     resolved, reason = classify_artifact(r.file_path)
@@ -214,6 +283,7 @@ async def download_report(
             "status": r.status,
             "artifact_name": resolved.name,
             "file_name": f"{fname}.pdf",
+            "delivery_state": "response_started",
         },
     )
     return FileResponse(resolved, media_type="application/pdf", filename=f"{fname}.pdf")
@@ -228,17 +298,18 @@ async def delete_report(
 ):
     from app.models import Report
 
-    r = (await db.execute(select(Report).where(Report.id == report_id))).scalar_one_or_none()
+    r = (await db.execute(select(Report).where(Report.id == report_id, Report.status != "deleted").with_for_update())).scalar_one_or_none()
     if not r:
         raise NotFoundException("Report not found")
 
+    original_status = r.status
     stored = r.file_path
     resolved, reason = classify_artifact(stored)
     details = {
         "report_id": str(report_id),
         "report_name": r.report_name,
         "status": r.status,
-        "artifact_removed": resolved is not None,
+        "artifact_removed": False,
     }
     if stored and resolved is None:
         # The row is still deleted — this is an administrator acting on a report
@@ -248,25 +319,68 @@ async def delete_report(
         details.update(describe_rejection(stored, reason))
 
     try:
-        await db.delete(r)
+        if stored and resolved is not None:
+            if await db.get(ReportArtifactCleanup, stored) is None:
+                db.add(ReportArtifactCleanup(artifact_name=stored, report_id=report_id))
+        elif stored and reason not in {"missing", "no_name"}:
+            details["cleanup_refused"] = reason
+        if original_status in {"pending", "generating"}:
+            details["cancelled_generation"] = True
+        r.status = "deleted"
+        r.file_path = ""
+        await AuditLogger.emit(
+            db,
+            action="report.delete",
+            ip_address=extract_ip(request),
+            user_id=user.id,
+            details={
+                **details,
+                "artifact_cleanup_pending": bool(stored and resolved is not None),
+            },
+            require_persistence=True,
+            commit=False,
+        )
         await db.commit()
     except Exception:
         await db.rollback()
         raise
-    if resolved is not None:
-        try:
-            os.remove(resolved)
-        except OSError as exc:
-            log.warning(
-                "report_delete_artifact_kept",
-                report_id=str(report_id),
-                err=str(exc)[:200],
+    if stored and resolved is not None:
+        # A report being generated derives its final artifact name from report_id.
+        # Retain its tombstone until that worker has stopped so cleanup cannot win
+        # against a late atomic publication. Other artifacts can be unlinked now.
+        intent = await db.get(ReportArtifactCleanup, stored)
+        if original_status not in {"pending", "generating"}:
+            try:
+                await asyncio.to_thread(os.remove, resolved)
+                await db.execute(
+                    delete(ReportArtifactCleanup).where(ReportArtifactCleanup.artifact_name == stored)
+                )
+                await db.commit()
+            except FileNotFoundError:
+                await db.execute(
+                    delete(ReportArtifactCleanup).where(ReportArtifactCleanup.artifact_name == stored)
+                )
+                await db.commit()
+            except OSError as exc:
+                from datetime import timedelta
+                from sqlalchemy import update as sql_update
+
+                await db.execute(
+                    sql_update(ReportArtifactCleanup)
+                    .where(ReportArtifactCleanup.artifact_name == stored)
+                    .values(
+                        attempts=ReportArtifactCleanup.attempts + 1,
+                        last_error=str(exc)[:500],
+                        available_at=datetime.now(timezone.utc) + timedelta(minutes=2),
+                    )
+                )
+                await db.commit()
+                log.warning("report_delete_artifact_kept", report_id=str(report_id), err=str(exc)[:200])
+        elif intent is not None:
+            from datetime import timedelta
+
+            intent.available_at = datetime.now(timezone.utc) + timedelta(
+                seconds=settings.REPORT_GENERATION_TIMEOUT_SECONDS + 60
             )
-    await AuditLogger.emit(
-        db,
-        action="report.delete",
-        ip_address=extract_ip(request),
-        user_id=user.id,
-        details=details,
-    )
+            await db.commit()
     return None

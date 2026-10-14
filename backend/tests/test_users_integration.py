@@ -78,6 +78,7 @@ class TestUserCRUD:
         )
         assert rows
         assert rows[-1].details.get("target_email") == "new.user@example.com"
+        assert rows[-1].entry_hash
 
     @pytest.mark.asyncio
     async def test_create_user_weak_password_422(self, client, auth_headers_admin):
@@ -140,6 +141,13 @@ class TestUserCRUD:
         )
         assert rows
         assert set(rows[-1].details["changed_fields"]) == {"email", "full_name", "role"}
+        assert rows[-1].details["changes"] == {
+            "email": {"from": "mutation-target@example.com", "to": "renamed.target@example.com"},
+            "full_name": {"from": None, "to": "Target User"},
+            "role": {"from": "viewer", "to": "analyst"},
+        }
+        assert "password" not in str(rows[-1].details).lower()
+        assert "password_hash" not in str(rows[-1].details).lower()
 
     @pytest.mark.asyncio
     async def test_self_demote_allowed_when_another_admin_remains(
@@ -216,6 +224,46 @@ class TestUserCRUD:
         assert r.status_code == 409, r.text
 
 
+class TestAuditFailClosedUserWrites:
+    @pytest.mark.asyncio
+    async def test_user_creation_rolls_back_when_audit_storage_fails(
+        self, client, auth_headers_admin, monkeypatch
+    ):
+        from app.core import audit as audit_module
+
+        async def fail_chain(*args, **kwargs):
+            raise RuntimeError("audit chain unavailable")
+
+        monkeypatch.setattr(audit_module, "prepare_entry", fail_chain)
+        response = await _create_user(client, auth_headers_admin, "audit-down@example.com")
+        assert response.status_code == 503, response.text
+        assert response.json()["code"] == "audit_unavailable"
+
+        monkeypatch.undo()
+        login = await _login(client, "audit-down@example.com", PASSWORD)
+        assert login.status_code == 401
+
+    @pytest.mark.asyncio
+    async def test_user_delete_rolls_back_when_audit_storage_fails(
+        self, client, auth_headers_admin, db_session, monkeypatch
+    ):
+        created = await _create_user(client, auth_headers_admin, "keep-on-audit-failure@example.com")
+        target_id = uuid.UUID(created.json()["id"])
+        from app.core import audit as audit_module
+
+        async def fail_chain(*args, **kwargs):
+            raise RuntimeError("audit chain unavailable")
+
+        monkeypatch.setattr(audit_module, "prepare_entry", fail_chain)
+        refused = await client.delete(f"/api/v1/users/{target_id}", headers=auth_headers_admin)
+        assert refused.status_code == 503, refused.text
+        assert refused.json()["code"] == "audit_unavailable"
+
+        monkeypatch.undo()
+        still_there = await db_session.execute(select(User).where(User.id == target_id))
+        assert still_there.scalar_one_or_none() is not None
+
+
 class TestPasswordResetSemantics:
     @pytest.mark.asyncio
     async def test_reset_clears_lock_and_revokes_refresh_families(
@@ -282,6 +330,7 @@ class TestPasswordResetSemantics:
         )
         assert rows
         assert rows[-1].details.get("refresh_families_revoked") == 1
+        assert rows[-1].entry_hash
 
     @pytest.mark.asyncio
     async def test_reactivation_clears_stale_lock(
@@ -352,6 +401,7 @@ class TestDeleteUser:
         )
         assert rows
         assert rows[-1].details.get("target_email") == "gone@example.com"
+        assert rows[-1].entry_hash
 
     @pytest.mark.asyncio
     async def test_delete_keeps_reports_and_sets_created_by_null(

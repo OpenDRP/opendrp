@@ -11,6 +11,7 @@ from sqlalchemy import (
     func,
     or_,
     select,
+    text,
 )
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.exc import IntegrityError
@@ -21,7 +22,7 @@ from app.core.exceptions import ConflictException, NotFoundException
 from app.core.security import hash_password
 from app.models.token import RefreshTokenFamily
 from app.models.user import User, role_name
-from app.schemas.common import PaginatedResponse
+from app.schemas.common import MAX_PAGE_SIZE, PaginatedResponse
 from app.services.refresh_sessions import revoke_refresh_families
 from app.schemas.user import (
     ToggleActiveResponse,
@@ -51,27 +52,26 @@ async def _ensure_active_admin_remains(
 ) -> None:
     """Lock the admin set before changing a user's effective admin status."""
     role = getattr(target.role, "value", target.role)
-    resulting_role = final_role if final_role is not None else str(role)
+    resulting_role = final_role if final_role is not None else role_name(role)
     resulting_active = target.is_active if final_active is None else final_active
     is_losing_admin = role == "admin" and target.is_active and (
         resulting_role != "admin" or not resulting_active
     )
     if not is_losing_admin:
         return
-    # PostgreSQL serializes competing demotion/deactivation operations here.
-    # SQLite ignores FOR UPDATE, but the invariant remains covered by the
-    # application transaction in the supported single-process test/development DB.
-    await db.execute(
-        select(User.id)
-        .where(User.role == "admin", User.is_active.is_(True))
-        .with_for_update()
-    )
+    # A row lock over the current predicate is insufficient under READ COMMITTED:
+    # it doesn't block a concurrent insert that adds another active admin. A
+    # transaction-scoped advisory lock serializes *all* operations that can enter
+    # or leave the active-admin set, including create_user(admin).
+    if db.get_bind().dialect.name == "postgresql":
+        await db.execute(text("SELECT pg_advisory_xact_lock(:lock_key)"), {"lock_key": 0x4F445250})
     if await _count_active_admins(db, exclude_id=target.id) < 1:
         raise ConflictException("Cannot remove the last active admin")
 
 
 @router.get("/brief", response_model=list[dict])
 async def list_users_brief(
+    request: Request,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_admin),
 ):
@@ -89,7 +89,7 @@ async def list_users_brief(
     await AuditLogger.emit_background(
         db,
         action="users.list",
-        ip_address="internal:users-brief",
+        ip_address=extract_ip(request),
         user_id=current_user.id,
         details={"brief": True, "results": len(rows)},
     )
@@ -106,7 +106,7 @@ async def list_users(
     role: UserRole | None = None,
     is_active: bool | None = None,
     page: int = Query(1, ge=1),
-    size: int = Query(10, ge=1, le=200),
+    size: int = Query(10, ge=1, le=MAX_PAGE_SIZE),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_admin),
 ):
@@ -192,8 +192,27 @@ async def create_user(
         # what that gate refuses in the meantime.
         must_change_password=True,
     )
-    db.add(new_user)
     try:
+        if role_name(new_user.role) == "admin" and db.get_bind().dialect.name == "postgresql":
+            await db.execute(text("SELECT pg_advisory_xact_lock(:lock_key)"), {"lock_key": 0x4F445250})
+        db.add(new_user)
+        await db.flush()
+        await AuditLogger.emit(
+            db,
+            action="user.created",
+            ip_address=extract_ip(request),
+            user_id=current_user.id,
+            details={
+                "target_user_id": str(new_user.id),
+                "target_email": new_user.email,
+                "role": role_name(new_user.role),
+                "rate_limit_minutes": new_user.rate_limit_minutes,
+                "created_by": str(current_user.id),
+                "onboarding_required": ["password"],
+            },
+            require_persistence=True,
+            commit=False,
+        )
         await db.commit()
         await db.refresh(new_user)
     except IntegrityError as exc:
@@ -201,21 +220,10 @@ async def create_user(
         if "users_email_key" in str(exc) or "duplicate" in str(exc).lower():
             raise ConflictException("A user with this email already exists") from exc
         raise ConflictException("Could not create user due to constraint violation") from exc
+    except Exception:
+        await db.rollback()
+        raise
 
-    await AuditLogger.emit(
-        db,
-        action="user.created",
-        ip_address=extract_ip(request),
-        user_id=current_user.id,
-        details={
-            "target_user_id": str(new_user.id),
-            "target_email": new_user.email,
-            "role": role_name(new_user.role),
-            "rate_limit_minutes": new_user.rate_limit_minutes,
-            "created_by": str(current_user.id),
-            "onboarding_required": ["password"],
-        },
-    )
     return new_user
 
 
@@ -234,12 +242,20 @@ async def update_user(
     update_fields = payload.model_dump(exclude_unset=True)
     details: dict = {"target_user_id": str(user_id), "target_email": user.email}
     changed: list[str] = []
+    changes: dict[str, dict[str, object]] = {}
+    old_value: object
+
+    def record_change(field: str, old: object, new: object) -> None:
+        if old != new:
+            changed.append(field)
+            changes[field] = {"from": old, "to": new}
 
     if "full_name" in update_fields:
         val = update_fields["full_name"]
         stripped = val.strip() if isinstance(val, str) else val
+        old_value = user.full_name
         user.full_name = stripped or None
-        changed.append("full_name")
+        record_change("full_name", old_value, user.full_name)
     if "email" in update_fields and update_fields["email"]:
         candidate = update_fields["email"].lower().strip()
         existing = (
@@ -247,20 +263,22 @@ async def update_user(
         ).scalar_one_or_none()
         if existing:
             raise ConflictException("A user with this email already exists")
+        old_value = user.email
         user.email = candidate
-        changed.append("email")
+        record_change("email", old_value, user.email)
     if "rate_limit_minutes" in update_fields and update_fields["rate_limit_minutes"] is not None:
         new_limit = int(update_fields["rate_limit_minutes"])
         if new_limit != user.rate_limit_minutes:
+            old_value = user.rate_limit_minutes
             user.rate_limit_minutes = new_limit
-            changed.append("rate_limit_minutes")
-            details["rate_limit_minutes"] = new_limit
+            record_change("rate_limit_minutes", old_value, new_limit)
     if "role" in update_fields and update_fields["role"]:
         await _ensure_active_admin_remains(
-            db, user, final_role=str(update_fields["role"]), final_active=user.is_active
+            db, user, final_role=role_name(update_fields["role"]), final_active=user.is_active
         )
+        old_value = role_name(user.role)
         user.role = update_fields["role"]
-        changed.append("role")
+        record_change("role", old_value, role_name(user.role))
 
     password_reset = False
     revoked_families = 0
@@ -286,21 +304,54 @@ async def update_user(
             if str(user_id) == str(current_user.id) and new_active is False:
                 raise ConflictException("You cannot deactivate your own account")
             await _ensure_active_admin_remains(
-                db, user, final_role=str(getattr(user.role, "value", user.role)), final_active=new_active
+                db, user, final_role=role_name(user.role), final_active=new_active
             )
+            old_value = user.is_active
             user.is_active = new_active
+            record_change("is_active", old_value, new_active)
             if new_active:
                 # Reviving an account must not restore stale lock state.
                 user.failed_login_attempts = 0
                 user.locked_until = None
             active_changed = True
-            changed.append("is_active")
 
     try:
         if password_reset:
             revoked_families = await revoke_refresh_families(db, user.id, reason="password_reset")
         if active_changed and not user.is_active:
             revoked_families += await revoke_refresh_families(db, user.id, reason="user_deactivated")
+
+        audit_events: list[tuple[str, dict]] = []
+        if password_reset:
+            audit_events.append((
+                "user.password_reset",
+                {
+                    "target_user_id": str(user_id),
+                    "target_email": user.email,
+                    "refresh_families_revoked": revoked_families,
+                    "onboarding_required": ["password"],
+                },
+            ))
+        if active_changed:
+            lock_action = "user.locked" if not user.is_active else "user.unlocked"
+            audit_events.append((
+                lock_action,
+                {"target_user_id": str(user_id), "target_email": user.email},
+            ))
+        if changed or password_reset:
+            details["changed_fields"] = changed
+            details["changes"] = changes
+            audit_events.append(("user.updated", details))
+        for action, event_details in audit_events:
+            await AuditLogger.emit(
+                db,
+                action=action,
+                ip_address=extract_ip(request),
+                user_id=current_user.id,
+                details=event_details,
+                require_persistence=True,
+                commit=False,
+            )
         await db.commit()
         await db.refresh(user)
     except IntegrityError as exc:
@@ -308,40 +359,10 @@ async def update_user(
         if "users_email_key" in str(exc):
             raise ConflictException("A user with this email already exists") from exc
         raise ConflictException("Could not update user") from exc
+    except Exception:
+        await db.rollback()
+        raise
 
-    if changed or password_reset:
-        details["changed_fields"] = changed
-        if password_reset:
-            details["password_reset"] = True
-            details["refresh_families_revoked"] = revoked_families
-            await AuditLogger.emit(
-                db,
-                action="user.password_reset",
-                ip_address=extract_ip(request),
-                user_id=current_user.id,
-                details={
-                    "target_user_id": str(user_id),
-                    "target_email": user.email,
-                    "refresh_families_revoked": revoked_families,
-                    "onboarding_required": ["password"],
-                },
-            )
-        if active_changed:
-            lock_action = "user.locked" if not user.is_active else "user.unlocked"
-            await AuditLogger.emit(
-                db,
-                action=lock_action,
-                ip_address=extract_ip(request),
-                user_id=current_user.id,
-                details={"target_user_id": str(user_id), "target_email": user.email},
-            )
-        await AuditLogger.emit(
-            db,
-            action="user.updated",
-            ip_address=extract_ip(request),
-            user_id=current_user.id,
-            details=details,
-        )
     return user
 
 
@@ -369,18 +390,24 @@ async def toggle_active(
     if new_active:
         user.failed_login_attempts = 0
         user.locked_until = None
-    await db.commit()
-    await db.refresh(user)
 
     action_str = "user.locked" if not new_active else "user.unlocked"
     label: Literal["locked", "unlocked"] = "locked" if not new_active else "unlocked"
-    await AuditLogger.emit(
-        db,
-        action=action_str,
-        ip_address=extract_ip(request),
-        user_id=current_user.id,
-        details={"target_user_id": str(user_id), "target_email": user.email, "method": "toggle-active"},
-    )
+    try:
+        await AuditLogger.emit(
+            db,
+            action=action_str,
+            ip_address=extract_ip(request),
+            user_id=current_user.id,
+            details={"target_user_id": str(user_id), "target_email": user.email, "method": "toggle-active"},
+            require_persistence=True,
+            commit=False,
+        )
+        await db.commit()
+        await db.refresh(user)
+    except Exception:
+        await db.rollback()
+        raise
     return ToggleActiveResponse(id=user.id, is_active=user.is_active, action=label)
 
 
@@ -421,31 +448,43 @@ async def reset_user_mfa(
     user.totp_secret = None
     user.totp_enabled_at = None
     user.totp_last_used_step = None
+    user.mfa_recovery_codes = None
+    user.mfa_failed_attempts = 0
+    user.mfa_locked_until = None
     # Recovery must not be a downgrade. Without this flag, clearing a factor for
     # an operator who lost their phone would leave the account permanently
     # password-only — the exact outcome the request was meant to undo. The next
     # sign-in asks for a new device before the rest of the platform opens.
     user.must_enrol_mfa = True
     try:
+        revoked_families = await revoke_refresh_families(
+            db, user.id, reason="mfa_reset"
+        )
+        await AuditLogger.emit(
+            db,
+            action="user.mfa.reset",
+            ip_address=extract_ip(request),
+            user_id=current_user.id,
+            details={
+                "target_user_id": str(user_id),
+                "target_email": user.email,
+                "was_enabled": was_enabled,
+                "refresh_families_revoked": revoked_families,
+                "method": "admin_reset",
+                "onboarding_required": ["mfa"],
+            },
+            require_persistence=True,
+            commit=False,
+        )
         await db.commit()
         await db.refresh(user)
     except IntegrityError as exc:
         await db.rollback()
         raise ConflictException("Could not reset the second factor") from exc
+    except Exception:
+        await db.rollback()
+        raise
 
-    await AuditLogger.emit(
-        db,
-        action="user.mfa.reset",
-        ip_address=extract_ip(request),
-        user_id=current_user.id,
-        details={
-            "target_user_id": str(user_id),
-            "target_email": user.email,
-            "was_enabled": was_enabled,
-            "method": "admin_reset",
-            "onboarding_required": ["mfa"],
-        },
-    )
     return user
 
 
@@ -484,20 +523,24 @@ async def delete_user(
     try:
         await db.execute(sa_delete(RefreshTokenFamily).where(RefreshTokenFamily.user_id == user.id))
         await db.execute(sa_delete(User).where(User.id == user.id))
+        await AuditLogger.emit(
+            db,
+            action="user.deleted",
+            ip_address=extract_ip(request),
+            user_id=current_user.id,
+            details={
+                "target_user_id": str(user_id),
+                "target_email": target_email,
+                "method": "purge",
+            },
+            require_persistence=True,
+            commit=False,
+        )
         await db.commit()
     except IntegrityError as exc:
         await db.rollback()
         raise ConflictException("Could not delete user: account is referenced by other records") from exc
-
-    await AuditLogger.emit(
-        db,
-        action="user.deleted",
-        ip_address=extract_ip(request),
-        user_id=current_user.id,
-        details={
-            "target_user_id": str(user_id),
-            "target_email": target_email,
-            "method": "purge",
-        },
-    )
+    except Exception:
+        await db.rollback()
+        raise
     return None

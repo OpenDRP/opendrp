@@ -10,7 +10,7 @@ from app.core.audit import AuditLogger
 from app.core.exceptions import NotFoundException
 from app.models.job import Job
 from app.models.user import User
-from app.schemas.common import PaginatedResponse
+from app.schemas.common import MAX_PAGE_SIZE, PaginatedResponse
 from app.schemas.job import JobResponse
 from app.services.job_service import JobService
 
@@ -56,7 +56,7 @@ async def list_jobs(
     created_by: uuid.UUID | None = None,
     search: str | None = None,
     page: int = Query(1, ge=1),
-    size: int = Query(20, ge=1, le=200),
+    size: int = Query(20, ge=1, le=MAX_PAGE_SIZE),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_viewer_plus),
 ):
@@ -146,6 +146,8 @@ async def delete_job(
         user_id=str(current_user.id),
         ip_address=extract_ip(request),
         details=details,
+        require_persistence=True,
+        commit=False,
     )
     await db.commit()
     return None
