@@ -4,12 +4,15 @@ import axios, {
   type InternalAxiosRequestConfig,
 } from "axios";
 import type {
+  Job,
   AlertChannelsHealthResponse,
+  AssetImportReport,
   AuthSession,
   ConnectorHealthResponse,
   MfaSetup,
   MfaStatus,
   SecurityActivity,
+  SourceAccount,
   TokenResponse,
   User,
 } from "@/types/api";
@@ -32,7 +35,9 @@ const SESSION_RESTORE = { _sessionRestore: true } as AxiosRequestConfig;
 
 export const api: AxiosInstance = axios.create({
   baseURL: VITE_API_BASE_URL,
-  timeout: 20_000,
+  // Above both the default DB statement (30 s) and async command (45 s)
+  // timeouts, allowing the API to return its structured timeout response.
+  timeout: 50_000,
   withCredentials: true,
   headers: { "Content-Type": "application/json" },
 });
@@ -342,13 +347,39 @@ export const endpoints = {
       // Handled above: the local session goes either way.
     }
   },
+  scanModule: (module: string) => api.post<{ status: string; job_ids: string[]; sources: { connector: string; status: string; reason?: string }[] }>(`/modules/${encodeURIComponent(module)}/scan`).then((r) => r.data),
+  listExposure: (params: { page: number; size: number; source?: string }) => api.get("/exposure/observations", { params }).then((r) => r.data),
+  updateExposure: (id: string, status: "observed" | "investigating" | "resolved") => api.patch(`/exposure/observations/${id}`, { status }).then((r) => r.data),
+  promoteExposureObservation: (id: string) => api.post<{ already_exists: boolean; asset: { asset_value: string }; source?: string }>(`/exposure/observations/${id}/asset`).then((r) => r.data),
+  phishingEvidence: (id: string) => api.get(`/phishing/threats/${id}/evidence`).then((r) => r.data),
   dashboardStats: () => api.get("/dashboard/stats").then((r) => r.data),
+  listDNSObservations: (params: any) => api.get("/dns/observations", { params }).then((r) => r.data),
+  scanDNSSecurity: () => api.post<{ status: string; job_ids: string[]; offline_connectors: string[] }>("/dns/scan").then((r) => r.data),
+  cleanOrphanDNSObservations: () => api.post<{ status: string; deleted: number }>("/dns/observations/cleanup-orphans").then((r) => r.data),
+  promoteDNSObservation: (id: string, target?: string) => api.post<{ already_exists: boolean; asset: any; source?: string }>(`/dns/observations/${id}/asset`, { target }).then((r) => r.data),
+  deleteDNSObservation: (id: string, value?: string | null) => api.delete(`/dns/observations/${id}`, { params: { value } }).then((r) => r.data),
   connectorsHealth: () => api.get<ConnectorHealthResponse>("/connectors/health").then((r) => r.data),
   alertChannelsHealth: () => api.get<AlertChannelsHealthResponse>("/alerts/health").then((r) => r.data),
   listAssets: (params: any) => api.get("/assets", { params }).then((r) => r.data),
   createAsset: (data: any) => api.post("/assets", data).then((r) => r.data),
   updateAsset: (id: string, data: any) => api.patch(`/assets/${id}`, data).then((r) => r.data),
   deleteAsset: (id: string, cascadeFindings = false) => api.delete(`/assets/${id}`, { params: { cascade_findings: cascadeFindings } }).then(() => ({})),
+  assetFindings: (id: string, params: any) => api.get(`/assets/${id}/findings`, { params }).then((r) => r.data),
+  // WI-18: a batch in, a file out. The import report is the response body (one
+  // entry per line, so the UI can show where a failure is); the export asks for
+  // the raw body so the caller can hand it to the browser as a download.
+  importAssets: (items: unknown[], dryRun: boolean) =>
+    api.post<AssetImportReport>("/assets/import", { items, dry_run: dryRun }).then((r) => r.data),
+  importAssetsCsv: (csv: string, dryRun: boolean) =>
+    api
+      .post<AssetImportReport>("/assets/import/csv", csv, {
+        params: { dry_run: dryRun },
+        headers: { "Content-Type": "text/csv" },
+      })
+      .then((r) => r.data),
+  exportAssets: (params: any) =>
+    api.get("/assets/export", { params, responseType: "blob" }).then((r) => r.data as Blob),
+  bulkAssets: (payload: any) => api.post("/assets/bulk", payload).then((r) => r.data),
   listPhishing: (params: any) => api.get("/phishing/threats", { params }).then((r) => r.data),
   updatePhishingThreat: (id: string, data: any) => api.patch(`/phishing/threats/${id}`, data).then((r) => r.data),
   deletePhishingThreat: (id: string) => api.delete(`/phishing/threats/${id}`).then(() => ({})),
@@ -363,7 +394,7 @@ export const endpoints = {
   scanBreachDomain: (domain: string) => api.post("/breaches/scan-domain", { domain }).then((r) => r.data),
   getBreach: (id: string) => api.get(`/breaches/${id}`).then((r) => r.data),
   deleteBreach: (id: string) => api.delete(`/breaches/${id}`).then(() => ({})),
-  generateReport: (name?: string) => api.post("/reports/generate", { report_name: name ?? null }).then((r) => r.data),
+  generateReport: (name?: string) => api.post<{ status: "scheduled"; queue_state: "queued"; report_id: string; job_id: string }>("/reports/generate", { report_name: name ?? null }).then((r) => r.data),
   listReports: (params: any) => api.get("/reports", { params }).then((r) => r.data),
   downloadReportBlob: (id: string) => api.get(`/reports/${id}/download`, { responseType: "blob" }).then((r) => r.data),
   deleteReport: (id: string) => api.delete(`/reports/${id}`).then(() => ({})),
@@ -373,6 +404,8 @@ export const endpoints = {
   updateUser: (id: string, data: any) => api.put(`/users/${id}`, data).then((r) => r.data),
   deleteUser: (id: string) => api.delete(`/users/${id}`).then(() => ({})),
   listAuditLogs: (params: any) => api.get("/audit/logs", { params }).then((r) => r.data),
+  auditIntegrity: () => api.get("/audit/integrity").then((r) => r.data),
+  alertQueue: () => api.get("/alerts/queue").then((r) => r.data),
   listAuditActions: () => api.get("/audit/actions").then((r) => r.data),
   getSettings: () => api.get("/settings").then((r) => r.data),
   getRuntimeConfiguration: () => api.get("/settings/runtime").then((r) => r.data),
@@ -383,8 +416,14 @@ export const endpoints = {
   sendTestEmail: (to?: string) => api.post("/settings/test-email", { to: to ?? null }).then((r) => r.data),
   deleteJob: (id: string) => api.delete(`/jobs/${id}`).then(() => ({})),
   listJobs: (params: any) => api.get("/jobs", { params }).then((r) => r.data),
-  getJob: (id: string) => api.get(`/jobs/${id}`).then((r) => r.data),
+  getJob: (id: string) => api.get<Job>(`/jobs/${id}`).then((r) => r.data),
   listConnectors: () => api.get("/connectors").then((r) => r.data),
+  listSourceAccounts: () => api.get<SourceAccount[]>("/connectors/accounts").then((r) => r.data),
+  createSourceAccount: (data: { source_id: string; name: string; credential_ref?: string }) => api.post<{ id: string }>("/connectors/accounts", data).then((r) => r.data),
+  approveSourceAccount: (id: string, policy: { approved: boolean; requests_per_minute: number; daily_budget: number }) => api.patch<{ id: string; policy: SourceAccount["policy"] }>(`/connectors/accounts/${id}/policy`, policy).then((r) => r.data),
+  setSourceAccountApiKey: (id: string, apiKey: string) => api.put<{ id: string; has_api_key: boolean; api_key_hint: string | null }>(`/connectors/accounts/${id}/api-key`, { api_key: apiKey }).then((r) => r.data),
+  clearSourceAccountApiKey: (id: string) => api.delete<{ id: string; has_api_key: boolean; api_key_hint: string | null }>(`/connectors/accounts/${id}/api-key`).then((r) => r.data),
+  bindConnectorAccount: (connectorId: string, accountId: string) => api.patch(`/connectors/${connectorId}/account`, null, { params: { account_id: accountId } }).then((r) => r.data),
   setConnectorStatus: (id: string, status: "enabled" | "disabled") => api.patch(`/connectors/${id}/status`, { status }).then((r) => r.data),
   setConnectorConfig: (id: string, config: Record<string, unknown>) => api.patch(`/connectors/${id}/config`, config).then((r) => r.data),
 };

@@ -121,7 +121,9 @@ export default function UsersPage() {
       search: debouncedSearch || undefined,
     }),
     staleTime: 15_000,
-    placeholderData: { items: [], total: 0, page: 1, size: 20, pages: 0 },
+    // Keep the last result visible while a new page/filter is loading instead
+    // of briefly presenting an empty user directory as a real result.
+    placeholderData: (previousData) => previousData,
   });
 
   const createMut = useMutation({
@@ -390,6 +392,7 @@ export default function UsersPage() {
         const pending = [
           u.must_change_password ? "new password" : null,
           u.must_enrol_mfa ? "new second factor" : null,
+          u.mfa_required_by_policy ? "MFA required by policy" : null,
         ].filter(Boolean) as string[];
         return (
           <div className="flex flex-wrap items-center gap-1.5">
@@ -408,7 +411,7 @@ export default function UsersPage() {
               <Badge
                 variant="outline"
                 className="border-amber-500/30 text-amber-500 bg-amber-500/10"
-                title="The account has to complete this at its next sign-in; until then the API refuses everything except the onboarding page."
+                title="The account has to complete this at its next sign-in; until then the API refuses everything except the onboarding page. MFA by policy is controlled by REQUIRE_MFA_FOR_ADMINS."
               >
                 pending: {pending.join(" + ")}
               </Badge>

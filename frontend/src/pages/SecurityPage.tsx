@@ -16,7 +16,7 @@ import {
 } from "lucide-react";
 import { describeApiError, endpoints } from "@/lib/api";
 import { auditCategory, auditTone, describeAuditEntry } from "@/lib/audit";
-import { formatDateTime } from "@/lib/datetime";
+import { TIME_ZONE_HINT, formatDateTime } from "@/lib/datetime";
 import { useAuthStore } from "@/store/auth";
 import { MfaEnrolment } from "@/components/Auth/MfaEnrolment";
 import { Button } from "@/components/ui/button";
@@ -337,9 +337,9 @@ export default function SecurityPage() {
         <CardHeader>
           <CardTitle as="h2">Active sessions</CardTitle>
           <CardDescription>
-            Where this account is signed in right now. Revoke a device you no longer recognize;
-            tokens are never displayed, and a session you end appears in Recent security activity
-            below rather than staying in this list.
+            Where this account is signed in right now. {TIME_ZONE_HINT}. Revoke a device you no longer
+            recognize; tokens are never displayed, and a session you end appears in Recent security
+            activity below rather than staying in this list.
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-3">
@@ -397,8 +397,9 @@ export default function SecurityPage() {
             Recent security activity
           </CardTitle>
           <CardDescription>
-            Only events belonging to this account are shown, newest first. The line under each entry
-            is its audit action, which is what the audit log and a support request name it by.
+            Only events belonging to this account are shown, newest first. {TIME_ZONE_HINT}. The line
+            under each entry is its audit action, which is what the audit log and a support request
+            name it by.
           </CardDescription>
         </CardHeader>
         <CardContent><SecurityActivityList /></CardContent>

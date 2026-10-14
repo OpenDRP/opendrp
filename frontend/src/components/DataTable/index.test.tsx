@@ -41,6 +41,20 @@ describe("PaginatedDataTable", () => {
     expect(document.getElementById("stable-row-1")).toHaveClass("highlight");
   });
 
+  it("uses the supplied identity for RRset members across refreshes", () => {
+    const error = vi.spyOn(console, "error");
+    const members = ["one", "two"].map(name => ({ id: "rrset", name, status: "Active" }));
+    const props = { columns, rows: members, total: 2, page: 1, pageSize: 10, onPageChange: vi.fn(), onPageSizeChange: vi.fn(), storageKey: "members", getRowId: (row: TestRow) => `${row.id}:${row.name}` };
+    const { rerender } = render(<PaginatedDataTable {...props} />);
+    expect(document.getElementById("rrset:one")).toHaveTextContent("one");
+    expect(document.getElementById("rrset:two")).toHaveTextContent("two");
+    rerender(<PaginatedDataTable {...props} rows={[members[1]]} total={1} />);
+    expect(document.getElementById("rrset:one")).not.toBeInTheDocument();
+    expect(document.getElementById("rrset:two")).toHaveTextContent("two");
+    expect(error).not.toHaveBeenCalled();
+    error.mockRestore();
+  });
+
   it("renders an empty state and initial skeletons", () => {
     const { rerender } = renderTable({ rows: [], total: 0, emptyText: "Nothing here" });
     expect(screen.getByText("Nothing here")).toBeInTheDocument();
@@ -78,6 +92,28 @@ describe("PaginatedDataTable", () => {
     renderTable({ isError: true });
     expect(screen.getByRole("table", { name: "Data table" })).toBeInTheDocument();
     expect(screen.getByText("Example")).toBeInTheDocument();
+  });
+
+  it("offers only page sizes the API accepts, and still shows a client-side one as All", () => {
+    // The control used to end at `10000` while every list endpoint bounded `size`
+    // at 200: picking that option answered HTTP 422 and replaced the table with an
+    // error state. A size larger than the bound is still *shown* when a caller
+    // hands the table rows it already holds, but it is never one of the sizes the
+    // control offers.
+    const apiPage = renderTable({ pageSize: 200, total: 400 });
+    expect(screen.getByRole("combobox", { name: "Items per page" })).toHaveTextContent("200");
+    apiPage.unmount();
+
+    renderTable({ rows, total: 5, page: 1, pageSize: 10000 });
+    expect(screen.getByRole("combobox", { name: "Items per page" })).toHaveTextContent("All");
+  });
+
+  it("counts a client-side page as one page without special-casing its size", () => {
+    // `pages` used to be computed with `pageSize === 10000` spelled out, so any
+    // other client-side size would have produced an empty page list.
+    renderTable({ rows, total: 5, page: 1, pageSize: 10000 });
+    expect(screen.getByRole("button", { name: "1" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "2" })).not.toBeInTheDocument();
   });
 
   it("names every pagination control for assistive technology", () => {

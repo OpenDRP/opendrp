@@ -13,6 +13,7 @@ vi.mock("@/lib/api", () => ({
   endpoints: {
     listAuditActions: actionsMock,
     listAuditLogs: logsMock,
+    auditIntegrity: vi.fn().mockResolvedValue({ committed: { through_seq: 1 }, archive: { configured: false, hold: false }, last_verification: { at: null } }),
   },
   describeApiError: (error: any) => String(error?.message ?? error ?? ""),
 }));
@@ -57,6 +58,8 @@ describe("AuditPage", () => {
     renderPage();
     expect(await screen.findByText("Audit Log")).toBeInTheDocument();
     expect(await screen.findByText("Added asset example.com")).toBeInTheDocument();
+    expect(screen.getByText("Raw JSON / identifiers")).toBeInTheDocument();
+    expect(screen.getByText(/retention blocked/)).toBeInTheDocument();
     expect(screen.getByText("admin@example.com")).toBeInTheDocument();
     expect(logsMock).toHaveBeenCalledWith(expect.objectContaining({ page: 1, size: 20 }));
   });

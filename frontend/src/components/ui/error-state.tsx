@@ -11,7 +11,15 @@ export function ErrorState({
   onRetry?: () => void;
 }) {
   return (
-    <div className="flex flex-col items-center justify-center gap-3 rounded-lg border border-destructive/20 bg-destructive/5 px-6 py-10 text-center">
+    // `role="alert"` (an assertive live region) rather than a plain box: every
+    // caller renders this *instead of* the data, so the failure arrives without a
+    // page navigation and a screen reader would otherwise be told nothing — the
+    // table or card it replaced simply disappears. The retry button stays inside
+    // the region, so the recovery action is announced with the failure.
+    <div
+      role="alert"
+      className="flex flex-col items-center justify-center gap-3 rounded-lg border border-destructive/20 bg-destructive/5 px-6 py-10 text-center"
+    >
       <AlertTriangle className="h-8 w-8 text-destructive" aria-hidden="true" />
       <div>
         <h3 className="font-semibold">{title}</h3>

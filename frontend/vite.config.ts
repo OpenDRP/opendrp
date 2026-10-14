@@ -87,5 +87,46 @@ export default defineConfig({
     isolate: true,
     clearMocks: true,
     setupFiles: ["./src/test-setup.ts"],
+    /**
+     * Coverage is configured here rather than left to the CLI defaults, because
+     * a `--coverage` run without a config measures what the suite happened to
+     * import and enforces nothing: `npm run test:coverage` in CI passed while
+     * coverage could fall to zero, the asymmetry the backend does not have
+     * (`backend/scripts/check_critical_coverage.py` plus the 70% floor in the
+     * `backend` job).
+     *
+     * `include` is what decides the denominator. In Vitest 3+ every file
+     * matching it is measured whether or not a test imported it, so a new
+     * component with no test lowers the numbers instead of being invisible —
+     * which is the second half of the same gap. Test files, the jsdom setup and
+     * the generated type declarations are not application code and are excluded.
+     */
+    coverage: {
+      provider: "v8",
+      include: ["src/**/*.{ts,tsx}"],
+      exclude: [
+        "src/**/*.test.{ts,tsx}",
+        "src/test-setup.ts",
+        "src/types/**",
+        "src/**/*.d.ts",
+      ],
+      reporter: ["text", "json-summary"],
+      /**
+       * The rule, measured on the suite that enforces it: 72.9% statements,
+       * 72.9% branches, 59.4% functions and 77.8% lines when these were set. The
+       * thresholds sit just under those numbers rather than on them, so ordinary
+       * work does not redden the build while a real drop — a page rewritten with
+       * its tests deleted, a helper no test imports — fails `npm run test:coverage`
+       * in the `frontend` job. Function coverage is the lowest of the four because
+       * the component library's event handlers are reached through interactions
+       * only some tests perform; it is a floor, not a target.
+       */
+      thresholds: {
+        statements: 70,
+        branches: 70,
+        functions: 55,
+        lines: 75,
+      },
+    },
   },
 });

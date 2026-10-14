@@ -132,6 +132,7 @@ describe("BreachesPage", () => {
 
     expect((await screen.findAllByText("Acme Leak")).length).toBeGreaterThan(0);
     expect(screen.getByText("user@acme.test")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Rescan" })).toHaveClass("bg-primary");
     await user.click(screen.getByRole("button", { name: "Rescan" }));
     await waitFor(() => expect(scanBreachesMock).toHaveBeenCalledTimes(1));
     expect(toastMock).toHaveBeenCalledWith(
@@ -150,6 +151,7 @@ describe("BreachesPage", () => {
     renderPage();
     await screen.findAllByText("Acme Leak");
 
+    expect(screen.getByRole("button", { name: "Rescan" })).toHaveClass("bg-primary");
     await user.click(screen.getByRole("button", { name: "Rescan" }));
     await waitFor(() =>
       expect(toastMock).toHaveBeenCalledWith(
@@ -167,7 +169,7 @@ describe("BreachesPage", () => {
     await user.click(screen.getByRole("button", { name: "Confirm action" }));
     await waitFor(() => expect(deleteBreachMock).toHaveBeenCalledWith("breach-1"));
 
-    await user.click(screen.getByRole("button", { name: "Clean orphan entries" }));
+    await user.click(screen.getByRole("button", { name: "Clean orphans" }));
     await user.click(screen.getByRole("button", { name: "Confirm action" }));
     await waitFor(() => expect(cleanOrphansMock).toHaveBeenCalledTimes(1));
   });

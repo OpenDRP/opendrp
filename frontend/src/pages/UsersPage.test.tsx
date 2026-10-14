@@ -213,6 +213,19 @@ describe("UsersPage", () => {
     await waitFor(() => expect(resetUserMfaMock).toHaveBeenCalledWith("analyst-1"));
   });
 
+  it("shows deployment-required MFA in the security state", async () => {
+    listUsersMock.mockResolvedValue({
+      items: [{ ...analyst, id: "policy-admin", email: "policy-admin@example.com", role: "admin", mfa_required_by_policy: true }],
+      total: 1,
+      page: 1,
+      size: 20,
+      pages: 1,
+    });
+    renderPage();
+
+    expect(await screen.findByText("pending: MFA required by policy")).toBeInTheDocument();
+  });
+
   it("holds back the second-factor action for the administrator's own account", async () => {
     // The API refuses clearing your own factor over the API — a session that can
     // remove its own second factor is not a second factor — so the table must not

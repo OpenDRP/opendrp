@@ -9,8 +9,11 @@ import { toast } from "@/components/ui/use-toast";
 import LoginPage from "@/pages/LoginPage";
 import DashboardPage from "@/pages/DashboardPage";
 import AssetsPage from "@/pages/AssetsPage";
+import AssetDetailPage from "@/pages/AssetDetailPage";
 import PhishingPage from "@/pages/PhishingPage";
 import BreachesPage from "@/pages/BreachesPage";
+import DNSSecurityPage from "@/pages/DNSSecurityPage";
+import ExposurePage from "@/pages/ExposurePage";
 import ReportsPage from "@/pages/ReportsPage";
 import SecurityPage from "@/pages/SecurityPage";
 import OnboardingPage from "@/pages/OnboardingPage";
@@ -154,7 +157,10 @@ export default function App() {
           <Route index element={<Navigate to="/dashboard" replace />} />
           <Route path="dashboard" element={<DashboardPage />} />
           <Route path="assets" element={<AssetsPage />} />
+          <Route path="assets/:id" element={<AssetDetailPage />} />
           <Route path="phishing" element={<PhishingPage />} />
+          <Route path="dns-security" element={<DNSSecurityPage />} />
+          <Route path="exposure" element={<ExposurePage />} />
           <Route path="breaches" element={<BreachesPage />} />
           <Route path="reports" element={<ReportsPage />} />
           {/* Every role, not only administrators: an analyst's account is worth

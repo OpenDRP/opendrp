@@ -20,7 +20,7 @@ import { JobsTable } from "@/components/JobsTable";
 import { toast } from "@/components/ui/use-toast";
 import { summarizeScanJobs, waitForScanJobs } from "@/lib/scanPolling";
 
-const SOURCES: DetectionSource[] = ["dnstwist", "shodan_ssl", "shodan_title", "shodan_favicon"];
+const SOURCES: DetectionSource[] = ["dnstwist", "shodan_ssl", "shodan_title", "shodan_favicon", "netlas"];
 const STATUSES: ThreatStatus[] = ["active", "investigating", "resolved"];
 
 /** Human-readable label for the detection source of a finding. */
@@ -34,6 +34,17 @@ const statusTone: Record<ThreatStatus, string> = {
   resolved: "bg-green-500/15 text-green-500 border-green-500/30",
 };
 
+function CandidateEvidence({ id }: { id: string }) {
+  const [open, setOpen] = useState(false);
+  const query = useQuery({ queryKey: ["phishing-evidence", id], queryFn: () => endpoints.phishingEvidence(id), enabled: open });
+  return <div className="text-xs"><Button size="sm" variant="ghost" onClick={() => setOpen(!open)} aria-expanded={open}>Source evidence</Button>
+    {open && <div className="space-y-1">
+      <p className="text-muted-foreground">Matches are candidates, not verified malicious verdicts.</p>
+      {query.isLoading ? <p>Loading evidence…</p> : query.isError ? <p>Evidence could not be loaded.</p> : query.data?.items.length ? query.data.items.map((e: { source: string; matched_asset: string; observed_at: string | null; first_seen_at: string; last_seen_at: string }, i: number) => <p key={i}>{e.source} · {e.matched_asset} · provider: {e.observed_at ? formatDateTime(e.observed_at) : "unknown"} · first: {formatDateTime(e.first_seen_at)} · last: {formatDateTime(e.last_seen_at)}</p>) : <p>No recorded source evidence.</p>}
+    </div>}
+  </div>;
+}
+
 export default function PhishingPage() {
   const canWrite = useIsAnalystPlus();
   const isAdmin = useIsAdmin();
@@ -42,6 +53,7 @@ export default function PhishingPage() {
   // declare, so a connector added later appears without a frontend change.
   const moduleJobTypes = useModuleJobTypes("phishing");
 
+  const [findingId] = useState(() => new URLSearchParams(window.location.search).get("finding_id") || undefined);
   const [page, setPage] = useState(1);
   const [size, setSize] = useState(20);
   const [search, setSearch] = useState("");
@@ -54,9 +66,9 @@ export default function PhishingPage() {
   const [cleanOrphansOpen, setCleanOrphansOpen] = useState(false);
 
   const { data, isLoading, isError, refetch, isFetching } = useQuery({
-    queryKey: ["phishing", page, size, debouncedSearch, sourceFilter, statusFilter],
+    queryKey: ["phishing", findingId, page, size, debouncedSearch, sourceFilter, statusFilter],
     queryFn: () => endpoints.listPhishing({
-      page, size, detection_source: sourceFilter, status: statusFilter, search: debouncedSearch || undefined,
+      finding_id: findingId, page, size, detection_source: sourceFilter, status: statusFilter, search: debouncedSearch || undefined,
     }),
     staleTime: 15_000,
     placeholderData: { items: [], total: 0, page: 1, size: 20, pages: 0 },
@@ -88,27 +100,17 @@ export default function PhishingPage() {
   });
 
   const scanMut = useMutation({
-    // One request per registered phishing connector; the core stays agnostic
-    // about which connectors exist, so wording stays source-independent.
+    // Registry owns fan-out and per-source admission, not this UI.
     mutationFn: async () => {
-      const started = await Promise.allSettled([endpoints.scanDnstwist(), endpoints.scanShodan()]);
-      const jobIds = started.flatMap((result) => result.status === "fulfilled" ? (result.value.job_ids ?? []) : []);
-      const jobs = jobIds.length ? await waitForScanJobs(jobIds) : [];
-      return { started, jobs };
+      const result = await endpoints.scanModule("phishing");
+      const jobs = result.job_ids.length ? await waitForScanJobs(result.job_ids) : [];
+      return { result, jobs };
     },
-    onSuccess: ({ started, jobs }) => {
+    onSuccess: ({ result, jobs }) => {
       qc.invalidateQueries({ queryKey: ["phishing"] });
-      const results = started;
-      const succeeded = results.filter((r) => r.status === "fulfilled" && r.value?.status === "scheduled").length;
-      const reasons = results
-        .filter((r): r is PromiseRejectedResult => r.status === "rejected")
-        // Surface the API reason (rate limit, no connector registered, …)
-        // instead of a generic failure so the operator knows what to do.
-        .map((r) => describeApiError(r.reason))
-        .concat(results
-          .filter((r): r is PromiseFulfilledResult<any> => r.status === "fulfilled" && r.value?.status !== "scheduled")
-          .map((r) => r.value?.error || "No connector is enabled for this scan."))
-        .filter(Boolean);
+      const succeeded = result.job_ids.length;
+      const reasons = result.sources.filter(source => source.status !== "queued" && source.status !== "disabled")
+        .map(source => `${source.connector}: ${source.reason || source.status}`);
       const jobSummary = summarizeScanJobs(jobs);
       if (succeeded && !reasons.length && (jobSummary.pending > 0 || jobs.length === 0)) {
         toast({ title: "Rescan started", description: "Phishing source scans queued. Progress is in Jobs history below." });
@@ -173,6 +175,12 @@ export default function PhishingPage() {
           </Badge>
         </div>
       ),
+    },
+    {
+      key: "evidence",
+      title: "Evidence",
+      minWidth: 200,
+      render: t => <CandidateEvidence id={t.id} />,
     },
     {
       key: "ip_address",
@@ -240,13 +248,13 @@ export default function PhishingPage() {
 
   return (
     <div className="space-y-6">
-      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-        <div>
+      <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
+        <div className="min-w-0 flex-1 max-w-2xl">
           <h1 className="text-2xl font-bold">Phishing Threats</h1>
           <p className="text-muted-foreground text-sm mt-1">Look-alike domains, certificate abuse and impersonation sites matched against your monitored assets.</p>
           <p className="text-xs text-muted-foreground mt-1">{TIME_ZONE_HINT}</p>
         </div>
-        <div className="flex flex-wrap gap-2">
+        <div className="flex shrink-0 flex-nowrap gap-2 overflow-x-auto">
           <Button variant="outline" onClick={() => refetch()} disabled={isFetching}>
             <RefreshCw className={`w-4 h-4 mr-2 ${isFetching ? "animate-spin" : ""}`} />
             Refresh
@@ -254,11 +262,11 @@ export default function PhishingPage() {
           {isAdmin && (
             <Button variant="outline" onClick={() => setCleanOrphansOpen(true)}>
               <Eraser className="w-4 h-4 mr-2" />
-              Clean orphan entries
+              Clean orphans
             </Button>
           )}
           {canWrite && (
-            <Button variant="outline" onClick={() => scanMut.mutate()} disabled={scanMut.isPending}>
+            <Button onClick={() => scanMut.mutate()} disabled={scanMut.isPending}>
               <Rocket className={`w-4 h-4 mr-2 ${scanMut.isPending ? "animate-pulse" : ""}`} />
               {scanMut.isPending ? "Starting..." : "Rescan"}
             </Button>

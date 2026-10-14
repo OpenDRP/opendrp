@@ -95,6 +95,59 @@ describe("describeAuditEntry", () => {
     ).toBe("Finding marked as resolved (was active)");
   });
 
+  it("describes an asset change by what changed, not by what was asked for", () => {
+    // The trail records the row's own before/after values, so the sentence can
+    // name the value that moved — including a canonicalization the request never
+    // mentioned. It used to render "Updated asset <uuid>".
+    expect(
+      describeAuditEntry({
+        action: "asset.update",
+        details: {
+          asset_value: "example.com",
+          changed_fields: ["criticality"],
+          changes: { criticality: { from: "medium", to: "high" } },
+        },
+      }),
+    ).toBe("Updated asset example.com — criticality: medium → high");
+    expect(
+      describeAuditEntry({ action: "asset.update", details: { asset_value: "example.com" } }),
+    ).toBe("Updated asset example.com");
+  });
+
+  it("describes the inventory events an operator otherwise reads as codes", () => {
+    expect(
+      describeAuditEntry({ action: "asset.list", details: { results: 12, search_used: true } }),
+    ).toBe("Viewed the asset inventory (12 assets), filtered");
+    expect(describeAuditEntry({ action: "asset.list", details: { results: 1 } })).toBe(
+      "Viewed the asset inventory (1 asset)",
+    );
+    expect(
+      describeAuditEntry({ action: "asset.view", details: { asset_value: "example.com" } }),
+    ).toBe("Viewed asset example.com");
+    expect(
+      describeAuditEntry({
+        action: "dns_security.asset.promoted",
+        details: { asset_type: "domain", asset_id: "a-1" },
+      }),
+    ).toBe("Added the domain asset observed by DNS Security");
+    expect(
+      describeAuditEntry({
+        action: "exposure.asset.already_exists",
+        details: { asset_type: "ip_address" },
+      }),
+    ).toBe("No change — the ip_address asset from Exposure was already monitored");
+    expect(
+      describeAuditEntry({
+        action: "asset.findings.list",
+        details: { asset_value: "example.com", module: "dns_security", counts: { total: 3 } },
+      }),
+    ).toBe("Viewed the findings of asset example.com — dns security tab, involved in 3 findings");
+    // The counters are optional detail: the action still reads as a sentence.
+    expect(
+      describeAuditEntry({ action: "asset.findings.list", details: { asset_value: "example.com" } }),
+    ).toBe("Viewed the findings of asset example.com");
+  });
+
   it("keeps the values of an action it does not know", () => {
     // The graceful path: a module or connector added later still produces a
     // readable line, never a bare code and never nothing at all.

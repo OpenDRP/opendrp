@@ -7,16 +7,16 @@ import { useAuthStore } from "@/store/auth";
 
 const {
   listPhishingMock,
-  scanDnstwistMock,
-  scanShodanMock,
+  evidenceMock,
+  scanModuleMock,
   updatePhishingMock,
   deletePhishingMock,
   cleanOrphansMock,
   toastMock,
 } = vi.hoisted(() => ({
   listPhishingMock: vi.fn(),
-  scanDnstwistMock: vi.fn(),
-  scanShodanMock: vi.fn(),
+  evidenceMock: vi.fn(),
+  scanModuleMock: vi.fn(),
   updatePhishingMock: vi.fn(),
   deletePhishingMock: vi.fn(),
   cleanOrphansMock: vi.fn(),
@@ -26,8 +26,8 @@ const {
 vi.mock("@/lib/api", () => ({
   endpoints: {
     listPhishing: listPhishingMock,
-    scanDnstwist: scanDnstwistMock,
-    scanShodan: scanShodanMock,
+    phishingEvidence: evidenceMock,
+    scanModule: scanModuleMock,
     updatePhishingThreat: updatePhishingMock,
     deletePhishingThreat: deletePhishingMock,
     cleanOrphanPhishing: cleanOrphansMock,
@@ -95,12 +95,12 @@ describe("PhishingPage", () => {
       size: 20,
       pages: 1,
     });
-    scanDnstwistMock.mockReset().mockResolvedValue({ status: "scheduled", job_ids: ["dnstwist-job"] });
-    scanShodanMock.mockReset().mockResolvedValue({ status: "scheduled", job_ids: ["shodan-job"] });
+    scanModuleMock.mockReset().mockResolvedValue({ status: "scheduled", job_ids: ["dnstwist-job", "netlas-job"], sources: [{ connector: "dnstwist", status: "queued" }, { connector: "netlas-phishing", status: "queued" }] });
     updatePhishingMock.mockReset().mockResolvedValue({});
     deletePhishingMock.mockReset().mockResolvedValue({});
     cleanOrphansMock.mockReset().mockResolvedValue({ deleted: 2 });
     toastMock.mockReset();
+    evidenceMock.mockReset().mockResolvedValue({ items: [{ source: "netlas", matched_asset: "example.com", observed_at: null, first_seen_at: "2026-01-01T00:00:00Z", last_seen_at: "2026-01-02T00:00:00Z" }] });
     useAuthStore.getState().clearAuth();
     useAuthStore.setState({
       user: {
@@ -117,29 +117,40 @@ describe("PhishingPage", () => {
     });
   });
 
-  it("loads threats and starts both connector scans", async () => {
+  it("loads threats and requests registry-driven scans including new providers", async () => {
     const user = userEvent.setup();
     renderPage();
 
     expect(await screen.findByText("evil-example.com")).toBeInTheDocument();
     expect(screen.getByText("example.com")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Rescan" })).toHaveClass("bg-primary");
     await user.click(screen.getByRole("button", { name: "Rescan" }));
 
     await waitFor(() => {
-      expect(scanDnstwistMock).toHaveBeenCalledTimes(1);
-      expect(scanShodanMock).toHaveBeenCalledTimes(1);
+      expect(scanModuleMock).toHaveBeenCalledTimes(1);
+      expect(scanModuleMock).toHaveBeenCalledWith("phishing");
     });
     expect(toastMock).toHaveBeenCalledWith(
       expect.objectContaining({ title: "Rescan started" }),
     );
   });
 
+  it("loads corroborating source evidence on demand", async () => {
+    renderPage();
+    await screen.findByText("evil-example.com");
+    expect(evidenceMock).not.toHaveBeenCalled();
+    await userEvent.click(screen.getByRole("button", { name: "Source evidence" }));
+    await waitFor(() => expect(evidenceMock).toHaveBeenCalledWith(threat.id));
+    expect(await screen.findByText(/netlas · example.com/)).toBeInTheDocument();
+  });
+
   it("reports a partial connector scan failure", async () => {
     const user = userEvent.setup();
-    scanShodanMock.mockRejectedValueOnce(new Error("Shodan unavailable"));
+    scanModuleMock.mockResolvedValueOnce({ status: "scheduled", job_ids: ["dnstwist-job"], sources: [{ connector: "dnstwist", status: "queued" }, { connector: "netlas-phishing", status: "offline" }] });
     renderPage();
     await screen.findByText("evil-example.com");
 
+    expect(screen.getByRole("button", { name: "Rescan" })).toHaveClass("bg-primary");
     await user.click(screen.getByRole("button", { name: "Rescan" }));
     await waitFor(() =>
       expect(toastMock).toHaveBeenCalledWith(
@@ -153,15 +164,11 @@ describe("PhishingPage", () => {
 
   it("surfaces the per-connector rate limit reason on a blocked rescan", async () => {
     const user = userEvent.setup();
-    scanShodanMock.mockRejectedValueOnce({
-      response: {
-        status: 429,
-        data: { detail: "Rate limit: phishing rescan (shodan) is limited ..." },
-      },
-    });
+    scanModuleMock.mockResolvedValueOnce({ status: "scheduled", job_ids: ["dnstwist-job"], sources: [{ connector: "dnstwist", status: "queued" }, { connector: "netlas-phishing", status: "blocked", reason: "Rate limit: source budget exhausted" }] });
     renderPage();
     await screen.findByText("evil-example.com");
 
+    expect(screen.getByRole("button", { name: "Rescan" })).toHaveClass("bg-primary");
     await user.click(screen.getByRole("button", { name: "Rescan" }));
     await waitFor(() =>
       expect(toastMock).toHaveBeenCalledWith(
@@ -184,7 +191,7 @@ describe("PhishingPage", () => {
     await user.click(screen.getByRole("button", { name: "Confirm action" }));
     await waitFor(() => expect(deletePhishingMock).toHaveBeenCalledWith("threat-1"));
 
-    await user.click(screen.getByRole("button", { name: "Clean orphan entries" }));
+    await user.click(screen.getByRole("button", { name: "Clean orphans" }));
     await user.click(screen.getByRole("button", { name: "Confirm action" }));
     await waitFor(() => expect(cleanOrphansMock).toHaveBeenCalledTimes(1));
   });

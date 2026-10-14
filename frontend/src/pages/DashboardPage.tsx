@@ -95,7 +95,9 @@ function HealthCard({ item, icon: Icon }: { item: ConnectorHealth | AlertChannel
         )}
         {"last_checked_at" in item && (
           <div className="text-xs text-muted-foreground">
-            Last checked: <span className="font-mono text-foreground">{formatDateTime(item.last_checked_at)}</span>
+            {item.last_checked_at ? (
+              <>Last checked: <span className="font-mono text-foreground">{formatDateTime(item.last_checked_at)}</span></>
+            ) : "Probe not run while channel is disabled"}
           </div>
         )}
       </CardContent>
@@ -187,7 +189,7 @@ export default function DashboardPage() {
     { label: "Monitored assets", value: data?.kpi.total_assets ?? 0, icon: ListTree, tone: "text-green-500", bg: "bg-green-500/10" },
     { label: "Phishing findings", value: data?.kpi.total_phishing ?? 0, icon: ShieldAlert, tone: "text-orange-500", bg: "bg-orange-500/10" },
     { label: "Breach matches", value: data?.kpi.total_breaches ?? 0, icon: AlertTriangle, tone: "text-red-500", bg: "bg-red-500/10" },
-    { label: "Active threats (7d)", value: data?.kpi.active_threats_7d ?? 0, icon: Activity, tone: "text-blue-500", bg: "bg-blue-500/10" },
+    { label: "Active phishing and breach threats (7d)", value: data?.kpi.active_threats_7d ?? 0, icon: Activity, tone: "text-blue-500", bg: "bg-blue-500/10" },
   ];
 
   const refreshAll = () => {

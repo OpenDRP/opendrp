@@ -49,6 +49,12 @@ export const FALLBACK_MODULE_JOB_TYPES = {
   phishing: ["phishing.dnstwist", "phishing.shodan"],
   breaches: ["breaches.hibp"],
   reports: ["report.generate"],
+  dns: [
+    "dns.rdap",
+    "dns.resolver",
+    "dns.ctlogs",
+    "dns.virustotal",
+  ],
 } as const;
 
 const JOB_TYPE_LABELS: Record<string, string> = {

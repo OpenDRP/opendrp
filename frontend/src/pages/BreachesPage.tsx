@@ -41,6 +41,7 @@ export default function BreachesPage() {
   // Declared by the registered breach connectors, not by this page.
   const moduleJobTypes = useModuleJobTypes("breaches");
 
+  const [findingId] = useState(() => new URLSearchParams(window.location.search).get("finding_id") || undefined);
   const [page, setPage] = useState(1);
   const [size, setSize] = useState(20);
   const [search, setSearch] = useState("");
@@ -52,8 +53,8 @@ export default function BreachesPage() {
   const [highlightedBreachName, setHighlightedBreachName] = useState<string | null>(null);
 
   const { data, isLoading, isError, refetch, isFetching } = useQuery({
-    queryKey: ["breaches", page, size, debouncedSearch],
-    queryFn: () => endpoints.listBreaches({ page, size, search: debouncedSearch || undefined }),
+    queryKey: ["breaches", findingId, page, size, debouncedSearch],
+    queryFn: () => endpoints.listBreaches({ finding_id: findingId, page, size, search: debouncedSearch || undefined }),
     staleTime: 30_000,
     placeholderData: { items: [], total: 0, page: 1, size: 20, pages: 0 },
   });
@@ -112,7 +113,8 @@ export default function BreachesPage() {
   const detailsRows = useMemo(() => {
     const grouped = new Map<string, Breach>();
     for (const breach of data?.items ?? []) {
-      if (!grouped.has(breach.breach_name)) grouped.set(breach.breach_name, breach);
+      const key = `${breach.source_id ?? "unattributed"}:${breach.breach_name}`;
+      if (!grouped.has(key)) grouped.set(key, breach);
     }
     return Array.from(grouped.values());
   }, [data?.items]);
@@ -223,7 +225,7 @@ export default function BreachesPage() {
         <button
           type="button"
           className="font-semibold text-sm text-left truncate max-w-full underline-offset-4 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring rounded"
-          onClick={() => jumpToDetails(b.breach_name)}
+          onClick={() => jumpToDetails(`${b.source_id ?? "unattributed"}:${b.breach_name}`)}
           aria-label={`Show details for ${b.breach_name}`}
         >
           {b.breach_name}
@@ -289,13 +291,13 @@ export default function BreachesPage() {
 
   return (
     <div className="space-y-6">
-      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-        <div>
+      <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
+        <div className="min-w-0 flex-1 max-w-2xl">
           <h1 className="text-2xl font-bold">Breaches</h1>
           <p className="text-muted-foreground text-sm mt-1">Leaked-credential and account-compromise findings matched against your monitored mailboxes and domains.</p>
           <p className="text-xs text-muted-foreground mt-1">{TIME_ZONE_HINT}</p>
         </div>
-        <div className="flex gap-2">
+        <div className="flex shrink-0 flex-nowrap gap-2 overflow-x-auto">
           <Button variant="outline" onClick={() => refetch()} disabled={isFetching}>
             <RefreshCw className={`w-4 h-4 mr-2 ${isFetching ? "animate-spin" : ""}`} />
             Refresh
@@ -303,11 +305,11 @@ export default function BreachesPage() {
           {isAdmin && (
             <Button variant="outline" onClick={() => setCleanOrphansOpen(true)}>
               <Eraser className="w-4 h-4 mr-2" />
-              Clean orphan entries
+              Clean orphans
             </Button>
           )}
           {canWrite && (
-            <Button variant="outline" onClick={() => scanMut.mutate()} disabled={scanMut.isPending}>
+            <Button onClick={() => scanMut.mutate()} disabled={scanMut.isPending}>
               <Rocket className={`w-4 h-4 mr-2 ${scanMut.isPending ? "animate-pulse" : ""}`} />
               {scanMut.isPending ? "Starting..." : "Rescan"}
             </Button>
@@ -355,7 +357,7 @@ export default function BreachesPage() {
         <CardHeader>
           <CardTitle className="text-base">Breach details</CardTitle>
           <CardDescription>
-            Breach metadata reported by the configured source connectors, grouped by breach name.
+            Breach metadata reported by the configured source connectors, grouped by source and incident name; different providers remain separate.
             {detailsRows.length < (data?.items?.length ?? 0)
               ? ` Showing ${detailsRows.length} distinct breach(es) from the ${data?.items?.length ?? 0} matches on this page.`
               : ""}
@@ -364,6 +366,7 @@ export default function BreachesPage() {
         <CardContent className="p-4">
           <PaginatedDataTable
             columns={[
+              { key: "source_id", title: "Source", width: 130, render: (b: Breach) => <span>{b.source_id ?? "unattributed"}</span> },
               { key: "breach_name", title: "Breach Name", width: 220, minWidth: 180, render: (b: Breach) => <span className="font-semibold text-sm">{b.breach_name}</span> },
               { key: "breach_date", title: "Breach date", width: 150, minWidth: 130, render: (b: Breach) => <div className="flex items-center gap-1.5 text-sm text-muted-foreground"><Calendar className="w-3.5 h-3.5" />{formatDate(b.breach_date)}</div> },
               { key: "domain", title: "Domain", width: 180, minWidth: 140, render: (b: Breach) => <span className="font-mono text-sm truncate">{b.domain || "—"}</span> },
@@ -387,8 +390,8 @@ export default function BreachesPage() {
             ariaLabel="Breach details"
             loading={isLoading}
             emptyText="No breach details available."
-            getRowId={(b) => `breach-detail-${encodeURIComponent(b.breach_name)}`}
-            getRowClassName={(b) => highlightedBreachName === b.breach_name ? "bg-primary/10 ring-2 ring-inset ring-primary/40" : undefined}
+            getRowId={(b) => `breach-detail-${encodeURIComponent(`${b.source_id ?? "unattributed"}:${b.breach_name}`)}`}
+            getRowClassName={(b) => highlightedBreachName === `${b.source_id ?? "unattributed"}:${b.breach_name}` ? "bg-primary/10 ring-2 ring-inset ring-primary/40" : undefined}
           />
         </CardContent>
       </Card>

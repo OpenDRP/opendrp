@@ -1,6 +1,28 @@
 export type UserRole = "admin" | "analyst" | "viewer";
 export type AssetType = "domain" | "ip_address" | "email_account" | "keyword_domain" | "keyword_title";
 export type AssetCriticality = "low" | "medium" | "high" | "critical";
+export type DNSObservationSource = "rdap" | "resolver" | "ctlogs" | "virustotal" | "netlas";
+
+export interface DNSObservation {
+  id: string;
+  observation_type: "dns_record" | "rdap" | "certificate" | "certificate_check" | "vt_subdomain" | "vt_resolution";
+  subject: string;
+  record_type?: string | null;
+  value?: string | null;
+  source: DNSObservationSource;
+  first_seen_at: string;
+  last_seen_at: string;
+  expires_at?: string | null;
+  status: "current" | "historical" | "expired" | "unknown";
+  metadata: Record<string, unknown>;
+  alerted_thresholds: number[];
+  evidence_count: number;
+  subject_in_assets: boolean;
+  value_asset_target?: string | null;
+  value_in_assets: boolean;
+  expiry_kind?: "registration" | "certificate" | "dns_cache" | "unknown";
+  expiry_monitor?: { kind: string; state: string; checked_at: string; successful_at: string | null; expires_at: string | null; certificate_id: string | null; not_before: string | null; remaining_seconds: number | null } | null;
+}
 
 export interface User {
   id: string;
@@ -94,6 +116,24 @@ export interface MfaSetup {
   period_seconds: number;
 }
 
+/**
+ * What the platform holds about one asset, per module (WI-20).
+ *
+ * The counters come from the backend's single matching rule, so a number here
+ * and the tab counters on the asset page are the same number. `last_seen` is ISO
+ * text per module: a breach reports a disclosure date while a scan reports a
+ * timestamp, and the two are never compared.
+ */
+export interface AssetFindingSummary {
+  total: number;
+  phishing: number;
+  breaches: number;
+  dns: number;
+  exposure: number;
+  findings: number;
+  last_seen: Partial<Record<string, string | null>>;
+}
+
 export interface Asset {
   id: string;
   asset_type: AssetType;
@@ -103,9 +143,70 @@ export interface Asset {
   is_active: boolean;
   created_at: string;
   updated_at: string;
+  /** Present on list rows (WI-20); absent on a create/update response. */
+  findings?: AssetFindingSummary | null;
 }
 
-export type DetectionSource = "dnstwist" | "shodan_ssl" | "shodan_title" | "shodan_favicon";
+/** The modules whose findings can name an asset, in the order the view shows them. */
+export type RelatedFindingModule = "phishing" | "breaches" | "dns" | "exposure" | "findings";
+
+/**
+ * One finding that names an asset, in the uniform shape the asset view returns
+ * for every module (each module's own list endpoint serves its full payload).
+ */
+export interface AssetRelatedFinding {
+  id: string;
+  module: RelatedFindingModule;
+  title: string;
+  matched_asset: string | null;
+  source: string | null;
+  status: string | null;
+  observed_at: string | null;
+}
+
+/**
+ * One line of an import report (WI-18). Every line the file contained has an
+ * entry, so a failure always names the row it belongs to.
+ */
+export interface AssetImportRowReport {
+  line: number;
+  outcome: "created" | "duplicate" | "invalid";
+  asset_type: string | null;
+  asset_value: string | null;
+  detail: string | null;
+}
+
+export interface AssetImportReport {
+  dry_run: boolean;
+  created: number;
+  duplicate: number;
+  invalid: number;
+  rows: AssetImportRowReport[];
+}
+
+export interface AssetBulkResult {
+  operation: "activate" | "deactivate" | "criticality" | "delete";
+  requested: number;
+  applied: number;
+  missing: string[];
+  cascade_findings: boolean;
+  findings_deleted: Record<string, number>;
+}
+
+export interface AssetFindingsResponse {
+  asset: { id: string; asset_type: AssetType; asset_value: string; is_active: boolean };
+  counts: Record<RelatedFindingModule, number> & { total: number };
+  /** When each module last saw a finding about this asset, as ISO text (WI-20). */
+  last_seen?: Partial<Record<string, string | null>>;
+  module: RelatedFindingModule;
+  items: AssetRelatedFinding[];
+  total: number;
+  page: number;
+  size: number;
+  pages: number;
+}
+
+export type DetectionSource = string;
 export type ThreatStatus = "active" | "investigating" | "resolved";
 
 export interface PhishingThreat {
@@ -131,6 +232,7 @@ export interface PhishingThreat {
  */
 export interface Breach {
   id: string;
+  source_id?: string;
   breach_name: string;
   title: string;
   domain: string;
@@ -186,6 +288,7 @@ export interface RuntimeConfiguration {
 
 export interface SystemSettings {
   id: string;
+  version: number;
   telegram_bot_token?: string;
   smtp_host?: string;
   smtp_port?: number;
@@ -200,6 +303,9 @@ export interface SystemSettings {
   telegram_chat_ids?: string[];
   schedule_phishing?: { days: number[]; hour: number; minute: number } | null;
   schedule_breaches?: { days: number[]; hour: number; minute: number } | null;
+  schedule_dns_security?: { days: number[]; hour: number; minute: number } | null;
+  schedule_exposure?: { days: number[]; hour: number; minute: number } | null;
+  schedules?: Record<string, { days: number[]; hour: number; minute: number } | null> | null;
   created_at: string;
   updated_at: string;
 }
@@ -211,6 +317,7 @@ export interface ConnectorHealth {
   connector_type: string;
   status: "enabled" | "disabled";
   health: HealthState;
+  online?: boolean;
   last_seen_at?: string | null;
   last_error?: string | null;
   info?: Record<string, unknown> | null;
@@ -242,6 +349,17 @@ export interface ConnectorManifest {
   config_schema: Record<string, ConnectorConfigField>;
 }
 
+export interface SourceAccount {
+  id: string;
+  source_id: string;
+  name: string;
+  credential_ref?: string | null;
+  policy: { approved: boolean; requests_per_minute?: number; daily_budget?: number };
+  access_state: string;
+  has_api_key?: boolean;
+  api_key_hint?: string | null;
+}
+
 export interface Connector {
   id: string;
   name: string;
@@ -253,6 +371,11 @@ export interface Connector {
   config?: Record<string, unknown> | null;
   last_seen_at?: string | null;
   last_error?: string | null;
+  provider?: string | null;
+  source_account_id?: string | null;
+  quota_group?: string | null;
+  readiness?: { credentials_configured: boolean; credential_state: string; provider_error?: string | null; capabilities: string[] } | null;
+  last_success_at?: string | null;
   info?: Record<string, unknown> | null;
   /** Credential state. The secret itself never leaves the core. */
   has_token?: boolean;
@@ -351,7 +474,8 @@ export interface AlertChannelHealth {
   health: HealthState;
   message: string;
   latency_ms?: number | null;
-  last_checked_at: string;
+  /** Null when the channel is disabled and no probe was performed. */
+  last_checked_at: string | null;
 }
 
 export interface AlertChannelsHealthResponse {

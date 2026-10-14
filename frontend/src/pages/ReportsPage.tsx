@@ -1,5 +1,5 @@
-import { useState } from "react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useEffect, useState } from "react";
+import { useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 import { RefreshCw, FileBarChart, Play, Download, Trash2, Clock, CheckCircle, XCircle, Loader2, Info } from "lucide-react";
 import { describeApiError, endpoints } from "@/lib/api";
 import { useAuthStore, useIsAdmin, useIsAuthenticated } from "@/store/auth";
@@ -7,7 +7,7 @@ import { formatNumber } from "@/lib/utils";
 import { useModuleJobTypes } from "@/hooks/useModuleJobTypes";
 import { JobsTable } from "@/components/JobsTable";
 import { TIME_ZONE_HINT, formatDateTime } from "@/lib/datetime";
-import type { Paginated, Report, ReportStatus } from "@/types/api";
+import type { Job, Paginated, Report, ReportStatus } from "@/types/api";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -46,6 +46,33 @@ export default function ReportsPage() {
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [deletingReport, setDeletingReport] = useState<Report | null>(null);
   const [downloadingId, setDownloadingId] = useState<string | null>(null);
+  const [generationJobIds, setGenerationJobIds] = useState<string[]>([]);
+
+  const generationJobs = useQueries({
+    queries: generationJobIds.map((jobId) => ({
+      queryKey: ["report-generation-job", jobId],
+      queryFn: () => endpoints.getJob(jobId),
+      refetchInterval: 3000,
+    })),
+  });
+
+  useEffect(() => {
+    const completed = generationJobs
+      .map((query, index) => ({ jobId: generationJobIds[index], job: query.data }))
+      .filter((item): item is { jobId: string; job: Job } => Boolean(item.job && ["success", "partial", "error", "cancelled", "skipped"].includes(item.job.status)));
+    if (!completed.length) return;
+
+    const completedIds = new Set(completed.map(({ jobId }) => jobId));
+    setGenerationJobIds((current) => current.filter((jobId) => !completedIds.has(jobId)));
+    for (const { job } of completed) {
+      qc.invalidateQueries({ queryKey: ["reports"] });
+      if (job.status === "success" || job.status === "partial") {
+        toast({ title: "Report is ready" });
+      } else {
+        toast({ variant: "destructive", title: "Report generation failed", description: job.error_message || "The report job ended without a PDF." });
+      }
+    }
+  }, [generationJobs, generationJobIds, qc]);
 
   const { data, isLoading, isError, refetch, isFetching } = useQuery<Paginated<Report>>({
     queryKey: ["reports", page, size],
@@ -54,7 +81,7 @@ export default function ReportsPage() {
     placeholderData: { items: [], total: 0, page: 1, size: 50, pages: 0 },
     refetchInterval: (q) => {
       const state = q.state.data;
-      return state && state.items.some((r) => r.status === "generating" || r.status === "pending") ? 3000 : false;
+      return generationJobIds.length > 0 || (state && state.items.some((r) => r.status === "generating" || r.status === "pending")) ? 3000 : false;
     },
   });
 
@@ -62,7 +89,8 @@ export default function ReportsPage() {
     mutationFn: () => endpoints.generateReport(),
     onSuccess: (r) => {
       qc.invalidateQueries({ queryKey: ["reports"] });
-      toast({ title: "Report generation started", description: `ETA ~${r.estimated_seconds}s · ID ${r.report_id.slice(0, 8)}` });
+      if (r.job_id) setGenerationJobIds((current) => current.includes(r.job_id) ? current : [...current, r.job_id]);
+      toast({ title: "Report queued", description: `ID ${r.report_id.slice(0, 8)} · status will update automatically` });
     },
     onError: (e: any) => {
       toast({
@@ -75,7 +103,12 @@ export default function ReportsPage() {
 
   const deleteMut = useMutation({
     mutationFn: (id: string) => endpoints.deleteReport(id),
-    onSuccess: () => { qc.invalidateQueries({ queryKey: ["reports"] }); toast({ title: "Report deleted" }); },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["reports"] });
+      setDeleteOpen(false);
+      setDeletingReport(null);
+      toast({ title: "Report deleted" });
+    },
     onError: (e: any) => toast({ variant: "destructive", title: "Delete failed", description: describeApiError(e) }),
   });
 
@@ -94,7 +127,9 @@ export default function ReportsPage() {
       document.body.appendChild(a);
       a.click();
       a.remove();
-      URL.revokeObjectURL(url);
+      // Give the browser time to consume the object URL after the synthetic
+      // anchor click; revoking synchronously can cancel downloads in some engines.
+      window.setTimeout(() => URL.revokeObjectURL(url), 1000);
       toast({ title: "Download started" });
     } catch (e: any) {
       toast({
@@ -302,21 +337,30 @@ export default function ReportsPage() {
 
       <ConfirmDialog
         open={deleteOpen}
-        onOpenChange={setDeleteOpen}
+        onOpenChange={(open) => {
+          if (!open && deleteMut.isPending) return;
+          setDeleteOpen(open);
+          if (!open) setDeletingReport(null);
+        }}
         variant="destructive"
         title="Delete report?"
         description={deletingReport ? (
-          <>You are about to permanently delete report <span className="font-semibold">{deletingReport.report_name}</span>. This action cannot be undone.</>
+          <>
+            You are about to permanently delete report <span className="font-semibold">{deletingReport.report_name}</span>. This action cannot be undone.
+            {(deletingReport.status === "pending" || deletingReport.status === "generating") && " The queued/running generation will be marked deleted; a worker may take time to stop and clean up its output."}
+          </>
         ) : "This action cannot be undone."}
-        confirmLabel="Delete report"
+        confirmLabel={deleteMut.isPending ? "Deleting..." : "Delete report"}
         confirmLoading={deleteMut.isPending}
         onConfirm={() => {
           if (deletingReport) deleteMut.mutate(deletingReport.id);
-          setDeleteOpen(false);
-          setDeletingReport(null);
         }}
         onCancel={() => setDeletingReport(null)}
-      />
+      >
+        {deleteMut.isError && (
+          <p role="alert" className="text-sm text-destructive">{describeApiError(deleteMut.error)}</p>
+        )}
+      </ConfirmDialog>
     </div>
   );
 }

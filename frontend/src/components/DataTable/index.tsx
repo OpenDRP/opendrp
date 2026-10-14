@@ -55,7 +55,16 @@ export interface PaginatedDataTableProps<T = any> {
   getRowClassName?: (row: T, index: number) => string | undefined;
 }
 
-const PAGE_SIZE_OPTIONS = [10, 20, 50, 10000] as const;
+//: The largest page the API will return (`MAX_PAGE_SIZE` in
+//: `backend/app/schemas/common.py`). Repeated here rather than fetched because a
+//: table must not need a request to know how it may page; the backend's
+//: pagination-contract test reads this file and fails when the two disagree.
+const MAX_PAGE_SIZE = 200;
+
+//: Offered page sizes. The list ends at the server's own bound: it used to end at
+//: `10000`, and every list endpoint answered that option with HTTP 422, which the
+//: operator saw as a table that could not load at all.
+const PAGE_SIZE_OPTIONS = [10, 20, 50, MAX_PAGE_SIZE] as const;
 const RESIZE_HANDLE_WIDTH = 6;
 
 export function PaginatedDataTable<T = any>({
@@ -79,7 +88,7 @@ export function PaginatedDataTable<T = any>({
   getRowId,
   getRowClassName,
 }: PaginatedDataTableProps<T>) {
-  const pages = pageSize === 10000 ? (total > 0 ? 1 : 0) : Math.max(0, Math.ceil(total / pageSize));
+  const pages = Math.max(0, Math.ceil(total / pageSize));
 
   const [colWidths, setColWidths] = React.useState<Record<string, number>>(() => {
     if (typeof window === "undefined") return {};
@@ -134,6 +143,15 @@ export function PaginatedDataTable<T = any>({
     if (colWidths[col.key]) return colWidths[col.key];
     return col.width ?? 150;
   }
+
+  //: A table that renders rows it already holds (the breach details list) is
+  //: handed a page size larger than any API page. That value is shown, never
+  //: offered: it is a client-side page, not a request parameter.
+  const sizeOptions = React.useMemo(() => {
+    const options: number[] = [...PAGE_SIZE_OPTIONS];
+    if (!options.includes(pageSize)) options.push(pageSize);
+    return options.sort((a, b) => a - b);
+  }, [pageSize]);
 
   const pageNumbers = React.useMemo(() => {
     if (pages <= 0) return [];
@@ -248,7 +266,7 @@ export function PaginatedDataTable<T = any>({
               </TableRow>
             )}
             {!showSkeleton && rows.map((row: any, ri) => (
-              <TableRow key={row.id ?? ri} id={getRowId?.(row, ri)} className={getRowClassName?.(row, ri)}>
+              <TableRow key={getRowId?.(row, ri) ?? row.id ?? ri} id={getRowId?.(row, ri)} className={getRowClassName?.(row, ri)}>
                 {columns.map(col => (
                   <TableCell
                     key={col.key}
@@ -276,16 +294,18 @@ export function PaginatedDataTable<T = any>({
             onValueChange={(v) => {
               const n = Number(v);
               onPageSizeChange(n);
-              if (n === 10000) onPageChange(1);
+              // A page number that existed under the old size may not exist under
+              // the new one, so the first page is where a resize starts.
+              onPageChange(1);
             }}
           >
             <SelectTrigger className="w-[110px] h-8" aria-label="Items per page">
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
-              {PAGE_SIZE_OPTIONS.map(s => (
+              {sizeOptions.map(s => (
                 <SelectItem key={s} value={String(s)}>
-                  {s === 10000 ? "All" : s}
+                  {s > MAX_PAGE_SIZE ? "All" : s}
                 </SelectItem>
               ))}
             </SelectContent>

@@ -107,6 +107,8 @@ describe("AppLayout", () => {
     expect(screen.getByText("OpenDRP Platform")).toBeInTheDocument();
     expect(screen.getByRole("link", { name: "Dashboard" })).toBeInTheDocument();
     expect(screen.getByRole("link", { name: "Assets" })).toBeInTheDocument();
+    const links = screen.getAllByRole("link");
+    expect(links.indexOf(screen.getByRole("link", { name: "DNS Security" }))).toBeLessThan(links.indexOf(screen.getByRole("link", { name: "Phishing" })));
     expect(screen.queryByRole("link", { name: "Users" })).not.toBeInTheDocument();
     expect(screen.queryByRole("link", { name: "Audit Log" })).not.toBeInTheDocument();
     expect(screen.queryByText("Theme control")).toBeInTheDocument();
