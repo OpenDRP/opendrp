@@ -549,3 +549,23 @@ class TestPositionAllocation:
 
         assert link.seq == 4
         assert link.key_id == key_id_for(chain_keys()[0])
+
+    @pytest.mark.anyio
+    async def test_rolled_back_append_does_not_burn_a_chain_position(self, db_session):
+        abandoned = await prepare_entry(
+            db_session,
+            timestamp=datetime.now(timezone.utc),
+            user_id=None,
+            action="asset.view",
+            ip_address="203.0.113.7",
+            details={"attempt": "rolled-back"},
+        )
+        await db_session.rollback()
+
+        await _emit(db_session, details={"attempt": "committed"})
+        rows = await _rows(db_session)
+
+        assert [row.seq for row in rows] == [1]
+        assert rows[0].seq == abandoned.seq
+        assert rows[0].prev_hash == GENESIS_PREV_HASH
+        assert (await verify(db_session, full=True)).ok

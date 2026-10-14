@@ -7,14 +7,15 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
-import structlog
+from sqlalchemy import event
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import Session
 
 from app.core.database import AsyncSessionLocal
 from app.core.logging_config import (
     AUDIT_EVENT_NAME,
-    AUDIT_LOGGER_NAME,
     configure_logging,
+    get_audit_logger,
 )
 from app.core.audit_chain import prepare_entry
 from app.core.request_context import current_request_id
@@ -27,9 +28,11 @@ from app.models.audit import AuditLog
 # and because the call is idempotent.
 configure_logging()
 
-# Named, not `structlog.get_logger()`: the audit trail must not share a level
-# with diagnostic logging, and a name is what keeps the two apart.
-log = structlog.get_logger(AUDIT_LOGGER_NAME)
+# The audit stream's own logger, pinned to the audit chain by logging_config:
+# the trail must not share a level with diagnostic logging, and its line must not
+# change shape because a connector configured structlog in this process. See
+# `get_audit_logger` for the failure that used to cause.
+log = get_audit_logger()
 
 # Process-local degradation marker. Security-critical callers can expose this in
 # readiness/health telemetry without making every ordinary read fail closed when
@@ -44,6 +47,35 @@ def audit_is_degraded() -> bool:
 def clear_audit_degraded() -> None:
     global _audit_degraded
     _audit_degraded = False
+
+
+def _publish_audit_event(event: dict[str, Any]) -> None:
+    """Send an already durable audit event to the structured stdout stream."""
+    try:
+        # The configured processor removes the synthetic event name and
+        # serializes exactly the five audit fields as one JSON line.
+        log.info(AUDIT_EVENT_NAME, **event)
+    except Exception:
+        # Last-resort path only. A record dropped for being below the level
+        # raises ``structlog.DropEvent``, which derives from BaseException and is
+        # why the audit logger's level is pinned in logging_config.
+        print(json.dumps(event, default=str, ensure_ascii=False), flush=True)
+
+
+def _publish_deferred_audit_events(session: Session) -> None:
+    """Publish `commit=False` events only after their caller commits the change."""
+    pending = session.info.pop("opendrp.pending_audit_events", [])
+    for event_payload in pending:
+        _publish_audit_event(event_payload)
+
+
+def _discard_deferred_audit_events(session: Session) -> None:
+    """Do not export an event whose accompanying transaction was rolled back."""
+    session.info.pop("opendrp.pending_audit_events", None)
+
+
+event.listen(Session, "after_commit", _publish_deferred_audit_events)
+event.listen(Session, "after_rollback", _discard_deferred_audit_events)
 
 
 AUDIT_ALLOWED_ACTIONS = frozenset(
@@ -86,6 +118,20 @@ AUDIT_ALLOWED_ACTIONS = frozenset(
         "asset.delete",
         "asset.list",
         "asset.view",
+        # The asset → findings view (WI-12). A read, but one that resolves the
+        # asset against four modules at once, so "who looked at what" has to be
+        # answerable from the trail.
+        "asset.findings.list",
+        # Inventory in bulk (WI-18): one summary row per call, naming the
+        # operation, how much of it applied, and which named assets were not
+        # found — the alternative was a hundred `asset.update` rows burying the
+        # call that produced them.
+        "asset.import",
+        "asset.export",
+        "asset.bulk.activate",
+        "asset.bulk.deactivate",
+        "asset.bulk.criticality",
+        "asset.bulk.delete",
         "settings.update",
         "settings.view",
         "settings.runtime.view",
@@ -98,6 +144,10 @@ AUDIT_ALLOWED_ACTIONS = frozenset(
         "alert.test_sent",
         "report.generate",
         "report.generate.failed",
+        "report.generate.completed",
+        "report.generate.retry",
+        "report.retention.expired",
+        "report.delete",
         "report.list",
         "report.download",
         "report.download.missing",
@@ -114,6 +164,7 @@ AUDIT_ALLOWED_ACTIONS = frozenset(
         # held, one for a pass that did not, so a SIEM rule does not have to parse
         # prose out of a details blob.
         "audit.chain.verified",
+        "audit.chain.progress",
         "audit.chain.broken",
         # An administrator looking at where the chain stands. A read of the
         # *integrity state* rather than of the entries, which is why it is
@@ -128,6 +179,14 @@ AUDIT_ALLOWED_ACTIONS = frozenset(
         "phishing.threat.orphans.cleaned",
         "phishing.scan.scheduled",
         "breach.scan.scheduled",
+        "dns_security.scan.scheduled",
+        "dns_security.scan.started",
+        "dns_security.scan.queued",
+        "dns_security.observation.orphans.cleaned",
+        "dns_security.observation.delete",
+        "dns_security.observations.list",
+        "dns_security.asset.promoted",
+        "dns_security.asset.already_exists",
         "breach.list",
         "breach.view",
         "breach.delete",
@@ -161,6 +220,11 @@ AUDIT_ALLOWED_ACTIONS = frozenset(
         "connectors.health.view",
         "connectors.modules.view",
         "alerts.health.view",
+        # An administrator ending a recipient's hold after an ambiguous delivery.
+        # The operator is asserting they reconciled a send whose outcome nobody
+        # knew, and the other possible outcome of that assertion is a duplicate
+        # notification, so the decision is recorded rather than merely applied.
+        "alerts.recipient.released",
         "connectors.list",
         # Module registry: a module is data, so declaring or toggling one is an
         # auditable change to what the platform can collect and store.
@@ -168,6 +232,19 @@ AUDIT_ALLOWED_ACTIONS = frozenset(
         "module.declared",
         "module.updated",
         "findings.list",
+        "source.scan.queued",
+        "source.observations.list",
+        "source_account.provisioned",
+        "source_account.credential_ref.updated",
+        "source_account.policy.updated",
+        "source_account.api_key.updated",
+        "source_account.api_key.cleared",
+        "connector.credential.read",
+        "connector.account.bound",
+        "source_account.quota_denied",
+        "exposure.observation.status_update",
+        "exposure.asset.promoted",
+        "exposure.asset.already_exists",
         "connector.registered",
         "connector.findings.ingested",
         "connector.scan.completed",
@@ -217,6 +294,10 @@ def _safe_jsonable_key(key: Any) -> str:
     if isinstance(key, str):
         return key
     return str(key)
+
+
+class AuditPersistenceError(RuntimeError):
+    """A required audit event could not be durably committed."""
 
 
 class AuditLogger:
@@ -280,12 +361,30 @@ class AuditLogger:
         user_id: uuid.UUID | str | None = None,
         details: dict | None = None,
         timestamp: datetime | None = None,
-    ) -> None:
+        require_persistence: bool = False,
+        commit: bool = True,
+    ) -> bool:
+        """Write one audit event to the trail and to stdout.
+
+        ``require_persistence`` is for the events the platform promises to
+        record — an asset added or removed, an inventory changed by a promotion.
+        When it is set and the row could not be written, this raises
+        ``AuditPersistenceError`` instead of returning a flag nobody reads.
+
+        ``commit=False`` writes into the caller's transaction rather than
+        committing: the mutation this event describes is not durable until the
+        caller commits, so neither is the event. That is what makes the promise
+        hold — a caller that owns a mutation and its audit row in one transaction
+        cannot end up with the first without the second. Use it with
+        ``require_persistence`` and an explicit commit in the caller.
+        """
         ts = timestamp or datetime.now(timezone.utc)
         event, uid, ip, normalized_action, ts_db = AuditLogger._stdout_event(
             ts, user_id, action, ip_address, details
         )
+        event["details"]["audit_persisted"] = True
 
+        persisted = False
         try:
             # The hash chain, computed against the final `details` (which already
             # carries the request id) and the position this row takes. Both the
@@ -293,6 +392,11 @@ class AuditLogger:
             # of the same event can be compared without guessing — see
             # app/core/audit_chain.py for what that comparison can and cannot
             # prove.
+            if uid is not None and "actor_email" not in event["details"]:
+                from app.models.user import User
+                actor = await db.get(User, uid)
+                if actor is not None:
+                    event["details"]["actor_email"] = actor.email
             link = await prepare_entry(
                 db,
                 timestamp=ts_db,
@@ -311,19 +415,32 @@ class AuditLogger:
             # chain key could not verify its own archive.
             event["details"]["audit_key_id"] = link.key_id
 
+            row_details = dict(event["details"])
+            # Persistence is transport metadata, not part of the signed audit
+            # record: the stdout copy can report it, while DB rows retain only
+            # fields whose meaning does not depend on the outcome of their own
+            # commit. Reserved in the canonical payload so a caller cannot forge it.
+            row_details.pop("audit_persisted", None)
             row = AuditLog(
                 timestamp=ts_db,
                 user_id=uid,
                 action=normalized_action,
                 ip_address=ip,
-                details=event["details"],
+                details=row_details,
                 seq=link.seq,
                 entry_hash=link.entry_hash,
                 prev_hash=link.prev_hash,
                 key_id=link.key_id,
             )
             db.add(row)
-            await db.commit()
+            if commit:
+                await db.commit()
+            else:
+                # Part of the caller's transaction: the mutation and the event
+                # become durable together. Defer stdout until that transaction's
+                # commit so an outer rollback cannot export a false success.
+                await db.flush()
+            persisted = True
             # A later successful write proves the audit path recovered. Keep
             # readiness degraded only while the failure is current, rather than
             # carrying a transient database/SQLite error forever in this worker.
@@ -337,16 +454,26 @@ class AuditLogger:
                 pass
             log.error("audit_db_write_failed", err=str(e)[:300], audit_degraded=True)
 
-        try:
-            # The configured processor removes the synthetic event name and
-            # serializes exactly the five audit fields as one JSON line.
-            log.info(AUDIT_EVENT_NAME, **event)
-        except Exception:
-            # Last-resort path only. A record dropped for being below the level
-            # raises ``structlog.DropEvent``, which derives from BaseException
-            # and is therefore not caught here — that is why the audit logger's
-            # level is pinned in logging_config instead of relied upon.
-            print(json.dumps(event, default=str, ensure_ascii=False), flush=True)
+        # Make persistence status explicit in the export. This transport marker
+        # is intentionally excluded from the HMAC: the row cannot contain the
+        # result of its own commit, and an unconfirmed write must not export a
+        # candidate hash as if it were part of the durable chain.
+        if not persisted:
+            for key in ("audit_hash", "audit_prev_hash", "audit_key_id"):
+                event["details"].pop(key, None)
+        event["details"]["audit_persisted"] = persisted
+
+        if persisted and not commit:
+            db.sync_session.info.setdefault("opendrp.pending_audit_events", []).append(event)
+            return True
+
+        _publish_audit_event(event)
+
+        if require_persistence and not persisted:
+            raise AuditPersistenceError(
+                f"required audit event {normalized_action!r} was not persisted"
+            )
+        return persisted
 
     @staticmethod
     async def emit_background(

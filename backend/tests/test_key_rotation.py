@@ -167,10 +167,14 @@ class TestProductionValidationOfPreviousKeys:
     def _production(self, **overrides) -> Settings:
         values = {
             "APP_ENV": "production",
-            "OPENDRP_VERSION": "0.1.1",
+            "OPENDRP_VERSION": "0.2.0",
             "JWT_SECRET_KEY": NEW_SECRET,
             "ENCRYPTION_KEY": NEW_KEY,
             "AUTH_COOKIE_SECURE": True,
+            # Pinned rather than inherited: production refuses a broker URL without
+            # a password unless the host is loopback, so inheriting one would make
+            # these tests pass or fail on the machine rather than on the code.
+            "REDIS_URL": "redis://127.0.0.1:6379/0",
             "DATABASE_URL": "postgresql://opendrp:str0ng-db-password@db:5432/opendrp",
             "AUDIT_CHAIN_KEYS": "chain-key-for-tests-only-" * 3,
         }

@@ -20,8 +20,13 @@ key first and the old one in `ENCRYPTION_PREVIOUS_KEYS`, restart the backend,
 `rewrap`, confirm with `status`, then drop the previous key.
 
 `rewrap` never silently skips a value: a stored secret that no configured key can
-read aborts the run, because the next step of the procedure is to delete a key,
-and deleting a key that is still needed destroys data.
+read aborts the run before anything is written, because the next step of the
+procedure is to delete a key, and deleting a key that is still needed destroys data.
+
+Everything the key protects is covered, second factors included: a user's
+`totp_secret` is Fernet ciphertext like the settings secrets, so dropping the
+previous key without re-encrypting it would make every enrolled authenticator
+unreadable and lock those accounts out of their own second factor.
 """
 
 from __future__ import annotations
@@ -29,6 +34,8 @@ from __future__ import annotations
 import argparse
 import secrets
 import sys
+from dataclasses import dataclass
+from typing import Any
 
 from cryptography.fernet import Fernet
 from sqlalchemy import select
@@ -38,6 +45,8 @@ from app.core.config import settings
 from app.core.crypto import configured_keys, key_index_for, rewrap_value
 from app.core.logging_config import configure_logging, get_logger
 from app.models.settings import SystemSettings
+from app.models.source_account import SourceAccount
+from app.models.user import User
 
 configure_logging()
 log = get_logger("opendrp.rotate_keys")
@@ -52,6 +61,16 @@ ENCRYPTED_COLUMNS = (
     "alert_recipient_email",
     "telegram_bot_token",
 )
+
+
+@dataclass
+class StoredSecret:
+    """One stored ciphertext, with the object and attribute that hold it."""
+
+    label: str
+    owner: Any
+    attribute: str
+    value: str
 
 
 def _generate(*, jwt: bool, audit_chain: bool = False) -> int:
@@ -108,6 +127,99 @@ async def _load_row(db: AsyncSession) -> SystemSettings | None:
     return (await db.execute(select(SystemSettings).limit(1))).scalar_one_or_none()
 
 
+async def stored_secrets(db: AsyncSession) -> list[StoredSecret]:
+    """Every stored ciphertext this script re-encrypts.
+
+    Three places hold one: the settings singleton, each provider key on a source
+    account, and each enrolled user's second factor. They are collected in one
+    list so `status`, `rewrap` and its verification all see the same set — a
+    column covered by re-encryption but not by the count would let `status`
+    report a rotation as finished while a value is still on the previous key.
+    """
+    found: list[StoredSecret] = []
+    row = await _load_row(db)
+    if row is not None:
+        for column in ENCRYPTED_COLUMNS:
+            value = getattr(row, column)
+            if value:
+                found.append(StoredSecret(f"system_settings.{column}", row, column, value))
+    accounts = (
+        await db.execute(
+            select(SourceAccount).where(SourceAccount.api_key_encrypted.is_not(None))
+        )
+    ).scalars().all()
+    for account in accounts:
+        found.append(
+            StoredSecret(
+                f"source_accounts.api_key_encrypted ({account.source_id}/{account.name})",
+                account,
+                "api_key_encrypted",
+                account.api_key_encrypted,
+            )
+        )
+    users = (
+        await db.execute(select(User).where(User.totp_secret.is_not(None)))
+    ).scalars().all()
+    for user in users:
+        if not user.totp_secret:
+            # An empty value is "no second factor" (`totp_enabled_at` is what
+            # makes the factor real), not a ciphertext to move to another key.
+            continue
+        found.append(
+            StoredSecret(
+                f"users.totp_secret ({user.email})",
+                user,
+                "totp_secret",
+                user.totp_secret,
+            )
+        )
+    return found
+
+
+def summarize_secrets(found: list[StoredSecret]) -> tuple[dict[int, int], list[str]]:
+    """Count stored values per configured key index, and list the unreadable ones."""
+    per_key: dict[int, int] = {index: 0 for index in range(len(configured_keys()))}
+    unreadable: list[str] = []
+    for item in found:
+        index = key_index_for(item.value)
+        if index is None:
+            unreadable.append(item.label)
+        else:
+            per_key[index] += 1
+    return per_key, unreadable
+
+
+async def rewrap_stored(db: AsyncSession) -> tuple[int, list[str]]:
+    """Re-encrypt every stored secret not yet on the newest key.
+
+    Returns ``(changed, failures)``. If any value is unreadable, nothing is written
+    and the unreadable labels are returned, so a partial rotation can never be
+    mistaken for a finished one.
+    """
+    found = await stored_secrets(db)
+    _, unreadable = summarize_secrets(found)
+    if unreadable:
+        return 0, unreadable
+
+    changed = 0
+    for item in found:
+        if key_index_for(item.value) == 0:
+            continue
+        setattr(item.owner, item.attribute, rewrap_value(item.value))
+        changed += 1
+    if changed:
+        await db.commit()
+
+    # Verified in memory after the write: the next documented step deletes a key,
+    # which is only safe if every value now reads with the newest one.
+    still_old = [
+        item.label
+        for item in found
+        if key_index_for(getattr(item.owner, item.attribute)) != 0
+    ]
+    return changed, still_old
+
+
 async def _status() -> int:
     keys = configured_keys()
     if not keys:
@@ -118,25 +230,15 @@ async def _status() -> int:
     try:
         factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
         async with factory() as db:
-            row = await _load_row(db)
-            if row is None:
-                print("No system_settings row exists yet; nothing is encrypted.")
-                return 0
-
-            per_key: dict[int, int] = {index: 0 for index in range(len(keys))}
-            unreadable: list[str] = []
-            for column in ENCRYPTED_COLUMNS:
-                value = getattr(row, column)
-                if not value:
-                    continue
-                index = key_index_for(value)
-                if index is None:
-                    unreadable.append(column)
-                else:
-                    per_key[index] += 1
+            found = await stored_secrets(db)
     finally:
         await engine.dispose()
 
+    if not found:
+        print("No encrypted values are stored yet; nothing is encrypted.")
+        return 0
+
+    per_key, unreadable = summarize_secrets(found)
     print(f"{len(keys)} encryption key(s) configured, newest first.")
     for index in range(len(keys)):
         role = "encrypts and decrypts" if index == 0 else "decrypts only"
@@ -162,41 +264,18 @@ async def _rewrap() -> int:
     try:
         factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
         async with factory() as db:
-            row = await _load_row(db)
-            if row is None:
-                print("No system_settings row exists yet; nothing to re-encrypt.")
-                return 0
-
-            changed = 0
-            for column in ENCRYPTED_COLUMNS:
-                value = getattr(row, column)
-                if not value:
-                    continue
-                index = key_index_for(value)
-                if index is None:
-                    print(
-                        f"FAIL: {column} cannot be decrypted with any configured key. "
-                        "Restore the key that wrote it — re-encrypting would destroy the value."
-                    )
-                    return 1
-                if index == 0:
-                    continue
-                setattr(row, column, rewrap_value(value))
-                changed += 1
-
-            if changed:
-                await db.commit()
-
-            # Verified after the write, in the same session: the next step of the
-            # documented procedure is to delete a key, which is only safe if this
-            # is true.
-            for column in ENCRYPTED_COLUMNS:
-                value = getattr(row, column)
-                if value and key_index_for(value) != 0:
-                    print(f"FAIL: {column} is still not readable with the newest key after rewrap.")
-                    return 1
+            changed, failures = await rewrap_stored(db)
     finally:
         await engine.dispose()
+
+    if failures:
+        for label in failures:
+            print(
+                f"FAIL: {label} cannot be decrypted with any configured key, "
+                "or was not moved to the newest key. Restore the key that wrote it — "
+                "re-encrypting would destroy the value."
+            )
+        return 1
 
     print(f"Re-encrypted {changed} value(s) with the newest key.")
     print("Confirm with `status`, then remove ENCRYPTION_PREVIOUS_KEYS from .env.")
