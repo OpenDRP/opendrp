@@ -28,11 +28,16 @@ the host needs no PostgreSQL client tools at all. Output lands in `./backups`:
 ```
 backups/opendrp-20260913T041500Z.dump        # the database
 backups/reports-20260913T041500Z.tgz         # the report store
-backups/latest.dump                          # hard link to the newest dump
+backups/latest.dump                          # the newest dump: a hard link where the filesystem allows one, a copy otherwise
 ```
 
 Every dump is checked with `pg_restore --list` before it is trusted, and the
-script keeps the newest `BACKUP_KEEP` (default 14) plus their archives.
+script keeps the newest `BACKUP_KEEP` (default 14) plus their archives. What it
+prunes is exactly what it writes: `opendrp-*.dump` and the `reports-*.tgz` beside
+each one. The `pre-restore-*.dump` safety copies a restore writes are not in that
+set, so they stay in `./backups` until you delete them — do that once the restore
+is settled, rather than letting the directory grow one full copy of the database
+per restore.
 
 **A backup follows the file set you address.** The installation mounts a named
 volume for the report store; the tooling overlay (`make up-tools`) replaces it
@@ -101,16 +106,24 @@ safety copy of the current database before touching it.
 
 ```bash
 # 1. Stop every writer.
-docker compose -f docker-compose.yml stop backend celery-worker celery-beat connector-dnstwist connector-shodan connector-hibp
+docker compose -f docker-compose.yml stop backend celery-worker celery-beat connector-phishing-dnstwist connector-phishing-shodan connector-breaches-hibp
 
 # 2. Restore. The script asks for CONFIRM_RESTORE=yes.
 CONFIRM_RESTORE=yes make restore FILE=backups/opendrp-20260913T041500Z.dump
 
 # 3. Bring the platform back and check it.
-docker compose up -d
+docker compose -f docker-compose.yml up -d
 make health
 make backup-verify
 ```
+
+`CONFIRM_RESTORE=yes` is read by the script, which runs inside the container, so
+the Makefile passes the value through to it — the confirmation is a deliberate
+friction point, not a variable that quietly goes missing.
+
+The database is not the only thing a dump describes: the report store is
+restored separately, below, because `scripts/restore.sh` restores the database
+and nothing else.
 
 Notes:
 
@@ -121,8 +134,33 @@ Notes:
   the script prints tells you exactly what to do: restore the
   `pre-restore-*.dump` file the same way.
 * Redis is **not** restored. It holds the Celery broker queues and the
-  one-minute schedule dedup keys, both of which are rebuilt: pending jobs are
-  recorded in PostgreSQL and re-enqueued on the next schedule tick by design.
+  short-lived schedule and rate-limit guards, all of which are rebuilt: pending
+  jobs, and the schedule occurrences that stop one from being queued twice, are
+  rows in PostgreSQL, and work is re-enqueued on the next schedule tick by design.
+
+### Restoring the report archive
+
+`scripts/restore.sh` restores the database and nothing else, so an instance
+restored from a dump has report rows whose PDFs are not on disk. The archive is
+`reports-<stamp>.tgz` beside the dump, written by the same pass.
+
+On a development stack the store is the `./reports_store` directory in the
+checkout, and the archive is the whole of it:
+
+```bash
+tar -xzf backups/reports-20260913T041500Z.tgz -C .
+```
+
+On an installation the store is the `reports_store` named volume. The archive is
+made with `tar -C <parent> reports_store`, so its one top-level entry is
+`reports_store/`; extract it with a container that mounts that volume
+read-write (the `backup` service mounts it read-only on purpose, so that a backup
+can never modify the store it archives).
+
+Either way, check afterwards that a report downloads. A restore that stops at the
+database leaves the inventory and the UI consistent and only the downloads
+missing, which reads like a permissions problem rather than an unfinished
+restore.
 
 ## Recovery objectives
 
@@ -139,11 +177,14 @@ someone else's estimate.
 Do this on a calendar, not when you need it. The run takes about ten minutes.
 
 1. `make backup` on the production host.
-2. Copy `latest.dump` to a machine that is *not* the production host.
+2. Copy `latest.dump` and the `reports-<stamp>.tgz` that goes with it to a
+   machine that is *not* the production host.
 3. There, start a throwaway stack with an empty database:
    `docker compose -f docker-compose.yml up -d postgres` and nothing else.
 4. `CONFIRM_RESTORE=yes make restore FILE=<the copied dump>` — against the
-   throwaway stack.
+   throwaway stack — then extract the report archive into the report store, or
+   step 5 cannot download a PDF (`tar -xzf backups/reports-<stamp>.tgz -C .` on a
+   development stack, whose store is `./reports_store`).
 5. `docker compose up -d`, sign in, and check three things by hand: the asset
    count on the dashboard, the newest audit rows, and that a generated report
    downloads.

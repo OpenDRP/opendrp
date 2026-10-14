@@ -9,7 +9,7 @@ The short version:
 ```bash
 make backup                     # 1. an upgrade you cannot undo is a migration
 # 2. set OPENDRP_VERSION to the release you are moving to, in .env
-make up                         # 3. pull/build and start; the API migrates itself
+make up                         # 3. build and start; the API migrates itself
 make health                     # 4. confirm the instance and the API answer
 ```
 
@@ -102,9 +102,24 @@ OPENDRP_VERSION=0.2.0
 
 ### 3. Start the new images
 
+An installation that runs published images moves to them first:
+
 ```bash
-docker compose pull          # or: docker compose build, if you build your own
-docker compose up -d
+docker compose -f docker-compose.yml pull
+```
+
+A source installation builds the images from the tree instead. This checkout is
+one: 0.2.0 declares its version but publishes no registry images, so a `pull` has
+nothing to fetch and `make up` is what builds and starts the stack.
+
+```bash
+docker compose -f docker-compose.yml build
+```
+
+Then start the stack, either way:
+
+```bash
+docker compose -f docker-compose.yml up -d
 ```
 
 The API container runs `python -m scripts.migrate` before it serves a request:
@@ -117,8 +132,8 @@ ordinary upgrade.
 
 For a migration that rewrites a lot of rows it is worth applying it while the old
 API is still running and the new one is not yet started, so the window in which
-the API is unavailable is not sized by the migration. After `docker compose
-pull`, before `up`:
+the API is unavailable is not sized by the migration. After the pull or the build
+above and before `up`:
 
 ```bash
 docker compose -f docker-compose.yml run --rm backend python -m scripts.migrate
@@ -144,18 +159,133 @@ migration is a state neither release supports.
 - The audit page shows new records — which also confirms the audit writer, the
   most load-bearing table in the schema, survived the upgrade.
 
-## Migrations that need attention
+## The schema and its single revision
 
-OpenDRP v0.1.0 is the initial baseline release (`0001_initial_schema`). Fresh installations apply all baseline tables directly through `alembic upgrade head`.
+`backend/alembic/versions/` holds one revision, `0001_initial_schema`, and it has
+no parent. It creates the whole schema in one step — identity, assets, phishing,
+breaches, DNS Security observations, exposure inventory, modules, findings, jobs,
+connectors, source accounts, settings, the audit trail with its archive, the alert
+queue and the report lifecycle — and seeds the built-in modules, the connectors
+this release ships and the source accounts they draw on. A fresh installation
+applies it once through the normal `alembic upgrade head` startup path, and
+`docker compose exec backend alembic heads` confirms it inside a running
+installation: there is no intermediate state left to rehearse and no
+revision-by-revision checklist to read, because the schema a deployment runs is
+the schema this release describes.
 
-| Revision | Target release | What to know |
-|---|---|---|
-| `0001_initial_schema` | 0.1.0 | Initial production schema. Creates all core tables (identity, assets, phishing, breaches, modules, findings, jobs, connectors, settings, audit trail, alert queue). |
+Nothing in the baseline deletes anything. The providers this platform does not
+ship (Censys, FOFA, Criminal IP) are simply not seeded, and their provider code is
+not in the repository; observations already recorded for them stay readable as
+evidence.
 
-Because it is a baseline, a database created by an *earlier* build cannot be
-upgraded in place: it records revision ids that no longer exist in the versions
-directory, and `alembic upgrade head` refuses to start rather than guessing. Move
-the data, not the stamp.
+The two index families described below are the only part of the baseline that
+behaves differently on a populated database than on an empty one, so a populated
+database still moves in a maintenance window — the collapse changed the shape of
+that window, not whether one is needed.
+
+### A database created by an earlier build
+
+A database an earlier build of this repository created already holds this schema.
+Alembic cannot move it on its own, because the revision id recorded in
+`alembic_version` names a file this release no longer ships, and `alembic upgrade
+head` refuses to start rather than guess what that file would have done. Adopting
+it means recording the revision the database is already at:
+
+```bash
+make backup                       # the dump is what makes this reversible
+docker compose exec backend python -m scripts.migrate
+```
+
+`scripts/migrate.py` recognises a recorded revision outside the script directory,
+logs `migration_adopted` and records `0001_initial_schema`: nothing is created and
+nothing is dropped. A revision it cannot place is refused rather than guessed at,
+which is the case of a database this project did not create.
+
+When the API container is not running, the same step by hand is the row itself —
+`alembic stamp` cannot do it, because stamp reads the recorded revision before it
+writes and stops on the id this one command exists to replace:
+
+```bash
+docker compose exec postgres psql -U opendrp -d opendrp -c "UPDATE alembic_version SET version_num = '0001_initial_schema'"
+```
+
+Recording the revision states a decision; it does not check one, so confirm the
+equality first.
+`make check-backend-migrations` runs both halves of that check inside the running
+backend container — the ORM models against the schema the revision builds, and
+`Base.metadata` against a database migrated from scratch — and
+`tests/test_alembic_migrations.py` does the same round trip in a disposable
+database. If`make backup` or `make backup-verify` did not succeed, stop here rather than recording the revision: restoring that dump is the only path back.
+
+Then add only the integration variables `.env.example` has gained; existing
+provider and worker secrets must be preserved. Two of them are new and optional —
+Compose's defaults apply when the file omits them: `MIGRATION_LOCK_TIMEOUT_MS`
+bounds how long the upgrade waits for a lock before failing with PostgreSQL's own
+`lock_timeout` error (the alternative is a container that is merely "unhealthy"
+while the startup migration blocks, with nothing naming the wait), and
+`MIGRATION_STATEMENT_TIMEOUT_MS` is `0` on purpose, because the index builds below
+are legitimately the longest statement this platform runs. Configure DNS sources
+through the [DNS connection guide](dns-security.md#connect-the-workers) and paid
+passive providers through the
+[source intelligence guide](source-intelligence.md#opt-in-setup).
+Schedules dispatch ready sources independently, but disabled or unconfigured
+entries stay blocked, and provider workers still need explicit enablement and an
+approved source-account budget. The base Compose startup does not enable optional
+worker profiles.
+
+### An index the baseline gained after your build was created
+
+Adoption records a revision and creates nothing — that is what makes it safe on a
+database with data — so an index the baseline has gained *since* the build that
+created your database is not there afterwards, and nothing says so: the queries it
+exists for keep working, only slowly. Two were added after the collapse, both for
+work that repeats on a timer:
+
+```bash
+docker compose exec postgres psql -U opendrp -d opendrp -c "CREATE INDEX IF NOT EXISTS ix_jobs_status_created ON jobs (status, created_at)"
+docker compose exec postgres psql -U opendrp -d opendrp -c "CREATE INDEX IF NOT EXISTS ix_ingestion_events_due ON ingestion_events (kind, processed_at, next_attempt_at)"
+```
+
+`ix_jobs_status_created` serves the claim every connector makes on every poll
+(`status='pending'`, ordered by `created_at`), and `ix_ingestion_events_due`
+serves the outbox dispatcher, which selects the unprocessed, due rows every
+fifteen seconds. Both are plain `CREATE INDEX` — not `CONCURRENTLY`, which cannot
+run inside a transaction and so cannot run inside a revision either — so they
+belong in the same maintenance window as the upgrade. Run them after the upgrade,
+not before: the revision creates them itself, and `CREATE INDEX IF NOT EXISTS` on a
+database that already has them is a no-op. A database this release created has
+them already, and `\di ix_jobs_status_created` is what tells the two cases apart.
+
+### The baseline's index families take a write lock
+
+Building an index is not a lock-free operation: `CREATE INDEX` holds a lock that
+blocks writes to the table for the duration of the build, and Alembic runs the
+whole revision in one transaction. The baseline creates the indexes behind asset
+matching, the asset list order and substring search, and — over expressions rather
+than columns — the ones the matching rule itself compares. On an installation with
+a large `drp_findings`, `drp_phishing_domains` or `source_observations` table those
+builds are the longest part of the upgrade, so run it in a maintenance window
+rather than during peak ingestion; a fresh database builds them in milliseconds.
+`CREATE INDEX CONCURRENTLY` is not an option here: it cannot run inside a
+transaction, and therefore not inside an Alembic revision.
+
+The baseline also installs the `pg_trgm` extension, which its substring-search
+indexes use, and `uuid-ossp` for the UUID defaults. The role that runs migrations
+must therefore be allowed to create extensions in the database — which is the case
+in the shipped Compose deployment, where the application role owns the database.
+`downgrade()` drops the indexes and deliberately leaves both extensions installed:
+an extension is database-wide, and another index or an operator's own query may be
+using it.
+
+The expression indexes exist because the matching rule never compares a stored
+column: it compares `lower(rtrim(trim(x), '.'))`, and an index on the bare column
+cannot serve that predicate. Without them the involvement counters on the asset
+list and the `has_findings` filter fall back to scanning the module tables —
+measurably (2000 assets, 100k breaches: 7.6 s for a page of 20
+rows, and a `statement_timeout` refusal when the same rule was used as a filter).
+The expression has to stay character-for-character equal to the one
+`app/services/asset_matching.py` renders; a test compares the stored definition
+so a refactor of the helper cannot silently orphan the indexes.
 
 ### Values worth checking by hand
 
@@ -173,13 +303,49 @@ error, just the wrong table. Two gates make that class of drift impossible to sh
 unnoticed: `python -m scripts.check_schema_drift` compares the ORM models with the
 schema the revisions build (no database needed), and the PostgreSQL migration test
 suite compares `Base.metadata` with a migrated database *and runs the startup
-seeder against it*. Both run in CI; `make check-backend-migrations` runs the first
-locally.
+seeder against it*. Both run in CI. `make check-backend-migrations` runs them on demand, inside the
+running backend container, so it needs the installation up (`make up`) rather than
+just checked out.
 
-Downgrades exist for every revision; `make check-backend-migrations` enforces
-that in CI, so a release cannot ship a migration that has no way back. A
-downgrade is still a schema change: it is only safe together with the images that
-match it, which is what the next section is about.
+`scripts/check_migrations.py` enforces that every revision has a `downgrade()`
+and that a deliberately empty one says so, so a release cannot ship a migration
+that has no way back. A downgrade is still a schema change: it is only safe
+together with the images that match it, which is what the next section is about.
+
+### Source accounts and uniform connector labels
+
+The labels are one scheme, and the baseline seeds exactly it. Every bundled
+connector is named `<module>-<provider>` — `phishing-dnstwist`, `phishing-shodan`,
+`phishing-netlas`, `breaches-hibp`, `dns-rdap`, `dns-resolver`, `dns-ctlogs`,
+`dns-virustotal`, `dns-netlas` — with a `-<task>` suffix where one provider serves
+several sources, as in `exposure-netlas-endpoints`, and the module id is the word
+the job type uses (`dns.rdap`, not `dns_security.rdap`). Compose service names
+follow the label (`connector-phishing-dnstwist`, `connector-dns-rdap`).
+
+Each seeded row also carries its earlier label as an alias, and the first alias is
+what the source identity is derived from: a connector image that registers under
+the name it was built with still authenticates, still owns its job type, and still
+attaches its observations to the same provider, so an upgrade does not fork a
+source's history. The same holds for `CONNECTOR_NAME` values and issued-token
+labels. `dns_security` remains accepted as an alias for the module id and for a
+connector's type, and the `schedule_dns_security` column keeps its name. Provision
+new connectors with the current label rather than an earlier one, which would be a
+second identity for the same source.
+
+A provider account is separate from an individual module worker. Existing
+account groups are created with `approved: false`, so explicitly review Settings
+→ Connectors → Provider accounts and set a conservative requests/minute and
+daily budget before enabling a provider worker. Credentials stay in each
+worker's environment/secret manager; `credential_ref` stores only the variable
+name. Jobs freeze account limits, connector config, manifest and target assets
+when queued, so editing a policy affects future jobs only.
+
+Breach identity is per source account: `(source_id, breach_name, matched_email)`,
+with the partial-index domain fallback where a provider reports no address. Two
+providers reporting the same incident are two rows, which is the point — the same
+breach seen twice is evidence, not a duplicate. Run
+`python -m scripts.check_schema_drift` before the deployment and perform the
+PostgreSQL migration round-trip in a disposable test database before rollout.
 
 ## The broker password and the network split
 
@@ -385,15 +551,17 @@ Rolling back is two moves — the images, then the schema — in that order.
 docker compose down
 # set OPENDRP_VERSION back to the previous release in .env
 docker compose up -d
-docker compose exec backend alembic downgrade <previous-head>
+docker compose exec backend alembic downgrade <target-revision>
 ```
 
 Notes:
 
-- The revision to downgrade to is the one the previous release ended at. If you
-  are unsure, restore the backup from the first step instead: it is the only path
-  that is guaranteed to reproduce the previous state exactly, including the data
-  written since the upgrade.
+- The target is the revision the previous release ends at. With a single baseline
+  revision there is nothing between `head` and `base` to step back to, so the
+  schema route and the data route are the same decision: if you are unsure,
+  restore the backup from the first step instead. That is the only path guaranteed
+  to reproduce the previous state exactly, including the data written since the
+  upgrade.
 - A downgrade can be destructive for exactly the same reasons the upgrade was: a
   revision that adds a column usually drops it in `downgrade()`, and the data it
   held goes with it. Check the revision's `downgrade()` before relying on it.
@@ -422,9 +590,24 @@ so when you run it.
 ### `ENCRYPTION_KEY` — the Fernet key for secrets at rest
 
 It encrypts `system_settings.smtp_password`, `smtp_from_email`,
-`alert_recipient_email` and `telegram_bot_token`. Two keys can be configured at
-once: `ENCRYPTION_KEY` encrypts, and `ENCRYPTION_PREVIOUS_KEYS` (comma-separated)
-is used only to decrypt.
+`alert_recipient_email` and `telegram_bot_token`, every provider key stored on a
+source account (`source_accounts.api_key_encrypted`) and the TOTP secret of every
+enrolled account (`users.totp_secret`). Two keys can be configured at once:
+`ENCRYPTION_KEY` encrypts, and `ENCRYPTION_PREVIOUS_KEYS` (comma-separated) is
+used only to decrypt.
+
+**An enrolled authenticator is inside the procedure, not beside it.** A TOTP
+secret is encrypted with the same key when the account enrols
+(`users.totp_secret`), so `rewrap` re-encrypts it and `status` counts it alongside
+the settings columns and the source-account keys. That is what makes the four
+steps below sufficient: while a key that wrote a live factor is still listed in
+`ENCRYPTION_PREVIOUS_KEYS`, `status` reports that value as readable under a key
+other than the first, and the rotation is not finished until it does not. Drop the
+key anyway and the factor is unreadable: that account is refused at its
+second-factor step with `mfa_secret_undecryptable` in the log, because an
+unreadable secret cannot answer "can this account prove possession". The way back
+is `python -m scripts.manage_admin mfa-off -e <email>`, after which the account
+enrols a new factor under the current key.
 
 ```bash
 # 1. Generate the new key and the .env lines to paste.
@@ -439,8 +622,9 @@ make restart
 docker compose exec backend python -m scripts.rotate_keys rewrap
 docker compose exec backend python -m scripts.rotate_keys status
 
-# 4. `status` says every value is readable with key [0]: drop
-#    ENCRYPTION_PREVIOUS_KEYS, recreate again, done.
+# 4. `status` says every value it counts is readable with key [0]: drop
+#    ENCRYPTION_PREVIOUS_KEYS, recreate again, done. That count includes the
+#    TOTP secret of every enrolled account (see above).
 ```
 
 Two properties are worth knowing before you start. `rewrap` **aborts** if it
@@ -495,19 +679,23 @@ rather than only in `.env` on the host.
 ### Connector credentials and provider API keys
 
 - **Connector tokens** are per connector, stored only as a SHA-256 digest, and
-  rotated one at a time: `make connector-token-rotate NAME=dnstwist` (the
-  Makefile writes the new value into `.env`), then recreate that connector:
-  `docker compose up -d connector-dnstwist`. No other connector is affected,
+  rotated one at a time: `make connector-token-rotate NAME=phishing-dnstwist` (the
+  Makefile writes the new value into the connector's `.env` variable), then
+  recreate that connector:
+  `docker compose up -d connector-phishing-dnstwist`. No other connector is affected,
   and no core secret is involved.
-- **Provider keys** (`SHODAN_API_KEY`, `HIBP_API_KEY`) live in the connector
-  containers' environment. Rotate them at the provider, update `.env`, and
-  recreate the affected connector: `docker compose up -d connector-shodan`.
+- **Provider keys** (`SHODAN_API_KEY`, `HIBP_API_KEY`, `DNS_SECURITY_CTLOGS_API_TOKEN`, `DNS_SECURITY_VT_API_KEY`) live either in a connector
+  container's environment or on the source account that owns the credential
+  (`PUT /api/v1/connectors/accounts/{account_id}/api-key`), where the ciphertext is
+  covered by the `rewrap` above. Rotate them at the provider, update whichever of
+  the two holds the key, and recreate the affected connector:
+  `docker compose up -d connector-phishing-shodan`.
 
 Both cases need a *recreate*, not a restart: Compose fixes a container's
 environment when it creates it, so `docker compose restart` keeps the value the
 container started with (the same reason the Compose file's own comments give
 `up -d` rather than `restart`). For a provider-key change in the tooling
-stack, use `docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --force-recreate connector-hibp connector-shodan`.
+stack, use `docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --force-recreate connector-breaches-hibp connector-phishing-shodan`.
 
 Connector scan jobs use a lease and active heartbeat. Upgrading or restarting a
 connector can therefore recover an interrupted job automatically. The job is
@@ -536,7 +724,8 @@ environment by every process that connects.
 
 1. `JWT_SECRET_KEY` — the exposed value may be a signing secret; sessions are the
    widest blast radius.
-2. `ENCRYPTION_KEY` — every stored provider and alert secret is readable with it.
+2. `ENCRYPTION_KEY` — every stored alert secret, provider key and enrolled
+   authenticator secret is readable with it.
 3. `AUDIT_CHAIN_KEYS` — an attacker holding it can rewrite history and make it
    verify, which is the one property the trail is supposed to have; rotate it
    before deciding the incident is over.
@@ -576,4 +765,12 @@ load balancer:
 
 ```bash
 ADMIN_EMAIL=admin@example.com ADMIN_PASSWORD='...' make verify-replicas
+```
+
+The target layers `docker-compose.replicas.yml` on the installation file itself
+and leaves the two replicas running so you can look at them; tear them down when
+you are done:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.replicas.yml down
 ```
