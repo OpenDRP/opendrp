@@ -70,6 +70,25 @@ THRESHOLDS: dict[str, float] = {
     "app/tasks/retention_tasks.py": 80.0,
     "app/services/provider_quota.py": 75.0,
     "app/tasks/integrity_tasks.py": 70.0,
+    # The boundaries this release adds. Each is a place where an untrusted input,
+    # a secret or the platform's own record is handled: the scrape token gate and
+    # the label shaping that keeps a request value out of a metric, the two halves
+    # of the audit pair (one reads the chain, the other deletes history only after
+    # the archive verifies), the validator for provider observations and the write
+    # path a declared module's findings arrive through, the outbox drain that
+    # settles a claim over a network call, the provider-credential store, the
+    # redaction every outbound message passes, and the resolution a connector's
+    # stored identity depends on.
+    "app/api/v1/routers/metrics.py": 90.0,
+    "app/core/metrics.py": 85.0,
+    "app/services/audit_verification.py": 90.0,
+    "app/services/audit_archive.py": 75.0,
+    "app/services/dns_security_service.py": 85.0,
+    "app/services/source_observations.py": 90.0,
+    "app/services/ingestion_events.py": 90.0,
+    "app/services/source_accounts.py": 80.0,
+    "app/services/alert_content.py": 80.0,
+    "app/services/module_aliases.py": 90.0,
 }
 
 
