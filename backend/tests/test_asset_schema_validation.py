@@ -38,6 +38,9 @@ class TestAcceptedValues:
             ("email_account", "admin@localdomain.local"),
             ("keyword_domain", "acme-phishing"),
             ("keyword_title", "  Sign in  "),
+            # Only quotes, backslashes and control characters are refused: a
+            # provider phrase may legitimately contain punctuation.
+            ("keyword_title", "Sign in (Acme): portal*"),
         ],
     )
     def test_valid_values_by_type(self, asset_type, value):
@@ -59,6 +62,13 @@ class TestRejectedValues:
             ("email_account", "not-an-email", "Invalid email format"),
             ("keyword_domain", "   ", "Keyword cannot be empty"),
             ("keyword_title", "", "Keyword cannot be empty"),
+            # AST-10/AST-30: a keyword reaches provider search grammars, where a
+            # quote ends the phrase. Such a value could append filters of its own
+            # to the operator's query, so it never becomes an asset.
+            ("keyword_domain", 'acme" -host:owned.example', "quotes, backslashes"),
+            ("keyword_title", "back\\slash", "quotes, backslashes"),
+            ("keyword_title", "tab\there", "quotes, backslashes"),
+            ("keyword_domain", "acme" * 51, "at most 200"),
         ],
     )
     def test_invalid_values_are_refused_with_a_reason(self, asset_type, value, fragment):
@@ -69,6 +79,14 @@ class TestRejectedValues:
     def test_a_value_longer_than_the_column_is_refused(self):
         with pytest.raises(ValidationError):
             _create("keyword_title", "x" * 513)
+
+    def test_the_keyword_limit_is_below_the_column_limit(self):
+        """200 characters is the documented keyword bound; the column is wider."""
+        from app.schemas.asset import KEYWORD_MAX_LENGTH
+
+        assert _create("keyword_title", "x" * KEYWORD_MAX_LENGTH).asset_value
+        with pytest.raises(ValidationError):
+            _create("keyword_domain", "x" * (KEYWORD_MAX_LENGTH + 1))
 
     def test_an_unknown_type_is_refused(self):
         with pytest.raises(ValidationError):
