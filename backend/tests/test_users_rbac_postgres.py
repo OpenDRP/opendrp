@@ -140,7 +140,10 @@ async def test_the_constraint_is_cascade_and_names_the_delete_rule():
                     )
                 )
             ).scalar_one_or_none()
-        assert rule == "c", (
+        # PostgreSQL's ``"char"`` maps to ``str`` on some asyncpg versions and to
+        # ``bytes`` on others; the rule is the same either way.
+        rule_text = rule.decode() if isinstance(rule, (bytes, bytearray)) else rule
+        assert rule_text == "c", (
             "the refresh-family foreign key is missing or does not cascade: "
             f"{rule!r} — 'c' is cascade, 'n' is set null, 'a' is no action"
         )
