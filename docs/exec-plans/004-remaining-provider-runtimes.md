@@ -180,6 +180,9 @@ Acceptance criteria, stated so the migration cannot drift:
       client. A new test pins the 4 KB snippet against a refusal body that nearly
       fills it, and another pins the long-hint policy: a `Retry-After: 3600` is
       waited out for five seconds and the call is retried, not abandoned.
+- [x] CI green on `dev` for every commit of this plan, `5b9edf5` last: `CI
+      completed/success`, every job including `backend` (the run also covers the
+      three commits before it, since only the tip is built).
 - [x] Contract suites, lint, types and docs gate green locally: 247 passed over
       `test_connector_runtime.py`, `test_connector_provider_client.py`,
       `test_connector_readiness_contract.py`, `test_connector_sdk_contract.py`,
