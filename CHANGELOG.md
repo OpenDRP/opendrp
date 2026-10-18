@@ -109,6 +109,12 @@ a pending or expired link.
 
 ### Changed
 
+- The Shodan worker's favicon fetch reads the icon under its size bound instead of
+  after the fact: the request is the only one a connector makes to a *target*
+  rather than to its provider, and it buffered whatever that host sent before
+  slicing the first 2 MB. Eight half-megabyte chunks now yield four read and the
+  same truncated slice as before — what changes is how much is ever held in
+  memory.
 - The intelligence worker makes its Netlas calls through the connector SDK's
   shared client, which is the last of the five copies of a pace, a quota
   reservation, a retry loop and a `Retry-After` parser. Its own numbers are stated

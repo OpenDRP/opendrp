@@ -1438,17 +1438,45 @@ class ShodanConnector(ConnectorBase):
             # a same-host redirect is ordinary; abandoning it made the favicon
             # capability report nothing at all.
             for _ in range(_FAVICON_MAX_REDIRECTS + 1):
-                r = await client.get(url, headers={"User-Agent": self.HEADERS["User-Agent"]})
-                if r.status_code in {301, 302, 303, 307, 308}:
-                    target = self._same_host_redirect(r.headers.get("location", ""), host)
-                    if target is None:
-                        return None
-                    url = target
-                    continue
-                if r.status_code == 200 and r.content:
-                    return r.content[:_FAVICON_MAX_BYTES]
-                return None
+                async with client.stream(
+                    "GET", url, headers={"User-Agent": self.HEADERS["User-Agent"]}
+                ) as r:
+                    if r.status_code in {301, 302, 303, 307, 308}:
+                        target = self._same_host_redirect(r.headers.get("location", ""), host)
+                        if target is None:
+                            return None
+                        url = target
+                        continue
+                    if r.status_code == 200:
+                        return await self._read_favicon(r) or None
+                    return None
         return None
+
+    async def _read_favicon(self, response) -> bytes:
+        """The icon's bytes, up to ``_FAVICON_MAX_BYTES``, read as they arrive.
+
+        The bound used to be a slice applied to a body that was already complete:
+        this fetch read whatever the target's host sent into memory and compared
+        its length afterwards, which is the buffering a bound exists to prevent.
+        It is also the one request a connector makes to the *target* rather than to
+        its provider, so the bytes are as untrusted as the URL that named them.
+
+        What is returned is the same slice as before — truncated at the bound, not
+        refused — because an icon that is too large is a fact about the target, and
+        half of one hashes to a value that is not an icon at all. Only the amount
+        held in memory changes.
+        """
+        content = bytearray()
+        try:
+            async for chunk in response.aiter_bytes():
+                remaining = _FAVICON_MAX_BYTES - len(content)
+                if len(chunk) >= remaining:
+                    content.extend(chunk[:remaining])
+                    break
+                content.extend(chunk)
+        except httpx.HTTPError:
+            return b""
+        return bytes(content)
 
     async def _favicon_findings(self, domain_asset: str, exclude: set[str], job_id: str) -> dict:
         """Hash one domain's favicon and search for it. Returns a capability tally."""

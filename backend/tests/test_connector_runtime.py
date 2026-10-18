@@ -900,7 +900,10 @@ class TestShodanConnector:
             def __init__(self, status_code, headers=None, content=b""):
                 self.status_code = status_code
                 self.headers = headers or {}
-                self.content = content
+                self._content = content
+
+            async def aiter_bytes(self):
+                yield self._content
 
         class FakeClient:
             async def __aenter__(self):
@@ -909,11 +912,23 @@ class TestShodanConnector:
             async def __aexit__(self, *args):
                 return None
 
-            async def get(self, url, **kwargs):
-                requested.append(url)
-                if url.endswith("/favicon.ico"):
-                    return FakeResponse(301, {"location": "https://brand.example/static/icon.png"})
-                return FakeResponse(200, content=b"icon-bytes")
+            def stream(self, method, url, **kwargs):
+                # The icon is read as it arrives now, so the fake is a transport:
+                # it answers with a streaming context manager, as httpx does.
+                from contextlib import asynccontextmanager
+
+                response = (
+                    FakeResponse(301, {"location": "https://brand.example/static/icon.png"})
+                    if url.endswith("/favicon.ico")
+                    else FakeResponse(200, content=b"icon-bytes")
+                )
+
+                @asynccontextmanager
+                async def stream():
+                    requested.append(url)
+                    yield response
+
+                return stream()
 
         monkeypatch.setattr(_shodanmodule.httpx, "AsyncClient", lambda **kwargs: FakeClient())
         assert await connector._fetch_favicon("brand.example", "https") == b"icon-bytes"
@@ -932,7 +947,9 @@ class TestShodanConnector:
         class FakeResponse:
             status_code = 301
             headers = {"location": "http://169.254.169.254/latest/meta-data/"}
-            content = b""
+
+            async def aiter_bytes(self):
+                yield b""
 
         class FakeClient:
             async def __aenter__(self):
@@ -941,13 +958,62 @@ class TestShodanConnector:
             async def __aexit__(self, *args):
                 return None
 
-            async def get(self, url, **kwargs):
-                requested.append(url)
-                return FakeResponse()
+            def stream(self, method, url, **kwargs):
+                from contextlib import asynccontextmanager
+
+                @asynccontextmanager
+                async def stream():
+                    requested.append(url)
+                    yield FakeResponse()
+
+                return stream()
 
         monkeypatch.setattr(_shodanmodule.httpx, "AsyncClient", lambda **kwargs: FakeClient())
         assert await connector._fetch_favicon("brand.example", "https") is None
         assert requested == ["https://brand.example/favicon.ico"]
+
+    @pytest.mark.asyncio
+    async def test_favicon_stops_reading_at_the_size_bound(self, connector_env, monkeypatch):
+        """A target's host must not decide how much of its body this worker holds.
+
+        Eight half-megabyte chunks are four megabytes; the bound is two. The read
+        stops at the fourth chunk and the same truncated slice is returned as
+        before — what changes is that the rest is never in memory.
+        """
+        monkeypatch.setenv("TESTING", "1")
+        connector = ShodanConnector()
+        pulled: list[int] = []
+        chunk = b"x" * (_shodanmodule._FAVICON_MAX_BYTES // 4)
+
+        class FakeResponse:
+            status_code = 200
+            headers: dict = {}
+
+            async def aiter_bytes(self):
+                for _ in range(8):
+                    pulled.append(len(chunk))
+                    yield chunk
+
+        class FakeClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return None
+
+            def stream(self, method, url, **kwargs):
+                from contextlib import asynccontextmanager
+
+                @asynccontextmanager
+                async def stream():
+                    yield FakeResponse()
+
+                return stream()
+
+        monkeypatch.setattr(_shodanmodule.httpx, "AsyncClient", lambda **kwargs: FakeClient())
+        icon = await connector._fetch_favicon("brand.example", "https")
+        assert icon is not None and len(icon) == _shodanmodule._FAVICON_MAX_BYTES
+        assert len(pulled) == 4, "the fifth chunk is never requested"
 
     def test_the_paid_query_narrows_our_own_hosts_before_it_is_sent(self, connector_env):
         """W3.2: the exclusion belongs in the query, not only after it was paid for.

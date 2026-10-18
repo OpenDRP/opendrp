@@ -13,6 +13,7 @@ They are working records, not operator guidance. The maintained pages are under
 |---|---|---|
 | [001-alert-service-message-layer.md](001-alert-service-message-layer.md) | done | Lifts the message vocabulary, the `Notification` shape and the routing decision out of `alert_service.py` into pure modules. |
 | [002-alert-transport-and-facts.md](002-alert-transport-and-facts.md) | done | Moves the delivery error taxonomy, the retry policy and the SMTP slot pool into `alert_transport.py`, and the stored-fact readers into `alert_facts.py`. |
+| [005-connector-body-reads.md](005-connector-body-reads.md) | in progress | Closes the last place a worker read a third party's body without a bound (the favicon fetch) and specifies the source-level gate that keeps the class from returning. |
 | [004-remaining-provider-runtimes.md](004-remaining-provider-runtimes.md) | done | Brings the last two workers with their own provider adapters (`intelligence`, `exposure_endpoints`) onto the shared client, and closes the buffered-body defect the second one carries. |
 | [003-connector-provider-runtime.md](003-connector-provider-runtime.md) | done | Puts pacing, quota reservation, the retry loop, `Retry-After` parsing and a bounded response read into one provider client shared by every connector, and closes the unbounded-body gap in two of them. Migrated `shodan`, `dns_security`, `hibp`; the other two workers followed in 004. |
 
