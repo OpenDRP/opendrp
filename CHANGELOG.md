@@ -109,6 +109,22 @@ a pending or expired link.
 
 ### Changed
 
+- DNS Security makes every provider call through the connector SDK's shared
+  client, which closes the third and last copy of a pace, a quota reservation, a
+  retry loop and a `Retry-After` parser. Four of its own numbers are stated
+  rather than inherited, because the shared defaults are a different product
+  decision: four attempts instead of three, a sixty second ceiling on a single
+  wait (a legitimate `Retry-After: 20` was being shortened to eight), the same
+  sixty abandoning a call as `http_<status>_retry_later` rather than stalling a
+  scan, and the timeout still taken from the client each source built — this one
+  worker runs clients at 15, 25 seconds and Shodan's operator setting, and one
+  shared number would have changed two of them. The RDAP bootstrap keeps its
+  address pinning and TLS SNI name: the shared client carries the connection
+  detail it is given (`extensions`) instead of resolving or pinning anything
+  itself. A scan that has spent its own request budget still reports
+  `request_budget_reached` with no request sent and nothing retried. One failure
+  name changes: a timeout is now `network_timeout` rather than `network_error`,
+  the vocabulary the other metered connectors already report.
 - The HIBP worker's two ways of calling the provider — the path form and the body
   form — are now one, and the JSON body it returns is bounded at 2 MB: it used to
   decode whatever a provider sent back, which is the defect DNS Security never

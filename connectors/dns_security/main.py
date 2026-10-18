@@ -15,7 +15,6 @@ import os
 import re
 import time
 from datetime import datetime, timezone
-from email.utils import parsedate_to_datetime
 from urllib.parse import quote, urljoin, urlsplit, urlunsplit
 
 import dns.resolver
@@ -25,6 +24,7 @@ import structlog
 from opendrp_connector import ConnectorBase
 from opendrp_connector.base import ConnectorAPIError
 from opendrp_connector.network import resolve_public_ips
+from opendrp_connector.provider import ProviderClient, ProviderLimits
 from tls_probe import (
     CONCURRENCY as TLS_PROBE_CONCURRENCY,
     DEFAULT_MAX_PROBES as DEFAULT_TLS_MAX_PROBES,
@@ -198,22 +198,6 @@ def _domain(raw: object) -> str | None:
     if not all(re.fullmatch(r"[a-z0-9-]+", label) for label in labels):
         return None
     return normalized
-
-
-def _retry_after(response: httpx.Response) -> float | None:
-    value = response.headers.get("Retry-After")
-    if not value:
-        return None
-    try:
-        return max(0.0, float(value))
-    except ValueError:
-        try:
-            target = parsedate_to_datetime(value)
-            if target.tzinfo is None:
-                target = target.replace(tzinfo=timezone.utc)
-            return max(0.0, (target - datetime.now(timezone.utc)).total_seconds())
-        except (TypeError, ValueError, OverflowError):
-            return None
 
 
 #: Shodan's two answers, and why this worker prices them differently.
@@ -555,6 +539,31 @@ class DNSConnector(ConnectorBase):
                 values.append(candidate)
         return values
 
+    def _provider_limits(self) -> ProviderLimits:
+        """This worker's numbers for one provider call, stated rather than inherited.
+
+        They are the constants this connector retried with before the shared client
+        existed: ``MAX_RETRIES`` + 1 attempts, a local backoff of ``2 ** attempt``,
+        and a ``Retry-After`` above sixty seconds abandoned as
+        ``http_<status>_retry_later`` rather than waited out inside a scan.
+
+        The retry ceiling is sixty because that is the *hint* ceiling: a provider
+        asking for twenty seconds is waited out for twenty, exactly as before. The
+        local backoff never reaches it (``2 ** 3`` is eight), so one constant keeps
+        both halves of the old behaviour and the shared default of thirty would
+        have quietly shortened a legitimate hint.
+
+        The body bound is read here, at call time, rather than baked into a
+        class attribute: it is the number under test, and a test lowering
+        ``MAX_RESPONSE_BYTES`` is asserting the bound rather than the value.
+        """
+        return ProviderLimits(
+            max_attempts=MAX_RETRIES + 1,
+            max_retry_delay=60.0,
+            max_response_bytes=MAX_RESPONSE_BYTES,
+            abort_when_retry_after_exceeds=60.0,
+        )
+
     async def _get_json(
         self,
         client: httpx.AsyncClient,
@@ -565,44 +574,40 @@ class DNSConnector(ConnectorBase):
         before_request=None,
         extensions: dict | None = None,
     ) -> tuple[dict | list | None, str | None, httpx.Response | None]:
-        """Fetch bounded JSON, invoking the reservation hook before every wire attempt."""
-        for attempt in range(MAX_RETRIES + 1):
-            try:
-                if before_request is not None:
-                    await before_request()
-                options = {"extensions": extensions} if extensions else {}
-                async with client.stream("GET", url, headers=headers, params=params, **options) as response:
-                    if response.status_code == 200:
-                        content = bytearray()
-                        async for chunk in response.aiter_bytes():
-                            if len(content) + len(chunk) > MAX_RESPONSE_BYTES:
-                                return None, "response_too_large", response
-                            content.extend(chunk)
-                        try:
-                            payload = json.loads(content)
-                        except (ValueError, UnicodeError):
-                            return None, "invalid_json", response
-                        if not isinstance(payload, (dict, list)):
-                            return None, "invalid_response", response
-                        return payload, None, response
-            except _RequestBudgetReached:
-                return None, "request_budget_reached", None
-            except (httpx.TimeoutException, httpx.HTTPError):
-                if attempt < MAX_RETRIES:
-                    await asyncio.sleep(min(8, 2 ** attempt))
-                    continue
-                return None, "network_error", None
-            if response.status_code == 429 or response.status_code >= 500:
-                if attempt < MAX_RETRIES:
-                    delay = _retry_after(response)
-                    if delay is not None and delay > 60:
-                        return None, f"http_{response.status_code}_retry_later", response
-                    await asyncio.sleep(delay if delay is not None else 2 ** attempt)
-                    continue
-            if response.status_code != 200:
-                return None, f"http_{response.status_code}", response
+        """Fetch bounded JSON, invoking the reservation hook before every wire attempt.
 
-        return None, "retry_exhausted", None
+        The pace, the reservation, the retry loop, ``Retry-After`` and the body bound
+        are :class:`ProviderClient`'s; what stays here is the shape every call site in
+        this worker reads — the payload, the name of the failure, and the response,
+        which the RDAP bootstrap needs for its ``Location`` header.
+
+        ``before_request`` becomes the client's reservation, so a hook that raises
+        (this scan's own request budget) arrives as "no call was made" instead of a
+        provider failure: nothing is sent, nothing is retried, and the check reports
+        ``request_budget_reached``. The ceiling stays the caller's: it is read off the
+        client it built, because this one worker runs clients with three different
+        timeouts (15s for RDAP and VirusTotal, 25s for CT logs, and Shodan's own
+        operator setting), and one shared number would change two of them.
+
+        ``extensions`` carries what only this connection knows (the SNI name for an
+        address-pinned RDAP request) to the shared client rather than around it.
+        """
+        provider = ProviderClient(
+            http=client,
+            limits=self._provider_limits(),
+            reserve=before_request,
+        )
+        try:
+            result = await provider.get_json(
+                url,
+                headers=headers,
+                params=params,
+                timeout=getattr(client, "timeout", None),
+                extensions=extensions,
+            )
+        except _RequestBudgetReached:
+            return None, "request_budget_reached", None
+        return result.payload, result.outcome, result.response
 
     async def _rdap_lookup(self, client: httpx.AsyncClient, domain: str):
         """Follow bounded HTTPS bootstrap redirects with public-IP pinning.

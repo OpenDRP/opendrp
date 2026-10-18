@@ -276,6 +276,32 @@ async def test_post_sends_the_json_body():
     assert http.calls[0][2]["json"] == {"query": "brand"}
 
 
+async def test_transport_extensions_reach_the_connection_untouched():
+    """A request pinned to an address still has to name the certificate's host.
+
+    The shared client does not resolve, pin or follow redirects; what it must do is
+    carry the connection detail the caller shaped to the transport that uses it
+    (DNS Security's RDAP bootstrap, whose URL is an address and whose SNI is the
+    registry's name).
+    """
+    http = _Http(_Response(200, b"{}"))
+    await _client(http).get_json(
+        "https://192.0.2.1/domain/example.com",
+        headers={"Host": "rdap.example"},
+        extensions={"sni_hostname": "rdap.example"},
+    )
+
+    assert http.calls[0][2]["extensions"] == {"sni_hostname": "rdap.example"}
+    assert http.calls[0][2]["headers"] == {"Host": "rdap.example"}
+
+
+async def test_a_call_without_extensions_does_not_invent_any():
+    http = _Http(_Response(200, b"{}"))
+    await _client(http).get_json("https://provider.example/x")
+
+    assert "extensions" not in http.calls[0][2]
+
+
 async def test_a_connector_can_name_a_rejection_the_vendor_words_its_way():
     """Some providers refuse in the body: the status alone cannot tell why."""
     http = _Http(_Response(403, b'{"error": "no query credits left"}'))

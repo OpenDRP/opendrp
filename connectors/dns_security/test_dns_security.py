@@ -115,7 +115,10 @@ async def test_vt_reserves_each_http_retry_before_making_it(monkeypatch):
     class Client:
         async def __aenter__(self): return self
         async def __aexit__(self, *args): return None
-        def stream(self, method, url, headers=None, params=None):
+        def stream(self, method, url, headers=None, params=None, **kwargs):
+            # The shared provider client is a real httpx caller: it streams and it
+            # names a timeout. This fake is the transport, so it takes the shape of
+            # the transport rather than the four arguments one test used to need.
             from contextlib import asynccontextmanager
 
             @asynccontextmanager
@@ -549,6 +552,72 @@ async def test_retry_after_is_not_shortened_below_provider_requirement(monkeypat
         _, error, _ = await connector._get_json(client, "https://api.ctlogs.dev/test")
     assert error == "http_429_retry_later"
     assert len(requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_hint_below_the_ceiling_is_waited_out_in_full(monkeypatch):
+    """Twenty seconds is the provider's answer, not something to shorten to eight.
+
+    The connector's local backoff never exceeds eight seconds, and the ceiling that
+    abandons a call is sixty. A shared default of thirty on the *wait* would have
+    clamped a legitimate hint, so this pins the pair: twenty is waited out, sixty
+    is refused.
+    """
+    requests = []
+    def handler(request):
+        requests.append(request)
+        if len(requests) == 1:
+            return httpx.Response(429, headers={"Retry-After": "20"})
+        return httpx.Response(200, json={"rows": []})
+    mock_transport(monkeypatch, handler)
+    sleep = AsyncMock()
+    monkeypatch.setattr("main.asyncio.sleep", sleep)
+    connector = make_connector(DNSConnector)
+    async with httpx.AsyncClient() as client:
+        payload, error, _ = await connector._get_json(client, "https://api.ctlogs.dev/test")
+    assert error is None
+    assert payload == {"rows": []}
+    assert [call.args[0] for call in sleep.await_args_list] == [20.0]
+    assert len(requests) == 2
+
+
+@pytest.mark.asyncio
+async def test_the_attempt_count_is_the_connectors_four(monkeypatch):
+    """``MAX_RETRIES`` + 1 attempts, the number this worker retried with before."""
+    requests = []
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(503)
+    mock_transport(monkeypatch, handler)
+    connector = make_connector(DNSConnector)
+    async with httpx.AsyncClient() as client:
+        _, error, response = await connector._get_json(client, "https://api.ctlogs.dev/test")
+    assert error == "http_503"
+    assert response is not None, "the last refusal is still the caller's to read"
+    assert len(requests) == 4
+
+
+@pytest.mark.asyncio
+async def test_a_refused_reservation_is_not_a_provider_failure(monkeypatch):
+    """The scan's own budget stops the call before the wire, and is not retried."""
+    requests = []
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(200, json={"rows": []})
+    mock_transport(monkeypatch, handler)
+    connector = make_connector(DNSConnector)
+    from main import _RequestBudgetReached
+
+    async def refuse():
+        raise _RequestBudgetReached
+
+    async with httpx.AsyncClient() as client:
+        payload, error, _ = await connector._get_json(
+            client, "https://api.ctlogs.dev/test", before_request=refuse
+        )
+    assert payload is None
+    assert error == "request_budget_reached"
+    assert requests == [], "a call the budget refused must not reach the provider"
 
 
 

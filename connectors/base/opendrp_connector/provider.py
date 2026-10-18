@@ -188,6 +188,7 @@ class ProviderClient:
         json: Any = None,
         free: bool = False,
         timeout: float | httpx.Timeout | None = None,
+        extensions: dict | None = None,
     ) -> ProviderResult:
         last_outcome = RETRY_EXHAUSTED
         last_response = None
@@ -204,6 +205,13 @@ class ProviderClient:
                     headers=headers,
                     json=json,
                     timeout=timeout if timeout is not None else self.limits.timeout,
+                    # ``extensions`` is how a caller says something about *this*
+                    # connection that only it knows: DNS Security pins an address
+                    # and has to name the certificate's host for SNI. Sending the
+                    # request the caller shaped is this client's job; shaping it
+                    # would be the redirect and pinning logic it deliberately
+                    # does not own.
+                    **(({"extensions": extensions}) if extensions else {}),
                 ) as response:
                     status = int(response.status_code)
                     if self._on_status is not None:

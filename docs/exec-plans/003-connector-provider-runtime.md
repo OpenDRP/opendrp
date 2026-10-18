@@ -188,11 +188,51 @@ Acceptance criteria, stated so the migration cannot drift:
       bound closes the remaining half of step 5 — this worker decoded whatever
       arrived — and `connectors/hibp/test_hibp.py` stays green unchanged, because
       the transport it drives is a real `httpx.AsyncClient` over MockTransport.
-- [ ] `dns_security`: the only connector still carrying its own read loop,
-      `MAX_RESPONSE_BYTES` and `_retry_after`. Its `_get_json` already returns the
-      triple `ProviderResult` carries, so it is the mechanical half of the plan.
-- [ ] Full backend fast suite green on CI (green for the pilot and for HIBP in
-      `test_connector_runtime.py`, `test_connector_provider_client.py`,
-      `test_connector_readiness_contract.py`, `test_connector_sdk_contract.py`,
-      `test_connectors_protocol_api.py`, `connectors/hibp/test_hibp.py` and
-      `connectors/dns_security/test_shodan_dns.py`).
+- [x] `dns_security`: the last connector carrying its own read loop,
+      `MAX_RESPONSE_BYTES` and `_retry_after`. `_get_json` is now an adapter over
+      `ProviderClient.get_json` that returns the triple every call site already
+      read (payload, outcome, response) — the response stays because the RDAP
+      bootstrap reads `Location` from a 3xx. Three things this worker owns are
+      stated rather than inherited: `max_attempts=MAX_RETRIES + 1` (four, not the
+      shared three), `max_retry_delay=60`, and
+      `abort_when_retry_after_exceeds=60`. The sixty is deliberately one number for
+      two jobs: a hint of twenty seconds is waited out in full (the shared default
+      of thirty on the *wait* would have clamped it), and a hint above sixty
+      abandons the call as `http_<status>_retry_later`. The local backoff never
+      reaches it, because `2 ** 3` is eight.
+      Two additions to the shared client came out of this migration. `_call` takes
+      `extensions`, so the address-pinned RDAP request keeps its `sni_hostname`
+      while still going through the client — the client sends the request the
+      caller shaped, it just does not shape it. And the timeout stays the caller's:
+      `_get_json` passes `client.timeout`, because this one worker runs clients at
+      15s (RDAP, VirusTotal), 25s (CT logs) and Shodan's own operator setting, and a
+      single shared number would have silently changed two of them.
+      The `_RequestBudgetReached` hook is now the client's `reserve`, so a scan that
+      has spent its own budget reports `request_budget_reached` with no request
+      sent and none retried — the test asserts the transport was never reached.
+      One vocabulary gain, called out as the acceptance criteria require: a timeout
+      is now named `network_timeout` rather than `network_error`. This is the
+      vocabulary the pilot and HIBP already report, and the reason the plan exists —
+      the core could not compare three names for one condition.
+- [x] Full backend fast suite green on CI on `dev` (`9e9ed94`, all jobs success) for
+      the pilot and HIBP; `dns_security` runs `test_dns_security.py`,
+      `test_shodan_dns.py` and `test_tls_probe.py` green locally (75 passed, 1
+      skipped), together with `test_connector_runtime.py`,
+      `test_connector_provider_client.py`, `test_connector_readiness_contract.py`,
+      `test_connector_sdk_contract.py`, `test_connectors_protocol_api.py`
+      (189 passed) and `connectors/hibp/test_hibp.py` (73 passed).
+
+## After the plan
+
+Nothing in this plan is left open. What it did not touch, and what the next plan
+should know, is recorded here rather than in a commit message:
+
+- `shodan` and `dns_security` keep `abort_when_retry_after_exceeds=None` and `60`
+  respectively. That difference is real — one waits out a long hint, the other
+  gives up on it — and it is a product decision about how long a scan may stall,
+  not a refactoring detail.
+- `dns_security` still runs four HTTP clients with three timeouts, one per source.
+  Converging them is a change to how long a source may take, not a deduplication.
+- The body bound is asserted per connector. A single test that fails when *any*
+  connector grows an unbounded read would need a transport-level probe; the
+  per-connector assertions are what the inventory could justify.

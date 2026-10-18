@@ -13,7 +13,7 @@ They are working records, not operator guidance. The maintained pages are under
 |---|---|---|
 | [001-alert-service-message-layer.md](001-alert-service-message-layer.md) | done | Lifts the message vocabulary, the `Notification` shape and the routing decision out of `alert_service.py` into pure modules. |
 | [002-alert-transport-and-facts.md](002-alert-transport-and-facts.md) | done | Moves the delivery error taxonomy, the retry policy and the SMTP slot pool into `alert_transport.py`, and the stored-fact readers into `alert_facts.py`. |
-| [003-connector-provider-runtime.md](003-connector-provider-runtime.md) | in progress | Puts pacing, quota reservation, the retry loop, `Retry-After` parsing and a bounded response read into one provider client shared by every connector, and closes the unbounded-body gap in two of them. |
+| [003-connector-provider-runtime.md](003-connector-provider-runtime.md) | done | Puts pacing, quota reservation, the retry loop, `Retry-After` parsing and a bounded response read into one provider client shared by every connector, and closes the unbounded-body gap in two of them. |
 
 ## Writing the next one
 
