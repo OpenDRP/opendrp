@@ -14,7 +14,7 @@ appeared, and nothing would notice the seventh. This gate is that missing
 observation, stated as one rule:
 
     A body from anywhere but this platform's own API is read through a bounded
-    reader — never through `.content`, `.text` or `.json()`.
+    reader — never through `.content`, `.text`, `.json()` or `.aread()`.
 
 The one exception is syntactically visible, which is why it can be enforced by
 reading source rather than by asking the reader to be careful: the platform's own
@@ -45,8 +45,10 @@ CONNECTOR_TREE = "connectors"
 SKIP_DIRECTORIES = {"base", "__pycache__"}
 #: Attributes that hand back a whole body that has already been read.
 BODY_ATTRIBUTES = {"content", "text"}
-#: Methods that decode a whole body.
-BODY_METHODS = {"json"}
+#: Methods that read a whole body. `aread()` is the same read as `.content` with
+#: an `await` in front of it, and it is the shape a fix that only banned the
+#: attribute would leave behind.
+BODY_METHODS = {"json", "aread"}
 #: The core's own request helpers. Their answers are this platform's, and the
 #: names bound from them are the only body reads this gate allows.
 CORE_CALLS = {"_request", "_request_with_retry"}
@@ -159,8 +161,8 @@ def main(argv: list[str] | None = None) -> int:
 
     print(
         "body-bound gate: OK — no module under connectors/ (outside the SDK) "
-        "reads a response body through `.content`, `.text` or `.json()` except "
-        "on an answer from this platform's own API"
+        "reads a response body through `.content`, `.text`, `.json()` or "
+        "`.aread()` except on an answer from this platform's own API"
     )
     return 0
 

@@ -104,6 +104,22 @@ def test_a_buffer_then_compare_read_is_reported(tmp_path):
     assert all("`content`" in failure for failure in failures)
 
 
+def test_a_body_read_through_aread_is_reported(tmp_path):
+    """`await response.aread()` is the same read as `.content`, with an await in front."""
+    root = _tree(
+        tmp_path,
+        **{
+            "worker__main.py": (
+                "async def body(response):\n    return await response.aread()\n"
+            )
+        },
+    )
+    failures = gate.check(root)
+
+    assert len(failures) == 1
+    assert "`aread`" in failures[0]
+
+
 def test_a_body_from_the_core_is_allowed_however_it_is_read(tmp_path):
     """The platform's own answers are the one exception, and it is syntactic."""
     root = _tree(

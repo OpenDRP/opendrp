@@ -109,6 +109,15 @@ a pending or expired link.
 
 ### Changed
 
+- The connector SDK owns the one bounded reader: `read_bounded` refuses the chunk
+  that crosses a limit and `read_head` keeps at most the limit and stops reading.
+  Every provider body goes through them, and so does the one body a worker reads
+  from a *target* rather than a provider (Shodan's icon fetch), which had grown
+  its own copy of the same loop. A body that crosses the bound raises the reader's
+  own `BodyTooLarge` and is reported differently from a failed connection, because
+  "the sender offered too much" and "the connection broke" are different facts.
+  The CI gate that bans direct body reads in connectors now covers `.aread()` as
+  well as `.content`, `.text` and `.json()`.
 - A new CI gate reads the connector tree for the defect class the last four
   fixes belonged to: five separate times a worker took a third party's body in
   full and considered its size afterwards, or had no bound at all. The rule is

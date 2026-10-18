@@ -42,9 +42,12 @@ from opendrp_connector.provider import (  # noqa: E402
     INVALID_RESPONSE,
     NETWORK_TIMEOUT,
     RESPONSE_TOO_LARGE,
+    BodyTooLarge,
     ProviderClient,
     ProviderLimits,
     parse_retry_after,
+    read_bounded,
+    read_head,
 )
 
 
@@ -329,6 +332,54 @@ async def test_a_call_without_extensions_does_not_invent_any():
     await _client(http).get_json("https://provider.example/x")
 
     assert "extensions" not in http.calls[0][2]
+
+
+async def test_read_bounded_keeps_a_body_under_the_limit():
+    assert await read_bounded(_Response(200, b'{"ok": true}'), 100) == b'{"ok": true}'
+
+
+async def test_read_bounded_refuses_the_chunk_that_crosses_the_limit():
+    """Refused while reading, not after: the rest is never pulled from the stream."""
+    pulled = []
+
+    class Streamed:
+        async def aiter_bytes(self):
+            for _ in range(4):
+                pulled.append(1)
+                yield b"x" * 8
+
+    with pytest.raises(BodyTooLarge):
+        await read_bounded(Streamed(), 10)
+    assert len(pulled) == 2, "the third chunk is never requested"
+
+
+async def test_read_head_keeps_exactly_the_bound_and_stops_reading():
+    """The truncating reader, which is what a target's icon or a refusal's text uses."""
+    pulled = []
+
+    class Streamed:
+        async def aiter_bytes(self):
+            for _ in range(4):
+                pulled.append(1)
+                yield b"x" * 8
+
+    head = await read_head(Streamed(), 10)
+
+    assert head == b"x" * 10
+    assert len(pulled) == 2, "the remainder of a body we are not keeping is not read"
+
+
+async def test_a_transport_failure_is_not_a_body_verdict():
+    """`BodyTooLarge` is the reader's own verdict; a broken stream stays a transport error."""
+
+    class Failing:
+        async def aiter_bytes(self):
+            raise httpx.ReadError("boom")
+            yield b""  # pragma: no cover - unreachable, and it keeps this a generator
+
+    for reader in (read_bounded, read_head):
+        with pytest.raises(httpx.HTTPError):
+            await reader(Failing(), 10)
 
 
 async def test_a_connector_can_name_a_rejection_the_vendor_words_its_way():

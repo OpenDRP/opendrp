@@ -161,6 +161,16 @@ Acceptance criteria:
       client, which was the gate's first and only finding. One attempt is stated
       explicitly: the tool's ceiling counts physical requests, and a retry would
       spend a second one on a question already answered.
+- [x] The bound itself now has one implementation. `read_bounded(response, limit)`
+      (refuses the chunk that crosses) and `read_head(response, limit)` (keeps at
+      most the bound and stops) are public in the SDK, `ProviderClient` reads
+      provider bodies through them, and Shodan's icon fetch — a target body, not a
+      provider's — uses `read_head` instead of the third copy of the same loop this
+      plan had just written. `BodyTooLarge` is the reader's own verdict and is
+      deliberately not a transport error: a connector reports "too much" and
+      "connection failed" by different names. The gate's banned set now covers
+      `.aread()` too, which is the shape a rule that only banned `.content` would
+      have left open.
 - [x] **Step 3 was not taken, on the gate's evidence.** The rule as written
       expressed the core exception structurally — a name bound from
       `self._request(...)` — and every core read in the tree is exactly that shape,

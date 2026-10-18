@@ -136,6 +136,54 @@ ClassifyError = Callable[[int, str], str | None]
 ERROR_SNIPPET_BYTES = 4096
 
 
+class BodyTooLarge(RuntimeError):
+    """A body crossed its bound while it was being read.
+
+    Raised rather than returned so a caller cannot confuse "the provider sent too
+    much" with "the transport failed": the first is a fact about the answer and
+    the second about the connection, and connectors report them by different names.
+    """
+
+
+async def read_bounded(response, limit: int) -> bytes:
+    """Read a body up to ``limit``, refusing it the moment it crosses.
+
+    The read is streamed rather than buffered so an oversized answer is refused as
+    it arrives instead of after it has been held in memory — the failure a bound
+    exists to prevent. A transport failure is propagated as the ``httpx.HTTPError``
+    it is; :class:`BodyTooLarge` is this function's own verdict.
+
+    Public because a connector does not only read a *provider*: DNS Security
+    reads registry JSON and Shodan reads a target's icon, and both belong under the
+    same bound as everything else. A connector that read such a body itself would
+    be the seventh instance of the defect this module and its gate exist for.
+    """
+    content = bytearray()
+    async for chunk in response.aiter_bytes():
+        if len(content) + len(chunk) > limit:
+            raise BodyTooLarge(f"body exceeds {limit} bytes")
+        content.extend(chunk)
+    return bytes(content)
+
+
+async def read_head(response, limit: int) -> bytes:
+    """Read at most ``limit`` bytes of a body, however much the sender offers.
+
+    The truncating counterpart of :func:`read_bounded`, for a caller that wants the
+    beginning of an answer rather than all of it: a rejection's wording, an icon's
+    first bytes. It never holds more than ``limit``, and it stops reading instead
+    of draining a body it has already decided not to keep.
+    """
+    content = bytearray()
+    async for chunk in response.aiter_bytes():
+        remaining = limit - len(content)
+        if len(chunk) >= remaining:
+            content.extend(chunk[:remaining])
+            break
+        content.extend(chunk)
+    return bytes(content)
+
+
 class ProviderClient:
     """Make one provider HTTP call under the account's budget and its pace.
 
@@ -264,18 +312,16 @@ class ProviderClient:
         return self.limits.backoff_factor * 2**attempt
 
     async def _read(self, response) -> tuple[dict | list | None, str | None]:
-        """Stream a body up to the limit, then decode it.
+        """Read a body under the limit, then decode it.
 
-        The read is streamed rather than buffered so an oversized answer is
-        refused at the moment it crosses the limit instead of after it has already
-        been held in memory — the failure this bound exists to prevent.
+        The reading is :func:`read_bounded`'s, so every connector's provider body
+        and every other body a worker reads go through one implementation of the
+        bound rather than one per call site.
         """
-        content = bytearray()
         try:
-            async for chunk in response.aiter_bytes():
-                if len(content) + len(chunk) > self.limits.max_response_bytes:
-                    return None, RESPONSE_TOO_LARGE
-                content.extend(chunk)
+            content = await read_bounded(response, self.limits.max_response_bytes)
+        except BodyTooLarge:
+            return None, RESPONSE_TOO_LARGE
         except httpx.HTTPError:
             return None, NETWORK_ERROR
         try:
@@ -314,18 +360,14 @@ class ProviderClient:
         Some providers state the reason in the text of the rejection, and the
         caller needs it to tell a drained account from a forbidden one. Reading
         the whole body here would reintroduce the unbounded read this file
-        exists to prevent, so the snippet stops at
-        :data:`ERROR_SNIPPET_BYTES` whatever the provider sends.
+        exists to prevent, so the snippet stops at :data:`ERROR_SNIPPET_BYTES`
+        whatever the provider sends — which is :func:`read_head`'s job.
         """
-        content = bytearray()
         try:
-            async for chunk in response.aiter_bytes():
-                content.extend(chunk)
-                if len(content) >= ERROR_SNIPPET_BYTES:
-                    break
+            head = await read_head(response, ERROR_SNIPPET_BYTES)
         except httpx.HTTPError:
             return ""
-        return bytes(content[:ERROR_SNIPPET_BYTES]).decode("utf-8", "replace")
+        return head.decode("utf-8", "replace")
 
     def _record(self, outcome: str) -> None:
         if outcome not in self.errors:

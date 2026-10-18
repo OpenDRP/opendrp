@@ -77,6 +77,7 @@ from opendrp_connector.provider import (
     NETWORK_TIMEOUT,
     ProviderClient,
     ProviderLimits,
+    read_head,
 )
 
 log = structlog.get_logger()
@@ -1464,19 +1465,14 @@ class ShodanConnector(ConnectorBase):
         What is returned is the same slice as before — truncated at the bound, not
         refused — because an icon that is too large is a fact about the target, and
         half of one hashes to a value that is not an icon at all. Only the amount
-        held in memory changes.
+        held in memory changes, and the reading itself is the SDK's
+        :func:`~opendrp_connector.provider.read_head` rather than a third copy of
+        the same loop.
         """
-        content = bytearray()
         try:
-            async for chunk in response.aiter_bytes():
-                remaining = _FAVICON_MAX_BYTES - len(content)
-                if len(chunk) >= remaining:
-                    content.extend(chunk[:remaining])
-                    break
-                content.extend(chunk)
+            return await read_head(response, _FAVICON_MAX_BYTES)
         except httpx.HTTPError:
             return b""
-        return bytes(content)
 
     async def _favicon_findings(self, domain_asset: str, exclude: set[str], job_id: str) -> dict:
         """Hash one domain's favicon and search for it. Returns a capability tally."""
