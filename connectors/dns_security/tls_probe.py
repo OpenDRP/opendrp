@@ -277,7 +277,9 @@ def read_certificate(pem: bytes) -> dict[str, Any]:
         san_dns = _san_dns_names(tbs[extensions_index][1])
     return {
         "fingerprint_sha256": hashlib.sha256(der).hexdigest(),
-        "fingerprint_sha1": hashlib.sha1(der).hexdigest(),  # noqa: S324 - identifier, not a signature
+        # A SHA-1 fingerprint is the certificate's identifier as CAs and CT tools
+        # print it, not a signature this probe trusts.
+        "fingerprint_sha1": hashlib.sha1(der, usedforsecurity=False).hexdigest(),
         "spki_sha256": hashlib.sha256(outer[0][1][spki[2]:spki[3]]).hexdigest(),
         "serial_hex": tbs[first][1].hex(),
         "not_before": not_before,

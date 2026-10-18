@@ -208,7 +208,12 @@ def _email_hash_parts(email: str, *, case: str = "lower") -> tuple[str, str]:
     value = str(email).strip()
     if case == "lower":
         value = value.lower()
-    digest = hashlib.sha1(value.encode("utf-8")).hexdigest().upper()
+    # HIBP's k-anonymity API is defined in terms of SHA-1: the prefix this asks
+    # with and the suffix it compares against are the provider's own digest, so
+    # the algorithm is part of the protocol rather than a security choice here.
+    digest = hashlib.sha1(
+        value.encode("utf-8"), usedforsecurity=False
+    ).hexdigest().upper()
     return digest[:RANGE_PREFIX_LEN], digest[RANGE_PREFIX_LEN:]
 
 

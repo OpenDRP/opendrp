@@ -72,7 +72,9 @@ def test_the_reader_agrees_with_cryptography_on_a_real_certificate():
     certificate = make_certificate()
     facts = tls_probe.read_certificate(pem_of(certificate))
     assert facts["fingerprint_sha256"] == certificate.fingerprint(hashes.SHA256()).hex()
-    assert facts["fingerprint_sha1"] == certificate.fingerprint(hashes.SHA1()).hex()
+    # SHA-1 here is the identifier the probe reports, compared against the
+    # canonical fingerprint of the same DER; it is not a signature check.
+    assert facts["fingerprint_sha1"] == certificate.fingerprint(hashes.SHA1()).hex()  # nosec B303
     assert facts["serial_hex"] == format(certificate.serial_number, "x")
     assert facts["not_before"] == certificate.not_valid_before_utc.isoformat()
     assert facts["not_after"] == certificate.not_valid_after_utc.isoformat()
