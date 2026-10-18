@@ -1094,6 +1094,7 @@ to.
 - [docs/dns-security.md](docs/dns-security.md) — the optional DNS Security workers and their provider configuration;
 - [docs/source-intelligence.md](docs/source-intelligence.md) — the passive-intelligence workers: setup, accounts, quotas and limits;
 - [docs/db.sql](docs/db.sql) — reference schema;
+- [docs/exec-plans/README.md](docs/exec-plans/README.md) — the refactoring plans: one measured step each, with its acceptance criteria and progress log;
 - [connectors/README.md](connectors/README.md) — writing a connector;
 - [CONTRIBUTING.md](CONTRIBUTING.md) — development setup, what a change should contain, security rules;
 - [CHANGELOG.md](CHANGELOG.md) — what changed in each release;
