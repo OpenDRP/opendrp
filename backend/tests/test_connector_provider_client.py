@@ -141,6 +141,35 @@ async def test_a_5xx_is_retried_until_it_answers():
     assert waits == [1, 2]
 
 
+async def test_the_local_backoff_can_be_a_quarter_of_the_exponent():
+    """Two workers wait ``0.25 * 2 ** attempt``; the factor is how they say so.
+
+    Without it, the shared client's plain ``2 ** attempt`` would make their first
+    retry four times longer than the interval they chose.
+    """
+    http = _Http(_Response(500), _Response(500), _Response(200, b"{}"))
+    waits, sleep = _sleeper()
+    limits = ProviderLimits(max_retry_delay=5.0, backoff_factor=0.25)
+    result = await _client(http, sleep=sleep, limits=limits).get_json(
+        "https://provider.example/x"
+    )
+
+    assert result.ok
+    assert waits == [0.25, 0.5]
+
+
+async def test_the_factor_does_not_override_the_provider_hint():
+    http = _Http(_Response(503, headers={"Retry-After": "3"}), _Response(200, b"{}"))
+    waits, sleep = _sleeper()
+    limits = ProviderLimits(max_retry_delay=5.0, backoff_factor=0.25)
+    result = await _client(http, sleep=sleep, limits=limits).get_json(
+        "https://provider.example/x"
+    )
+
+    assert result.ok
+    assert waits == [3.0], "the provider's own pause is not scaled by our factor"
+
+
 async def test_the_provider_hint_wins_over_the_local_backoff_and_is_clamped():
     http = _Http(_Response(429, headers={"Retry-After": "7"}), _Response(200, b"{}"))
     waits, sleep = _sleeper()

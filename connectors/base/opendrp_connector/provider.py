@@ -62,6 +62,13 @@ class ProviderLimits:
     #: scan: the call is abandoned with ``http_<status>_retry_later`` instead, so
     #: a 30 minute hint cannot silently stretch one job. ``None`` disables it.
     abort_when_retry_after_exceeds: float | None = 60.0
+    #: The local backoff is ``backoff_factor * 2 ** attempt``, clamped by
+    #: :attr:`max_retry_delay`. It is a factor rather than the plain exponent
+    #: because two workers wait a quarter of it (``0.25 * 2 ** attempt``), and a
+    #: migration that ignored the difference would make their first retry four
+    #: times longer than the interval they chose. The default keeps every caller
+    #: that passes nothing waiting exactly what it waited before.
+    backoff_factor: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -232,7 +239,11 @@ class ProviderClient:
                                 response, status, f"http_{status}_{RETRY_LATER}"
                             )
                         if attempt + 1 < self.limits.max_attempts:
-                            delay = hint if hint is not None else 2**attempt
+                            delay = (
+                                hint
+                                if hint is not None
+                                else self._local_backoff(attempt)
+                            )
                             await self._sleep(min(self.limits.max_retry_delay, delay))
                             continue
                         return await self._rejected(response, status, last_outcome)
@@ -242,9 +253,15 @@ class ProviderClient:
             except httpx.HTTPError:
                 last_outcome = NETWORK_ERROR
             if attempt + 1 < self.limits.max_attempts:
-                await self._sleep(min(self.limits.max_retry_delay, 2**attempt))
+                await self._sleep(
+                    min(self.limits.max_retry_delay, self._local_backoff(attempt))
+                )
         self._record(last_outcome)
         return ProviderResult(None, None, last_outcome, last_response)
+
+    def _local_backoff(self, attempt: int) -> float:
+        """What to wait when the provider named no hint: ``factor * 2 ** attempt``."""
+        return self.limits.backoff_factor * 2**attempt
 
     async def _read(self, response) -> tuple[dict | list | None, str | None]:
         """Stream a body up to the limit, then decode it.
