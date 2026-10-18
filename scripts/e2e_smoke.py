@@ -439,6 +439,25 @@ def main() -> int:  # noqa: C901 - a journey, read top to bottom
         )
         print(f"      phishing threats total = {threats}")
 
+        step("an analyst confirms the candidate (a decision is itself a message)")
+        # The first sighting of an unscored candidate is routed to the list by the
+        # alert budget: a bare finding carries no signals, and the platform does not
+        # interrupt anyone for it. The message this journey asserts is the one a
+        # decision produces — a confirmation goes through the same outbox and the
+        # same routing, where the analyst's verdict outranks the score.
+        listed = _finding_row(client, phishing_domain) or {}
+        threat_id = listed.get("id")
+        if not threat_id:
+            raise SmokeFailure(f"the listed candidate carries no id: {listed}")
+        decided = client.json(
+            "PATCH",
+            f"/api/v1/phishing/threats/{threat_id}",
+            body={"verdict": "confirmed"},
+        )
+        if decided.get("verdict") != "confirmed":
+            raise SmokeFailure(f"the verdict was not recorded: {decided}")
+        print(f"      candidate {str(threat_id)[:8]}... confirmed")
+
         step("a notification for it is queued for delivery")
         deliveries_after = wait_for(
             "the alert queue to grow",
@@ -453,6 +472,7 @@ def main() -> int:  # noqa: C901 - a journey, read top to bottom
             ("source.scan.queued", MODULE),
             ("connector.token.issued", connector_name),
             ("connector.findings.ingested", connector_name),
+            ("phishing.threat.verdict", threat_id),
         ):
             rows = client.json(
                 "GET", f"/api/v1/audit/logs?action={action}&size=20"
@@ -512,6 +532,15 @@ def _finding(client: Client, phishing_domain: str) -> int | None:
     listing = client.json("GET", "/api/v1/phishing/threats?size=50")
     if any(row.get("phishing_domain") == phishing_domain for row in listing.get("items", [])):
         return int(listing.get("total") or 0)
+    return None
+
+
+def _finding_row(client: Client, phishing_domain: str) -> dict | None:
+    """The listed row for one candidate, so a decision can name it."""
+    listing = client.json("GET", "/api/v1/phishing/threats?size=50")
+    for row in listing.get("items", []):
+        if row.get("phishing_domain") == phishing_domain:
+            return row
     return None
 
 
