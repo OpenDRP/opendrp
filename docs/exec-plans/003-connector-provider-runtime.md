@@ -178,8 +178,21 @@ Acceptance criteria, stated so the migration cannot drift:
       The 2 MB body bound arrived with the shared client and is asserted per
       connector here, so step 5's Shodan half is closed: the defect cannot be
       folded out of a refactor that replaces the read it lived in.
-- [ ] `dns_security`.
-- [ ] `hibp` (still decodes an unbounded body — the remaining half of step 5).
-- [ ] Full backend fast suite green on CI (the pilot is green in
-      `test_connector_runtime.py`, `test_connector_provider_client.py` and
+- [x] `hibp`. `_get` and `_post` are two names for one `_call`: the pace, the
+      reservation, the credential bookkeeping and the body bound are shared, and
+      the per-route limiter became the second pacer the class documents. Two of
+      this provider's rules are stated instead of inherited: `max_attempts=1`,
+      because HIBP bills a request whether or not it succeeds, and
+      `abort_when_retry_after_exceeds=None`, because a `Retry-After` here pauses
+      the bucket for the *next* call rather than driving a retry loop. The 2 MB
+      bound closes the remaining half of step 5 — this worker decoded whatever
+      arrived — and `connectors/hibp/test_hibp.py` stays green unchanged, because
+      the transport it drives is a real `httpx.AsyncClient` over MockTransport.
+- [ ] `dns_security`: the only connector still carrying its own read loop,
+      `MAX_RESPONSE_BYTES` and `_retry_after`. Its `_get_json` already returns the
+      triple `ProviderResult` carries, so it is the mechanical half of the plan.
+- [ ] Full backend fast suite green on CI (green for the pilot and for HIBP in
+      `test_connector_runtime.py`, `test_connector_provider_client.py`,
+      `test_connector_readiness_contract.py`, `test_connector_sdk_contract.py`,
+      `test_connectors_protocol_api.py`, `connectors/hibp/test_hibp.py` and
       `connectors/dns_security/test_shodan_dns.py`).

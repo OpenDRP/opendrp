@@ -109,6 +109,15 @@ a pending or expired link.
 
 ### Changed
 
+- The HIBP worker's two ways of calling the provider — the path form and the body
+  form — are now one, and the JSON body it returns is bounded at 2 MB: it used to
+  decode whatever a provider sent back, which is the defect DNS Security never
+  had and Shodan no longer does. What stays this provider's own is stated rather
+  than inherited: one attempt, because HIBP bills a request whether or not it
+  succeeds, and a `Retry-After` that pauses the bucket for the next call instead
+  of driving a retry loop. A refusal still names the key as invalid in the
+  readiness row, and an oversized or unparseable answer now reports
+  `response_too_large` / `invalid_json` instead of looking like an empty result.
 - The Shodan worker makes every provider call through the connector SDK's shared
   client, so its pace, quota reservation, retry loop and failure vocabulary are
   the mechanisms the other metered connectors use instead of a fourth copy of

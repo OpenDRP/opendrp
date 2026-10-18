@@ -72,12 +72,18 @@ class ProviderResult:
     ``http_<status>``. ``response`` is kept on failure because a caller may need
     it (RDAP reads ``Location`` from a 3xx); it is ``None`` when there was no
     response at all.
+
+    ``snippet`` is the head of the body that came with a refusal, bounded by
+    :data:`ERROR_SNIPPET_BYTES`. A connector that writes the provider's own words
+    into its log gets them from here rather than re-reading a stream that is
+    already closed.
     """
 
     payload: dict | list | None
     status: int | None
     outcome: str | None
     response: Any | None = field(default=None, repr=False)
+    snippet: str | None = field(default=None, repr=False)
 
     @property
     def ok(self) -> bool:
@@ -264,13 +270,18 @@ class ProviderClient:
         that already carries a decision (``http_429_retry_later``) is this
         client's own verdict about the wait, and a connector's error table must
         not overwrite it with the bare status again.
+
+        The head of the body is read either way, because it is what the caller
+        logs beside the failure. A waiter that skipped the read would leave the
+        operator with a status and no reason.
         """
-        if self._classify is not None and outcome == f"http_{status}":
-            named = self._classify(status, await self._snippet(response))
-            if named:
-                outcome = named
+        snippet = ""
+        if outcome == f"http_{status}":
+            snippet = await self._snippet(response)
+            if self._classify is not None:
+                outcome = self._classify(status, snippet) or outcome
         self._record(outcome)
-        return ProviderResult(None, status, outcome, response)
+        return ProviderResult(None, status, outcome, response, snippet=snippet)
 
     async def _snippet(self, response) -> str:
         """Read the head of a refused body, never more than the bound.

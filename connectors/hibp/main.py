@@ -45,8 +45,35 @@ import structlog
 
 from opendrp_connector import ConnectorBase
 from opendrp_connector.base import ConnectorAPIError, DEFAULT_CATALOGUE_BATCH
+from opendrp_connector.provider import ProviderClient, ProviderLimits, ProviderResult
 
 log = structlog.get_logger()
+
+#: What every provider call from this worker is held to.
+#:
+#: One attempt, which is this provider's rule and not the shared default: HIBP bills
+#: a request whether or not it succeeds, so a retry the vendor did not ask for is a
+#: second charge for the same answer. The 2 MB body is the bound this worker lacked —
+#: it decoded whatever arrived — and it arrives with the client that reads the answer.
+#: ``abort_when_retry_after_exceeds`` is off because there is no retry to abort: a
+#: ``Retry-After`` here pauses the bucket for the next call, which is what the header
+#: is about, and it is applied after the answer rather than inside a retry loop.
+PROVIDER_LIMITS = ProviderLimits(
+    max_attempts=1,
+    max_response_bytes=2_000_000,
+    timeout=30.0,
+    abort_when_retry_after_exceeds=None,
+)
+
+
+class _SpendRefused(RuntimeError):
+    """The call must not leave the worker: nothing left to spend, or no reservation.
+
+    Raised from the reservation hook, which the shared client awaits before the
+    request. The client hands it back untouched — only the connector knows a refusal
+    from a failure — and :meth:`HibpConnector._call` turns it into the ``None`` its
+    callers already read as "asked nothing".
+    """
 
 #: The provider operation buckets this worker reserves against. Declared in the
 #: readiness row before they are ever used, because the core refuses a bucket its
@@ -368,26 +395,6 @@ def _parse_dt(value):
         return _dt.fromisoformat(str(value).replace("Z", "+00:00")[:26]).isoformat()
     except (ValueError, TypeError):
         return None
-
-
-def _json_value(response) -> object:
-    """A provider body as JSON, or ``None`` when there is no usable one.
-
-    Both halves matter: a non-200 has no body to read, and a body that is not JSON
-    is a version of the API this worker does not understand — either way the answer
-    is *unknown*, which is a different statement from an empty list.
-    """
-    if response is None or response.status_code != 200:
-        return None
-    try:
-        return response.json()
-    except ValueError:
-        return None
-
-
-def _json_object(response) -> dict | None:
-    value = _json_value(response)
-    return value if isinstance(value, dict) else None
 
 
 def _aware(value: _dt) -> _dt:
@@ -916,6 +923,101 @@ class HibpConnector(ConnectorBase):
     def _hibp_headers(self) -> dict:
         return {**self.UA, "hibp-api-key": self.api_key}
 
+    def _note(self, result: ProviderResult) -> None:
+        """Record one failed call in the shared vocabulary, once.
+
+        The client names what happened — ``http_403``, ``network_timeout``,
+        ``response_too_large`` — and a 200 whose body was not the shape this route
+        asked for is ``invalid_json``, which is this worker's own word for a version
+        of the API it does not understand.
+        """
+        code = result.outcome or "invalid_json"
+        if code not in self._provider_errors:
+            self._provider_errors.append(code)
+
+    def _credential_status(self, status: int) -> None:
+        """Read the key's standing off every answer, which is what readiness needs.
+
+        A 401 is a statement about the credential rather than about this incident, and
+        the readiness row has to carry it or an operator sees a scan that found
+        nothing (F-04). A 200 is the provider accepting the key.
+        """
+        if status == 401:
+            self.credential_state = "invalid"
+            self.provider_error = "invalid_credentials"
+        elif status == 200:
+            self.credential_state = "valid"
+            self.provider_error = None
+
+    async def _spend(self, bucket: str) -> None:
+        """Ask the account for one request, or stop before it is sent."""
+        if self._out_of_budget():
+            raise _SpendRefused()
+        if not await self._reserve(bucket):
+            raise _SpendRefused()
+        self._budget_left -= 1
+
+    async def _call(
+        self,
+        method: str,
+        client: httpx.AsyncClient,
+        url: str,
+        *,
+        params: dict | None = None,
+        json: dict | None = None,
+        headers: dict | None = None,
+        bucket: str = "search",
+        extra_limiter: "RateLimiter | None" = None,
+    ) -> ProviderResult | None:
+        """One provider request: paced, budgeted, and answered in one shape.
+
+        ``None`` means the call was not made at all (nothing left to spend, or the
+        bound account refused it) or that no answer arrived; the outcome is recorded
+        here, so the summary can still tell "we stopped asking" from "the provider
+        answered nothing". Both forms of the worker's spending — the path one and the
+        body one — go through here, because a second way of spending money would be
+        the thing that is not paced.
+
+        The pace is taken before the reservation, which is the shared client's order
+        for every provider: a call that has to wait is waited out before it asks the
+        account for permission it would otherwise hold while idle. Nothing about a
+        refused call changes — it is still not sent and still not counted.
+        """
+        pacers = [self._limiter.acquire]
+        if extra_limiter is not None:
+            # A route with its own, lower allowance waits for both: the key's pace is
+            # not permission to spend a per-route limit faster than it exists (WI-18).
+            pacers.append(extra_limiter.acquire)
+        provider = ProviderClient(
+            http=client,
+            limits=PROVIDER_LIMITS,
+            reserve=lambda: self._spend(bucket),
+            pace=pacers,
+            on_status=self._credential_status,
+        )
+        try:
+            if method == "POST":
+                result = await provider.post_json(url, json=json, headers=headers)
+            else:
+                result = await provider.get_json(url, params=params, headers=headers)
+        except _SpendRefused:
+            return None
+        if result.status is None:
+            # No answer at all: the transport failed, and the outcome is the only
+            # thing that can be said about it.
+            self._note(result)
+            log.warning("hibp_network_failed", err=result.outcome or "network_error")
+            return None
+        if result.status == 429:
+            # The provider's own answer about when to come back. It pauses the bucket
+            # rather than the call, because a refusal is still an answer: what the
+            # header buys is that the *next* request waits, whatever this one did.
+            header = result.response.headers.get("Retry-After") if result.response is not None else None
+            retry_after = _retry_after_seconds(header)
+            if retry_after:
+                self._limiter.pause(retry_after)
+        return result
+
     async def _get(
         self,
         client: httpx.AsyncClient,
@@ -925,46 +1027,17 @@ class HibpConnector(ConnectorBase):
         headers: dict | None = None,
         bucket: str = "search",
         extra_limiter: "RateLimiter | None" = None,
-    ) -> httpx.Response | None:
-        """One provider call, under the run's pace and its request budget.
-
-        Returns ``None`` when the call was not made at all (the budget is spent, or
-        the bound account refused it) or when it raised; both are counted, so the
-        summary can tell "we stopped asking" from "the provider answered nothing".
-        """
-        if self._out_of_budget():
-            return None
-        if not await self._reserve(bucket):
-            return None
-        await self._limiter.acquire()
-        if extra_limiter is not None:
-            # A route with its own, lower allowance waits for both: the key's pace is
-            # not permission to spend a per-route limit faster than it exists (WI-18).
-            await extra_limiter.acquire()
-        self._budget_left -= 1
-        try:
-            response = await client.get(url, params=params, headers=headers)
-        except Exception as exc:  # noqa: BLE001 - any transport failure is one outcome
-            self._provider_errors.append("network_error")
-            log.warning("hibp_network_failed", err=str(exc)[:200])
-            return None
-        if response.status_code == 429:
-            # The provider's own answer about when to come back. Read before the
-            # error is classified, because the pause applies even when the caller
-            # treats the status as just another failure.
-            retry_after = _retry_after_seconds(response.headers.get("Retry-After"))
-            if retry_after:
-                self._limiter.pause(retry_after)
-        elif response.status_code == 401:
-            # The key itself was refused, which is a statement about the credential
-            # rather than about this incident: the readiness row has to carry it, or
-            # an operator sees a scan that found nothing (F-04).
-            self.credential_state = "invalid"
-            self.provider_error = "invalid_credentials"
-        elif response.status_code == 200:
-            self.credential_state = "valid"
-            self.provider_error = None
-        return response
+    ) -> ProviderResult | None:
+        """The path form of :meth:`_call`, kept named because every route reads it."""
+        return await self._call(
+            "GET",
+            client,
+            url,
+            params=params,
+            headers=headers,
+            bucket=bucket,
+            extra_limiter=extra_limiter,
+        )
 
     async def _post(
         self,
@@ -974,38 +1047,11 @@ class HibpConnector(ConnectorBase):
         json: dict,
         headers: dict | None = None,
         bucket: str = "search",
-    ) -> httpx.Response | None:
-        """One provider call that carries a body, under the same pace and budget.
-
-        The verification routes answer questions about one domain and take their input in
-        the body rather than the path, so this mirrors :meth:`_get`: the same budget
-        check, the same reservation against the account, the same ``Retry-After`` and
-        credential bookkeeping. A second way of spending money would be the thing that is
-        not paced.
-        """
-        if self._out_of_budget():
-            return None
-        if not await self._reserve(bucket):
-            return None
-        await self._limiter.acquire()
-        self._budget_left -= 1
-        try:
-            response = await client.post(url, json=json, headers=headers)
-        except Exception as exc:  # noqa: BLE001 - any transport failure is one outcome
-            self._provider_errors.append("network_error")
-            log.warning("hibp_network_failed", err=str(exc)[:200])
-            return None
-        if response.status_code == 429:
-            retry_after = _retry_after_seconds(response.headers.get("Retry-After"))
-            if retry_after:
-                self._limiter.pause(retry_after)
-        elif response.status_code == 401:
-            self.credential_state = "invalid"
-            self.provider_error = "invalid_credentials"
-        elif response.status_code == 200:
-            self.credential_state = "valid"
-            self.provider_error = None
-        return response
+    ) -> ProviderResult | None:
+        """The body form of :meth:`_call`: the verification routes take their input here."""
+        return await self._call(
+            "POST", client, url, json=json, headers=headers, bucket=bucket
+        )
 
     async def generate_domain_token(self, client: httpx.AsyncClient, domain: str) -> dict:
         """The DNS record this domain has to publish, as the provider states it (WI-20).
@@ -1015,27 +1061,27 @@ class HibpConnector(ConnectorBase):
         record the provider then refuses. Only the shape is checked — a 200 whose body has
         no value is a malformed answer, not an empty record.
         """
-        response = await self._post(
+        result = await self._post(
             client,
             f"{self.BASE}/domainVerification/generateDnsToken",
             json={"DomainName": domain},
             headers=self._hibp_headers(),
             bucket="lookup",
         )
-        if response is None:
+        if result is None:
             return {"status": "failed", "reason": "not_answered"}
-        if response.status_code != 200:
-            self._provider_errors.append(f"http_{response.status_code}")
+        if result.status != 200:
+            self._note(result)
             log.warning(
                 "hibp_verification_generate_failed",
-                status=response.status_code,
-                err=response.text[:200],
+                status=result.status,
+                err=(result.snippet or "")[:200],
             )
-            return {"status": "failed", "reason": _verification_reason(response.status_code)}
-        payload = _json_object(response)
+            return {"status": "failed", "reason": _verification_reason(result.status)}
+        payload = result.payload if isinstance(result.payload, dict) else None
         value = str((payload or {}).get("txtRecordValue") or "").strip()
         if not value:
-            self._provider_errors.append("invalid_json")
+            self._note(result)
             return {"status": "failed", "reason": "malformed_answer"}
         return {"status": "generated", "txt_record_value": value[:1024]}
 
@@ -1048,28 +1094,28 @@ class HibpConnector(ConnectorBase):
         usually just DNS TTL. Everything else is a refusal or a transport failure, and is
         reported as such instead of as "the record is missing".
         """
-        response = await self._post(
+        result = await self._post(
             client,
             f"{self.BASE}/domainVerification/verifyDnsToken",
             json={"DomainName": domain},
             headers=self._hibp_headers(),
             bucket="lookup",
         )
-        if response is None:
+        if result is None:
             return {"status": "failed", "reason": "not_answered"}
-        if response.status_code == 200:
+        if result.status == 200:
             return {"status": "verified"}
-        if response.status_code == 400:
+        if result.status == 400:
             # Documented as the answer for a token the provider cannot find on the domain: a
             # normal step of the flow rather than an error, so it is not a provider error.
             return {"status": "not_verified", "reason": "token_not_found"}
-        self._provider_errors.append(f"http_{response.status_code}")
+        self._note(result)
         log.warning(
             "hibp_verification_verify_failed",
-            status=response.status_code,
-            err=response.text[:200],
+            status=result.status,
+            err=(result.snippet or "")[:200],
         )
-        return {"status": "failed", "reason": _verification_reason(response.status_code)}
+        return {"status": "failed", "reason": _verification_reason(result.status)}
 
     async def run_domain_verification(
         self, work: dict, policy: dict, request: dict, *, reset_readiness: bool = True
@@ -1130,59 +1176,59 @@ class HibpConnector(ConnectorBase):
             return []
         url = f"{self.BASE}/breachedaccount/{email}"
         params = {"truncateResponse": "false", "includeUnverified": "true"}
-        response = await self._get(
+        result = await self._get(
             client, url, params=params, headers=self._hibp_headers(), bucket="lookup"
         )
-        if response is None:
+        if result is None:
             return []
-        if response.status_code == 404:
+        if result.status == 404:
             return []
-        if response.status_code != 200:
-            self._provider_errors.append(f"http_{response.status_code}")
+        if result.status != 200:
+            self._note(result)
             log.warning(
                 "hibp_email_http_error",
-                status=response.status_code,
-                err=response.text[:200],
+                status=result.status,
+                err=(result.snippet or "")[:200],
             )
             return []
-        try:
-            return response.json() or []
-        except Exception as exc:  # noqa: BLE001 - a malformed body is one outcome
-            self._provider_errors.append("invalid_json")
-            log.warning("hibp_email_json_failed", err=str(exc)[:200])
+        if result.outcome is not None:
+            self._note(result)
+            log.warning("hibp_email_json_failed", err=result.outcome)
             return []
+        return result.payload if isinstance(result.payload, list) else []
 
     async def search_domain_breaches(self, client: httpx.AsyncClient, domain: str) -> dict[str, list[str]]:
         """Returns {alias: [breach names]} for every breached address."""
         if not self.api_key:
             return {}
         url = f"{self.BASE}/breacheddomain/{domain}"
-        response = await self._get(
+        result = await self._get(
             client, url, headers=self._hibp_headers(), bucket="lookup"
         )
-        if response is None:
+        if result is None:
             return {}
-        if response.status_code == 404:
+        if result.status == 404:
             return {}
-        if response.status_code != 200:
+        if result.status != 200:
             # Remembered per domain, because a refusal is about *this* domain rather
             # than about the scan: the summary has to be able to say the domain was
             # not asked about instead of reporting an empty result (F-04).
-            self._domain_http[str(domain)] = response.status_code
-            self._provider_errors.append(f"http_{response.status_code}")
+            self._domain_http[str(domain)] = result.status
+            self._note(result)
             log.warning(
                 "hibp_domain_http_error",
                 domain=domain,
-                status=response.status_code,
-                err=response.text[:200],
+                status=result.status,
+                err=(result.snippet or "")[:200],
             )
             return {}
-        try:
-            raw = response.json()
-        except Exception as exc:  # noqa: BLE001 - a malformed body is one outcome
-            self._provider_errors.append("invalid_json")
-            log.warning("hibp_domain_json_failed", err=str(exc)[:200])
+        if result.outcome is not None:
+            # A body this worker cannot read: JSON that does not parse, or one larger
+            # than it will decode. Both are "nothing was learned", not "no breaches".
+            self._note(result)
+            log.warning("hibp_domain_json_failed", err=result.outcome)
             return {}
+        raw = result.payload
         result: dict[str, list[str]] = {}
         if isinstance(raw, dict):
             for alias, value in raw.items():
@@ -1235,27 +1281,27 @@ class HibpConnector(ConnectorBase):
         if not self.api_key:
             return None
         prefix, suffix = _email_hash_parts(email, case=case)
-        response = await self._get(
+        result = await self._get(
             client,
             f"{self.BASE}/breachedaccount/range/{prefix}",
             headers=self._hibp_headers(),
             bucket="lookup",
         )
-        if response is None:
+        if result is None:
             return None
-        if response.status_code == 404:
+        if result.status == 404:
             # Documented as "nothing in this range", which is an answer about the bucket
             # rather than a refusal.
             return [], False
-        if response.status_code != 200:
-            self._provider_errors.append(f"http_{response.status_code}")
+        if result.status != 200:
+            self._note(result)
             log.warning(
-                "hibp_range_http_error", status=response.status_code, err=response.text[:200]
+                "hibp_range_http_error", status=result.status, err=(result.snippet or "")[:200]
             )
             return None
-        payload = _json_value(response)
+        payload = result.payload
         if not isinstance(payload, list):
-            self._provider_errors.append("invalid_json")
+            self._note(result)
             return None
         names: list[str] = []
         matched = False
@@ -1338,26 +1384,26 @@ class HibpConnector(ConnectorBase):
         """
         if not self.api_key:
             return None
-        response = await self._get(
+        result = await self._get(
             client,
             f"{self.BASE}/pasteAccount/{email}",
             headers=self._hibp_headers(),
             bucket="lookup",
         )
-        if response is None:
+        if result is None:
             return None
-        if response.status_code == 404:
+        if result.status == 404:
             # Documented as "no pastes": an answer, not a refusal.
             return []
-        if response.status_code != 200:
-            self._provider_errors.append(f"http_{response.status_code}")
+        if result.status != 200:
+            self._note(result)
             log.warning(
-                "hibp_paste_http_error", status=response.status_code, err=response.text[:200]
+                "hibp_paste_http_error", status=result.status, err=(result.snippet or "")[:200]
             )
             return None
-        payload = _json_value(response)
+        payload = result.payload
         if not isinstance(payload, list):
-            self._provider_errors.append("invalid_json")
+            self._note(result)
             return None
         return payload
 
@@ -1371,28 +1417,27 @@ class HibpConnector(ConnectorBase):
         """
         if not self.api_key:
             return None
-        response = await self._get(
+        result = await self._get(
             client,
             f"{self.BASE}/stealerLogsByEmail/{email}",
             headers=self._hibp_headers(),
             bucket="lookup",
         )
-        if response is None:
+        if result is None:
             return None
-        if response.status_code == 404:
+        if result.status == 404:
             return []
-        if response.status_code != 200:
-            self._provider_errors.append(f"http_{response.status_code}")
+        if result.status != 200:
+            self._note(result)
             log.warning(
                 "hibp_stealer_email_http_error",
-                status=response.status_code,
-                err=response.text[:200],
+                status=result.status,
+                err=(result.snippet or "")[:200],
             )
             return None
-        payload = _json_value(response)
-        names = _site_names(payload)
+        names = _site_names(result.payload)
         if names is None:
-            self._provider_errors.append("invalid_json")
+            self._note(result)
         return names
 
     async def search_stealer_logs_for_email_domain(
@@ -1407,30 +1452,30 @@ class HibpConnector(ConnectorBase):
         """
         if not self.api_key:
             return None
-        response = await self._get(
+        result = await self._get(
             client,
             f"{self.BASE}/stealerLogsByEmailDomain/{domain}",
             headers=self._hibp_headers(),
             bucket="lookup",
             extra_limiter=self._stealer_limiter,
         )
-        if response is None:
+        if result is None:
             return None
-        if response.status_code == 404:
+        if result.status == 404:
             return {}
-        if response.status_code != 200:
+        if result.status != 200:
             # Remembered per domain like every other refusal, so the summary can say
             # the domain was not scanned instead of that it had nothing (F-04).
-            self._domain_http[str(domain)] = response.status_code
-            self._provider_errors.append(f"http_{response.status_code}")
+            self._domain_http[str(domain)] = result.status
+            self._note(result)
             log.warning(
                 "hibp_stealer_domain_http_error",
                 domain=domain,
-                status=response.status_code,
-                err=response.text[:200],
+                status=result.status,
+                err=(result.snippet or "")[:200],
             )
             return None
-        payload = _json_value(response)
+        payload = result.payload
         if not isinstance(payload, dict):
             self._provider_errors.append("invalid_json")
             return None
@@ -1475,10 +1520,14 @@ class HibpConnector(ConnectorBase):
         is nothing to find" (WI-14, WI-15).
         """
         facts: dict[str, object] = {}
-        response = await self._get(
+        result = await self._get(
             client, f"{self.BASE}/subscription/status", headers=self._hibp_headers(), bucket="lookup"
         )
-        payload = _json_object(response)
+        payload = (
+            result.payload
+            if result is not None and isinstance(result.payload, dict)
+            else None
+        )
         if payload is not None:
             name = str(payload.get("SubscriptionName") or "")[:64]
             if name:
@@ -1504,13 +1553,13 @@ class HibpConnector(ConnectorBase):
             # answer decides which form the address search uses (WI-19).
             if isinstance(facts.get("includes_kanon"), bool):
                 self._kanon_entitled = bool(facts["includes_kanon"])
-        elif response is not None:
-            facts["subscription_status_http"] = response.status_code
+        elif result is not None:
+            facts["subscription_status_http"] = result.status
 
-        response = await self._get(
+        result = await self._get(
             client, f"{self.BASE}/subscribedDomains", headers=self._hibp_headers(), bucket="lookup"
         )
-        payload = _json_value(response)
+        payload = result.payload if result is not None else None
         if isinstance(payload, list):
             self._subscribed_domains = {
                 str(item).strip().lower()
@@ -1518,8 +1567,8 @@ class HibpConnector(ConnectorBase):
                 if isinstance(item, str) and item.strip()
             }
             facts["subscribed_domains"] = len(self._subscribed_domains)
-        elif response is not None:
-            facts["subscribed_domains_http"] = response.status_code
+        elif result is not None:
+            facts["subscribed_domains_http"] = result.status
         return facts
 
     # ------------------------------------------------------------------
@@ -1536,15 +1585,15 @@ class HibpConnector(ConnectorBase):
         none, which is a catalogue nothing can be newer than.  Both spellings are
         returned because ``None`` alone cannot tell them apart.
         """
-        response = await self._get(
+        result = await self._get(
             client, f"{self.BASE}/latestBreach", headers=self._hibp_headers(), bucket="search"
         )
-        if response is None:
+        if result is None:
             return None, False
-        if response.status_code not in (200, 404):
-            self._provider_errors.append(f"http_{response.status_code}")
+        if result.status not in (200, 404):
+            self._note(result)
             return None, False
-        return _json_object(response), True
+        return (result.payload if isinstance(result.payload, dict) else None), True
 
     async def catalogue_sweep(self, client: httpx.AsyncClient, limit: int) -> dict:
         """The source's whole catalogue, bounded, as entries the core accepts.
@@ -1555,15 +1604,15 @@ class HibpConnector(ConnectorBase):
         cost — and ``answered`` separates a provider that read out its catalogue from one
         that refused or did not answer: an unanswered sweep is not an empty catalogue.
         """
-        response = await self._get(
+        result = await self._get(
             client, f"{self.BASE}/breaches", headers=self._hibp_headers(), bucket="search"
         )
-        if response is None:
+        if result is None:
             return {"entries": [], "truncated": False, "answered": False}
-        payload = _json_value(response)
+        payload = result.payload
         if not isinstance(payload, list):
-            self._provider_errors.append(f"http_{response.status_code}")
-            log.warning("hibp_catalogue_http_error", status=response.status_code)
+            self._note(result)
+            log.warning("hibp_catalogue_http_error", status=result.status)
             return {"entries": [], "truncated": False, "answered": False}
         entries = [entry for entry in (_catalogue_entry(item) for item in payload) if entry]
         return {
@@ -1658,13 +1707,13 @@ class HibpConnector(ConnectorBase):
         """
         if self._data_class_labels is not None:
             return self._data_class_labels
-        response = await self._get(
+        result = await self._get(
             client,
             f"{self.BASE}/dataClasses/descriptions",
             headers=self._hibp_headers(),
             bucket="search",
         )
-        payload = _json_value(response)
+        payload = result.payload if result is not None else None
         labels: dict[str, str] = {}
         if isinstance(payload, dict):
             for key, value in payload.items():
@@ -1698,15 +1747,12 @@ class HibpConnector(ConnectorBase):
         if safe in self._metadata_cache:
             return self._metadata_cache[safe]
         url = f"{self.BASE}/breach/{safe}"
-        response = await self._get(client, url, headers=self.UA, bucket="lookup")
+        result = await self._get(client, url, headers=self.UA, bucket="lookup")
         metadata: dict | None = None
-        if response is not None and response.status_code == 200:
-            try:
-                payload = response.json()
-            except Exception:  # noqa: BLE001 - a malformed body is "no metadata"
-                payload = None
-            if isinstance(payload, dict):
-                metadata = payload
+        if result is not None and result.status == 200 and isinstance(result.payload, dict):
+            # A malformed body is "no metadata" rather than an incident the platform
+            # makes up (F-02) — the same answer a refusal gets.
+            metadata = result.payload
         self._metadata_cache[safe] = metadata
         return metadata
 

@@ -142,6 +142,42 @@ class TestHibpConnector:
             assert await connector.search_email_breaches(client, "user@example.com") == []
         assert connector._provider_errors == ["network_error"]
 
+    @pytest.mark.asyncio
+    async def test_a_rate_limit_is_answered_once_because_the_provider_bills_it(
+        self, connector_env
+    ):
+        """A retry the vendor did not ask for is a second charge for one answer.
+
+        The shared client retries three times by default; this provider's rule is one
+        attempt, and the connector has to state that rather than inherit it.
+        """
+        connector = HibpConnector()
+        calls: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(request.url.path)
+            return httpx.Response(429, headers={"Retry-After": "30"})
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            assert await connector.search_email_breaches(client, "user@example.com") == []
+
+        assert len(calls) == 1
+        assert connector._provider_errors == ["http_429"]
+
+    @pytest.mark.asyncio
+    async def test_an_oversized_answer_is_refused_before_it_is_decoded(self, connector_env):
+        """A stranger's body is bounded, and the bound is checked while reading."""
+        connector = HibpConnector()
+        body = b"[" + b" " * 2_000_001 + b"]"
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, content=body)
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            assert await connector.search_email_breaches(client, "user@example.com") == []
+
+        assert connector._provider_errors == ["response_too_large"]
+
     async def test_domain_lookup_filters_malformed_alias_entries(self, connector_env):
         connector = HibpConnector()
         payload = {
