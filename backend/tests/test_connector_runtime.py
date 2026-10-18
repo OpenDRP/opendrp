@@ -271,6 +271,25 @@ def _leased(connector):
     return connector
 
 
+class _Stream:
+    """The transport shape the shared provider client reads through.
+
+    The client streams an answer and never buffers it, so a connector double has to
+    present ``stream`` and an ``aiter_bytes`` body instead of the ``get`` call the
+    connector used to make itself. This is the shape of the wire, not the behaviour
+    under test: every assertion below is the one it was before the migration.
+    """
+
+    def __init__(self, response):
+        self._response = response
+
+    async def __aenter__(self):
+        return self._response
+
+    async def __aexit__(self, *exc_info):
+        return False
+
+
 class TestShodanConnector:
     def test_capabilities_prefer_registry_values_and_use_env_fallbacks(self, connector_env):
         """The three historical questions follow env; every new one is opt-in.
@@ -346,9 +365,13 @@ class TestShodanConnector:
 
         class FakeResponse:
             status_code = 200
+            headers: dict = {}
 
             def json(self):
                 return {"matches": [{"ip_str": "198.51.100.20", "domains": ["found.example"]}] * 100}
+
+            async def aiter_bytes(self):
+                yield json.dumps(self.json()).encode()
 
         class FakeClient:
             async def __aenter__(self):
@@ -357,9 +380,12 @@ class TestShodanConnector:
             async def __aexit__(self, *args):
                 return None
 
-            async def get(self, url, **kwargs):
+            def _respond(self, url, **kwargs):
                 calls.append(kwargs["params"])
                 return FakeResponse()
+
+            def stream(self, method, url, **kwargs):
+                return _Stream(self._respond(url, **kwargs))
 
         monkeypatch.setattr(_shodanmodule.httpx, "AsyncClient", lambda **kwargs: FakeClient())
         await connector._search('ssl:"example.com"', set())
@@ -445,9 +471,13 @@ class TestShodanConnector:
 
             def __init__(self, payload):
                 self.payload = payload
+                self.headers = {}
 
             def json(self):
                 return self.payload
+
+            async def aiter_bytes(self):
+                yield json.dumps(self.payload).encode()
 
         class FakeClient:
             async def __aenter__(self):
@@ -456,9 +486,12 @@ class TestShodanConnector:
             async def __aexit__(self, *args):
                 return None
 
-            async def get(self, url, **kwargs):
+            def _respond(self, url, **kwargs):
                 calls.append(kwargs["params"])
                 return FakeResponse(responses.pop(0))
+
+            def stream(self, method, url, **kwargs):
+                return _Stream(self._respond(url, **kwargs))
 
         monkeypatch.setattr(_shodanmodule.httpx, "AsyncClient", lambda **kwargs: FakeClient())
         result = await connector._search("ssl:\"example.com\"", {"owned.example", "203.0.113.10"})
@@ -483,6 +516,9 @@ class TestShodanConnector:
             def json(self):
                 return self._payload
 
+            async def aiter_bytes(self):
+                yield json.dumps(self._payload).encode()
+
         responses.extend([
             FakeResponse(429, headers={"Retry-After": "0"}, text="rate limited"),
             FakeResponse(200, {"matches": []}),
@@ -493,8 +529,10 @@ class TestShodanConnector:
                 return self
             async def __aexit__(self, *args):
                 return None
-            async def get(self, *args, **kwargs):
+            def _respond(self, url, **kwargs):
                 return responses.pop(0)
+            def stream(self, method, url, **kwargs):
+                return _Stream(self._respond(url, **kwargs))
 
         monkeypatch.setattr(_shodanmodule.httpx, "AsyncClient", lambda **kwargs: FakeClient())
         monkeypatch.setattr(_shodanmodule.asyncio, "sleep", AsyncMock())
@@ -509,7 +547,7 @@ class TestShodanConnector:
                 return self
             async def __aexit__(self, *args):
                 return None
-            async def get(self, *args, **kwargs):
+            def stream(self, *args, **kwargs):
                 raise _shodanmodule.httpx.ReadTimeout("provider timeout")
         monkeypatch.setattr(_shodanmodule.httpx, "AsyncClient", lambda **kwargs: FakeClient())
         monkeypatch.setattr(_shodanmodule.asyncio, "sleep", AsyncMock())
@@ -525,6 +563,9 @@ class TestShodanConnector:
             text = "invalid key"
             headers = {}
 
+            async def aiter_bytes(self):
+                yield self.text.encode()
+
         class FakeClient:
             async def __aenter__(self):
                 return self
@@ -532,11 +573,76 @@ class TestShodanConnector:
             async def __aexit__(self, *args):
                 return None
 
-            async def get(self, *args, **kwargs):
-                return FakeResponse()
+            def stream(self, *args, **kwargs):
+                return _Stream(FakeResponse())
 
         monkeypatch.setattr(_shodanmodule.httpx, "AsyncClient", lambda **kwargs: FakeClient())
         assert await connector._search("ssl:\"example.com\"", set()) == []
+
+    @pytest.mark.asyncio
+    async def test_a_403_naming_credit_is_reported_as_a_drained_quota(self, connector_env, monkeypatch):
+        """The vendor answers 403 for a spent account, so the body is the evidence.
+
+        Without this the operator reads "access denied" and checks the key, while
+        the real answer is that the plan's query credits are gone for the day.
+        """
+        connector = _leased(ShodanConnector())
+
+        class FakeResponse:
+            status_code = 403
+            headers = {}
+
+            async def aiter_bytes(self):
+                yield b'{"error": "Insufficient query credits"}'
+
+        class FakeClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return None
+
+            def stream(self, *args, **kwargs):
+                return _Stream(FakeResponse())
+
+        monkeypatch.setattr(_shodanmodule.httpx, "AsyncClient", lambda **kwargs: FakeClient())
+        assert await connector._search("ssl:\"example.com\"", set()) == []
+        assert connector._provider_errors == ["quota_exhausted"]
+
+    @pytest.mark.asyncio
+    async def test_an_oversized_answer_is_refused_before_it_is_decoded(
+        self, connector_env, monkeypatch
+    ):
+        """A stranger's body is bounded, and the bound is checked while reading.
+
+        This connector used to decode whatever arrived; the shared client refuses
+        the answer once it crosses the limit, so an oversized payload is never held
+        in memory and never parsed.
+        """
+        connector = _leased(ShodanConnector())
+        body = b"{\"matches\": [" + b" " * (_shodanmodule._SHODAN_MAX_RESPONSE_BYTES + 1) + b"]}"
+
+        class FakeResponse:
+            status_code = 200
+            headers = {}
+
+            async def aiter_bytes(self):
+                for start in range(0, len(body), 65536):
+                    yield body[start : start + 65536]
+
+        class FakeClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return None
+
+            def stream(self, *args, **kwargs):
+                return _Stream(FakeResponse())
+
+        monkeypatch.setattr(_shodanmodule.httpx, "AsyncClient", lambda **kwargs: FakeClient())
+        assert await connector._search("ssl:\"example.com\"", set()) == []
+        assert connector._provider_errors == ["response_too_large"]
 
     @pytest.mark.asyncio
     async def test_scan_skips_when_all_capabilities_disabled(self, connector_env, monkeypatch):
@@ -867,6 +973,9 @@ class TestShodanConnector:
             def json(self):
                 return self.payload
 
+            async def aiter_bytes(self):
+                yield json.dumps(self.payload).encode()
+
         class FakeClient:
             async def __aenter__(self):
                 return self
@@ -874,8 +983,11 @@ class TestShodanConnector:
             async def __aexit__(self, *args):
                 return None
 
-            async def get(self, url, **kwargs):
+            def _respond(self, url, **kwargs):
                 return FakeResponse(pages.pop(0))
+
+            def stream(self, method, url, **kwargs):
+                return _Stream(self._respond(url, **kwargs))
 
         monkeypatch.setattr(_shodanmodule.httpx, "AsyncClient", lambda **kwargs: FakeClient())
         _, summary = await connector.run_scan(
@@ -1083,6 +1195,9 @@ class TestShodanConnector:
             def json(self):
                 return self.payload
 
+            async def aiter_bytes(self):
+                yield json.dumps(self.payload).encode()
+
         class FakeClient:
             async def __aenter__(self):
                 return self
@@ -1093,11 +1208,14 @@ class TestShodanConnector:
             def __init__(self):
                 self.lookups = 0
 
-            async def get(self, url, **kwargs):
+            def _respond(self, url, **kwargs):
                 if url.endswith("/search"):
                     return FakeResponse({"matches": [banner]})
                 self.lookups += 1
                 return FakeResponse(lookup_payload)
+
+            def stream(self, method, url, **kwargs):
+                return _Stream(self._respond(url, **kwargs))
 
         clients: list[FakeClient] = []
 

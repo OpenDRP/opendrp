@@ -37,6 +37,7 @@ else:
     )
 
 from opendrp_connector.provider import (  # noqa: E402
+    ERROR_SNIPPET_BYTES,
     INVALID_JSON,
     INVALID_RESPONSE,
     NETWORK_TIMEOUT,
@@ -273,6 +274,52 @@ async def test_post_sends_the_json_body():
 
     assert http.calls[0][0] == "POST"
     assert http.calls[0][2]["json"] == {"query": "brand"}
+
+
+async def test_a_connector_can_name_a_rejection_the_vendor_words_its_way():
+    """Some providers refuse in the body: the status alone cannot tell why."""
+    http = _Http(_Response(403, b'{"error": "no query credits left"}'))
+
+    def classify(status: int, body: str) -> str | None:
+        return "quota_exhausted" if status == 403 and "credit" in body else None
+
+    result = await _client(http, classify_error=classify).get_json(
+        "https://provider.example/x"
+    )
+
+    assert result.outcome == "quota_exhausted"
+    assert result.status == 403
+    assert len(http.calls) == 1, "a refusal is not retried"
+
+
+async def test_a_classifier_sees_only_the_head_of_a_refusal():
+    """Naming a refusal must not become the unbounded read this client prevents."""
+    http = _Http(_Response(403, b"x" * 8192 + b"missing credit"))
+    seen: list[str] = []
+
+    def classify(status: int, text: str) -> str | None:
+        seen.append(text)
+        return "quota_exhausted" if "credit" in text else None
+
+    result = await _client(http, classify_error=classify).get_json(
+        "https://provider.example/x"
+    )
+
+    assert result.outcome == "http_403", "nothing beyond the snippet is guessed at"
+    assert len(seen) == 1
+    assert len(seen[0]) <= ERROR_SNIPPET_BYTES
+
+
+async def test_a_classifier_does_not_overwrite_the_clients_own_verdict():
+    """A wait this client already decided on is not renamed back to the status."""
+    http = _Http(_Response(429, b"slow down", headers={"Retry-After": "600"}))
+    limits = ProviderLimits(abort_when_retry_after_exceeds=60.0)
+
+    result = await _client(
+        http, limits=limits, classify_error=lambda status, body: f"http_{status}"
+    ).get_json("https://provider.example/x")
+
+    assert result.outcome == "http_429_retry_later"
 
 
 def test_retry_after_reads_seconds_dates_and_nonsense():

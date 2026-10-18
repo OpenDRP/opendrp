@@ -113,6 +113,14 @@ def parse_retry_after(value, *, now: datetime | None = None) -> float | None:
 Reserve = Callable[[], Awaitable[None]]
 Pace = Callable[[], Awaitable[None]]
 OnStatus = Callable[[int], None]
+#: ``(status, body snippet) -> outcome``. A provider that refuses in its body
+#: rather than its status (Shodan's 403 with the word "credit") needs this; the
+#: snippet is bounded, so naming a refusal can never become an unbounded read.
+ClassifyError = Callable[[int, str], str | None]
+
+#: How much of a refused response's body a classifier may see. Large enough for
+#: the sentence a provider writes, small enough that it is never the whole answer.
+ERROR_SNIPPET_BYTES = 4096
 
 
 class ProviderClient:
@@ -140,6 +148,7 @@ class ProviderClient:
         reserve: Reserve | None = None,
         pace: Pace | Sequence[Pace] | None = None,
         on_status: OnStatus | None = None,
+        classify_error: ClassifyError | None = None,
         errors: list[str] | None = None,
         sleep: Callable[[float], Awaitable[None]] | None = None,
     ) -> None:
@@ -153,6 +162,7 @@ class ProviderClient:
         else:
             self._pacers = (pace,)
         self._on_status = on_status
+        self._classify = classify_error
         self.errors: list[str] = errors if errors is not None else []
         self._sleep = sleep or asyncio.sleep
 
@@ -171,7 +181,7 @@ class ProviderClient:
         headers: dict | None = None,
         json: Any = None,
         free: bool = False,
-        timeout: float | None = None,
+        timeout: float | httpx.Timeout | None = None,
     ) -> ProviderResult:
         last_outcome = RETRY_EXHAUSTED
         last_response = None
@@ -204,18 +214,15 @@ class ProviderClient:
                         hint = parse_retry_after(response.headers.get("Retry-After"))
                         ceiling = self.limits.abort_when_retry_after_exceeds
                         if hint is not None and ceiling is not None and hint > ceiling:
-                            last_outcome = f"http_{status}_{RETRY_LATER}"
-                            self._record(last_outcome)
-                            return ProviderResult(None, status, last_outcome, response)
+                            return await self._rejected(
+                                response, status, f"http_{status}_{RETRY_LATER}"
+                            )
                         if attempt + 1 < self.limits.max_attempts:
                             delay = hint if hint is not None else 2**attempt
                             await self._sleep(min(self.limits.max_retry_delay, delay))
                             continue
-                        self._record(last_outcome)
-                        return ProviderResult(None, status, last_outcome, response)
-                    outcome = f"http_{status}"
-                    self._record(outcome)
-                    return ProviderResult(None, status, outcome, response)
+                        return await self._rejected(response, status, last_outcome)
+                    return await self._rejected(response, status, f"http_{status}")
             except httpx.TimeoutException:
                 last_outcome = NETWORK_TIMEOUT
             except httpx.HTTPError:
@@ -247,6 +254,42 @@ class ProviderClient:
         if not isinstance(payload, (dict, list)):
             return None, INVALID_RESPONSE
         return payload, None
+
+    async def _rejected(
+        self, response, status: int, outcome: str
+    ) -> ProviderResult:
+        """Name a refusal the way the connector does, then report it.
+
+        Only a plain ``http_<status>`` is offered to the classifier: an outcome
+        that already carries a decision (``http_429_retry_later``) is this
+        client's own verdict about the wait, and a connector's error table must
+        not overwrite it with the bare status again.
+        """
+        if self._classify is not None and outcome == f"http_{status}":
+            named = self._classify(status, await self._snippet(response))
+            if named:
+                outcome = named
+        self._record(outcome)
+        return ProviderResult(None, status, outcome, response)
+
+    async def _snippet(self, response) -> str:
+        """Read the head of a refused body, never more than the bound.
+
+        Some providers state the reason in the text of the rejection, and the
+        caller needs it to tell a drained account from a forbidden one. Reading
+        the whole body here would reintroduce the unbounded read this file
+        exists to prevent, so the snippet stops at
+        :data:`ERROR_SNIPPET_BYTES` whatever the provider sends.
+        """
+        content = bytearray()
+        try:
+            async for chunk in response.aiter_bytes():
+                content.extend(chunk)
+                if len(content) >= ERROR_SNIPPET_BYTES:
+                    break
+        except httpx.HTTPError:
+            return ""
+        return bytes(content[:ERROR_SNIPPET_BYTES]).decode("utf-8", "replace")
 
     def _record(self, outcome: str) -> None:
         if outcome not in self.errors:

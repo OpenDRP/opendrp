@@ -64,8 +64,6 @@ import ipaddress
 import os
 import re
 import time
-from email.utils import parsedate_to_datetime
-from datetime import datetime, timezone
 
 import httpx
 import mmh3
@@ -74,6 +72,12 @@ import structlog
 from opendrp_connector import ConnectorBase
 from opendrp_connector.base import ConnectorAPIError
 from opendrp_connector.network import is_safe_external_ip
+from opendrp_connector.provider import (
+    NETWORK_ERROR,
+    NETWORK_TIMEOUT,
+    ProviderClient,
+    ProviderLimits,
+)
 
 log = structlog.get_logger()
 
@@ -87,6 +91,11 @@ _SHODAN_DEFAULT_MAX_PAGES = 3
 _SHODAN_DEFAULT_MIN_INTERVAL = 1.0
 _SHODAN_DEFAULT_TIMEOUT = 30.0
 _SHODAN_MAX_RETRY_DELAY = 30.0
+#: The largest body a provider answer may carry before it is refused undecoded.
+#: A page of 100 minified banners is far below it, while the old unbounded read
+#: would hold whatever a provider (or something in front of it) sent back — the
+#: defect the shared client closes for every connector at once.
+_SHODAN_MAX_RESPONSE_BYTES = 2_000_000
 _SHODAN_COUNT_API = "https://api.shodan.io/shodan/host/count"
 _SHODAN_HOST_API = "https://api.shodan.io/shodan/host/{ip}"
 _SHODAN_TOKENS_API = "https://api.shodan.io/shodan/host/search/tokens"
@@ -240,6 +249,20 @@ class ShodanConnector(ConnectorBase):
             5.0,
             min(120.0, float(self.env.get("SHODAN_REQUEST_TIMEOUT_SECONDS", str(_SHODAN_DEFAULT_TIMEOUT)))),
         )
+        #: Every provider call is held to these. Three attempts and a 30 second
+        #: ceiling on any single wait are the connector's historical constants;
+        #: the body bound is what the shared client adds, and
+        #: ``abort_when_retry_after_exceeds=None`` keeps the older answer to a long
+        #: ``Retry-After`` — wait out the ceiling and retry rather than abandon the
+        #: call. Turning the abort on is a behaviour change and belongs to its own
+        #: commit, not to a refactor.
+        self._provider_limits = ProviderLimits(
+            max_attempts=_SHODAN_MAX_RETRIES + 1,
+            max_retry_delay=_SHODAN_MAX_RETRY_DELAY,
+            max_response_bytes=_SHODAN_MAX_RESPONSE_BYTES,
+            timeout=self._request_timeout,
+            abort_when_retry_after_exceeds=None,
+        )
         # ---- per-run state ------------------------------------------------
         #: The job id of the scan being executed. Which provider request is billed
         #: to which job is part of the reservation, so the connector has to keep it.
@@ -249,8 +272,9 @@ class ShodanConnector(ConnectorBase):
         self._policy: dict[str, int] = {key: limits[2] for key, limits in POLICY.items()}
         self._skipped: dict[str, int] = {}
         self._refusal: str | None = None
-        #: Named apart from :meth:`_retry_after`, which parses the *provider's*
-        #: header; this is the wait the *core* named when it refused a request.
+        #: Named apart from the provider's own ``Retry-After`` header, which the
+        #: shared client reads and honours; this is the wait the *core* named when
+        #: it refused a request.
         self._named_retry_after: float | None = None
         self._spent = 0
         self._budget_left: int | None = None
@@ -479,27 +503,24 @@ class ShodanConnector(ConnectorBase):
         self._last_provider_request = time.monotonic()
 
     @staticmethod
-    def _retry_after(response: httpx.Response) -> float | None:
-        raw = response.headers.get("Retry-After")
-        if not raw:
-            return None
-        try:
-            return max(0.0, float(raw))
-        except ValueError:
-            try:
-                target = parsedate_to_datetime(raw)
-                if target.tzinfo is None:
-                    target = target.replace(tzinfo=timezone.utc)
-                return max(0.0, (target - datetime.now(timezone.utc)).total_seconds())
-            except (TypeError, ValueError, OverflowError):
-                return None
+    def _error_code(status: int, body: str) -> str:
+        """Shodan's own wording for a refusal, on top of the shared vocabulary.
 
-    @staticmethod
-    def _error_code(response: httpx.Response) -> str:
-        text = getattr(response, "text", "") or ""
-        if response.status_code == 403 and "credit" in text.lower():
+        A 403 is not one thing at this vendor: a key without access and an account
+        whose query credits are spent both answer with it, and the second must reach
+        the operator as ``quota_exhausted`` or a topped-up account reads as a
+        permissions problem. The sentence in the body is what separates them, which
+        is why the shared client hands a bounded snippet to this table instead of
+        guessing from the status alone.
+        """
+        if status == 403 and "credit" in body.lower():
             return "quota_exhausted"
-        return f"http_{response.status_code}"
+        return f"http_{status}"
+
+    def _note_provider_error(self, code: str) -> None:
+        """Record a provider failure once, in the order it happened."""
+        if code not in self._provider_errors:
+            self._provider_errors.append(code)
 
     async def _reserve(self, bucket: str = "search") -> None:
         """Reserve one provider request, or stop the scan with a named reason.
@@ -552,58 +573,55 @@ class ShodanConnector(ConnectorBase):
         """One paced and classified provider GET; ``None`` when it did not answer.
 
         Every provider request in this connector goes through here, so the pace,
-        the budget reservation and the failure classification exist once — a call
-        site that forgot to reserve would be spending without asking, which is the
-        one thing the account's quota exists to prevent. ``free=True`` is the
-        documented no-credit case (an IP lookup), and it is deliberately explicit:
-        charging for a call the vendor does not bill would make this platform
-        refuse enrichment it never paid for.
+        the budget reservation, the retries and the failure classification cannot
+        be forgotten at a call site — a request that skipped the reservation would
+        be spending without asking, which is the one thing the account's quota
+        exists to prevent. The mechanisms themselves live in
+        :class:`ProviderClient`, shared with the other metered connectors; what
+        stays here is what only Shodan knows: the bucket a request is billed to,
+        the interval its plan implies, and the sentence that turns a 403 into an
+        exhausted quota. ``free=True`` is the documented no-credit case (an IP
+        lookup), and it is deliberately explicit: charging for a call the vendor
+        does not bill would make this platform refuse enrichment it never paid for.
         """
-        for attempt in range(_SHODAN_MAX_RETRIES + 1):
-            try:
-                await self._pace_provider_request()
-                if not free:
-                    await self._reserve("search")
-                response = await client.get(url, params=params, headers=self.HEADERS)
-                retryable = response.status_code == 429 or 500 <= response.status_code < 600
-                if retryable and attempt < _SHODAN_MAX_RETRIES:
-                    delay = self._retry_after(response)
-                    if delay is None:
-                        delay = min(_SHODAN_MAX_RETRY_DELAY, 2 ** attempt)
-                    await asyncio.sleep(min(_SHODAN_MAX_RETRY_DELAY, delay))
-                    continue
-                if response.status_code != 200:
-                    code = self._error_code(response)
-                    if code not in self._provider_errors:
-                        self._provider_errors.append(code)
-                    log.warning("shodan_request_non_200", status=response.status_code, error_code=code)
-                    return None
-                try:
-                    payload = response.json()
-                except ValueError:
-                    if "invalid_json" not in self._provider_errors:
-                        self._provider_errors.append("invalid_json")
-                    log.warning("shodan_response_invalid_json")
-                    return None
-                if not isinstance(payload, dict):
-                    if "invalid_response" not in self._provider_errors:
-                        self._provider_errors.append("invalid_response")
-                    return None
-                return payload
-            except httpx.TimeoutException as exc:
-                if attempt < _SHODAN_MAX_RETRIES:
-                    await asyncio.sleep(min(_SHODAN_MAX_RETRY_DELAY, 2 ** attempt))
-                    continue
-                if "network_timeout" not in self._provider_errors:
-                    self._provider_errors.append("network_timeout")
-                log.warning("shodan_req_timeout", err=type(exc).__name__)
-            except httpx.HTTPError as exc:
-                if attempt < _SHODAN_MAX_RETRIES:
-                    await asyncio.sleep(min(_SHODAN_MAX_RETRY_DELAY, 2 ** attempt))
-                    continue
-                if "network_error" not in self._provider_errors:
-                    self._provider_errors.append("network_error")
-                log.warning("shodan_req_failed", err=type(exc).__name__)
+        provider = ProviderClient(
+            http=client,
+            limits=self._provider_limits,
+            reserve=lambda: self._reserve("search"),
+            pace=self._pace_provider_request,
+            classify_error=self._error_code,
+        )
+        result = await provider.get_json(
+            url,
+            params=params,
+            headers=self.HEADERS,
+            free=free,
+            # Connecting is bounded separately from reading: a host that never
+            # completes a handshake should not be waited on for the whole read
+            # budget, which is what one flat timeout would do.
+            timeout=httpx.Timeout(
+                self._request_timeout, connect=min(10.0, self._request_timeout)
+            ),
+        )
+        if result.outcome is not None:
+            self._note_provider_error(result.outcome)
+            if result.outcome == NETWORK_TIMEOUT:
+                log.warning("shodan_req_timeout", err=result.outcome)
+            elif result.outcome == NETWORK_ERROR:
+                log.warning("shodan_req_failed", err=result.outcome)
+            elif result.status is not None and result.status != 200:
+                log.warning(
+                    "shodan_request_non_200", status=result.status, error_code=result.outcome
+                )
+            else:
+                # A 200 whose body could not be used: invalid JSON, a payload that
+                # is not an object, or one larger than this connector will decode.
+                log.warning("shodan_response_unusable", error_code=result.outcome)
+            return None
+        payload = result.payload
+        if isinstance(payload, dict):
+            return payload
+        self._note_provider_error("invalid_response")
         return None
 
     def _params(self, query: str, **extra) -> dict:
@@ -627,8 +645,7 @@ class ShodanConnector(ConnectorBase):
             return None
         total = payload.get("total")
         if isinstance(total, bool) or not isinstance(total, int) or total < 0:
-            if "invalid_response" not in self._provider_errors:
-                self._provider_errors.append("invalid_response")
+            self._note_provider_error("invalid_response")
             return None
         return total
 
@@ -655,8 +672,7 @@ class ShodanConnector(ConnectorBase):
                     break
                 matches = payload.get("matches")
                 if not isinstance(matches, list):
-                    if "invalid_response" not in self._provider_errors:
-                        self._provider_errors.append("invalid_response")
+                    self._note_provider_error("invalid_response")
                     break
                 results.extend(matches)
                 self._pages += 1

@@ -161,9 +161,25 @@ Acceptance criteria, stated so the migration cannot drift:
 ## Progress and Milestones
 
 - [x] Duplication inventory (this document).
-- [ ] `provider.py` + SDK unit tests.
-- [ ] Pilot migration: `shodan`.
+- [x] `provider.py` + SDK unit tests. While the pilot migrated, the "provider
+      names its own rejection" hook the sketch called `provider_errors` became
+      `classify_error`: Shodan answers a drained account with a 403 whose body
+      says so, and a streamed response cannot be re-read after it is closed, so
+      the class reads a bounded snippet and hands it to the connector's table.
+      A classifier never renames a decision the client already made
+      (`http_429_retry_later` stays as it is).
+- [x] Pilot migration: `shodan`. `_get` is now an adapter over
+      `ProviderClient.get_json`; `_retry_after` and its imports are gone,
+      `_reserve`, `_pace_provider_request` and the 403+credit table stay where
+      they were. `ProviderLimits` carries today's constants explicitly
+      (`max_attempts=3`, `max_retry_delay=30`), and
+      `abort_when_retry_after_exceeds=None` keeps the old answer to a long hint —
+      waiting it out at the ceiling and retrying, rather than abandoning the call.
+      The 2 MB body bound arrived with the shared client and is asserted per
+      connector here, so step 5's Shodan half is closed: the defect cannot be
+      folded out of a refactor that replaces the read it lived in.
 - [ ] `dns_security`.
-- [ ] `hibp`.
-- [ ] Unbounded-response defect fixed for `hibp` and `shodan`.
-- [ ] Full backend fast suite green.
+- [ ] `hibp` (still decodes an unbounded body — the remaining half of step 5).
+- [ ] Full backend fast suite green on CI (the pilot is green in
+      `test_connector_runtime.py`, `test_connector_provider_client.py` and
+      `connectors/dns_security/test_shodan_dns.py`).

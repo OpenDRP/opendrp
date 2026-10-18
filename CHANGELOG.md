@@ -109,6 +109,15 @@ a pending or expired link.
 
 ### Changed
 
+- The Shodan worker makes every provider call through the connector SDK's shared
+  client, so its pace, quota reservation, retry loop and failure vocabulary are
+  the mechanisms the other metered connectors use instead of a fourth copy of
+  them. What was deliberate is unchanged: three attempts, a 30 second ceiling on
+  any single wait, a `Retry-After` read in seconds or as an HTTP date, and a 403
+  whose text names credits reported as `quota_exhausted` rather than as a
+  permissions problem. One thing does change: an answer larger than 2 MB is
+  refused as it is read instead of being decoded into memory — the bound DNS
+  Security already had, with HIBP next to get it.
 - Alert-channel health no longer dials SMTP and Telegram on every page load: a
   probe's result is reused for `ALERT_HEALTH_CACHE_SECONDS` (60 by default, `0`
   disables the cache), in Redis under a key hashed from that channel's settings,
