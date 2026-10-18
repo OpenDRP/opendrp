@@ -26,6 +26,11 @@ from app.core.audit_chain import prepare_entry
 from app.core.config import settings
 from app.models import Report
 from app.models.token import RefreshTokenFamily
+from app.models.tls_certificate import (
+    CertificateScopeException,
+    TLSCertificateIdentity,
+    TLSCertificateSighting,
+)
 from app.tasks import retention_tasks as rt
 
 
@@ -34,13 +39,28 @@ def _old(days: int) -> datetime:
 
 
 async def _add_session(db, *, created_days_ago: int, revoked_days_ago: int | None = None):
-    """One `drp_refresh_families` row, as login (and a password change) writes it."""
+    """One `drp_refresh_families` row, as login (and a password change) writes it.
+
+    The owner is a real ``users`` row: ``drp_refresh_families.user_id`` is a foreign
+    key with ``ON DELETE CASCADE`` (RWI-10), so a family attached to an invented id
+    is a row the schema refuses — which is the property that keeps a session from
+    outliving its account.
+    """
+    from app.models.user import User
+
+    owner = User(
+        email=f"session-{uuid.uuid4().hex[:12]}@example.com",
+        password_hash="not-used-in-this-test",
+        role="viewer",
+    )
+    db.add(owner)
+    await db.commit()
     family_id = uuid.uuid4()
     db.add(
         RefreshTokenFamily(
             id=family_id,
             family_id=family_id,
-            user_id=uuid.uuid4(),
+            user_id=owner.id,
             last_jti=str(uuid.uuid4()),
             last_issued_at=_old(created_days_ago),
             revoked=revoked_days_ago is not None,
@@ -478,6 +498,168 @@ class TestPurgeExpiredSessions:
         assert rows[0].details["session_retention_days"] == 3
 
 
+class TestPurgeExpiredCertificateEvidence:
+    """Certificate evidence has to expire, and the identity with it.
+
+    The identity and sighting tables grow with every scan and every provider read: a
+    certificate observed years ago is history, and an identity nothing points at is
+    weight the review workflow can never reach. What the sweep must not do is the
+    opposite: deleting an identity a sighting still refers to, because the fingerprint
+    is the value the rules and the operator's verdicts name.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _window(self, monkeypatch):
+        monkeypatch.setattr(settings, "TLS_CERTIFICATE_RETENTION_DAYS", 365)
+        monkeypatch.setattr(settings, "RETENTION_BATCH_SIZE", 100)
+        monkeypatch.setattr(settings, "RETENTION_MAX_BATCHES_PER_RUN", 50)
+
+    async def _identity(self, db, *, fingerprint: str, seen_days_ago: int):
+        identity = TLSCertificateIdentity(
+            id=uuid.uuid4(),
+            fingerprint_sha256=fingerprint,
+            origin="ct",
+            first_seen_at=_old(seen_days_ago),
+            last_seen_at=_old(seen_days_ago),
+            san_dns=[],
+        )
+        db.add(identity)
+        await db.flush()
+        return identity
+
+    async def _sighting(self, db, identity, *, ip: str, seen_days_ago: int):
+        sighting = TLSCertificateSighting(
+            id=uuid.uuid4(),
+            identity_id=identity.id,
+            subject="mail.example.com",
+            ip=ip,
+            port=443,
+            source="ctlogs",
+            observed_at=_old(seen_days_ago),
+            first_seen_at=_old(seen_days_ago),
+            last_seen_at=_old(seen_days_ago),
+            is_ours=False,
+            confidence=80,
+            signals={},
+            verdict="candidate",
+        )
+        db.add(sighting)
+        return sighting
+
+    async def _identities(self, db) -> set[str]:
+        return {
+            row
+            for row in (
+                await db.execute(select(TLSCertificateIdentity.fingerprint_sha256))
+            ).scalars().all()
+        }
+
+    async def _sightings(self, db) -> set[str]:
+        return {
+            row for row in (await db.execute(select(TLSCertificateSighting.ip))).scalars().all()
+        }
+
+    @pytest.mark.asyncio
+    async def test_an_old_sighting_is_history_and_a_recent_one_is_kept(self, db_session):
+        identity = await self._identity(db_session, fingerprint="a" * 64, seen_days_ago=400)
+        await self._sighting(db_session, identity, ip="198.51.100.7", seen_days_ago=400)
+        recent = await self._identity(db_session, fingerprint="b" * 64, seen_days_ago=1)
+        await self._sighting(db_session, recent, ip="198.51.100.8", seen_days_ago=1)
+        await db_session.commit()
+
+        results = await rt.purge_expired_certificate_evidence(
+            db_session, now=datetime.now(timezone.utc)
+        )
+
+        assert results["tls_certificate_sightings"].deleted_rows == 1
+        assert await self._sightings(db_session) == {"198.51.100.8"}
+        # The old identity lost its only sighting, so it goes with it; the one a
+        # surviving sighting refers to stays, whatever its own age.
+        assert await self._identities(db_session) == {"b" * 64}
+
+    @pytest.mark.asyncio
+    async def test_an_identity_a_sighting_still_refers_to_is_kept(self, db_session):
+        identity = await self._identity(db_session, fingerprint="c" * 64, seen_days_ago=400)
+        await self._sighting(db_session, identity, ip="198.51.100.7", seen_days_ago=400)
+        await self._sighting(db_session, identity, ip="198.51.100.8", seen_days_ago=1)
+        await db_session.commit()
+
+        await rt.purge_expired_certificate_evidence(db_session, now=datetime.now(timezone.utc))
+
+        assert await self._identities(db_session) == {"c" * 64}
+        assert await self._sightings(db_session) == {"198.51.100.8"}
+
+    @pytest.mark.asyncio
+    async def test_an_expired_scope_exception_is_removed_and_an_open_ended_one_is_not(
+        self, db_session
+    ):
+        expired = CertificateScopeException(
+            id=uuid.uuid4(), match_kind="fingerprint", match_value="d" * 64,
+            reason="Shared hosting, retired", expires_at=_old(1),
+        )
+        still_valid = CertificateScopeException(
+            id=uuid.uuid4(), match_kind="issuer", match_value="CN=Example CA",
+            reason="Our own certificate authority", expires_at=_old(-30),
+        )
+        # No end date means no end date: an operator who did not set one did not ask
+        # for it to lapse, and the row is the only record of why a rule is quiet.
+        open_ended = CertificateScopeException(
+            id=uuid.uuid4(), match_kind="asn", match_value="64512", reason="Partner",
+        )
+        db_session.add_all([expired, still_valid, open_ended])
+        await db_session.commit()
+
+        results = await rt.purge_expired_certificate_evidence(
+            db_session, now=datetime.now(timezone.utc)
+        )
+
+        assert results["certificate_scope_exceptions"].deleted_rows == 1
+        remaining = {
+            row
+            for row in (
+                await db_session.execute(select(CertificateScopeException.match_value))
+            ).scalars().all()
+        }
+        assert remaining == {"CN=Example CA", "64512"}
+
+    @pytest.mark.asyncio
+    async def test_zero_days_disables_the_whole_policy(self, db_session, monkeypatch):
+        monkeypatch.setattr(settings, "TLS_CERTIFICATE_RETENTION_DAYS", 0)
+        identity = await self._identity(db_session, fingerprint="e" * 64, seen_days_ago=4000)
+        await self._sighting(db_session, identity, ip="198.51.100.7", seen_days_ago=4000)
+        await db_session.commit()
+
+        results = await rt.purge_expired_certificate_evidence(
+            db_session, now=datetime.now(timezone.utc)
+        )
+
+        assert {name for name, result in results.items() if result.deleted_rows} == set()
+        assert await self._identities(db_session) == {"e" * 64}
+        assert await self._sightings(db_session) == {"198.51.100.7"}
+
+    @pytest.mark.asyncio
+    async def test_the_sweep_runs_it_and_echoes_the_window_it_used(self, db_session, monkeypatch):
+        monkeypatch.setattr(settings, "AUDIT_RETENTION_DAYS", 0)
+        monkeypatch.setattr(settings, "REPORT_RETENTION_DAYS", 0)
+        identity = await self._identity(db_session, fingerprint="f" * 64, seen_days_ago=400)
+        await self._sighting(db_session, identity, ip="198.51.100.7", seen_days_ago=400)
+        await db_session.commit()
+
+        results = await rt.run_retention_sweep(db_session)
+
+        assert results["tls_certificate_sightings"].deleted_rows == 1
+        await rt._emit_sweep_audit(results)
+        rows = (
+            await db_session.execute(
+                select(AuditLog).where(AuditLog.action == rt.ACTION_RETENTION_PURGED)
+            )
+        ).scalars().all()
+        # Deleting certificate evidence is the only way a certificate somebody could
+        # still triage disappears, so the window that did it is on the record.
+        assert rows[0].details["certificate_retention_days"] == 365
+        assert rows[0].details["tables"]["tls_certificate_sightings"]["deleted_rows"] == 1
+
+
 class TestRetentionSweep:
     @pytest.fixture(autouse=True)
     def archive_storage(self, monkeypatch, tmp_path):
@@ -558,5 +740,14 @@ class TestPurgeTask:
             None, functools.partial(purge_expired_data_task.run)
         )
 
-        assert set(summary) == {"drp_audit_logs", "reports", "drp_refresh_families", "alert_deliveries", "ingestion_events"}
+        assert set(summary) == {
+            "drp_audit_logs",
+            "reports",
+            "drp_refresh_families",
+            "alert_deliveries",
+            "ingestion_events",
+            "tls_certificate_identities",
+            "tls_certificate_sightings",
+            "certificate_scope_exceptions",
+        }
         json.dumps(summary)  # the Celery result must be JSON-serializable

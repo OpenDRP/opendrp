@@ -73,6 +73,17 @@ class UserResponse(UserBase):
     # makes sense for an account that has one. This is a timestamp, not a secret:
     # the same value is already returned by GET /auth/mfa for the account itself.
     totp_enabled_at: Optional[datetime] = None
+    # When the account last completed a sign-in, or NULL when it never has. Both
+    # the owner (`/auth/me`) and an administrator see it: "created last month and
+    # never used" is the fact that explains an unused licence or a colleague who
+    # was told the account existed. NULL is a real answer here, which is why the
+    # client renders it as "never" rather than an empty cell — an empty cell
+    # cannot be told apart from a field the API forgot to send (RWI-14).
+    last_login_at: Optional[datetime] = None
+    # When an outstanding invitation expires, or NULL when there is none. The
+    # token itself is never part of a payload read back from the database: the
+    # administrator receives it once, from the response that created it.
+    invitation_expires_at: Optional[datetime] = None
 
     model_config = ConfigDict(from_attributes=True, use_enum_values=True)
 
@@ -138,12 +149,6 @@ class UserUpdate(BaseModel):
         if hasattr(v, "value"):
             return v.value
         return str(v)
-
-
-class ToggleActiveResponse(BaseModel):
-    id: uuid.UUID
-    is_active: bool
-    action: Literal["locked", "unlocked"]
 
 
 class LoginRequest(BaseModel):
@@ -248,6 +253,60 @@ class MfaRecoveryCodesResponse(BaseModel):
 
 class MfaRecoveryCodeRequest(BaseModel):
     code: SecretStr
+
+
+class UserInviteRequest(BaseModel):
+    """Create an account whose password only its owner will ever know (U-7)."""
+
+    email: EmailAddress
+    role: UserRole
+    full_name: Optional[str] = None
+    rate_limit_minutes: int = Field(default=0, ge=0, le=RATE_LIMIT_MAX_MINUTES)
+
+
+class UserInviteResponse(BaseModel):
+    """The created account and its one-time invitation material.
+
+    ``invitation_token`` is returned here and in no other response: the server
+    keeps only a digest, and the administrator either lets the platform mail the
+    link or passes it on themselves.
+    """
+
+    user: UserResponse
+    invitation_token: str
+    expires_at: datetime
+    email_scheduled: bool = False
+
+
+class AcceptInvitationRequest(BaseModel):
+    token: SecretStr
+    new_password: SecretStr
+
+    @field_validator("new_password")
+    @classmethod
+    def _validate_new_password(cls, value: SecretStr) -> SecretStr:
+        return validate_password_strength(value)  # type: ignore[return-value]
+
+
+class UserBulkRequest(BaseModel):
+    """One activation change over many accounts (U-5).
+
+    Only the two reversible operations are batched. Deleting an account stays a
+    single, deliberate action: the same request that can revoke a session and
+    free an address should not be one checkbox away from doing it to forty
+    accounts. The bound is explicit because a bulk action is still one
+    transaction holding one set of row locks.
+    """
+
+    operation: Literal["activate", "deactivate"]
+    user_ids: list[uuid.UUID] = Field(min_length=1, max_length=100)
+
+
+class UserBulkResponse(BaseModel):
+    operation: Literal["activate", "deactivate"]
+    changed: int
+    skipped: int = 0
+    revoked_sessions: int = 0
 
 
 class SessionResponse(BaseModel):

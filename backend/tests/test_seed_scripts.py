@@ -23,7 +23,15 @@ import pytest
 from sqlalchemy import func, select
 
 import scripts.seed_data as seed_data
-from app.models import Asset, Breach, DrpPhishingDomain, SystemSettings, User
+from app.models import (
+    Asset,
+    Breach,
+    Connector,
+    DrpPhishingDomain,
+    SourceAccount,
+    SystemSettings,
+    User,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -210,4 +218,65 @@ class TestSeedDefaults:
             await db_session.execute(select(func.count(SystemSettings.id)))
         ).scalar_one()
         assert count == 1
+        await engine.dispose()
+
+    @pytest.mark.asyncio
+    async def test_binds_an_adopted_hibp_row_to_its_account(self, db_session, monkeypatch):
+        """A database an earlier build created keeps a row without a provider.
+
+        The baseline now declares `breaches-hibp` with `source: hibp`; a row seeded
+        before that change is gated on nothing and spends requests no account
+        records. The startup seeder is the one place that runs against an existing
+        installation, so the binding is applied there and only while it is missing.
+        """
+        import importlib
+
+        sd = importlib.import_module("scripts.seed_defaults")
+        from sqlalchemy.ext.asyncio import (
+            async_sessionmaker as _mk,
+            create_async_engine as _cae,
+        )
+
+        engine = _cae(str(db_session.bind.url), future=True)
+        monkeypatch.setattr(sd, "create_async_engine", lambda *a, **kw: engine)
+        monkeypatch.setattr(sd, "async_sessionmaker", lambda *a, **kw: _mk(engine))
+
+        connector = Connector(
+            name="breaches-hibp",
+            connector_type="breaches",
+            default_job_type="breaches.hibp",
+            provider=None,
+        )
+        db_session.add(connector)
+        await db_session.commit()
+
+        await sd._seed()
+        await db_session.refresh(connector)
+        accounts = (
+            await db_session.execute(
+                select(SourceAccount).where(SourceAccount.source_id == "hibp")
+            )
+        ).scalars().all()
+
+        assert connector.provider == "hibp"
+        assert connector.quota_group == "default"
+        assert len(accounts) == 1
+        assert accounts[0].policy == {"approved": False}
+        assert connector.source_account_id == accounts[0].id
+
+        #: Second start: the row is bound, so it is left alone, and no second
+        #: account appears. A seeder that ran twice must not undo an operator's
+        #: reassignment or stack a duplicate account.
+        connector.provider = "someone-else"
+        await db_session.commit()
+        await sd._seed()
+        await db_session.refresh(connector)
+        assert connector.provider == "someone-else"
+        assert (
+            await db_session.execute(
+                select(func.count(SourceAccount.id)).where(
+                    SourceAccount.source_id == "hibp"
+                )
+            )
+        ).scalar_one() == 1
         await engine.dispose()

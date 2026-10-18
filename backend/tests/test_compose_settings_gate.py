@@ -31,6 +31,11 @@ from pydantic import ValidationError
 
 from app.core.config import Settings
 
+# The gate builds production settings, and the suite sets `TESTING=1` for every
+# other test; production refuses that flag outright, so this module has to look
+# like a deployment rather than like the suite.
+pytestmark = pytest.mark.usefixtures("without_testing_switch")
+
 _ROOT = Path(__file__).resolve().parents[2]
 _GATE = _ROOT / "scripts" / "check_compose_healthchecks.py"
 _COMPOSE = _ROOT / "docker-compose.yml"

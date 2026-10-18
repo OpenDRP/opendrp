@@ -69,6 +69,11 @@ services:
       # like one. Read-only: nothing here writes to it.
       - ./docker:/docker:ro
       - ./frontend/Dockerfile:/frontend/Dockerfile:ro
+      # `tests/test_version_consistency_gate.py` runs `scripts/check_version_consistency.py`
+      # against the shipped tree, which reads the SPA package version as one of
+      # the statements the release must agree with. Without this mount the gate
+      # answers "cannot read" for a file that exists in the checkout.
+      - ./frontend/package.json:/frontend/package.json:ro
       # The installation shape is asserted rather than described:
       # tests/test_single_installation_shape.py reads the Makefile's targets and the
       # operator documentation, so both are mounted read-only as well.

@@ -18,6 +18,8 @@ from app.core import crypto
 from app.core.config import Settings, settings
 from app.core.security import create_access_token, decode_token
 
+pytestmark = pytest.mark.usefixtures("without_testing_switch")
+
 OLD_KEY = Fernet.generate_key().decode("ascii")
 NEW_KEY = Fernet.generate_key().decode("ascii")
 OLD_SECRET = "old-jwt-secret-" + "a" * 40

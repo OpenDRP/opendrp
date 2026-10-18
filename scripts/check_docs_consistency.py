@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Fail when the documentation stops being a tree an operator can navigate.
 
-Three failures are invisible in a rendered page and each of them shipped here:
+Six failures are invisible in a rendered page and each of them shipped here:
 
 1. **A relative link that points nowhere.** A rename in `docs/` leaves the pages
    that referenced it silently broken: the text still reads as an instruction and
@@ -21,11 +21,41 @@ Three failures are invisible in a rendered page and each of them shipped here:
    exist, and a sentence that presents one as the *current* head has to name the
    head that is actually there.
 
-`docs/internal/` records what was true when it was written, so neither revision
-rule applies there: those pages quote a historical head and a historical chain on
-purpose, and the audit trail of what a document used to say is worth keeping.
-Their links are still checked like everyone else's, because a link that leads
-nowhere strands a reader whenever the page was written.
+4. **A page a document names and the repository does not have.** The alerts
+   runbook was folded into `README.md`, and `docs/observability.md` went on telling
+   an operator on call to reconcile a held recipient on a page that had stopped
+   existing. The name was in backticks, not in a link, so rule 1 could not see it
+   and nothing else could either: a written-out page name is an instruction
+   whether or not it is clickable. Every `*.md` name a tracked document writes is
+   resolved against the checkout — beside its own page and at the repository root,
+   the two ways a reader would look.
+
+5. **A fragment that names no section.** `docs/configuration.md#pooling` reads as
+   a precise reference, and when the heading behind it is renamed the link keeps
+   resolving — to the top of the right page. The reader lands somewhere plausible
+   and reads the wrong paragraph. Every `#fragment` on a link into a Markdown page
+   is checked against the anchors that page actually offers: its headings, slugged
+   the way GitHub slugs them (lowercased, spaces to hyphens, punctuation dropped,
+   repeats suffixed `-1`, `-2`), and its explicit `<a name>`/`id=` anchors.
+
+6. **A block that renders as text instead of what it is.** An unclosed code fence
+   swallows every heading after it: the page turns into one grey rectangle, its
+   table of contents points into nothing, and the reader concludes the runbook
+   ends where the sample begins. A table row with a cell missing renders as a
+   paragraph, so a settings matrix silently loses the column its reader was
+   looking for. Fences are balanced (a marker closes only its own kind, and an
+   unclosed one is reported where it opened) and every table row is required to
+   carry as many cells as its header — an escaped pipe in a cell is text, not a
+   separator.
+
+`docs/internal/` records what was true when it was written, so no rule but the
+first applies there: those pages quote a historical head, a historical chain, the
+page names of their own time and the sections they linked to then on purpose, and
+the audit trail of what a document used to say is worth keeping. `CHANGELOG.md`
+is the same kind of record for the surfaces a release removed — an entry naming
+the page it deleted is the entry doing its job — so rules 3, 4 and 5 leave it
+alone as well. The links of both are still checked like everyone else's, because
+a link that leads nowhere strands a reader whenever the page was written.
 
 Deliberately stdlib-only, like its neighbours in this directory: the
 repository-hygiene CI job installs nothing.
@@ -77,6 +107,25 @@ _FENCE = re.compile(r"^\s*(?:```|~~~)")
 #: A revision reference, always written in backticks so it reads as a name.
 _REVISION_TOKEN = re.compile(r"`(?P<id>\d{4}_[a-z0-9_]+)`")
 
+#: A page named in a document — `docs/observability.md`, `connectors/README.md`,
+#: or a bare `security.md` beside the page that names it. The negative lookaheads
+#: keep the match off a longer path (`.../other.md`) and off a file that merely
+#: contains a dot (`report.md.bak`).
+_PAGE_NAME = re.compile(r"(?<![\w.-])(?P<name>[A-Za-z0-9_][A-Za-z0-9_./-]*\.md)(?![\w/-])")
+#: A URL that ends in `.md` names somebody else's page, not one of ours.
+_URL_TAIL = re.compile(r"https?://\S*$")
+#: A Markdown link target, which rule 1 resolves; reporting it twice would make
+#: one broken link read as two findings.
+_LINK_TARGET_TAIL = re.compile(r"\]\(\s*<?$")
+
+#: Where a bare page name is looked for, relative to the checkout and to the
+#: document that names it. `docs/` and `connectors/` are the directories whose
+#: pages are habitually named without a path.
+_PAGE_DIRS: Tuple[str, ...] = ("docs", "connectors", ".github")
+
+#: A record of a removed surface, not a promise about this tree.
+_HISTORY_DOCUMENTS: Tuple[str, ...] = ("CHANGELOG.md",)
+
 #: Sentences that present a revision as the state of the tree *now*. The two
 #: spellings are the ones this documentation actually uses; a page that quotes an
 #: old claim without dating it is exactly the defect being looked for.
@@ -86,6 +135,24 @@ _HEAD_CLAIMS: Tuple[re.Pattern[str], ...] = (
 )
 
 _VERSIONS_DIR = Path("backend") / "alembic" / "versions"
+#: An ATX heading: up to three spaces, one to six `#`, the text. A closing run of
+#: `#` is decoration, not part of the title.
+_ATX_HEADING = re.compile(r"^ {0,3}(?P<hashes>#{1,6})(?:[ \t]+(?P<text>.*?))?[ \t]*$")
+_ATX_CLOSING = re.compile(r"[ \t]+#+[ \t]*$")
+#: A link label, kept while its target is dropped: GitHub builds the anchor from
+#: what the reader sees, not from where the link points.
+_INLINE_LINK_LABEL = re.compile(r"\[(?P<label>[^\]]*)\]\([^)]*\)")
+#: An HTML tag in a heading, which GitHub does not render into the anchor.
+_HTML_TAG = re.compile(r"<[^>]+>")
+#: What GitHub keeps in a slug: word characters (letters, digits, `_`), hyphens
+#: and spaces. Everything else is punctuation and is cut.
+_SLUG_DROPPED = re.compile(r"[^\w\- ]+", re.UNICODE)
+#: An anchor a page declares by hand, `<a name="x">` or `id="x"`.
+_EXPLICIT_ANCHOR = re.compile(r"\b(?:name|id)\s*=\s*[\"'](?P<name>[^\"']+)[\"']")
+#: A link that is not somebody else's page: the fragment rule looks at ours.
+_OFFSITE_PREFIXES = ("http://", "https://", "mailto:", "tel:", "data:", "//")
+_MARKDOWN_SUFFIXES = (".md", ".markdown")
+
 _REVISION = re.compile(r"^\s*revision(?::[^=]+)?\s*=\s*[\"'](?P<id>[^\"']+)[\"']", re.M)
 _DOWN_REVISION = re.compile(
     r"^\s*down_revision(?::[^=]+)?\s*=\s*(?P<value>.+?)\s*$", re.M
@@ -335,6 +402,301 @@ def check_revisions(root: Path, files: Sequence[Path]) -> List[str]:
     return failures
 
 
+#: A table's delimiter row: one or more dashes per column, optionally aligned.
+_TABLE_DELIMITER = re.compile(r"^:?-+:?$")
+_FENCE_MARKER = re.compile(r"^\s*(?P<marker>`{3,}|~{3,})")
+
+
+def _table_cells(line: str) -> List[str]:
+    """The cells of one table row, with escaped pipes kept as text.
+
+    GFM splits on an unescaped `|` whether or not it sits in a code span, so a
+    literal pipe is written `\\|`; that is the one escape this walks.
+    """
+    text = line.strip()
+    cells: List[str] = []
+    current: List[str] = []
+    ended_with_pipe = False
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if char == "\\" and index + 1 < len(text):
+            current.append(text[index + 1])
+            ended_with_pipe = False
+            index += 2
+            continue
+        if char == "|":
+            cells.append("".join(current))
+            current = []
+            ended_with_pipe = True
+            index += 1
+            continue
+        current.append(char)
+        ended_with_pipe = False
+        index += 1
+    if not ended_with_pipe:
+        cells.append("".join(current))
+    if text.startswith("|") and cells and not cells[0].strip():
+        cells = cells[1:]
+    return [cell.strip() for cell in cells]
+
+
+def _is_table_row(line: str) -> bool:
+    """Whether the line looks like a table row at all, pipes and all."""
+    return "|" in line and bool(line.strip())
+
+
+def _is_delimiter_row(line: str) -> bool:
+    if "-" not in line or "|" not in line:
+        return False
+    cells = _table_cells(line)
+    return len(cells) >= 1 and all(_TABLE_DELIMITER.match(cell) for cell in cells)
+
+
+def check_fences(root: Path, files: Sequence[Path]) -> List[str]:
+    """Every opened code block is closed, by a marker of its own kind."""
+    failures: List[str] = []
+    for path in files:
+        display = path.relative_to(root).as_posix()
+        opened: Tuple[int, str] | None = None
+        for number, line in enumerate(_read(path).splitlines(), start=1):
+            match = _FENCE_MARKER.match(line)
+            if match is None:
+                continue
+            marker = match.group("marker")
+            if opened is None:
+                opened = (number, marker)
+                continue
+            opening_line, opening_marker = opened
+            if marker[0] != opening_marker[0]:
+                # A run of the other kind is sample text inside the block, not its
+                # close: GFM only ends a fence with the character that opened it.
+                continue
+            if len(marker) < len(opening_marker):
+                continue
+            opened = None
+        if opened is not None:
+            opening_line, marker = opened
+            failures.append(
+                f"{display}:{opening_line}: a `{marker}` block is opened and never "
+                f"closed: everything after it renders inside the sample, so the "
+                f"page's headings and tables disappear into a code block"
+            )
+    return failures
+
+
+def check_tables(root: Path, files: Sequence[Path]) -> List[str]:
+    """A table's rows all carry the number of cells its header promised."""
+    failures: List[str] = []
+    for path in files:
+        display = path.relative_to(root).as_posix()
+        lines = _read(path).splitlines()
+        in_fence = False
+        index = 0
+        while index < len(lines):
+            line = lines[index]
+            if _FENCE_MARKER.match(line):
+                in_fence = not in_fence
+                index += 1
+                continue
+            if in_fence:
+                index += 1
+                continue
+            if not _is_table_row(line) or index + 1 >= len(lines):
+                index += 1
+                continue
+            delimiter = lines[index + 1]
+            if not _is_delimiter_row(delimiter):
+                index += 1
+                continue
+
+            header_cells = len(_table_cells(line))
+            delimiter_cells = len(_table_cells(delimiter))
+            number = index + 1
+            if header_cells != delimiter_cells:
+                failures.append(
+                    f"{display}:{number}: the table header has {header_cells} "
+                    f"cell(s) and its separator has {delimiter_cells}: GitHub "
+                    f"renders this as a paragraph rather than a table, and the "
+                    f"reader loses the matrix it was written as"
+                )
+                index += 2
+                continue
+
+            row = index + 2
+            while row < len(lines) and _is_table_row(lines[row]):
+                cells = len(_table_cells(lines[row]))
+                if cells != header_cells:
+                    failures.append(
+                        f"{display}:{row + 1}: the table row has {cells} cell(s) "
+                        f"where its header has {header_cells}: the missing cell "
+                        f"shifts everything after it into the wrong column"
+                    )
+                row += 1
+            index = row
+    return failures
+
+
+def _slugify(title: str) -> str:
+    """The anchor GitHub generates for a heading, as far as its text decides it.
+
+    Lowercase, spaces turned into hyphens, punctuation dropped, link labels kept
+    and HTML tags removed. The algorithm is GitHub's; a page that follows it can
+    be linked into from anywhere, including from a browser's address bar.
+    """
+    text = _INLINE_LINK_LABEL.sub(lambda match: match.group("label"), title)
+    text = _HTML_TAG.sub("", text)
+    text = _SLUG_DROPPED.sub("", text.lower())
+    return text.strip().replace(" ", "-")
+
+
+def _anchors_in(text: str) -> Set[str]:
+    """Every anchor a Markdown page offers: its headings and its named anchors.
+
+    A repeated heading gets `-1`, `-2`, ... in document order, the way GitHub
+    disambiguates two sections that read the same. Headings inside a fenced block
+    are sample text, not sections, and are skipped by the same helper the link
+    rules use.
+    """
+    anchors: Set[str] = set()
+    repeated: Dict[str, int] = {}
+    for _number, line in _lines_outside_fences(text):
+        for match in _EXPLICIT_ANCHOR.finditer(line):
+            anchors.add(match.group("name"))
+        heading = _ATX_HEADING.match(line)
+        if heading is None:
+            continue
+        title = _ATX_CLOSING.sub("", (heading.group("text") or "").strip())
+        slug = _slugify(title)
+        if not slug:
+            continue
+        anchors.add(slug)
+        seen = repeated.get(slug, 0)
+        if seen:
+            anchors.add(f"{slug}-{seen}")
+        repeated[slug] = seen + 1
+    return anchors
+
+
+def _fragment_targets(text: str) -> Iterable[Tuple[int, str]]:
+    """Yield `(line_number, target)` for every link that names a fragment.
+
+    A same-page link (`#section`) is included, because the page it points into is
+    the one the reader is already reading.
+    """
+    for number, line in _lines_outside_fences(text):
+        for match in _INLINE_LINK.finditer(line):
+            target = match.group("target").strip()
+            if "#" not in target:
+                continue
+            if target.startswith(_OFFSITE_PREFIXES):
+                continue
+            yield number, target
+
+
+def check_anchors(root: Path, files: Sequence[Path]) -> List[str]:
+    """Every `#fragment` on a Markdown page has to name a place on that page.
+
+    A link whose page resolves but whose anchor does not is the same experience as
+    a link to nowhere: the reader lands at the top of a page that has since been
+    reorganized, and concludes the instruction is stale. `docs/internal/**` and
+    `CHANGELOG.md` are excluded for the reason rule 3 excludes them — a dated
+    record quotes the tree of its own time, and a heading it linked to then may
+    legitimately be gone now.
+    """
+    failures: List[str] = []
+    known: Dict[Path, Set[str]] = {}
+
+    def anchors_of(path: Path) -> Set[str]:
+        key = path.resolve()
+        if key not in known:
+            known[key] = _anchors_in(_read(path))
+        return known[key]
+
+    for path in files:
+        relative = path.relative_to(root)
+        if relative.parts[:2] == _INTERNAL_PREFIX.parts:
+            continue
+        if relative.name in _HISTORY_DOCUMENTS:
+            continue
+        display = relative.as_posix()
+        # A heading nothing can slug is a heading nothing can link to; saying so
+        # is better than letting a page quietly offer no anchor for it.
+        for number, line in _lines_outside_fences(_read(path)):
+            heading = _ATX_HEADING.match(line)
+            if heading is None:
+                continue
+            title = _ATX_CLOSING.sub("", (heading.group("text") or "").strip())
+            if title and not _slugify(title):
+                failures.append(
+                    f"{display}:{number}: the heading `{title}` slugs to nothing, "
+                    f"so no link can name it: give it a word and the reader can "
+                    f"be sent to it"
+                )
+        for number, target in _fragment_targets(_read(path)):
+            fragment = unquote(target.split("#", 1)[1])
+            if not fragment:
+                # `page.md#` names the page; it makes no promise about a place in it.
+                continue
+            destination = path if target.startswith("#") else _resolve(path, target, root)
+            if destination.suffix.lower() not in _MARKDOWN_SUFFIXES:
+                continue
+            if not destination.is_file():
+                # The link rule reports the missing page; a second finding for its
+                # anchor would make one broken link read as two.
+                continue
+            if fragment in anchors_of(destination):
+                continue
+            try:
+                named = destination.relative_to(root).as_posix()
+            except ValueError:  # pragma: no cover - a link outside the checkout
+                named = str(destination)
+            failures.append(
+                f"{display}:{number}: link to `{target}` names the anchor "
+                f"`{fragment}`, which `{named}` does not have: the page resolves, "
+                f"so the reader is dropped at its top and reads a section that "
+                f"has moved or been renamed"
+            )
+    return failures
+
+
+def check_named_pages(root: Path, files: Sequence[Path]) -> List[str]:
+    """Every page name a document writes has to be a page that exists."""
+    failures: List[str] = []
+    for path in files:
+        relative = path.relative_to(root)
+        if relative.parts[:2] == _INTERNAL_PREFIX.parts:
+            continue
+        if relative.name in _HISTORY_DOCUMENTS:
+            continue
+        display = relative.as_posix()
+        for number, line in _lines_outside_fences(_read(path)):
+            for match in _PAGE_NAME.finditer(line):
+                before = line[: match.start()]
+                if _URL_TAIL.search(before) or _LINK_TARGET_TAIL.search(before):
+                    continue
+                name = match.group("name")
+                if _page_exists(root, path, name):
+                    continue
+                failures.append(
+                    f"{display}:{number}: `{name}` is named as a page but no such "
+                    f"file exists: a reader who goes looking for it finds nothing, "
+                    f"and no link rule applies because the name is not a link"
+                )
+    return failures
+
+
+def _page_exists(root: Path, source: Path, name: str) -> bool:
+    """Whether `name`, written in `source`, names a file in the checkout.
+
+    The reader's two readings are the ones tried: the path as written (at the
+    repository root), and the same name next to the page that mentions it.
+    """
+    candidates = [root / name, source.parent / name]
+    candidates.extend(root / directory / name for directory in _PAGE_DIRS)
+    return any(candidate.exists() for candidate in candidates)
+
+
 def check(root: Path) -> List[str]:
     files = documents(root)
     if not files:
@@ -344,6 +706,10 @@ def check(root: Path) -> List[str]:
     failures.extend(check_links(root, files))
     failures.extend(check_reachability(root, files))
     failures.extend(check_revisions(root, files))
+    failures.extend(check_anchors(root, files))
+    failures.extend(check_fences(root, files))
+    failures.extend(check_tables(root, files))
+    failures.extend(check_named_pages(root, files))
     return failures
 
 
@@ -376,8 +742,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     files = documents(root)
     print(
         f"docs gate: OK — {len(files)} document(s): every relative link resolves, "
-        f"every page is reachable from its index, and every migration reference "
-        f"names a revision that exists"
+        f"every page is reachable from its index, every migration reference "
+        f"names a revision that exists, every `#fragment` names a heading the "
+        f"page has, every code fence is closed, every table row matches its "
+        f"header, and every page a document names is a page this repository "
+        f"has"
     )
     return 0
 

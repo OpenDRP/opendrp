@@ -258,7 +258,13 @@ class TestAssetExport:
         assert csv_response.headers["content-type"].startswith("text/csv")
         assert "attachment" in csv_response.headers["content-disposition"]
         lines = csv_response.text.strip().splitlines()
-        assert lines[0] == "asset_type,asset_value,criticality,is_active,created_at"
+        # The original five stay first — a positional consumer is not broken by
+        # columns appended for the list's counters (AWI-12/AST-49).
+        assert lines[0] == (
+            "asset_type,asset_value,criticality,is_active,created_at,"
+            "findings_total,findings_phishing,findings_breaches,findings_dns,"
+            "findings_exposure,findings_other,last_seen"
+        )
         assert any("export-a.example" in line for line in lines[1:])
         assert not any("10.4.4.4" in line for line in lines[1:])
 

@@ -5,7 +5,7 @@ from fastapi import APIRouter, Depends, Query, Request, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import extract_ip, get_db, require_admin, require_viewer_plus
+from app.api.deps import extract_ip, get_db, require_admin, require_active_account
 from app.core.audit import AuditLogger
 from app.core.exceptions import NotFoundException
 from app.models.job import Job
@@ -58,7 +58,7 @@ async def list_jobs(
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=MAX_PAGE_SIZE),
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_viewer_plus),
+    current_user: User = Depends(require_active_account),
 ):
     user_id = current_user.id
     as_admin = current_user.role == "admin"
@@ -108,7 +108,7 @@ async def get_job(
     request: Request,
     job_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_viewer_plus),
+    current_user: User = Depends(require_active_account),
 ):
     job = (await db.execute(select(Job).where(Job.id == job_id))).scalar_one_or_none()
     if job is None:

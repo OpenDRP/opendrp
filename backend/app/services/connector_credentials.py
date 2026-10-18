@@ -41,7 +41,13 @@ log = structlog.get_logger()
 TOKEN_PREFIX = "opendrp"
 #: Entropy of the random part: 32 bytes -> 43 url-safe characters.
 _TOKEN_BYTES = 32
+#: The stored public label's budget (``Connector.token_prefix`` is ``String(16)``).
 TOKEN_PREFIX_LEN = 16
+#: The label's shape: a short name and the head of this issuance's random part.
+#: Eight random characters distinguish one rotation from the next; six name
+#: characters keep the label readable. Together with the separator that is 15.
+_PREFIX_NAME_LEN = 6
+_PREFIX_RANDOM_LEN = 8
 #: ``token_last_used_at`` is bookkeeping, not a request counter: connectors poll
 #: every few seconds, so one write per minute per connector is plenty.
 _LAST_USED_WRITE_INTERVAL = timedelta(minutes=1)
@@ -52,14 +58,37 @@ def hash_token(token: str) -> str:
     return hashlib.sha256(token.strip().encode("utf-8")).hexdigest()
 
 
+def _safe_name(connector_name: str) -> str:
+    return "".join(ch for ch in str(connector_name).lower() if ch.isalnum() or ch in "-_")
+
+
+def generate_token_and_prefix(connector_name: str) -> tuple[str, str]:
+    """Create a token and the public label that identifies *this issuance*.
+
+    The label used to be `token[:16]`: eight constant characters of `opendrp_`
+    and eight of the connector's name, so rotating a credential left it
+    unchanged and two connectors whose names share a start showed the same
+    label. The field exists so an operator can tell which credential is in use
+    — including whether a rotation took — and it could not answer either
+    question. The name still appears, shortened, and the head of the random
+    part makes the label change with the token while staying far too short to
+    be used as one.
+    """
+    safe_name = _safe_name(connector_name)
+    random_part = secrets.token_urlsafe(_TOKEN_BYTES)
+    token = f"{TOKEN_PREFIX}_{safe_name[:24]}_{random_part}"
+    label_name = safe_name[:_PREFIX_NAME_LEN] or "conn"
+    prefix = f"{label_name}_{random_part[:_PREFIX_RANDOM_LEN]}"
+    return token, prefix
+
+
 def generate_token(connector_name: str) -> str:
     """Create a fresh token that identifies the connector it belongs to.
 
     The name inside the token is a convenience for operators reading logs or a
     secrets manager; authority still comes from the stored digest.
     """
-    safe_name = "".join(ch for ch in str(connector_name).lower() if ch.isalnum() or ch in "-_")
-    return f"{TOKEN_PREFIX}_{safe_name[:24]}_{secrets.token_urlsafe(_TOKEN_BYTES)}"
+    return generate_token_and_prefix(connector_name)[0]
 
 
 def connector_name_from_token(token: str | None) -> str | None:
@@ -94,9 +123,9 @@ class ConnectorCredentials:
         the digest, so the previous token stops authenticating immediately.
         """
         rotated = bool(connector.token_hash)
-        token = generate_token(connector.name)
+        token, prefix = generate_token_and_prefix(connector.name)
         connector.token_hash = hash_token(token)
-        connector.token_prefix = token[:TOKEN_PREFIX_LEN]
+        connector.token_prefix = prefix
         connector.token_created_at = datetime.now(timezone.utc)
         connector.token_last_used_at = None
         await self.db.commit()

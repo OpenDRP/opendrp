@@ -1,5 +1,6 @@
 import re
 import uuid
+from typing import Literal
 
 from app.services.module_aliases import canonical_module_id
 from datetime import datetime
@@ -62,6 +63,27 @@ class SystemSettingsBase(BaseModel):
     alert_email_user_ids: list[str] | None = None
     # Telegram chat IDs, each validated in SystemSettingsUpdate.
     telegram_chat_ids: list[str] | None = None
+
+    # --- Alert budget (see app/services/alert_policy.py) ---
+    # The operator's half of the alert policy. ``None`` is not "off" or "zero":
+    # it is "this installation has not decided this one", and the environment's
+    # ``ALERT_*`` value answers it. The four numbers carry the same bounds the
+    # environment schema does, so a row cannot be written through the API that the
+    # resolver would have to refuse; the one relationship between two of them (the
+    # digest threshold stays below the direct one) is checked where both values are
+    # known — in the service, against the row as it will be saved, because a save
+    # may state only one of the pair.
+    alert_confidence_direct: int | None = Field(None, ge=1, le=100)
+    alert_confidence_digest: int | None = Field(None, ge=0, le=99)
+    alert_phishing_digest_enabled: bool | None = None
+    alert_phishing_digest_hour_utc: int | None = Field(None, ge=0, le=23)
+    alert_no_channel_retry_hours: int | None = Field(None, ge=0, le=8760)
+    alert_candidate_change_notifications: bool | None = None
+    # The breach module's half of the budget (see app/services/alert_policy.py).
+    # ``None`` is "not decided here", exactly as above; ``all`` restores the
+    # behaviour that reported spam and fabricated incidents like any other.
+    alert_breach_noise_policy: Literal["store_only_spam", "verified_only", "all"] | None = None
+    alert_breach_digest_threshold: int | None = Field(None, ge=0, le=500)
 
     # --- Scan schedules (UTC) ---
     schedule_phishing: dict | None = None
@@ -299,6 +321,14 @@ class SystemSettingsResponse(SystemSettingsBase):
             "telegram_alerts_enabled",
             "alert_email_user_ids",
             "telegram_chat_ids",
+            "alert_confidence_direct",
+            "alert_confidence_digest",
+            "alert_phishing_digest_enabled",
+            "alert_phishing_digest_hour_utc",
+            "alert_no_channel_retry_hours",
+            "alert_candidate_change_notifications",
+            "alert_breach_noise_policy",
+            "alert_breach_digest_threshold",
             "schedule_phishing",
             "schedule_breaches",
             "schedule_dns_security",
@@ -334,6 +364,34 @@ class SystemSettingsResponse(SystemSettingsBase):
             # for callers that provide an already-plain value in production.
             decrypted = v
         return mask_value(decrypted, keep_first=2, keep_last=2)
+
+
+class AlertPolicyResponse(BaseModel):
+    """The alert budget as it is *in force*, not as it is stored (WI-13).
+
+    The Settings page edits the six columns; this is what the platform is routing
+    by right now, and the two are not the same thing: a value the operator never
+    stated is the deployment's, and a row that does not hold together is refused in
+    favour of it. ``source`` answers "did my save take effect?" and ``invalid``
+    names the fields that were refused, so the page can say which of the two
+    answered instead of showing six empty inputs and leaving the operator to guess.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    confidence_direct: int
+    confidence_digest: int
+    digest_enabled: bool
+    digest_hour_utc: int
+    no_channel_retry_hours: int
+    candidate_change_notifications: bool
+    #: The breach module's two values: which incidents the channel stores silently,
+    #: and how many new incidents one scan reports before the rest wait for the
+    #: digest (0 = no waiting).
+    breach_noise_policy: Literal["store_only_spam", "verified_only", "all"]
+    breach_digest_threshold: int
+    source: Literal["environment", "settings"]
+    invalid: list[str]
 
 
 class TestEmailRequest(BaseModel):

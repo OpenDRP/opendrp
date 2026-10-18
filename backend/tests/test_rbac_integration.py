@@ -140,7 +140,7 @@ class TestUserAdministrationRoleMatrix:
             ("GET", "/api/v1/users/00000000-0000-0000-0000-000000000001", None),
             ("POST", "/api/v1/users", {"email": "rbac-new@example.com", "password": "StrongPass123!", "role": "viewer"}),
             ("PUT", "/api/v1/users/00000000-0000-0000-0000-000000000001", {"role": "analyst"}),
-            ("PATCH", "/api/v1/users/00000000-0000-0000-0000-000000000001/toggle-active", None),
+            ("PUT", "/api/v1/users/00000000-0000-0000-0000-000000000001", {"is_active": False}),
             ("POST", "/api/v1/users/00000000-0000-0000-0000-000000000001/mfa/reset", None),
             ("DELETE", "/api/v1/users/00000000-0000-0000-0000-000000000001", None),
         ],

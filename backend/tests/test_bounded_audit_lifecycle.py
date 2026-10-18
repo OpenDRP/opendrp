@@ -1,9 +1,17 @@
+import json
 from datetime import datetime, timedelta, timezone
 
 import pytest
 from sqlalchemy import select, update
 
-from app.core.audit import AuditLogger
+from app.core.audit import (
+    MAX_DETAIL_ITEMS,
+    MAX_DETAIL_STRING,
+    MAX_DETAILS_JSON,
+    AuditLogger,
+    _fit_details,
+    bound_details,
+)
 from app.core.config import settings
 from app.models.audit import AuditChain, AuditLog
 from app.models.alert_delivery import AlertDelivery, AlertDeliveryStatus
@@ -12,6 +20,48 @@ from app.services.audit_verification import verify_full_chunk
 from app.services.audit_archive import archive_prefix
 from app.services.connector_service import ConnectorService
 from app.tasks.retention_tasks import purge_terminal_alert_history
+
+
+def test_a_details_tree_is_bounded_value_by_value():
+    """A half-trusted caller cannot choose the size of an immutable audit row."""
+    bounded = bound_details(
+        {
+            "long": "x" * 500,
+            "items": list(range(50)),
+            "deep": {"a": {"b": {"c": {"d": "x"}}}},
+        }
+    )
+    assert len(bounded["long"]) == MAX_DETAIL_STRING
+    assert bounded["items"] == list(range(MAX_DETAIL_ITEMS))
+    assert bounded["deep"]["a"]["b"]["c"] == "…"
+
+
+def test_the_total_details_cap_marks_what_it_dropped():
+    bounded, cut = _fit_details({f"key{i}": "x" * 200 for i in range(64)})
+
+    assert cut is True
+    assert bounded["details_truncated"] is True
+    assert len(json.dumps(bounded)) <= MAX_DETAILS_JSON
+
+
+@pytest.mark.asyncio
+async def test_an_oversized_details_tree_reaches_the_trail_bounded(db_session):
+    await AuditLogger.emit(
+        db_session,
+        action="asset.view",
+        ip_address="test",
+        details={f"key{i}": "x" * 200 for i in range(64)},
+        require_persistence=True,
+    )
+
+    row = (
+        await db_session.execute(select(AuditLog).order_by(AuditLog.timestamp.desc()))
+    ).scalars().first()
+    assert row is not None
+    assert row.details["details_truncated"] is True
+    # The chain fields are added after the cap and are fixed-size, so the stored
+    # row exceeds the cap only by their own length.
+    assert len(json.dumps(row.details)) < MAX_DETAILS_JSON + 1_000
 
 
 async def append(db, count):

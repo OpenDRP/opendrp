@@ -1,8 +1,11 @@
 # DNS Security connector workers
 
-This image contains four independently provisioned workers for the `dns`
-module: `dns-rdap`, `dns-resolver`, `dns-ctlogs`, and `dns-virustotal`. Each worker
-uses its own connector token and reads only active `domain` assets. It submits
+This image contains six independently provisioned workers for the `dns`
+module: `dns-rdap`, `dns-resolver`, `dns-ctlogs`, `dns-tlsprobe`, `dns-virustotal`
+and `dns-shodan`. Each worker
+uses its own connector token and reads active `domain` assets — `dns-shodan` also
+reads active `ip_address` assets, because it asks the index about our own
+addresses as well as their names. It submits
 normalized observations through the connector API; it has no database or Redis
 credentials.
 
@@ -11,8 +14,10 @@ credentials.
 Follow the [DNS Security operator guide](../../docs/dns-security.md#connect-the-workers)
 for exact per-worker token commands, `.env` variables, selective Compose startup,
 health verification and rotation. The module id is `dns` (the former `dns_security`
-stays accepted as a transitional alias). RDAP, resolver and CT Logs start with
-the installation; only VirusTotal is gated by the `virustotal` Compose profile.
+stays accepted as a transitional alias). RDAP, resolver, CT Logs and the TLS probe
+start with
+the installation; VirusTotal is gated by the `virustotal` Compose profile and
+`dns-shodan` by `shodan`, which the phishing Shodan worker shares.
 The standard setup wizard does not yet select these workers. Configure and start only intended sources: starting a worker may
 immediately execute previously queued jobs. Worker core tokens are not provider
 API keys, and a container restart does not apply environment changes.
@@ -35,6 +40,25 @@ API keys, and a container restart does not apply environment changes.
   100 requests/hour, one at a time, up to 10 pages. Requests (including retries)
   are paced at 36 seconds and bounded to 100 per scan. Current host/DNS endpoints
   may be considered separately; certificate records remain historical evidence.
+- **TLS probe** opens one bounded handshake per active asset and allowlisted port
+  (`DNS_SECURITY_TLS_PORTS`, default `443`, at most three; `DNS_SECURITY_TLS_PATH`
+  is the request path) and stores the certificate the service actually serves,
+  with its chain, validity, serial, SPKI hash and SAN names. It reads our own
+  assets only, sends no traffic to a third party, and stops at
+  `DNS_SECURITY_TLS_MAX_PROBES` handshakes with `probe_budget_reached`. A refused
+  or failed handshake is evidence about the probe, never about the certificate,
+  and a served-certificate expiry reminder needs a fresh successful handshake.
+- **Shodan** asks the index what each of our own addresses serves — the free
+  `GET /shodan/host/{ip}` lookup, whose answer confirms the certificate our probe
+  read and adds the organisation, ASN, JARM, page title and favicon hash the
+  certificate rules score on — and, per certificate this scan just found, a
+  `GET /shodan/host/search` for `ssl.cert.fingerprint` that answers where *else*
+  it is being served. The reverse search spends one query credit per request, so
+  it is capped per scan by the `max_searches` connector setting (default 1; `0`
+  keeps the free half) and reserved against the approved source account before it
+  is sent. Provider data only: no request is ever sent to an address the provider
+  reported. The SHA-1 fingerprint is the search key — Shodan accepts the
+  SHA-256 spelling and matches nothing — and `test_shodan_dns.py` pins that.
 - **VirusTotal** reads the public API v3 subdomain and resolution endpoints. It
   is disabled unless both `DNS_SECURITY_VT_API_KEY` and
   `DNS_SECURITY_VT_PUBLIC_NONCOMMERCIAL=true` are set. The public API is limited

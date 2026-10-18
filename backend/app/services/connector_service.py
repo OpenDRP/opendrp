@@ -73,6 +73,13 @@ def normalize_connector_name(raw: str) -> str:
     return name[:100]
 
 
+#: How many confirmed candidates one scan is handed. A confirmation is a human
+#: decision, so the list is short by nature - and every entry costs the worker three
+#: provider questions, so the bound is what keeps a heavily triaged installation from
+#: queueing a scan larger than the job budget that pays for it.
+MAX_SCAN_CANDIDATES = 20
+
+
 class ConnectorService:
     def __init__(self, db: AsyncSession):
         self.db = db
@@ -352,7 +359,12 @@ class ConnectorService:
                 job.status = JobStatus.cancelled
                 job.finished_at = datetime.now(timezone.utc)
                 job.error_message = (
-                    "Queued source account is missing or no longer approved"
+                    (
+                        "provider_account_missing"
+                        if account is None
+                        else "account_policy_unapproved"
+                    )
+                    + ": queued source work is bound to its original account"
                 )
                 await self.db.commit()
                 return None
@@ -588,6 +600,7 @@ class ConnectorService:
         require_online: bool = False,
         commit: bool = True,
         admitted_out: list[tuple[str, str | None]] | None = None,
+        admission: bool = True,
     ) -> list[Job]:
         """Create pending scan jobs for enabled connectors of a module.
 
@@ -601,6 +614,13 @@ class ConnectorService:
         Each job carries the connector's own declared job type and the subset of
         the asset inventory that connector said it consumes. Paid provider
         connectors must be bound to an approved source account.
+
+        ``admission=False`` creates the job without the per-connector scan slot, for
+        work that is not a scan: a domain-verification step is one question an operator
+        asked about one domain (WI-20), it cannot be duplicated by a second caller into
+        two spends of the same quota, and refusing it because a scheduled scan holds the
+        slot would block the very step that makes a domain scannable — right after the
+        record is published.
         """
         # Registry-driven: any declared module can be scanned, and an unknown
         # module is refused with the list of modules that do exist.
@@ -641,7 +661,11 @@ class ConnectorService:
             # provider quota on identical work. The token is carried in the job
             # params and released when the connector reports a terminal result.
             try:
-                admission_token = await acquire_scan_slot(conn.name, ttl_seconds=3600)
+                admission_token = (
+                    await acquire_scan_slot(conn.name, ttl_seconds=3600)
+                    if admission
+                    else None
+                )
                 admitted.append((conn.name, admission_token))
                 source = conn.provider or (
                     conn.aliases[0] if conn.aliases else conn.name
@@ -659,7 +683,11 @@ class ConnectorService:
                     default_job_type=conn.default_job_type,
                     manifest=conn.manifest,
                 )
-                snapshot = await self._active_asset_snapshot(manifest["asset_types"])
+                snapshot = await self._active_asset_snapshot(
+                    manifest["asset_types"],
+                    include_candidates=canonical_module_id(conn.connector_type)
+                    == "phishing",
+                )
                 account_policy = {}
                 account = None
                 if conn.source_account_id:
@@ -688,7 +716,17 @@ class ConnectorService:
                     if conn.provider:
                         conn.source_account_id = account.id
                 if conn.provider:
-                    if account is None or account.source_id != conn.provider:
+                    if account is None:
+                        # Named, not generic: an installation whose account row is
+                        # missing has to read that from the refusal, and it is a
+                        # different answer from an account nobody approved. The
+                        # startup seeder creates the row; approving it stays the
+                        # operator's step.
+                        raise BadRequestException(
+                            "provider_account_missing: no source account is bound "
+                            f"to provider {conn.provider!r}"
+                        )
+                    if account.source_id != conn.provider:
                         raise BadRequestException("Matching provider account required")
                     readiness = conn.readiness or {}
                     if not readiness.get("credentials_configured") or readiness.get(
@@ -704,10 +742,38 @@ class ConnectorService:
                         )
                     capabilities = set(readiness.get("capabilities") or [])
                     if conn.connector_type == "phishing":
+                        # A brand asset is what turns a brand question into a scan: the
+                        # certificate collection asked from the organisation, and page
+                        # text asked for the brand itself. A confirmed candidate is the
+                        # fourth way in - the platform already found the name, and the
+                        # provider is asked what serves it.
+                        brands = [
+                            item
+                            for item in snapshot["keyword_domains"]
+                            if item.get("type") == "keyword_domain"
+                        ]
                         usable = bool(
                             snapshot["domains"] and "certificate" in capabilities
                         ) or bool(
                             snapshot["keyword_titles"] and "title" in capabilities
+                        ) or bool(brands and "certificate_brand" in capabilities) or bool(
+                            snapshot["candidates"] and "hostname" in capabilities
+                        )
+                    elif canonical_module_id(conn.connector_type) == "breaches":
+                        # A breach worker asks about identifiers, not hosts: an
+                        # address is the account question and a domain is the
+                        # leak-list question. Reading its capabilities as
+                        # `hostname`/`ip` (the shape the host-oriented workers use)
+                        # would refuse every breach scan the moment the worker is
+                        # bound to an account, which is exactly the state HIBP now
+                        # ships in.
+                        usable = bool(
+                            snapshot["emails"] and "email_account" in capabilities
+                        ) or bool(
+                            snapshot["domains"] and "domain" in capabilities
+                        ) or bool(
+                            "catalogue" in capabilities
+                            and (snapshot["emails"] or snapshot["domains"])
                         )
                     else:
                         usable = bool(
@@ -725,25 +791,44 @@ class ConnectorService:
                             "No active assets or capabilities match this request"
                         )
                 config_snapshot = {**dict(conn.config or {}), **account_policy}
+                job_params = {
+                    **snapshot,
+                    **caller,
+                    "connector_id": str(conn.id),
+                    "source_account_id": str(conn.source_account_id)
+                    if conn.source_account_id
+                    else None,
+                    "source_id": source,
+                    "config_snapshot": config_snapshot,
+                    "manifest_snapshot": manifest,
+                    "connector": conn.name,
+                    "module": conn.connector_type,
+                    "trigger": trigger,
+                    "scan_admission_token": admission_token,
+                }
+                if canonical_module_id(conn.connector_type) == "breaches":
+                    # The incident catalogue's checkpoint (WI-13). The worker asks its
+                    # source the cheap question first and sweeps the whole catalogue
+                    # only when the answer changed; the checkpoint lives here because
+                    # the core is what stores the diff, so a worker restarted against a
+                    # fresh installation is told it has never synced rather than left to
+                    # guess a window for itself.
+                    from app.services.breach_catalogue import (
+                        catalogue_window,
+                        stealer_logs_window,
+                    )
+
+                    job_params["catalogue"] = await catalogue_window(self.db, source)
+                    # The stealer-log pass is not every scan: it spends a separately
+                    # priced allowance, so the worker is told when the last pass ran
+                    # and decides whether the interval has elapsed (WI-18). The core
+                    # holds that fact because the worker may have restarted since.
+                    job_params["stealer_logs"] = await stealer_logs_window(self.db, source)
                 job = await JobService(self.db).create_job(
                     job_type=manifest["job_type"],
                     created_by=created_by,
                     title=f"{title} [{conn.name}]",
-                    params={
-                        **snapshot,
-                        **caller,
-                        "connector_id": str(conn.id),
-                        "source_account_id": str(conn.source_account_id)
-                        if conn.source_account_id
-                        else None,
-                        "source_id": source,
-                        "config_snapshot": config_snapshot,
-                        "manifest_snapshot": manifest,
-                        "connector": conn.name,
-                        "module": conn.connector_type,
-                        "trigger": trigger,
-                        "scan_admission_token": admission_token,
-                    },
+                    params=job_params,
                 )
                 job.connector_id = conn.id
                 job.schedule_key = schedule_key
@@ -797,11 +882,35 @@ class ConnectorService:
                 continue
             if connector_name and conn.name in (conn.aliases or []):
                 conn.aliases = list(conn.aliases or [])
+            account = None
+            if conn.provider:
+                from app.models.source_account import SourceAccount
+
+                account = (
+                    await self.db.get(SourceAccount, conn.source_account_id)
+                    if conn.source_account_id
+                    else None
+                )
+                if account is None:
+                    account = (
+                        await self.db.execute(
+                            select(SourceAccount).where(
+                                SourceAccount.source_id == conn.provider,
+                                SourceAccount.name == (conn.quota_group or "default"),
+                            )
+                        )
+                    ).scalar_one_or_none()
             reason = None
             if not conn.is_enabled:
                 reason = "disabled"
             elif not self.is_online(conn):
                 reason = "offline"
+            elif conn.provider and account is None:
+                # Readiness cannot answer this one: a worker with no account row
+                # was never set up, which is a different statement from an
+                # account an operator has not approved yet, and it is the state
+                # an upgraded installation is in until the seeder has run.
+                reason = "provider_account_missing"
             elif conn.provider and not (conn.readiness or {}).get(
                 "credentials_configured"
             ):
@@ -826,24 +935,6 @@ class ConnectorService:
                     conn.config or {}
                 ).get("cooldown_seconds", 60):
                     reason = "cooldown"
-            account = None
-            if conn.provider:
-                from app.models.source_account import SourceAccount
-
-                account = (
-                    await self.db.get(SourceAccount, conn.source_account_id)
-                    if conn.source_account_id
-                    else None
-                )
-                if account is None:
-                    account = (
-                        await self.db.execute(
-                            select(SourceAccount).where(
-                                SourceAccount.source_id == conn.provider,
-                                SourceAccount.name == (conn.quota_group or "default"),
-                            )
-                        )
-                    ).scalar_one_or_none()
             if reason is None and conn.provider:
                 if (
                     account is None
@@ -984,7 +1075,10 @@ class ConnectorService:
         return seen
 
     async def _active_asset_snapshot(
-        self, asset_types: list[str] | None = None
+        self,
+        asset_types: list[str] | None = None,
+        *,
+        include_candidates: bool = False,
     ) -> dict:
         """Return the active asset inventory in the connector scan-param shape.
 
@@ -996,6 +1090,16 @@ class ConnectorService:
         ``domain`` values feed both ``domains`` and, paired with their type,
         ``keyword_domains``; ``domain``/``ip_address`` assets form the exclude
         set so owned hosts are never flagged.
+
+        ``include_candidates`` adds the candidates an analyst has *confirmed*, each
+        with the asset it was matched to. The point of the list is the opposite of the
+        exclude set: an owned name is never scanned, and a confirmed look-alike is the
+        one name a provider can usefully be asked about again (what it serves, when it
+        was registered, whether it receives mail). Only the phishing module asks for
+        it - every other module's question starts from the inventory, not from a
+        finding - and only a confirmed verdict qualifies, because a candidate nobody
+        has reviewed is a guess the platform is still making rather than a fact it
+        would spend provider quota re-reading.
         """
         from sqlalchemy import select
 
@@ -1056,6 +1160,34 @@ class ConnectorService:
             ):
                 ips.append(value)
                 exclude.append(value)
+        candidates: list[dict] = []
+        if include_candidates:
+            from app.models import PhishingDomain
+
+            blocked = set(exclude)
+            confirmed = (
+                await self.db.execute(
+                    select(
+                        PhishingDomain.phishing_domain, PhishingDomain.matched_asset
+                    )
+                    .where(PhishingDomain.verdict == "confirmed")
+                    .order_by(
+                        PhishingDomain.confidence.desc(),
+                        PhishingDomain.created_at.desc(),
+                    )
+                    .limit(MAX_SCAN_CANDIDATES)
+                )
+            ).all()
+            for candidate_domain, matched in confirmed:
+                value = str(candidate_domain or "").strip().lower()
+                if not value or value in blocked:
+                    continue
+                candidates.append(
+                    {
+                        "value": value,
+                        "matched_asset": str(matched or "")[:512] or value,
+                    }
+                )
         return {
             "domains": domains,
             "ips": ips,
@@ -1063,4 +1195,5 @@ class ConnectorService:
             "keyword_domains": keyword_domains,
             "keyword_titles": keyword_titles,
             "exclude": exclude,
+            "candidates": candidates,
         }

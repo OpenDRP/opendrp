@@ -1,5 +1,5 @@
-import { useState } from "react";
-import { Link } from "react-router";
+import { useEffect, useState } from "react";
+import { Link, useSearchParams } from "react-router";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Plus, Search, Pencil, Trash2, RefreshCw, X, Check, Power, Download, Upload } from "lucide-react";
 import { describeApiError, endpoints } from "@/lib/api";
@@ -26,11 +26,30 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Badge } from "@/components/ui/badge";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
-import { PaginatedDataTable, type DataTableColumn } from "@/components/DataTable";
+import {
+  PaginatedDataTable,
+  type DataTableColumn,
+  type DataTableSort,
+} from "@/components/DataTable";
 import { toast } from "@/components/ui/use-toast";
 
 const ASSET_TYPES: AssetType[] = ["domain", "ip_address", "email_account", "keyword_domain", "keyword_title"];
 const CRITICALITIES: AssetCriticality[] = ["low", "medium", "high", "critical"];
+
+//: The fields `GET /assets` orders by (AST-48). This list mirrors the server's
+//: `AssetSortField` allowlist — the backend rejects anything else with 422 — so
+//: the header never offers a value the API would refuse. A value in the URL that
+//: is not here falls back to the server's default rather than being forwarded.
+const ASSET_SORT_FIELDS = [
+  "created_at",
+  "updated_at",
+  "asset_value",
+  "asset_type",
+  "criticality",
+  "is_active",
+] as const;
+type AssetSortField = (typeof ASSET_SORT_FIELDS)[number];
+const DEFAULT_SORT: DataTableSort = { field: "created_at", direction: "desc" };
 
 /**
  * Save a downloaded file (WI-18).
@@ -79,6 +98,18 @@ export default function AssetsPage() {
   const canDelete = useIsAdmin();
   const qc = useQueryClient();
 
+  const [searchParams, setSearchParams] = useSearchParams();
+  // The ordering is part of the page's address (AST-48): a link an operator
+  // pastes to a colleague reproduces what they were looking at, instead of
+  // silently reverting to "newest first".
+  const requestedSort = searchParams.get("sort");
+  const sort: DataTableSort = ASSET_SORT_FIELDS.includes(requestedSort as AssetSortField)
+    ? {
+        field: requestedSort as AssetSortField,
+        direction: searchParams.get("order") === "asc" ? "asc" : "desc",
+      }
+    : DEFAULT_SORT;
+
   const [page, setPage] = useState(1);
   const [size, setSize] = useState(20);
   const [search, setSearch] = useState("");
@@ -118,6 +149,15 @@ export default function AssetsPage() {
   const [importReport, setImportReport] = useState<AssetImportReport | null>(null);
   const [importError, setImportError] = useState<string | null>(null);
   const [exporting, setExporting] = useState(false);
+  // AWI-11/AST-42: batch actions work on the rows the operator ticked on this
+  // page. The selection is not carried across pages on purpose: a batch route
+  // takes ids, and "everything matching the filter" would need the filter, not
+  // the page, to define what the operator meant.
+  const [selectedIds, setSelectedIds] = useState<string[]>([]);
+  const [bulkDeleteOpen, setBulkDeleteOpen] = useState(false);
+  const [bulkDeleteConfirmation, setBulkDeleteConfirmation] = useState("");
+  const [bulkCascade, setBulkCascade] = useState(false);
+  const [bulkCriticality, setBulkCriticality] = useState("");
   // WI-14: the delete dialog says how much would be affected, so the counts come
   // from the same view the asset page uses (WI-12). They are fetched only while
   // the dialog is open.
@@ -128,8 +168,8 @@ export default function AssetsPage() {
   });
   const [cascadeFindings, setCascadeFindings] = useState(false);
 
-  const { data, isLoading, isError, refetch, isFetching } = useQuery({
-    queryKey: ["assets", page, size, debouncedSearch, typeFilter, critFilter, activeFilter, findingsFilter],
+  const { data, isLoading, isPlaceholderData, isError, error, refetch, isFetching } = useQuery({
+    queryKey: ["assets", page, size, debouncedSearch, typeFilter, critFilter, activeFilter, findingsFilter, sort.field, sort.direction],
     queryFn: () => endpoints.listAssets({
       page, size,
       asset_type: typeFilter as AssetType | undefined,
@@ -137,10 +177,27 @@ export default function AssetsPage() {
       is_active: activeFilter,
       has_findings: findingsFilter,
       search: debouncedSearch || undefined,
+      sort: sort.field,
+      order: sort.direction,
     }),
     staleTime: 20_000,
     placeholderData: { items: [], total: 0, page: 1, size: 20, pages: 0 },
   });
+
+  // A filter change is a new result set, so a tick on the previous one means
+  // nothing. Clearing here keeps a batch action from naming a row the operator
+  // can no longer see.
+  useEffect(() => {
+    setSelectedIds([]);
+  }, [page, size, debouncedSearch, typeFilter, critFilter, activeFilter, findingsFilter, sort.field, sort.direction]);
+
+  function changeSort(next: DataTableSort) {
+    const params = new URLSearchParams(searchParams);
+    params.set("sort", next.field);
+    params.set("order", next.direction);
+    setSearchParams(params, { replace: true });
+    setPage(1);
+  }
 
   const createMut = useMutation({
     mutationFn: (d: Partial<Asset>) => endpoints.createAsset(d),
@@ -237,6 +294,26 @@ export default function AssetsPage() {
     },
     onError: (e: any) => toast({ variant: "destructive", title: "Failed to update asset", description: describeApiError(e) }),
   });
+  // One request for the whole ticked set: the API applies it in one
+  // transaction and writes one summary audit row (AWI-11).
+  const bulkMut = useMutation({
+    mutationFn: (payload: Record<string, unknown>) =>
+      endpoints.bulkAssets({ ids: selectedIds, ...payload }),
+    onSuccess: (result: any) => {
+      qc.invalidateQueries({ queryKey: ["assets"] });
+      const missing = Array.isArray(result?.missing) ? result.missing.length : 0;
+      toast({
+        title: `Bulk ${result?.operation ?? "action"} finished`,
+        description: `${result?.applied ?? 0} of ${result?.requested ?? selectedIds.length} assets changed${missing ? `, ${missing} no longer existed` : ""}.`,
+      });
+      setSelectedIds([]);
+      setBulkDeleteOpen(false);
+      setBulkDeleteConfirmation("");
+      setBulkCascade(false);
+    },
+    onError: (e: any) =>
+      toast({ variant: "destructive", title: "Batch action failed", description: describeApiError(e) }),
+  });
 
   function resetForm() { setEditing(null); setForm({ asset_type: "domain", asset_value: "", criticality: "medium" }); setFormErrors({}); }
   function openCreate() { resetForm(); setDialogOpen(true); }
@@ -272,6 +349,7 @@ export default function AssetsPage() {
     {
       key: "asset_value",
       title: "Value",
+      sortable: true,
       width: 280,
       minWidth: 180,
       // One value, not two: `asset_value` is stored canonicalized, so a second
@@ -291,6 +369,7 @@ export default function AssetsPage() {
     {
       key: "asset_type",
       title: "Type",
+      sortable: true,
       width: 190,
       minWidth: 140,
       // WI-20: the type is not only a label — it is what decides whether anything
@@ -341,6 +420,7 @@ export default function AssetsPage() {
     {
       key: "criticality",
       title: "Criticality",
+      sortable: true,
       width: 140,
       minWidth: 120,
       render: (a) => (
@@ -352,6 +432,7 @@ export default function AssetsPage() {
     {
       key: "is_active",
       title: "Status",
+      sortable: true,
       width: 130,
       minWidth: 110,
       render: (a) => (
@@ -364,9 +445,20 @@ export default function AssetsPage() {
     {
       key: "created_at",
       title: "Created",
+      sortable: true,
       width: 160,
       minWidth: 140,
       render: (a) => <span className="text-muted-foreground text-sm">{formatDateTime(a.created_at)}</span>,
+    },
+    {
+      key: "updated_at",
+      title: "Updated",
+      sortable: true,
+      width: 160,
+      minWidth: 140,
+      // The second date is what "did anything change here?" is asked of; it is
+      // also the sixth field the server can order by (AST-48).
+      render: (a) => <span className="text-muted-foreground text-sm">{formatDateTime(a.updated_at)}</span>,
     },
     {
       key: "actions",
@@ -482,6 +574,69 @@ export default function AssetsPage() {
         </CardContent>
       </Card>
 
+      {canWrite && selectedIds.length > 0 && (
+        <Card>
+          <CardContent className="flex flex-wrap items-center gap-2 p-4" role="region" aria-label="Batch actions">
+            <span className="text-sm font-medium mr-2">{selectedIds.length} selected</span>
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => bulkMut.mutate({ operation: "activate" })}
+              disabled={bulkMut.isPending}
+            >
+              Activate
+            </Button>
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => bulkMut.mutate({ operation: "deactivate" })}
+              disabled={bulkMut.isPending}
+            >
+              Deactivate
+            </Button>
+            <Select
+              value={bulkCriticality}
+              onValueChange={(value: string) => {
+                setBulkCriticality("");
+                bulkMut.mutate({ operation: "criticality", criticality: value });
+              }}
+            >
+              <SelectTrigger className="w-[170px]" aria-label="Set criticality for selected assets">
+                <SelectValue placeholder="Set criticality…" />
+              </SelectTrigger>
+              <SelectContent>
+                {CRITICALITIES.map((c) => (
+                  <SelectItem key={c} value={c} className="capitalize">{c}</SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            {canDelete && (
+              <Button
+                size="sm"
+                variant="outline"
+                className="text-destructive hover:text-destructive"
+                onClick={() => {
+                  setBulkDeleteConfirmation("");
+                  setBulkCascade(false);
+                  setBulkDeleteOpen(true);
+                }}
+                disabled={bulkMut.isPending}
+              >
+                Delete
+              </Button>
+            )}
+            <Button
+              size="sm"
+              variant="ghost"
+              onClick={() => setSelectedIds([])}
+              disabled={bulkMut.isPending}
+            >
+              Clear selection
+            </Button>
+          </CardContent>
+        </Card>
+      )}
+
       <Card>
         <CardContent className="p-4">
           <PaginatedDataTable
@@ -493,10 +648,27 @@ export default function AssetsPage() {
             onPageChange={setPage}
             onPageSizeChange={(s) => { setSize(s); setPage(1); }}
             storageKey="assets-table-widths-v1"
-            loading={isLoading}
+            // `isPlaceholderData` is the first request's own signal (AST-41):
+            // with placeholder rows the query is neither `isLoading` nor
+            // carrying data, and the table used to read that as "no assets".
+            loading={isLoading || isPlaceholderData}
             isError={isError}
-            errorDescription="The asset list could not be loaded, so it is not known whether any asset is currently monitored."
+            errorDescription={
+              isError
+                ? describeApiError(
+                    error,
+                    "The asset list could not be loaded, so it is not known whether any asset is currently monitored.",
+                  )
+                : undefined
+            }
             onRetry={() => refetch()}
+            selectable={canWrite}
+            selectedIds={selectedIds}
+            onSelectedChange={setSelectedIds}
+            getRowId={(a) => a.id}
+            getRowLabel={(a) => a.asset_value}
+            sort={sort}
+            onSortChange={changeSort}
             emptyText={search || typeFilter || critFilter || activeFilter !== undefined || findingsFilter !== undefined ? "No assets match the current filters." : "No assets yet. Add a domain, IP address or mailbox to start monitoring it."}
           />
         </CardContent>
@@ -641,6 +813,65 @@ export default function AssetsPage() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      <ConfirmDialog
+        open={bulkDeleteOpen}
+        onOpenChange={(open) => {
+          if (!open && bulkMut.isPending) return;
+          setBulkDeleteOpen(open);
+          if (!open) { setBulkDeleteConfirmation(""); setBulkCascade(false); }
+        }}
+        variant="destructive"
+        title={`Delete ${selectedIds.length} assets?`}
+        description="The selected assets are removed together, in one transaction. This action cannot be undone."
+        confirmLabel={bulkMut.isPending ? "Deleting…" : "Delete assets"}
+        confirmLoading={bulkMut.isPending}
+        // A batch is the one place a single mis-click removes many things, so the
+        // confirmation is typed rather than clicked (AWI-11).
+        confirmDisabled={bulkDeleteConfirmation.trim().toUpperCase() !== "DELETE"}
+        onConfirm={() =>
+          bulkMut.mutate({ operation: "delete", cascade_findings: bulkCascade })
+        }
+        onCancel={() => { setBulkDeleteConfirmation(""); setBulkCascade(false); }}
+      >
+        <p className="text-sm text-muted-foreground">
+          Deleting an asset alone leaves the findings that name it in place. The
+          checkbox below deletes those findings too (phishing, breach and generic)
+          for every selected asset, and that part is not reversible.
+        </p>
+        <label className="flex items-start gap-3 rounded-md border border-border p-3 text-sm cursor-pointer">
+          <input
+            type="checkbox"
+            className="mt-0.5 h-4 w-4 accent-destructive"
+            checked={bulkCascade}
+            onChange={(event) => setBulkCascade(event.target.checked)}
+            disabled={bulkMut.isPending}
+          />
+          <span>
+            <span className="font-medium">Also delete related findings</span>
+            <span className="block text-muted-foreground mt-1">
+              Source observations are kept: they record what the provider saw, not
+              what you monitor.
+            </span>
+          </span>
+        </label>
+        <label className="block text-sm space-y-2">
+          <span className="text-muted-foreground">
+            Type <span className="font-mono font-semibold text-foreground">DELETE</span> to confirm.
+          </span>
+          <Input
+            value={bulkDeleteConfirmation}
+            onChange={(event) => setBulkDeleteConfirmation(event.target.value)}
+            disabled={bulkMut.isPending}
+            aria-label="Type DELETE to confirm deleting the selected assets"
+          />
+        </label>
+        {bulkMut.isError && (
+          <p role="alert" className="text-sm text-destructive">
+            {describeApiError(bulkMut.error)}
+          </p>
+        )}
+      </ConfirmDialog>
 
       <ConfirmDialog
         open={togglingAsset !== null}

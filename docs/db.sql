@@ -3,7 +3,7 @@
 -- Schema baseline: 0001_initial_schema, the only revision this release ships
 -- and therefore the current head. `backend/alembic/versions/` holds that one
 -- file and it creates everything below: identity and sessions, monitored assets,
--- phishing, breaches, the module and connector registries, jobs, connector
+-- phishing, breaches and the incident catalogue, the module and connector registries, jobs, connector
 -- observations, DNS Security inventory and expiry monitoring, reports, settings,
 -- the tamper-evident audit trail with its archive bookkeeping, and the durable
 -- alert delivery queue.
@@ -14,6 +14,11 @@
 -- earlier build created already holds this schema and is adopted by recording
 -- 0001_initial_schema as its revision; `scripts/migrate.py` does that itself
 -- and `docs/upgrading.md` states the procedure.
+--
+-- `backend/tests/test_schema_reference_gate.py` compares this file with the
+-- models on every run: a table or column the models map and this file omits, or
+-- one this file names and no model maps, fails the `backend` job. The file is a
+-- snapshot an operator reads, and that test is what keeps it one.
 --
 -- The seed rows the revision inserts are not repeated here: the built-in
 -- modules, the connectors this release ships and their source accounts live in
@@ -116,6 +121,34 @@ CREATE SEQUENCE audit_archives_first_seq_seq
 
 ALTER SEQUENCE audit_archives_first_seq_seq OWNED BY audit_archives.first_seq;
 
+CREATE TABLE breach_catalogue (
+    id uuid DEFAULT uuid_generate_v4() NOT NULL,
+    source character varying(100) NOT NULL,
+    breach_name character varying(255) NOT NULL,
+    title character varying(255) DEFAULT ''::character varying NOT NULL,
+    domain character varying(255) DEFAULT ''::character varying NOT NULL,
+    breach_date date,
+    added_date timestamp with time zone,
+    modified_date timestamp with time zone,
+    pwn_count integer DEFAULT 0 NOT NULL,
+    data_classes json DEFAULT '[]'::json NOT NULL,
+    attributes json DEFAULT '{}'::json NOT NULL,
+    last_synced_at timestamp with time zone DEFAULT now() NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+CREATE TABLE certificate_scope_exceptions (
+    id uuid NOT NULL,
+    match_kind character varying(16) NOT NULL,
+    match_value character varying(255) NOT NULL,
+    reason character varying(1000),
+    created_by uuid,
+    expires_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
 CREATE TABLE dns_expiry_monitors (
     id uuid NOT NULL,
     asset_id uuid NOT NULL,
@@ -130,6 +163,7 @@ CREATE TABLE dns_expiry_monitors (
     observation_id uuid,
     cycle character varying(64),
     alerted_thresholds json NOT NULL,
+    stale_alerted_at timestamp with time zone,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL
 );
@@ -203,7 +237,11 @@ CREATE TABLE drp_breaches (
     matched_email character varying(255),
     matched_domain character varying(255),
     status character varying(50) DEFAULT 'active'::character varying NOT NULL,
+    exposure_kind character varying(32) DEFAULT 'breach'::character varying NOT NULL,
+    severity character varying(16) DEFAULT 'unknown'::character varying NOT NULL,
     attributes json DEFAULT '{}'::json NOT NULL,
+    last_seen_at timestamp with time zone,
+    verified_at timestamp with time zone,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     source_id character varying(100) NOT NULL
@@ -279,6 +317,13 @@ CREATE TABLE drp_phishing_domains (
     whois_abuse_email character varying(255),
     domain_created_at timestamp with time zone,
     status character varying(50) DEFAULT 'active'::character varying NOT NULL,
+    confidence smallint DEFAULT '0'::smallint NOT NULL,
+    signals json DEFAULT '{}'::json NOT NULL,
+    digest_queued_at timestamp with time zone,
+    verdict character varying(32),
+    verdict_reason character varying(2000),
+    verdict_by uuid,
+    verdict_at timestamp with time zone,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL
 );
@@ -334,6 +379,16 @@ CREATE TABLE jobs (
     schedule_key character varying(128),
     CONSTRAINT ck_jobs_job_type_len CHECK (((char_length((job_type)::text) >= 1) AND (char_length((job_type)::text) <= 50))),
     CONSTRAINT ck_jobs_status_len CHECK (((char_length((status)::text) >= 1) AND (char_length((status)::text) <= 32)))
+);
+
+CREATE TABLE phishing_candidate_signals (
+    id uuid NOT NULL,
+    candidate_id uuid NOT NULL,
+    name character varying(64) NOT NULL,
+    value json NOT NULL,
+    confidence smallint DEFAULT '0'::smallint NOT NULL,
+    observed_at timestamp with time zone,
+    source character varying(100)
 );
 
 CREATE TABLE report_artifact_cleanup (
@@ -442,6 +497,14 @@ CREATE TABLE system_settings (
     alert_email_user_ids json,
     schedule_phishing json,
     schedule_breaches json,
+    alert_confidence_direct smallint,
+    alert_confidence_digest smallint,
+    alert_phishing_digest_enabled boolean,
+    alert_phishing_digest_hour_utc smallint,
+    alert_no_channel_retry_hours smallint,
+    alert_candidate_change_notifications boolean,
+    alert_breach_noise_policy character varying(32),
+    alert_breach_digest_threshold smallint,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     schedule_dns_security json,
@@ -451,6 +514,46 @@ CREATE TABLE system_settings (
     version integer DEFAULT 1 NOT NULL,
     CONSTRAINT ck_system_settings_singleton CHECK ((singleton_key = 1)),
     CONSTRAINT ck_system_settings_smtp_security_mode CHECK (((smtp_security_mode)::text = ANY ((ARRAY['starttls'::character varying, 'ssl'::character varying, 'plain'::character varying])::text[])))
+);
+
+CREATE TABLE tls_certificate_identities (
+    id uuid NOT NULL,
+    fingerprint_sha256 character varying(64) NOT NULL,
+    fingerprint_sha1 character varying(40),
+    spki_sha256 character varying(64),
+    serial_hex character varying(128),
+    subject_dn character varying(1000),
+    issuer_dn character varying(1000),
+    not_before timestamp with time zone,
+    not_after timestamp with time zone,
+    san_dns json DEFAULT '[]'::json NOT NULL,
+    key_algo character varying(64),
+    origin character varying(32) NOT NULL,
+    first_seen_at timestamp with time zone NOT NULL,
+    last_seen_at timestamp with time zone NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+CREATE TABLE tls_certificate_sightings (
+    id uuid NOT NULL,
+    identity_id uuid NOT NULL,
+    subject character varying(253),
+    ip character varying(64),
+    port integer,
+    source character varying(32) NOT NULL,
+    observed_at timestamp with time zone NOT NULL,
+    first_seen_at timestamp with time zone NOT NULL,
+    last_seen_at timestamp with time zone NOT NULL,
+    is_ours boolean DEFAULT false NOT NULL,
+    confidence smallint DEFAULT '0'::smallint NOT NULL,
+    signals json DEFAULT '{}'::json NOT NULL,
+    verdict character varying(32) DEFAULT 'candidate'::character varying NOT NULL,
+    reviewed_by uuid,
+    reviewed_at timestamp with time zone,
+    review_note character varying(2000),
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL
 );
 
 CREATE TABLE users (
@@ -472,6 +575,8 @@ CREATE TABLE users (
     mfa_recovery_codes json,
     must_change_password boolean DEFAULT false NOT NULL,
     must_enrol_mfa boolean DEFAULT false NOT NULL,
+    invitation_token_hash character varying(64),
+    invitation_expires_at timestamp with time zone,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL
 );
@@ -610,6 +715,34 @@ ALTER TABLE ONLY system_settings
 ALTER TABLE ONLY users
     ADD CONSTRAINT uq_users_email UNIQUE (email);
 
+ALTER TABLE ONLY breach_catalogue
+    ADD CONSTRAINT pk_breach_catalogue PRIMARY KEY (id);
+
+ALTER TABLE ONLY breach_catalogue
+    ADD CONSTRAINT uq_breach_catalogue_incident UNIQUE (source, breach_name);
+
+ALTER TABLE ONLY certificate_scope_exceptions
+    ADD CONSTRAINT certificate_scope_exceptions_pkey PRIMARY KEY (id);
+
+ALTER TABLE ONLY certificate_scope_exceptions
+    ADD CONSTRAINT uq_certificate_scope_exception UNIQUE (match_kind, match_value);
+
+ALTER TABLE ONLY phishing_candidate_signals
+    ADD CONSTRAINT phishing_candidate_signals_pkey PRIMARY KEY (id);
+
+ALTER TABLE ONLY tls_certificate_identities
+    ADD CONSTRAINT tls_certificate_identities_pkey PRIMARY KEY (id);
+
+ALTER TABLE ONLY tls_certificate_identities
+    ADD CONSTRAINT uq_tls_identity_fingerprint_sha256 UNIQUE (fingerprint_sha256);
+
+ALTER TABLE ONLY tls_certificate_sightings
+    ADD CONSTRAINT tls_certificate_sightings_pkey PRIMARY KEY (id);
+
+ALTER TABLE ONLY tls_certificate_sightings
+    ADD CONSTRAINT uq_tls_sighting_identity_endpoint_source UNIQUE (identity_id, ip, port, source);
+
+
 -- ---------------------------------------------------------------------------
 -- Indexes
 -- ---------------------------------------------------------------------------
@@ -646,6 +779,8 @@ CREATE INDEX ix_audit_request_id ON drp_audit_logs USING btree (((details ->> 'r
 
 CREATE INDEX ix_audit_timestamp_id ON drp_audit_logs USING btree ("timestamp", id);
 
+CREATE INDEX ix_breach_catalogue_source_domain ON breach_catalogue USING btree (source, domain);
+
 CREATE INDEX ix_dns_expiry_monitor_due ON dns_expiry_monitors USING btree (state, expires_at);
 
 CREATE INDEX ix_dns_observation_expires ON dns_security_observations USING btree (expires_at);
@@ -674,7 +809,11 @@ CREATE INDEX ix_drp_audit_logs_user_id ON drp_audit_logs USING btree (user_id);
 
 CREATE INDEX ix_drp_audit_logs_user_timestamp ON drp_audit_logs USING btree (user_id, "timestamp");
 
+CREATE INDEX ix_drp_breaches_exposure_kind ON drp_breaches USING btree (exposure_kind);
+
 CREATE INDEX ix_drp_breaches_matched_domain ON drp_breaches USING btree (matched_domain);
+
+CREATE INDEX ix_drp_breaches_severity ON drp_breaches USING btree (severity);
 
 CREATE INDEX ix_drp_breaches_matched_domain_key ON drp_breaches USING btree (lower(rtrim(TRIM(BOTH FROM matched_domain), '.'::text)));
 
@@ -728,6 +867,9 @@ CREATE INDEX ix_jobs_status ON jobs USING btree (status);
 
 CREATE INDEX ix_jobs_task_id ON jobs USING btree (task_id);
 
+CREATE INDEX ix_phishing_candidate_signals_candidate ON phishing_candidate_signals USING btree (candidate_id);
+
+
 CREATE INDEX ix_report_artifact_cleanup_available_at ON report_artifact_cleanup USING btree (available_at);
 
 CREATE INDEX ix_report_artifact_cleanup_report_id ON report_artifact_cleanup USING btree (report_id);
@@ -746,6 +888,19 @@ CREATE INDEX ix_source_observations_matched_asset_key ON source_observations USI
 
 CREATE INDEX ix_source_observations_module_seen ON source_observations USING btree (module, last_seen_at);
 
+CREATE INDEX ix_tls_exception_kind_value ON certificate_scope_exceptions USING btree (match_kind, match_value);
+
+CREATE INDEX ix_tls_identity_serial ON tls_certificate_identities USING btree (serial_hex);
+
+CREATE INDEX ix_tls_identity_spki ON tls_certificate_identities USING btree (spki_sha256);
+
+CREATE INDEX ix_tls_sighting_identity ON tls_certificate_sightings USING btree (identity_id);
+
+CREATE INDEX ix_tls_sighting_ip ON tls_certificate_sightings USING btree (ip);
+
+CREATE INDEX ix_tls_sighting_verdict ON tls_certificate_sightings USING btree (verdict);
+
+
 CREATE UNIQUE INDEX ix_users_email ON users USING btree (email);
 
 CREATE UNIQUE INDEX uq_assets_type_normalized_value ON assets USING btree (asset_type, normalized_value) WHERE (normalized_value IS NOT NULL);
@@ -759,6 +914,10 @@ CREATE UNIQUE INDEX uq_breach_domain_only ON drp_breaches USING btree (source_id
 ALTER TABLE ONLY alert_deliveries
     ADD CONSTRAINT alert_deliveries_job_id_fkey FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE SET NULL;
 
+ALTER TABLE ONLY certificate_scope_exceptions
+    ADD CONSTRAINT certificate_scope_exceptions_created_by_fkey FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE SET NULL;
+
+
 ALTER TABLE ONLY dns_expiry_monitors
     ADD CONSTRAINT dns_expiry_monitors_asset_id_fkey FOREIGN KEY (asset_id) REFERENCES assets(id) ON DELETE CASCADE;
 
@@ -770,6 +929,9 @@ ALTER TABLE ONLY drp_connectors
 
 ALTER TABLE ONLY drp_findings
     ADD CONSTRAINT drp_findings_module_fkey FOREIGN KEY (module) REFERENCES drp_modules(id) ON DELETE RESTRICT;
+
+ALTER TABLE ONLY drp_refresh_families
+    ADD CONSTRAINT fk_drp_refresh_families_user_id_users FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE;
 
 ALTER TABLE ONLY jobs
     ADD CONSTRAINT fk_jobs_created_by_users FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE SET NULL;
@@ -786,6 +948,10 @@ ALTER TABLE ONLY jobs
 ALTER TABLE ONLY schedule_occurrences
     ADD CONSTRAINT schedule_occurrences_job_id_fkey FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE SET NULL;
 
+ALTER TABLE ONLY phishing_candidate_signals
+    ADD CONSTRAINT phishing_candidate_signals_candidate_id_fkey FOREIGN KEY (candidate_id) REFERENCES drp_phishing_domains(id) ON DELETE CASCADE;
+
+
 ALTER TABLE ONLY source_observations
     ADD CONSTRAINT source_observations_candidate_id_fkey FOREIGN KEY (candidate_id) REFERENCES drp_phishing_domains(id) ON DELETE CASCADE;
 
@@ -794,3 +960,10 @@ ALTER TABLE ONLY source_observations
 
 ALTER TABLE ONLY source_observations
     ADD CONSTRAINT source_observations_source_account_id_fkey FOREIGN KEY (source_account_id) REFERENCES source_accounts(id) ON DELETE SET NULL;
+
+ALTER TABLE ONLY tls_certificate_sightings
+    ADD CONSTRAINT tls_certificate_sightings_identity_id_fkey FOREIGN KEY (identity_id) REFERENCES tls_certificate_identities(id) ON DELETE CASCADE;
+
+ALTER TABLE ONLY tls_certificate_sightings
+    ADD CONSTRAINT tls_certificate_sightings_reviewed_by_fkey FOREIGN KEY (reviewed_by) REFERENCES users(id) ON DELETE SET NULL;
+

@@ -12,9 +12,9 @@ delivery.
 * missing phishing domain / breach name / breach match are rejected;
 * unknown connector type is rejected;
 * defensive date parsing for HIBP metadata (ISO strings, 'Z' suffix,
-  datetimes, garbage, epoch default);
-* malformed date strings fall back instead of raising (pinned current
-  behavior of the 1970-01-01 default);
+  datetimes, garbage);
+* a finding with no usable breach date is refused instead of stored as
+  1970-01-01, unless its reporter declares the metadata did not arrive;
 * unknown connector type is rejected;
 * data_classes is kept only when it is a real list.
 """
@@ -198,9 +198,11 @@ async def test_ingest_breach_requires_name_and_match(
         _never_called_patch,
     )
     ok1 = await ingest_breach_finding(db_session, breaches_connector, {"matched_email": "a@x.com"})
-    ok2 = await ingest_breach_finding(db_session, breaches_connector, {"breach_name": "B"})
+    ok2 = await ingest_breach_finding(
+        db_session, breaches_connector, {"breach_name": "B", "breach_date": "2020-01-02"}
+    )
     ok3 = await ingest_breach_finding(
-        db_session, breaches_connector, {"breach_name": "B3", "matched_email": "", "matched_domain": ""}
+        db_session, breaches_connector, {"breach_name": "B3", "matched_email": "", "matched_domain": "", "breach_date": "2020-01-02"}
     )
     assert ok1 is False and ok2 is False and ok3 is False
     assert await _count(db_session, Breach) == 0
@@ -252,6 +254,7 @@ async def test_ingest_breach_non_numeric_pwn_count_is_safe(
         {
             "breach_name": "BadCount",
             "matched_domain": "corp.example.com",
+            "breach_date": "2020-01-02",
             "pwn_count": "not-a-number",
         },
     )
@@ -270,7 +273,11 @@ async def test_ingest_breach_duplicate_email_pair_rejected(
         "app.services.ingestion_service.AlertDeliveryService.enqueue",
         _no_alert,
     )
-    finding = {"breach_name": "DupPair", "matched_email": "dup@x.com"}
+    finding = {
+        "breach_name": "DupPair",
+        "matched_email": "dup@x.com",
+        "breach_date": "2020-01-02",
+    }
     first = await ingest_breach_finding(db_session, breaches_connector, finding)
     second = await ingest_breach_finding(db_session, breaches_connector, dict(finding))
     assert first is True and second is False
@@ -290,7 +297,11 @@ async def test_ingest_breach_keeps_same_breach_for_multiple_domain_aliases(
         "app.services.ingestion_service.AlertDeliveryService.enqueue",
         _no_alert,
     )
-    common = {"breach_name": "Adobe", "matched_domain": "hibp-integration-tests.com"}
+    common = {
+        "breach_name": "Adobe",
+        "matched_domain": "hibp-integration-tests.com",
+        "breach_date": "2020-01-02",
+    }
     first = await ingest_breach_finding(
         db_session,
         breaches_connector,
@@ -322,7 +333,11 @@ async def test_ingest_breach_domain_only_fallback_is_still_deduped(
         "app.services.ingestion_service.AlertDeliveryService.enqueue",
         _no_alert,
     )
-    finding = {"breach_name": "DomainOnly", "matched_domain": "example.com"}
+    finding = {
+        "breach_name": "DomainOnly",
+        "matched_domain": "example.com",
+        "breach_date": "2020-01-02",
+    }
     first = await ingest_breach_finding(db_session, breaches_connector, finding)
     second = await ingest_breach_finding(db_session, breaches_connector, dict(finding))
     assert first is True and second is False
@@ -390,46 +405,92 @@ async def test_phishing_persisted_when_alert_fanout_fails(
 # Pure date-parser pins (Step 5): edge behavior of the HIBP metadata parsing
 # ---------------------------------------------------------------------------
 
-async def _parse_date_via_ingest(db, connector, value, monkeypatch) -> date:
-    """Drive _parse_date through the public path with a minimal finding."""
+async def _ingest_with_date(db, connector, value, monkeypatch):
+    """Drive the breach date through the public path with a minimal finding."""
     monkeypatch.setattr(
         "app.services.ingestion_service.AlertDeliveryService.enqueue",
         _no_alert,
     )
-    ok = await ingest_breach_finding(
-        db,
-        connector,
-        {"breach_name": f"D{uuid.uuid4().hex[:6]}", "matched_domain": "d.example.com", "breach_date": value},
+    name = f"D{uuid.uuid4().hex[:6]}"
+    finding = {"breach_name": name, "matched_domain": "d.example.com"}
+    if value is not _ABSENT:
+        finding["breach_date"] = value
+    accepted = await ingest_breach_finding(db, connector, finding)
+    rows = list(
+        (await db.execute(select(Breach).where(Breach.breach_name == name))).scalars()
     )
-    assert ok is True
-    rows = list((await db.execute(select(Breach))).scalars())
-    return rows[-1].breach_date
+    return accepted, (rows[-1].breach_date if rows else None)
+
+
+#: "the finding did not carry this key at all", which is a different case from
+#: carrying a null: both must be refused, and only one of them is a missing key.
+_ABSENT = object()
 
 
 @pytest.mark.asyncio
-async def test_parse_date_garbage_falls_back_to_epoch(
+async def test_a_breach_without_a_usable_date_is_refused(
     db_session, breaches_connector, monkeypatch
 ):
-    """TODO(refactor-step-5): pinned current fallback behavior.
+    """The platform may not invent the day an incident happened (F-02).
 
-    A malformed breach_date silently becomes 1970-01-01 instead of being
-    rejected. Changing this to a validation error is a separately-reviewed
-    behavior change.
+    This used to be pinned as "a malformed date becomes 1970-01-01", which stored
+    a finding with a date no breach can have and showed it on the page, in the
+    report and in an alert as though it were a fact. The finding is refused
+    instead - visibly, as a rejected item of the batch - and a reporter whose data
+    genuinely has no date says so (``attributes.metadata_incomplete``, covered
+    below), which is the only path that stores a row without one.
     """
-    d = await _parse_date_via_ingest(db_session, breaches_connector, "06/05/2020", monkeypatch)
-    assert d == date(1970, 1, 1)
+    for value in ("06/05/2020", None, _ABSENT):
+        accepted, stored = await _ingest_with_date(
+            db_session, breaches_connector, value, monkeypatch
+        )
+        assert accepted is False, f"a date of {value!r} produced a row"
+        assert stored is None
+    assert await _count(db_session, Breach) == 0
 
 
 @pytest.mark.asyncio
 async def test_parse_date_iso_string_accepted(db_session, breaches_connector, monkeypatch):
-    d = await _parse_date_via_ingest(db_session, breaches_connector, "2021-11-03", monkeypatch)
-    assert d == date(2021, 11, 3)
+    accepted, stored = await _ingest_with_date(
+        db_session, breaches_connector, "2021-11-03", monkeypatch
+    )
+    assert accepted is True
+    assert stored == date(2021, 11, 3)
 
 
 @pytest.mark.asyncio
-async def test_parse_date_epoch_fallback_on_none(db_session, breaches_connector, monkeypatch):
-    d = await _parse_date_via_ingest(db_session, breaches_connector, None, monkeypatch)
-    assert d == date(1970, 1, 1)
+async def test_a_reporter_that_declares_its_gap_stores_the_row_anyway(
+    db_session, breaches_connector, monkeypatch
+):
+    """The one path that stores an incident with no date of its own.
+
+    A paste or a dump with no catalogue entry is real exposure with no date to
+    report. The reporter states that (``metadata_incomplete``), the row is kept,
+    and the fact travels with it: the date stored is the observation's, and the
+    API, the page and the message say the metadata is incomplete rather than
+    presenting that day as the incident's.
+    """
+    monkeypatch.setattr(
+        "app.services.ingestion_service.AlertDeliveryService.enqueue", _no_alert
+    )
+    accepted = await ingest_breach_finding(
+        db_session,
+        breaches_connector,
+        {
+            "breach_name": "PasteNoDate",
+            "matched_email": "someone@example.com",
+            "attributes": {"metadata_incomplete": True, "source": "paste:42"},
+        },
+    )
+    assert accepted is True
+    row = (
+        await db_session.execute(
+            select(Breach).where(Breach.breach_name == "PasteNoDate")
+        )
+    ).scalar_one()
+    assert row.breach_date != date(1970, 1, 1)
+    assert row.attributes["metadata_incomplete"] is True
+    assert row.metadata_incomplete is True
 
 
 # ---------------------------------------------------------------------------
@@ -467,9 +528,9 @@ async def test_ingest_breach_via_batch_entry_alerts_once_per_finding(
         connector=breaches_connector,
         job_id=uuid.uuid4(),
         findings=[
-            {"breach_name": "BatchB1", "matched_email": "b1@x.com"},
-            {"breach_name": "BatchB1", "matched_email": "b2@x.com"},
-            {"breach_name": "BatchB1", "matched_email": ""},
+            {"breach_name": "BatchB1", "matched_email": "b1@x.com", "breach_date": "2020-01-02"},
+            {"breach_name": "BatchB1", "matched_email": "b2@x.com", "breach_date": "2020-01-02"},
+            {"breach_name": "BatchB1", "matched_email": "", "breach_date": "2020-01-02"},
         ],
         connector_name=breaches_connector.name,
         connector_type="breaches",
@@ -518,6 +579,7 @@ async def test_ingest_source_timestamps_are_kept_verbatim(db_session, breaches_c
             {
                 "breach_name": name,
                 "matched_domain": f"{name.lower()}.example.com",
+                "breach_date": "2020-01-02",
                 "attributes": {"added_date": raw},
             },
         )
@@ -567,6 +629,7 @@ async def test_ingest_types_core_fields_and_stores_only_declared_extras(
         {
             "breach_name": "DtTopLevel",
             "matched_domain": "toplevel.example.com",
+            "breach_date": "2020-01-02",
             "added_date": "2024-01-02 03:04:05",
         },
     )
@@ -595,6 +658,7 @@ async def test_ingest_serializes_attribute_values_the_payload_can_carry(
         {
             "breach_name": name,
             "matched_domain": "attr.example.com",
+            "breach_date": "2020-01-02",
             "attributes": {"added_date": datetime(2024, 1, 2, 3, 4, 5)},
         },
     )
@@ -642,7 +706,11 @@ async def test_breach_db_failure_propagates_to_caller(
             await ingest_breach_finding(
                 db_session,
                 breaches_connector,
-                {"breach_name": "DbFailB", "matched_domain": "dbfail.example.com"},
+                {
+                    "breach_name": "DbFailB",
+                    "matched_domain": "dbfail.example.com",
+                    "breach_date": "2020-01-02",
+                },
             )
     finally:
         db_session.flush = original_flush
@@ -692,7 +760,11 @@ async def test_ingest_awaits_the_queue_handoff(
     ok = await ingest_breach_finding(
         db_session,
         breaches_connector,
-        {"breach_name": "GatherB", "matched_domain": "gather.example.com"},
+        {
+            "breach_name": "GatherB",
+            "matched_domain": "gather.example.com",
+            "breach_date": "2020-01-02",
+        },
     )
     assert ok is True
 
@@ -716,7 +788,11 @@ async def test_breach_alert_fanout_failure_does_not_fail_ingestion(
     ok = await ingest_breach_finding(
         db_session,
         breaches_connector,
-        {"breach_name": "AlertFailB", "matched_domain": "alertfail.example.com"},
+        {
+            "breach_name": "AlertFailB",
+            "matched_domain": "alertfail.example.com",
+            "breach_date": "2020-01-02",
+        },
     )
     assert ok is True
 

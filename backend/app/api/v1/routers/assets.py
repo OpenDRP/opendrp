@@ -1,10 +1,13 @@
+import asyncio
 import csv
 import io
 import math
 import uuid
+from datetime import datetime, timezone
 from typing import Literal
 
 from fastapi import APIRouter, Body, Depends, Query, Request, Response
+from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -13,8 +16,8 @@ from app.api.deps import (
     extract_ip,
     get_db,
     require_admin,
-    require_analyst_or_admin,
-    require_viewer_plus,
+    require_analyse,
+    require_active_account,
 )
 from app.core.audit import AuditLogger
 from app.core.exceptions import (
@@ -59,6 +62,87 @@ from app.services.asset_service import (
 )
 
 router = APIRouter(prefix="/assets", tags=["Assets"])
+
+#: The time budget of an asset read whose cost grows with the inventory
+#: (AST-50). It sits below the browser's 50 s timeout and above the measured
+#: budget of the queries it covers, so the API answers with a named refusal
+#: before the client gives up. The list without ``has_findings`` and a single
+#: asset's own reads are cheap enough to run unbounded.
+ASSET_QUERY_DEADLINE_SECONDS = 40.0
+
+
+def _deadline_exceeded() -> JSONResponse:
+    """A bounded, machine-readable refusal for a read that ran out of budget.
+
+    A 503 rather than a 500: nothing is broken, the query was stopped on purpose
+    and the same request may succeed once the operator narrows it. ``code`` is
+    what lets the SPA tell this apart from a network failure or a database
+    timeout and show "narrow the filter" instead of "something went wrong".
+    """
+    return JSONResponse(
+        status_code=503,
+        content={
+            "detail": (
+                "This asset query exceeded its time budget. Narrow the filter "
+                "(for example by asset type, search term or criticality) and "
+                "try again."
+            ),
+            "code": "query_deadline_exceeded",
+        },
+        headers={"Retry-After": "5"},
+    )
+
+
+async def _read_inventory(
+    service: AssetService, **paging
+) -> tuple[list, int, dict]:
+    """A page of assets together with their involvement summaries.
+
+    Split out so the caller can put a deadline around the whole read: the list
+    and its counters are one answer, and a deadline around only the first query
+    would let the second outlive it.
+    """
+    items, total = await service.list_assets(**paging)
+    summaries = await service.related_finding_summaries(items)
+    return items, total, summaries
+
+
+async def _read_export(service: AssetService, **paging) -> tuple[list, int, dict]:
+    """The export read: the rows, the total, and their counters.
+
+    The cap is checked before the counters are computed: an export that will be
+    refused anyway must not pay for the involvement lookups.
+    """
+    items, total = await service.list_assets(**paging)
+    if total > EXPORT_MAX_ROWS:
+        return items, total, {}
+    return items, total, await service.related_finding_summaries(items)
+
+
+def _latest_seen(summary) -> str:
+    """The newest observation about an asset, as the text the module published.
+
+    The stored values mix a disclosure *date* with scan *timestamps*, so they are
+    parsed rather than compared as strings; an unparseable value is skipped
+    instead of becoming the answer by accident.
+    """
+    latest: tuple[datetime, str] | None = None
+    for moment in (getattr(summary, "last_seen", None) or {}).values():
+        if not moment:
+            continue
+        text = str(moment)
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if parsed.tzinfo is None:
+            # A disclosure date has no offset; treat it as the UTC day it names
+            # rather than comparing a naive value with an aware one, which would
+            # raise instead of answering.
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        if latest is None or parsed > latest[0]:
+            latest = (parsed, text)
+    return latest[1] if latest else ""
 
 
 def _related_row(module: str, row) -> dict:
@@ -118,7 +202,7 @@ async def list_assets(
     page: int = Query(1, ge=1),
     size: int = Query(50, ge=1, le=MAX_PAGE_SIZE),
     db: AsyncSession = Depends(get_db),
-    user=Depends(require_viewer_plus),
+    user=Depends(require_active_account),
 ):
     """The asset inventory, filtered, sorted and paged by the server.
 
@@ -132,7 +216,7 @@ async def list_assets(
     """
     skip = (page - 1) * size
     service = AssetService(db)
-    items, total = await service.list_assets(
+    paging = dict(
         asset_type=asset_type,
         criticality=criticality,
         is_active=is_active,
@@ -143,11 +227,24 @@ async def list_assets(
         skip=skip,
         limit=size,
     )
+    # ``has_findings`` is the one filter whose cost grows with the inventory:
+    # answering it reads every asset's matching keys (AST-40). The deadline turns
+    # "the client timed out while the server kept working" into one bounded
+    # answer that names the condition (AST-50). Cheap list reads stay unbounded.
+    try:
+        if has_findings is None:
+            items, total, summaries = await _read_inventory(service, **paging)
+        else:
+            items, total, summaries = await asyncio.wait_for(
+                _read_inventory(service, **paging),
+                timeout=ASSET_QUERY_DEADLINE_SECONDS,
+            )
+    except asyncio.TimeoutError:
+        return _deadline_exceeded()
     # Each row carries its own involvement count, computed from the same
     # predicates the asset page and the cascade use (WI-20). Without it, an
     # operator cannot tell an asset that is being monitored from one that is
     # only configured, which is the difference the audit called out.
-    summaries = await service.related_finding_summaries(items)
     rows = [
         AssetResponse.model_validate(asset).model_copy(
             update={"findings": summaries.get(asset.id)}
@@ -192,7 +289,7 @@ async def create_asset(
     request: Request,
     data: AssetCreate,
     db: AsyncSession = Depends(get_db),
-    user=Depends(require_analyst_or_admin),
+    user=Depends(require_analyse),
 ):
     # Creating an asset is not a free operation: it adds a value to every scan
     # that monitors its type, so it is subject to the same per-user throttle as a
@@ -473,11 +570,34 @@ def _error_detail(exc: Exception) -> str:
     return str(getattr(exc, "detail", exc))
 
 
-def _assets_as_csv(items) -> str:
+def _assets_as_csv(items, summaries: dict) -> str:
+    """The export rows, with the same involvement the list shows (AST-49).
+
+    The columns keep the original five first — a consumer that read the old file
+    by position still finds them where they were — and append the counters and
+    the newest observation. ``findings_other`` is the generic module bucket, so
+    the per-module and generic numbers add up to ``findings_total``.
+    """
     buffer = io.StringIO()
     writer = csv.writer(buffer)
-    writer.writerow(["asset_type", "asset_value", "criticality", "is_active", "created_at"])
+    writer.writerow(
+        [
+            "asset_type",
+            "asset_value",
+            "criticality",
+            "is_active",
+            "created_at",
+            "findings_total",
+            "findings_phishing",
+            "findings_breaches",
+            "findings_dns",
+            "findings_exposure",
+            "findings_other",
+            "last_seen",
+        ]
+    )
     for asset in items:
+        summary = summaries.get(asset.id)
         writer.writerow(
             [
                 asset_type_value(asset.asset_type),
@@ -485,6 +605,13 @@ def _assets_as_csv(items) -> str:
                 asset.criticality,
                 "true" if asset.is_active else "false",
                 asset.created_at.isoformat() if asset.created_at else "",
+                summary.total if summary else 0,
+                summary.phishing if summary else 0,
+                summary.breaches if summary else 0,
+                summary.dns if summary else 0,
+                summary.exposure if summary else 0,
+                summary.findings if summary else 0,
+                _latest_seen(summary) if summary else "",
             ]
         )
     return buffer.getvalue()
@@ -495,7 +622,7 @@ async def import_assets(
     request: Request,
     payload: AssetImportRequest,
     db: AsyncSession = Depends(get_db),
-    user=Depends(require_analyst_or_admin),
+    user=Depends(require_analyse),
 ):
     """JSON import: ``{"items": [...], "dry_run": false}`` (WI-18)."""
     rows = [(index, item) for index, item in enumerate(payload.items, start=1)]
@@ -510,7 +637,7 @@ async def import_assets_csv(
     raw: bytes = Body(..., media_type="text/csv"),
     dry_run: bool = Query(False),
     db: AsyncSession = Depends(get_db),
-    user=Depends(require_analyst_or_admin),
+    user=Depends(require_analyse),
 ):
     """CSV import: ``asset_type,asset_value,criticality`` with a header row (WI-18)."""
     rows, invalid = _csv_rows(raw)
@@ -529,7 +656,7 @@ async def export_assets(
     order: SortDirection = Query("desc"),
     format: Literal["csv", "json"] = Query("csv"),
     db: AsyncSession = Depends(get_db),
-    user=Depends(require_viewer_plus),
+    user=Depends(require_active_account),
 ):
     """The inventory behind the current filter, as a file (WI-18/AST-24).
 
@@ -537,17 +664,27 @@ async def export_assets(
     and ordering: an export that re-implemented the filter would eventually
     disagree with the table the operator checked before downloading it.
     """
-    items, total = await AssetService(db).list_assets(
-        asset_type=asset_type,
-        criticality=criticality,
-        is_active=is_active,
-        has_findings=has_findings,
-        search=search,
-        sort=sort,
-        order=order,
-        skip=0,
-        limit=EXPORT_MAX_ROWS,
-    )
+    # An export can carry ten thousand rows; the rows and their counters are one
+    # answer, so the deadline covers both (AST-50). A file that took longer is
+    # refused with a named reason rather than left half-built.
+    try:
+        items, total, summaries = await asyncio.wait_for(
+            _read_export(
+                AssetService(db),
+                asset_type=asset_type,
+                criticality=criticality,
+                is_active=is_active,
+                has_findings=has_findings,
+                search=search,
+                sort=sort,
+                order=order,
+                skip=0,
+                limit=EXPORT_MAX_ROWS,
+            ),
+            timeout=ASSET_QUERY_DEADLINE_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        return _deadline_exceeded()
     if total > EXPORT_MAX_ROWS:
         raise BadRequestException(
             f"This filter matches {total} assets; an export carries at most "
@@ -571,12 +708,24 @@ async def export_assets(
     if format == "json":
         return {
             "items": [
-                {"id": str(asset.id), **asset_audit_snapshot(asset)} for asset in items
+                {
+                    "id": str(asset.id),
+                    **asset_audit_snapshot(asset),
+                    # The same ``AssetFindingSummary`` a list row carries, so a
+                    # consumer reads one shape for the table and the file.
+                    "findings": (
+                        summaries[asset.id].model_dump()
+                        if asset.id in summaries
+                        else None
+                    ),
+                    "last_seen": _latest_seen(summaries.get(asset.id)),
+                }
+                for asset in items
             ],
             "total": int(total),
         }
     return Response(
-        content=_assets_as_csv(items),
+        content=_assets_as_csv(items, summaries),
         media_type="text/csv; charset=utf-8",
         headers={"Content-Disposition": 'attachment; filename="assets.csv"'},
     )
@@ -587,7 +736,7 @@ async def bulk_update_assets(
     request: Request,
     payload: AssetBulkRequest,
     db: AsyncSession = Depends(get_db),
-    user=Depends(require_analyst_or_admin),
+    user=Depends(require_analyse),
 ):
     """One action over many assets, with one summary audit row (WI-18/AST-24).
 
@@ -680,7 +829,7 @@ async def get_asset(
     request: Request,
     asset_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    user=Depends(require_viewer_plus),
+    user=Depends(require_active_account),
 ):
     asset = await AssetService(db).get_asset(asset_id)
     if not asset:
@@ -704,7 +853,7 @@ async def update_asset(
     asset_id: uuid.UUID,
     data: AssetUpdate,
     db: AsyncSession = Depends(get_db),
-    user=Depends(require_analyst_or_admin),
+    user=Depends(require_analyse),
 ):
     service = AssetService(db)
     asset = await service.get_asset(asset_id)
@@ -785,7 +934,7 @@ async def list_asset_findings(
     page: int = Query(1, ge=1),
     size: int = Query(50, ge=1, le=MAX_PAGE_SIZE),
     db: AsyncSession = Depends(get_db),
-    user=Depends(require_viewer_plus),
+    user=Depends(require_active_account),
 ):
     """What the platform holds about one asset, across every module (WI-12/AST-22).
 
@@ -824,19 +973,24 @@ async def list_asset_findings(
 
     total = counts[selected]
     all_counts = {**counts, "total": summary.total}
-    await AuditLogger.emit_background(
-        db,
-        action="asset.findings.list",
-        ip_address=extract_ip(request),
-        user_id=user.id,
-        details={
-            "asset_id": str(asset.id),
-            "asset_type": asset_type_value(asset.asset_type),
-            "asset_value": asset.asset_value,
-            "module": selected,
-            "counts": all_counts,
-        },
-    )
+    # Read auditing is per result set, like `asset.list` (AST-44): the card asks
+    # for one page per module tab, and paging through a tab must not append a row
+    # per click to the audit chain. The first page of a tab is the read; the
+    # pages that continue it are the same read.
+    if page == 1:
+        await AuditLogger.emit_background(
+            db,
+            action="asset.findings.list",
+            ip_address=extract_ip(request),
+            user_id=user.id,
+            details={
+                "asset_id": str(asset.id),
+                "asset_type": asset_type_value(asset.asset_type),
+                "asset_value": asset.asset_value,
+                "module": selected,
+                "counts": all_counts,
+            },
+        )
 
     return {
         "asset": {

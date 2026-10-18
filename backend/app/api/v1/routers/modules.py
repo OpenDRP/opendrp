@@ -25,8 +25,8 @@ from app.api.deps import (
     extract_ip,
     get_db,
     require_admin,
-    require_analyst_or_admin,
-    require_viewer_plus,
+    require_analyse,
+    require_active_account,
 )
 from app.core.audit import AuditLogger
 from app.core.exceptions import BadRequestException, NotFoundException
@@ -57,7 +57,7 @@ router = APIRouter(tags=["Modules"])
 async def list_modules(
     request: Request,
     db: AsyncSession = Depends(get_db),
-    user=Depends(require_viewer_plus),
+    user=Depends(require_active_account),
 ):
     """Every registered module, including disabled ones (flagged as such)."""
     specs = await load_modules(db)
@@ -158,7 +158,7 @@ async def list_findings(
     page: int = Query(1, ge=1),
     size: int = Query(50, ge=1, le=MAX_PAGE_SIZE),
     db: AsyncSession = Depends(get_db),
-    user=Depends(require_viewer_plus),
+    user=Depends(require_active_account),
 ):
     """Findings stored generically, newest first, optionally for one module."""
     from math import ceil
@@ -202,7 +202,7 @@ async def update_finding(
     payload: FindingUpdateRequest,
     request: Request,
     db: AsyncSession = Depends(get_db),
-    user=Depends(require_analyst_or_admin),
+    user=Depends(require_analyse),
 ):
     """Move a generic finding through triage.
 

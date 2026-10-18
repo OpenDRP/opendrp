@@ -25,9 +25,10 @@ for:
   position would be re-pointed at a different key by the next rotation.
 """
 
+import uuid
 from datetime import datetime
 
-from sqlalchemy import BigInteger, DateTime, Index, JSON, SmallInteger, String, UUID
+from sqlalchemy import BigInteger, DateTime, Index, JSON, SmallInteger, String, Uuid
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import Base, TimestampMixin, UUIDMixin
@@ -46,8 +47,8 @@ class AuditLog(Base, UUIDMixin):
         nullable=False,
         index=True,
     )
-    user_id: Mapped[UUID | None] = mapped_column(
-        UUID(as_uuid=True),
+    user_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
         nullable=True,
         index=True,
     )

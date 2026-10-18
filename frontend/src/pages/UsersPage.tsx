@@ -1,11 +1,11 @@
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Plus, Search, Pencil, Trash2, RefreshCw, Check, X, ShieldAlert, ShieldCheck, ShieldOff, Eye, UserRound, RotateCcw } from "lucide-react";
+import { Plus, Search, Pencil, Trash2, RefreshCw, Check, X, ShieldAlert, ShieldCheck, ShieldOff, Eye, UserRound, RotateCcw, Download, MonitorSmartphone, Power, MailPlus, Copy, Send } from "lucide-react";
 import { describeApiError, endpoints } from "@/lib/api";
 import { useDebounce } from "@/lib/useDebounce";
 import { useAuthStore } from "@/store/auth";
 import { formatNumber } from "@/lib/utils";
-import { TIME_ZONE_HINT, formatDateTime } from "@/lib/datetime";
+import { TIME_ZONE_HINT, formatDateTime, formatDateTimeOrNever } from "@/lib/datetime";
 import type { User, UserRole } from "@/types/api";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -86,6 +86,22 @@ function describeRateLimit(minutes: number): string {
   return `Every ${minutes} min`;
 }
 
+/** Save a response the server already rendered, without a second request. */
+function saveBlob(content: Blob, filename: string) {
+  if (typeof URL.createObjectURL !== "function") return;
+  const url = URL.createObjectURL(content);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+}
+
+/** The three support cuts (U-3); `all` means no extra condition. */
+type SupportView = "all" | "onboarding" | "no-mfa" | "locked";
+
 export default function UsersPage() {
   const qc = useQueryClient();
   const currentUser = useAuthStore(s => s.user);
@@ -96,6 +112,24 @@ export default function UsersPage() {
   const debouncedSearch = useDebounce(search, 400);
   const [roleFilter, setRoleFilter] = useState<UserRole | undefined>();
   const [activeFilter, setActiveFilter] = useState<boolean | undefined>();
+  // `false` is the access-review question ("never signed in"), not "no filter":
+  // `undefined` means every account regardless of sign-in history.
+  const [signedInFilter, setSignedInFilter] = useState<boolean | undefined>();
+  const [supportView, setSupportView] = useState<SupportView>("all");
+  const [selectedIds, setSelectedIds] = useState<string[]>([]);
+  const [sessionsUser, setSessionsUser] = useState<User | null>(null);
+  const [bulkConfirm, setBulkConfirm] = useState<"activate" | "deactivate" | null>(null);
+  const [inviteOpen, setInviteOpen] = useState(false);
+  const [inviteEmail, setInviteEmail] = useState("");
+  const [inviteName, setInviteName] = useState("");
+  const [inviteRole, setInviteRole] = useState<UserRole>("viewer");
+  const [inviteResult, setInviteResult] = useState<{
+    email: string;
+    token: string;
+    expires_at: string;
+    email_scheduled: boolean;
+  } | null>(null);
+  const [resendUser, setResendUser] = useState<User | null>(null);
 
   const [dialogOpen, setDialogOpen] = useState(false);
   const [editing, setEditing] = useState<User | null>(null);
@@ -112,12 +146,16 @@ export default function UsersPage() {
   const [mfaResetUser, setMfaResetUser] = useState<User | null>(null);
 
   const { data, isLoading, isError, refetch, isFetching } = useQuery({
-    queryKey: ["users", page, size, debouncedSearch, roleFilter, activeFilter],
+    queryKey: ["users", page, size, debouncedSearch, roleFilter, activeFilter, signedInFilter, supportView],
     queryFn: () => endpoints.listUsers({
       page,
       size,
       role: roleFilter,
       is_active: activeFilter,
+      signed_in: signedInFilter,
+      requires_onboarding: supportView === "onboarding" ? true : undefined,
+      mfa_enrolled: supportView === "no-mfa" ? false : undefined,
+      locked: supportView === "locked" ? true : undefined,
       search: debouncedSearch || undefined,
     }),
     staleTime: 15_000,
@@ -215,6 +253,176 @@ export default function UsersPage() {
       });
     },
   });
+
+  const unlockMut = useMutation({
+    mutationFn: (id: string) => endpoints.unlockUser(id),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["users"] });
+      toast({
+        title: "Account unlocked",
+        description:
+          "The failed sign-in counter is cleared. The password, role and second factor are unchanged.",
+      });
+    },
+    onError: (e: any) => {
+      // The API refuses an account that is not locked any more, which is what a
+      // stale table and a colleague's simultaneous click both look like. Saying
+      // so is more useful than a generic failure toast.
+      const status = e?.response?.status;
+      toast({
+        variant: "destructive",
+        title: status === 409 ? "Nothing to unlock" : "Could not unlock the account",
+        description: describeApiError(e, "This account is no longer locked."),
+      });
+    },
+  });
+
+  const sessions = useQuery({
+    queryKey: ["user-sessions", sessionsUser?.id],
+    queryFn: () => endpoints.listUserSessions(sessionsUser!.id),
+    enabled: sessionsUser !== null,
+    staleTime: 5_000,
+  });
+
+  const revokeSessionsMut = useMutation({
+    mutationFn: (id: string) => endpoints.revokeUserSessions(id),
+    onSuccess: (result) => {
+      qc.invalidateQueries({ queryKey: ["user-sessions"] });
+      qc.invalidateQueries({ queryKey: ["users"] });
+      toast({
+        title: "Sessions ended",
+        description:
+          result.revoked === 1
+            ? "One session was signed out."
+            : `${result.revoked} sessions were signed out.`,
+      });
+    },
+    onError: (e: any) => {
+      toast({
+        variant: "destructive",
+        title: "Could not end the sessions",
+        description: describeApiError(e, "Use the sessions page for your own account."),
+      });
+    },
+  });
+
+  const bulkMut = useMutation({
+    mutationFn: (operation: "activate" | "deactivate") =>
+      endpoints.bulkUsers({ operation, user_ids: selectedIds }),
+    onSuccess: (result, operation) => {
+      qc.invalidateQueries({ queryKey: ["users"] });
+      setSelectedIds([]);
+      toast({
+        title: operation === "deactivate" ? "Accounts deactivated" : "Accounts activated",
+        description:
+          `${result.changed} changed` +
+          (result.skipped ? `, ${result.skipped} already in that state` : "") +
+          (result.revoked_sessions ? `, ${result.revoked_sessions} sessions ended` : "") +
+          ".",
+      });
+    },
+    onError: (e: any) => {
+      const status = e?.response?.status;
+      toast({
+        variant: "destructive",
+        title: status === 409 ? "Bulk action refused" : "Bulk action failed",
+        description: describeApiError(e, "Nothing was changed."),
+      });
+    },
+  });
+
+  const inviteMut = useMutation({
+    mutationFn: () =>
+      endpoints.inviteUser({
+        email: inviteEmail.trim(),
+        role: inviteRole,
+        full_name: inviteName.trim() || undefined,
+      }),
+    onSuccess: (result) => {
+      qc.invalidateQueries({ queryKey: ["users"] });
+      setInviteResult({
+        email: inviteEmail.trim(),
+        token: result.invitation_token,
+        expires_at: result.expires_at,
+        email_scheduled: result.email_scheduled,
+      });
+    },
+    onError: (e: any) => {
+      toast({
+        variant: "destructive",
+        title: "Could not create the invitation",
+        description: describeApiError(e),
+      });
+    },
+  });
+
+  const resendMut = useMutation({
+    mutationFn: (user: User) => endpoints.reissueInvitation(user.id),
+    onSuccess: (result, user) => {
+      qc.invalidateQueries({ queryKey: ["users"] });
+      setResendUser(null);
+      setInviteResult({
+        email: user.email,
+        token: result.invitation_token,
+        expires_at: result.expires_at,
+        email_scheduled: result.email_scheduled,
+      });
+      setInviteOpen(true);
+    },
+    onError: (e: any) => {
+      setResendUser(null);
+      toast({
+        variant: "destructive",
+        title: "Could not reissue the invitation",
+        description: describeApiError(e),
+      });
+    },
+  });
+
+  function closeInvite() {
+    setInviteOpen(false);
+    setInviteResult(null);
+    setInviteEmail("");
+    setInviteName("");
+    setInviteRole("viewer");
+  }
+
+  const inviteUrl = inviteResult
+    ? `${window.location.origin}/accept-invitation?token=${encodeURIComponent(inviteResult.token)}`
+    : "";
+
+  async function copyInviteLink() {
+    try {
+      await navigator.clipboard?.writeText(inviteUrl);
+      toast({ title: "Link copied", description: "Send it to the account owner over a channel you trust." });
+    } catch {
+      toast({ variant: "destructive", title: "Could not copy", description: "Select the link and copy it manually." });
+    }
+  }
+
+  const [exporting, setExporting] = useState(false);
+
+  async function handleExport() {
+    setExporting(true);
+    try {
+      const blob = await endpoints.exportUsers({
+        search: debouncedSearch || undefined,
+        role: roleFilter,
+        is_active: activeFilter,
+        signed_in: signedInFilter,
+        requires_onboarding: supportView === "onboarding" ? true : undefined,
+        mfa_enrolled: supportView === "no-mfa" ? false : undefined,
+        locked: supportView === "locked" ? true : undefined,
+        format: "csv",
+      });
+      saveBlob(blob, "users.csv");
+      toast({ title: "Export ready", description: "users.csv downloaded." });
+    } catch (error: unknown) {
+      toast({ variant: "destructive", title: "Export failed", description: describeApiError(error) });
+    } finally {
+      setExporting(false);
+    }
+  }
 
   const deleteMut = useMutation({
     mutationFn: (id: string) => endpoints.deleteUser(id),
@@ -367,13 +575,28 @@ export default function UsersPage() {
               {u.is_active ? "Active" : "Inactive"}
             </Badge>
             {isLocked && (
-              <Badge
-                variant="outline"
-                className="border-red-500/30 text-red-500 bg-red-500/10 text-[10px]"
-                title={`Temporarily locked due to failed login attempts until ${formatDateTime(u.locked_until!)}`}
-              >
-                Locked (Brute-force)
-              </Badge>
+              <div className="flex items-center gap-1.5">
+                <Badge
+                  variant="outline"
+                  className="border-red-500/30 text-red-500 bg-red-500/10 text-[10px]"
+                  title={`Temporarily locked due to failed login attempts until ${formatDateTime(u.locked_until!)}`}
+                >
+                  Locked (Brute-force)
+                </Badge>
+                {/* The lockout is the control working, so the way out is next to
+                    the state rather than in a support note: an operator releasing
+                    it is a decision about this account, not a settings change. */}
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  className="h-6 px-2 text-xs"
+                  onClick={() => unlockMut.mutate(u.id)}
+                  disabled={unlockMut.isPending && unlockMut.variables === u.id}
+                  title="Clear the failed sign-in counter and lift the lockout. The password, role and second factor are not touched."
+                >
+                  {unlockMut.isPending && unlockMut.variables === u.id ? "Unlocking..." : "Unlock"}
+                </Button>
+              </div>
             )}
           </div>
         );
@@ -407,6 +630,15 @@ export default function UsersPage() {
             >
               {u.totp_enabled_at ? "2FA" : "password only"}
             </Badge>
+            {u.invitation_expires_at ? (
+              <Badge
+                variant="outline"
+                className="border-sky-500/30 text-sky-500 bg-sky-500/10"
+                title={`Invitation expires ${formatDateTime(u.invitation_expires_at)}`}
+              >
+                invited
+              </Badge>
+            ) : null}
             {pending.length > 0 && (
               <Badge
                 variant="outline"
@@ -419,6 +651,19 @@ export default function UsersPage() {
           </div>
         );
       },
+    },
+    {
+      key: "last_login_at",
+      title: "Last sign-in",
+      width: 170,
+      minWidth: 150,
+      // "never" and "just now" are different answers, so the empty case is
+      // written out rather than left blank.
+      render: (u) => (
+        <span className={u.last_login_at ? "text-sm text-muted-foreground" : "text-sm text-amber-500"}>
+          {formatDateTimeOrNever(u.last_login_at)}
+        </span>
+      ),
     },
     {
       key: "created_at",
@@ -448,6 +693,26 @@ export default function UsersPage() {
             </Button>
             <Button size="icon" variant="ghost" onClick={() => openEdit(u)} title="Edit user" aria-label="Edit user">
               <Pencil className="w-4 h-4" />
+            </Button>
+            {u.invitation_expires_at ? (
+              <Button
+                size="icon"
+                variant="ghost"
+                onClick={() => setResendUser(u)}
+                title="Replace the invitation link (the old one stops working)"
+                aria-label="Resend invitation"
+              >
+                <Send className="w-4 h-4" />
+              </Button>
+            ) : null}
+            <Button
+              size="icon"
+              variant="ghost"
+              onClick={() => setSessionsUser(u)}
+              title="Show this account's sessions and end them"
+              aria-label="Show sessions"
+            >
+              <MonitorSmartphone className="w-4 h-4" />
             </Button>
             <Button
               size="icon"
@@ -491,9 +756,17 @@ export default function UsersPage() {
           <p className="text-xs text-muted-foreground mt-1">{TIME_ZONE_HINT}</p>
         </div>
         <div className="flex items-center gap-2">
+          <Button variant="outline" onClick={handleExport} disabled={exporting}>
+            <Download className="w-4 h-4 mr-2" />
+            {exporting ? "Exporting..." : "Export CSV"}
+          </Button>
           <Button variant="outline" onClick={() => refetch()} disabled={isFetching}>
             <RefreshCw className={`w-4 h-4 mr-2 ${isFetching ? "animate-spin" : ""}`} />
             Refresh
+          </Button>
+          <Button variant="outline" onClick={() => { closeInvite(); setInviteOpen(true); }}>
+            <MailPlus className="w-4 h-4 mr-2" />
+            Invite user
           </Button>
           <Button onClick={openCreate}>
             <Plus className="w-4 h-4 mr-2" />
@@ -530,15 +803,67 @@ export default function UsersPage() {
                 <SelectItem value="inactive">Inactive</SelectItem>
               </SelectContent>
             </Select>
+            <Select value={signedInFilter === undefined ? "all" : signedInFilter ? "signed-in" : "never"} onValueChange={(v: string) => { setSignedInFilter(v === "all" ? undefined : v === "signed-in"); setPage(1); }}>
+              <SelectTrigger aria-label="Filter by sign-in history"><SelectValue placeholder="Sign-in" /></SelectTrigger>
+              <SelectContent>
+                <SelectItem value="all">Any sign-in history</SelectItem>
+                <SelectItem value="signed-in">Has signed in</SelectItem>
+                <SelectItem value="never">Never signed in</SelectItem>
+              </SelectContent>
+            </Select>
+            {/* The three slices support asks for, in the list they are already
+                looking at — a separate counters panel would be a second query
+                and would show zeros while the first one is loading (U-3). */}
+            <Select value={supportView} onValueChange={(v: string) => { setSupportView(v as SupportView); setPage(1); setSelectedIds([]); }}>
+              <SelectTrigger aria-label="Filter by support view"><SelectValue placeholder="Support view" /></SelectTrigger>
+              <SelectContent>
+                <SelectItem value="all">Every account</SelectItem>
+                <SelectItem value="onboarding">Owes onboarding</SelectItem>
+                <SelectItem value="no-mfa">No second factor</SelectItem>
+                <SelectItem value="locked">Locked out</SelectItem>
+              </SelectContent>
+            </Select>
           </div>
         </CardContent>
       </Card>
+
+      {selectedIds.length > 0 && (
+        <Card>
+          <CardContent className="flex flex-wrap items-center gap-2 p-4" role="region" aria-label="Bulk actions">
+            <span className="text-sm font-medium mr-2">{selectedIds.length} selected</span>
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => setBulkConfirm("deactivate")}
+              disabled={bulkMut.isPending}
+            >
+              <Power className="w-4 h-4 mr-1" />
+              Deactivate selected
+            </Button>
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => setBulkConfirm("activate")}
+              disabled={bulkMut.isPending}
+            >
+              Activate selected
+            </Button>
+            <Button size="sm" variant="ghost" onClick={() => setSelectedIds([])} disabled={bulkMut.isPending}>
+              Clear selection
+            </Button>
+          </CardContent>
+        </Card>
+      )}
 
       <Card>
         <CardContent className="p-4">
           <PaginatedDataTable
             columns={columns}
             rows={data?.items ?? []}
+            selectable
+            selectedIds={selectedIds}
+            onSelectedChange={setSelectedIds}
+            getRowLabel={(row) => row.email}
             total={data?.total ?? 0}
             page={page}
             pageSize={size}
@@ -609,6 +934,170 @@ export default function UsersPage() {
           setMfaResetUser(null);
         }}
         onCancel={() => setMfaResetUser(null)}
+      />
+
+      <Dialog open={inviteOpen} onOpenChange={(open) => { if (!open) closeInvite(); }}>
+        <DialogContent className="sm:max-w-lg">
+          <DialogHeader>
+            <DialogTitle>{inviteResult ? "Invitation link" : "Invite a user"}</DialogTitle>
+            <DialogDescription>
+              {inviteResult
+                ? "This link works once. The account keeps only its digest, so it cannot be shown again — copy it now if you need it."
+                : "The account is created without a password you know. The owner chooses one from the link, so no temporary password travels through chat or mail."}
+            </DialogDescription>
+          </DialogHeader>
+          {inviteResult ? (
+            <div className="space-y-4 py-2">
+              <div className="space-y-2">
+                <Label htmlFor="invitation-link">Link for {inviteResult.email}</Label>
+                <div className="flex gap-2">
+                  <Input id="invitation-link" readOnly value={inviteUrl} onFocus={(event) => event.target.select()} />
+                  <Button type="button" variant="outline" onClick={copyInviteLink} aria-label="Copy invitation link">
+                    <Copy className="w-4 h-4" />
+                  </Button>
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  Expires {formatDateTime(inviteResult.expires_at)}.
+                  {" "}
+                  {inviteResult.email_scheduled
+                    ? "The platform also queued this link by email."
+                    : "No email was queued (SMTP or a public origin is not configured) — send the link yourself."}
+                </p>
+              </div>
+            </div>
+          ) : (
+            <div className="space-y-4 py-2">
+              <div className="space-y-2">
+                <Label htmlFor="invite-email">Email</Label>
+                <Input
+                  id="invite-email"
+                  type="email"
+                  value={inviteEmail}
+                  onChange={(event) => setInviteEmail(event.target.value)}
+                  placeholder="user@example.com"
+                />
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="invite-name">Full name <span className="text-muted-foreground">(optional)</span></Label>
+                <Input id="invite-name" value={inviteName} onChange={(event) => setInviteName(event.target.value)} />
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="invite-role">Role</Label>
+                <Select value={inviteRole} onValueChange={(value: string) => setInviteRole(value as UserRole)}>
+                  <SelectTrigger id="invite-role"><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    {ROLES.map((role) => (
+                      <SelectItem key={role} value={role} className="capitalize">{role}</SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+            </div>
+          )}
+          <DialogFooter>
+            {inviteResult ? (
+              <Button onClick={closeInvite}>Done</Button>
+            ) : (
+              <>
+                <Button variant="outline" onClick={closeInvite}>Cancel</Button>
+                <Button
+                  onClick={() => inviteMut.mutate()}
+                  disabled={inviteMut.isPending || !inviteEmail.trim()}
+                >
+                  {inviteMut.isPending ? "Creating..." : "Create invitation"}
+                </Button>
+              </>
+            )}
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <ConfirmDialog
+        open={resendUser !== null}
+        onOpenChange={(open) => { if (!open) setResendUser(null); }}
+        title="Replace the invitation link?"
+        description={
+          resendUser ? (
+            <>The link already sent to <span className="font-semibold">{resendUser.email}</span> stops working. A new one is created and, when mail is configured, sent.</>
+          ) : (
+            "The previous link stops working."
+          )
+        }
+        confirmLabel="Create a new link"
+        confirmLoading={resendMut.isPending}
+        onConfirm={() => { if (resendUser) resendMut.mutate(resendUser); }}
+        onCancel={() => setResendUser(null)}
+      />
+
+      <Dialog open={sessionsUser !== null} onOpenChange={(open) => { if (!open) setSessionsUser(null); }}>
+        <DialogContent className="sm:max-w-lg">
+          <DialogHeader>
+            <DialogTitle>Active sessions</DialogTitle>
+            <DialogDescription>
+              {sessionsUser
+                ? `Browsers that can still act as ${sessionsUser.email}. Only identifiers and times are shown — never a token.`
+                : ""}
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-3 py-2">
+            {sessions.isLoading ? (
+              <p className="text-sm text-muted-foreground">Loading sessions...</p>
+            ) : sessions.isError ? (
+              <p className="text-sm text-destructive">The sessions could not be loaded.</p>
+            ) : (sessions.data?.length ?? 0) === 0 ? (
+              <p className="text-sm text-muted-foreground">
+                No active sessions. The account can sign in again at any time; ending a session does not deactivate it.
+              </p>
+            ) : (
+              <ul className="divide-y rounded-md border" aria-label="Active sessions">
+                {sessions.data!.map((session) => (
+                  <li key={session.id} className="p-3 text-sm">
+                    <div className="font-mono text-xs break-all">{session.id}</div>
+                    <div className="text-muted-foreground text-xs mt-1">
+                      Created {formatDateTime(session.created_at)}
+                      {session.last_used_at ? ` · last used ${formatDateTime(session.last_used_at)}` : ""}
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setSessionsUser(null)}>Close</Button>
+            <Button
+              variant="destructive"
+              onClick={() => sessionsUser && revokeSessionsMut.mutate(sessionsUser.id)}
+              disabled={revokeSessionsMut.isPending || (sessions.data?.length ?? 0) === 0}
+            >
+              {revokeSessionsMut.isPending ? "Ending..." : "End all sessions"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <ConfirmDialog
+        open={bulkConfirm !== null}
+        onOpenChange={(open) => { if (!open) setBulkConfirm(null); }}
+        variant={bulkConfirm === "deactivate" ? "destructive" : "default"}
+        title={bulkConfirm === "deactivate" ? "Deactivate the selected accounts?" : "Activate the selected accounts?"}
+        description={
+          bulkConfirm === "deactivate" ? (
+            <>
+              {selectedIds.length} selected accounts will lose access and their sessions will be ended.
+              The whole selection is applied at once, or not at all; the last active administrator is refused
+              by the API rather than left behind as an exception.
+            </>
+          ) : (
+            <>{selectedIds.length} selected accounts will be able to sign in again.</>
+          )
+        }
+        confirmLabel={bulkConfirm === "deactivate" ? "Deactivate" : "Activate"}
+        confirmLoading={bulkMut.isPending}
+        onConfirm={() => {
+          if (bulkConfirm) bulkMut.mutate(bulkConfirm);
+          setBulkConfirm(null);
+        }}
+        onCancel={() => setBulkConfirm(null)}
       />
 
       <Dialog open={dialogOpen} onOpenChange={(o) => { if (!o) resetForm(); setDialogOpen(o); }}>

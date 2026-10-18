@@ -254,6 +254,21 @@ function alreadyMonitored(details: Details, source: string): string {
 }
 
 /**
+ * `Confirmed that this certificate of ours is served by 198.51.100.7:443`.
+ *
+ * The address is the actionable half of a foreign deployment, so it is rendered
+ * as `ip:port`; a sighting a provider indexed without an address falls back to
+ * the hostname it was about, and then to the sighting itself so the sentence is
+ * never left without a subject.
+ */
+function certificateSighting(prefix: string, details: Details): string {
+  const ip = asText(details.ip);
+  const port = asText(details.port);
+  const address = ip ? `${ip}${port ? `:${port}` : ""}` : asText(details.subject);
+  return `${prefix} ${address ?? asText(details.sighting_id) ?? "an address a provider did not record"}`;
+}
+
+/**
  * One sentence per action, for entries whose details refine it no further.
  *
  * A missing action falls through to `fallbackDescription`, so adding a case here
@@ -324,8 +339,28 @@ const AUDIT_DESCRIPTIONS: Record<string, (details: Details) => string> = {
     d.was_enabled === true
       ? `${named("Cleared the second factor of", d.target_email, d.target_user_id)} — enrolment is required at the next sign-in`
       : named("Cleared the second factor of", d.target_email, d.target_user_id),
+  // Backlog U-1/U-2/U-5: the operator surfaces added after the audit.
+  "users.export": (d) =>
+    `Exported ${typeof d.rows === "number" ? `${d.rows} ` : ""}user accounts`,
+  "users.bulk": (d) =>
+    `${d.operation === "activate" ? "Activated" : "Deactivated"} ${
+      typeof d.changed === "number" ? d.changed : "selected"
+    } accounts in one action`,
+  "user.sessions.revoked": (d) =>
+    named(
+      `Ended ${typeof d.revoked_count === "number" ? d.revoked_count : "all"} sessions of`,
+      d.target_email,
+      d.target_user_id,
+    ),
   "user.locked": (d) => named("Deactivated user", d.target_email, d.target_user_id),
-  "user.unlocked": (d) => named("Activated user", d.target_email, d.target_user_id),
+  // One action name covers two different operations: the API's activation
+  // change and the release of a brute-force lockout. `method` is what tells
+  // them apart, and reading "Activated user" for a lockout release would be a
+  // false statement about what happened (RWI-13).
+  "user.unlocked": (d) =>
+    d.method === "brute_force_unlock"
+      ? named("Unlocked user (failed sign-ins)", d.target_email, d.target_user_id)
+      : named("Activated user", d.target_email, d.target_user_id),
 
   // --- assets ---
   "asset.create": (d) => named("Added asset", d.asset_value, d.asset_id),
@@ -342,6 +377,23 @@ const AUDIT_DESCRIPTIONS: Record<string, (details: Details) => string> = {
       ? alreadyMonitored(d, "DNS Security")
       : promotedAsset(d, "DNS Security"),
   "dns_security.asset.already_exists": (d) => alreadyMonitored(d, "DNS Security"),
+  // A decision about a certificate of ours seen somewhere else. These are the
+  // reviewer's judgements rather than sightings, so each reads as an act, and the
+  // address it was made about comes from the row's own details.
+  "tls.sighting.candidate": (d) =>
+    certificateSighting("Reopened the review of the certificate served at", d),
+  "tls.sighting.expected": (d) =>
+    certificateSighting("Marked as expected the certificate served at", d),
+  "tls.sighting.shared_infrastructure": (d) =>
+    certificateSighting("Marked as shared infrastructure the certificate served at", d),
+  "tls.sighting.confirmed_foreign": (d) =>
+    certificateSighting("Confirmed that this certificate of ours is served by", d),
+  "tls.sighting.rejected": (d) =>
+    certificateSighting("Rejected the evidence that we serve a certificate at", d),
+  "tls.exception.added": (d) =>
+    named("Allowed a certificate out of the scope rules:", d.match_value, d.match_kind),
+  "tls.exception.removed": (d) =>
+    named("Removed a certificate scope exception:", d.match_value, d.match_kind),
   "exposure.asset.promoted": (d) =>
     d.already_exists === true
       ? alreadyMonitored(d, "Exposure")

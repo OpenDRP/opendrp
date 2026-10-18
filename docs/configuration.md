@@ -16,7 +16,7 @@ Connector-scoped settings are namespaced after their connector (`SHODAN_*`, `DNS
 
 `CORS_ORIGINS` is the origin the **browser** uses, which is the TLS terminator in front of the installation. The published ports answer a different question: they bind the containers to this host (loopback by default) so that terminator can forward to them. `FRONTEND_PORT` and `docker/nginx/reverse-proxy.example.conf`'s `proxy_pass` have to be changed together; [deployment.md](deployment.md#the-origin-and-the-bindings) has the table. `python setup.py --check` warns when a plain-HTTP loopback origin names a port nothing in the file is published on.
 
-Provider API keys reach a connector by one of two routes, and the core `system_settings` table is neither of them. The first is the connector's own environment: `.env` and Compose hand the key to the matching container, namespaced after the provider. The second is a **source account** row in the core database: the value is stored as ciphertext under `ENCRYPTION_KEY`, an administrator writes it with `PUT /api/v1/connectors/accounts/{account_id}/api-key` and clears it with `DELETE` on the same path, the API answers with a four-character hint (`mask_value(api_key, keep_first=0, keep_last=4)`, so the last four characters, which Settings renders as `API key stored (1234)`) and never with the value, and the connector bound to that account receives it when it asks `GET /api/v1/connectors/me/credential`. Alert secrets entered in Settings are encrypted at rest with `ENCRYPTION_KEY` and sender/recipient addresses are masked in API responses. SMTP security is explicit: `starttls` (recommended), `ssl` (implicit TLS), or `plain` (trusted internal relay only). It is not inferred from the port number.
+Provider API keys reach a connector by one of two routes, and the core `system_settings` table is neither of them. The first is the connector's own environment: `.env` and Compose hand the key to the matching container, namespaced after the provider. The second is a **source account** row in the core database: the value is stored as ciphertext under `ENCRYPTION_KEY`, an administrator writes it with `PUT /api/v1/connectors/accounts/{account_id}/api-key` and clears it with `DELETE` on the same path, the API answers with a four-character hint (`mask_value(api_key, keep_first=0, keep_last=4)`, so the last four characters, which Settings renders as `API key stored (1234)`) and never with the value, and the connector bound to that account receives it when it asks `GET /api/v1/connectors/me/credential`. Alert secrets entered in Settings are encrypted at rest with `ENCRYPTION_KEY` and sender/recipient addresses are masked in API responses. That key also derives the HMAC that signs the one-time second-factor recovery codes (`users.mfa_recovery_codes`), so a rotation keeps printed codes working only while the old key is listed in `ENCRYPTION_PREVIOUS_KEYS` — [upgrading.md](upgrading.md) has the procedure and what dropping it retires. SMTP security is explicit: `starttls` (recommended), `ssl` (implicit TLS), or `plain` (trusted internal relay only). It is not inferred from the port number.
 
 ## Production-required values
 
@@ -55,6 +55,108 @@ docker compose -f docker-compose.yml up -d --force-recreate <service>
 
 `docker compose restart` does not reload `.env` values.
 
+## Second factor: who the installation requires it from
+
+Two settings state the same policy, and they are read together — the roles named
+in `REQUIRE_MFA_ROLES` plus `admin` whenever `REQUIRE_MFA_FOR_ADMINS=true`. The
+flag is what an older deployment already has on, so it is not replaced by the
+list: an installation that sets both requires a factor from the union.
+
+| Setting | Value | What it means |
+|---|---|---|
+| `REQUIRE_MFA_ROLES` | comma-separated `admin`, `analyst`, `viewer`; empty by default | An account whose role is listed and has no enrolled authenticator is held at the onboarding step: refused everywhere except `/auth/mfa/*` (and the endpoints that finish the flow), audited as `auth.mfa.required` with `reason: require_mfa`, and told at sign-in through `mfa_required_by_policy` on the user payload. An unknown role name fails at startup. |
+| `REQUIRE_MFA_FOR_ADMINS` | `true` / `false`, default `false` | Adds `admin` to the list above. The release valve for an administrator who cannot enrol is turning this off (or removing the role from the list) and recreating the API container. |
+
+This is a property of the deployment, not of an account: nothing is written to
+`users` when a role is listed, so removing the role releases every account it held
+without a back-fill. `manage_admin onboarding-off` does **not** release it — that
+command clears the flags on an account, and this requirement has none.
+
+## Alert budget
+
+Eight values decide how loudly the channel reports what it found. Six are the phishing
+budget: where a candidate stops being a message and starts being a line in the daily
+digest, below which it is list-only, whether that digest runs and at which UTC hour, how
+long a finding that no configured channel can receive is held before the outbox tries it
+again, and whether a *revision* of an already reported candidate is a second message.
+The other two are the breach module's: `ALERT_BREACH_NOISE_POLICY` decides what the
+channel does with an incident the source itself labels spam or fabricated (stored and
+visible, not announced, under the default), and `ALERT_BREACH_DIGEST_THRESHOLD` decides
+how many new incidents one scan may report before the rest wait for the daily digest —
+the same hour as the phishing digest, so an installation has one summary hour.
+`ALERT_BREACH_GROWTH_FLOOR` belongs to the same decision: it is how much the
+affected-account count of an already reported incident must grow for that growth to be
+worth a second message. All of them have `ALERT_*` defaults in `.env.example`.
+
+An installation can restate any of them on the Settings page's **Alert budget** section,
+which writes `system_settings`; a value the operator has not stated keeps answering from
+the environment, so editing `.env` still reaches every value nobody has overridden. (The
+two ceilings — `ALERT_MAX_FINDINGS_PER_MESSAGE` and `ALERT_MAX_TELEGRAM_MESSAGE_LENGTH` —
+are the exception: they are the message's own shape, not the budget's voice.) The two
+sources are merged rather than replaced, and a stored row that contradicts itself — a
+digest threshold at or above the direct one, a noise policy that is not one of the three
+— is refused as a whole in favour of the environment. `GET /api/v1/settings/alert-policy` reports the result: the values in force,
+whether they came from the environment or from the row, and which fields were refused.
+Because the row is read where it is used, a save takes effect on the next scan, the next
+delivery pass and the next digest tick — no container is recreated for it.
+
+## Alert health probes
+
+`GET /api/v1/alerts/health` dials the configured channels, and both health cards
+on the dashboard read that answer. Two settings bound the work; neither is part
+of the alert budget above.
+
+| Setting | Default | What it decides |
+|---|---|---|
+| `ALERT_HEALTH_CHECK_TIMEOUT_SECONDS` | `15` | the socket/HTTP timeout of one probe, and the budget a request waits for a probe already in flight |
+| `ALERT_HEALTH_CACHE_SECONDS` | `60` | how long one channel's answer is reused; `0` probes on every request |
+
+The cache lives in Redis, not in the process, so every replica reads the same
+answer and restarting an API container does not make a stale result look fresh.
+Its key carries a hash of the channel's settings: editing the SMTP host, port,
+mode, login, sender or the Telegram token or chats probes again on the next
+request. A Redis that cannot be reached degrades to probing, with
+`from_cache: false` in the response — it never fails the health page.
+
+## Connector scan shape
+
+The two keyed phishing workers have settings that decide what a scan *asks for*,
+and they live in two places on purpose: the capability toggles and pacing are
+`DNSTWIST_*` / `SHODAN_SCAN_*` environment values with per-connector names, while
+the numbers that bound one scan are **registry** settings of that connector
+(Settings → Connectors), stored in PostgreSQL and frozen into each queued job. An
+administrator who saves a capability in the connector's form overrides the env value
+for every later scan; a policy number has no env fallback at all, because a spend
+limit that a stale `.env` could raise is not a limit.
+
+| Setting | Connector | Default | What it bounds |
+|---|---|---|---|
+| `DNSTWIST_FUZZER_CLASSES` | phishing-dnstwist | `typo` | which techniques run; a class brings the dictionary the CLI needs beside its fuzzer |
+| `DNSTWIST_MAX_CANDIDATES` | phishing-dnstwist | `250` | permutations considered per domain, capped before resolution where it costs no DNS request |
+| `DNSTWIST_TLD_DICTIONARY`, `DNSTWIST_DICTIONARY` | phishing-dnstwist | packaged files | the dictionaries for the `tld` and `dictionary` classes; a missing file is a named skip |
+| `DNSTWIST_MX_CHECK` | phishing-dnstwist | `false` | the CLI's MX check plus one SPF TXT question, so `mx_without_spf` is answered |
+| `DNSTWIST_CONTENT_INSPECTION` | phishing-dnstwist | `false` | page similarity (`--lsh tlsh`); unavailable without the TLSh module, never `--phash` |
+| `SHODAN_SCAN_*` | phishing-shodan | three on, five off | which provider questions run; the five added later are opt-in per account |
+| `max_pages`, `max_broad_results`, `max_pivots`, `max_exclusions` | phishing-shodan | `3`, `1000`, `3`, `15` | pages per query, result size refused as too broad, follow-up pivots per scan, and how many of our own names go into the paid query |
+| `requests_per_minute`, `burst`, `max_aliases_per_domain`, `max_requests_per_scan`, `max_catalogue_entries` | breaches-hibp | `10`, `1`, `200`, `500`, `2000` | the key's pace (a subscription's own `Rpm` can only lower it), the alias expansion and whole-scan budget, and how much of the incident catalogue one sweep stores |
+| `stealer_logs_enabled` | breaches-hibp | `false` | whether the stealer-log pass runs at all; those routes are sold separately and a plan that does not include them is never asked |
+| `breachedaccount_range_enabled` | breaches-hibp | `true` | whether the hash-range form replaces the address form when the plan includes it; the summary names the form used and whose decision it was |
+| `pastes_enabled` | breaches-hibp | `true` | whether the paste lookup runs; that route takes the address itself, so a range-plan installation that must not send an address turns it off |
+| `stealer_logs_interval_hours` | breaches-hibp | `168` | how often the stealer-log pass may spend its separately priced allowance; a scan inside the interval asks nothing and says `not_due` |
+| `stealer_logs_domain_requests_per_minute` | breaches-hibp | `3` | the pace of the domain-shaped stealer-log routes, which the provider documents as much lower than the key's own |
+| `max_stealer_log_sites_per_asset` | breaches-hibp | `50` | how many websites one address (or one domain alias) may contribute before the rest are counted as `sites_over_limit` |
+
+The flags that widen a scan's *network* footprint rather than its provider bill
+(`DNSTWIST_MX_CHECK`, `DNSTWIST_CONTENT_INSPECTION`, `stealer_logs_enabled`) default
+to off: a scan that connects to a stranger's mail server, fetches their page or spends
+a separately priced provider allowance should be an operator's explicit choice, not a
+default. The two switches that are on by default (`breachedaccount_range_enabled`,
+`pastes_enabled`) are on because the safer behaviour is also the default one: an address
+that need not be sent is not sent, and a lookup that would send it anyway is named in
+the scan summary. [connectors/README.md](../connectors/README.md) has the
+full capability tables and the operator-run spikes that confirm a provider field name
+against the account that pays for it.
+
 ## Resource settings
 
 Every service in `docker-compose.yml` carries `mem_limit`, `cpus` and
@@ -76,7 +178,9 @@ sum, not a promise about what the stack will use.
 | `connector-dns-rdap` | `512m` | `0.75` | `128` |
 | `connector-dns-resolver` | `512m` | `0.75` | `128` |
 | `connector-dns-ctlogs` | `512m` | `0.75` | `128` |
+| `connector-dns-tlsprobe` | `512m` | `0.75` | `128` |
 | `connector-dns-virustotal` | `512m` | `0.75` | `128` |
+| `connector-dns-shodan` | `512m` | `0.75` | `128` |
 | `connector-phishing-netlas` | `512m` | `0.75` | `128` |
 | `connector-dns-netlas` | `512m` | `0.75` | `128` |
 | `connector-exposure-netlas` | `512m` | `0.75` | `128` |
@@ -85,8 +189,8 @@ sum, not a promise about what the stack will use.
 | `frontend` | `256m` | `0.5` | `128` |
 | `backup` | `512m` | `0.5` | `128` |
 
-The keyless DNS workers (`connector-dns-rdap`, `connector-dns-resolver` and
-`connector-dns-ctlogs`) start with the installation. The keyed connectors and
+The keyless DNS workers (`connector-dns-rdap`, `connector-dns-resolver`,
+`connector-dns-ctlogs` and `connector-dns-tlsprobe`) start with the installation. The keyed connectors and
 `backup` run only when their profile is named in `COMPOSE_PROFILES` — `shodan`,
 `shodan-endpoints`, `hibp`, `virustotal`, `netlas`, `netlas-endpoints` or `backup`.
 `scripts/check_compose_healthchecks.py` compares every row above against
@@ -97,9 +201,14 @@ The Netlas-provider services are in `docker-compose.yml`:
 `connector-phishing-netlas`, `connector-dns-netlas` and `connector-exposure-netlas`
 under the `netlas` profile, and `connector-exposure-netlas-endpoints` under
 `netlas-endpoints`. Each carries **512 MB RAM, 0.75 CPU and 128 PIDs**, the same
-bounds as the Shodan and HIBP connectors. The Shodan endpoint worker,
-`connector-exposure-shodan-endpoints`, sits under the `shodan-endpoints` profile
-with those same bounds.
+bounds as the Shodan and HIBP connectors. The Shodan workers sit under the `shodan`
+profile — `connector-phishing-shodan` and `connector-dns-shodan`, the latter being the
+DNS module's certificate confirmation and reverse search — and
+`connector-exposure-shodan-endpoints` under `shodan-endpoints`, all with the same
+bounds. The DNS module's Shodan worker reads its per-scan host-lookup and search
+budgets from the connector's own configuration (`max_host_lookups`, default 25, and
+`max_searches`, default 1); it needs no setting of its own in `.env` beyond the
+`CONNECTOR_TOKEN_DNS_SHODAN` worker token.
 
 Sums by set. "Base" is the always-on set: the services above that are in no
 profile. Each further line adds the set it names.

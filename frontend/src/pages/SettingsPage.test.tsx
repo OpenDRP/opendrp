@@ -6,6 +6,7 @@ import SettingsPage from "@/pages/SettingsPage";
 
 const {
   getSettingsMock,
+  getAlertPolicyMock,
   updateSettingsMock,
   listUsersBriefMock,
   listConnectorsMock,
@@ -23,6 +24,7 @@ const {
   toastMock,
 } = vi.hoisted(() => ({
   getSettingsMock: vi.fn(),
+  getAlertPolicyMock: vi.fn(),
   updateSettingsMock: vi.fn(),
   listUsersBriefMock: vi.fn(),
   listConnectorsMock: vi.fn(),
@@ -43,6 +45,7 @@ const {
 vi.mock("@/lib/api", () => ({
   endpoints: {
     getSettings: getSettingsMock,
+    getAlertPolicy: getAlertPolicyMock,
     alertQueue: vi.fn().mockResolvedValue({ counts: {}, items: [] }),
     updateSettings: updateSettingsMock,
     listUsersBrief: listUsersBriefMock,
@@ -120,6 +123,18 @@ function renderPage() {
 describe("SettingsPage", () => {
   beforeEach(() => {
     getSettingsMock.mockReset().mockResolvedValue(settings);
+    // The alert budget in force (WI-13): what the page shows next to the six
+    // stored values, since a value nobody saved is the deployment's.
+    getAlertPolicyMock.mockReset().mockResolvedValue({
+      confidence_direct: 60,
+      confidence_digest: 30,
+      digest_enabled: true,
+      digest_hour_utc: 6,
+      no_channel_retry_hours: 24,
+      candidate_change_notifications: true,
+      source: "environment",
+      invalid: [],
+    });
     updateSettingsMock.mockReset().mockResolvedValue(settings);
     listUsersBriefMock.mockReset().mockResolvedValue([
       { id: "user-1", email: "admin@example.com", role: "admin" },

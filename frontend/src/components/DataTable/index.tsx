@@ -1,6 +1,13 @@
 import * as React from "react";
 import type { ReactNode } from "react";
-import { ChevronLeft, ChevronRight, ChevronsLeft, ChevronsRight } from "lucide-react";
+import {
+  ArrowDown,
+  ArrowUp,
+  ChevronLeft,
+  ChevronRight,
+  ChevronsLeft,
+  ChevronsRight,
+} from "lucide-react";
 import {
   Table, TableHeader, TableRow, TableHead, TableBody, TableCell,
 } from "@/components/ui/table";
@@ -18,6 +25,14 @@ export interface DataTableColumn<T = any> {
   minWidth?: number;
   render?: (row: T) => ReactNode;
   align?: "left" | "right" | "center";
+  /** Set when the server can order by this column; the header becomes a button. */
+  sortable?: boolean;
+}
+
+/** The ordering the table is currently showing, in the server's own field names. */
+export interface DataTableSort {
+  field: string;
+  direction: "asc" | "desc";
 }
 
 export interface PaginatedDataTableProps<T = any> {
@@ -53,6 +68,21 @@ export interface PaginatedDataTableProps<T = any> {
   /** Stable DOM id for a rendered data row, useful for deep-linking within a page. */
   getRowId?: (row: T, index: number) => string | undefined;
   getRowClassName?: (row: T, index: number) => string | undefined;
+  /**
+   * Enables a leading checkbox column. Selection is controlled by the caller: a
+   * batch action belongs to the page that will send it, and a table that owned
+   * the ids would clear them without the caller knowing. Only the rows currently
+   * rendered can be selected — this is deliberately not a cross-page selection,
+   * which would need the filter, not the page, to define "all".
+   */
+  selectable?: boolean;
+  selectedIds?: string[];
+  onSelectedChange?: (ids: string[]) => void;
+  /** Accessible name for a row's checkbox, e.g. the asset value. */
+  getRowLabel?: (row: T, index: number) => string;
+  /** Current ordering and its change handler; absent means headers are static. */
+  sort?: DataTableSort | null;
+  onSortChange?: (sort: DataTableSort) => void;
 }
 
 //: The largest page the API will return (`MAX_PAGE_SIZE` in
@@ -87,8 +117,54 @@ export function PaginatedDataTable<T = any>({
   onRetry,
   getRowId,
   getRowClassName,
+  selectable = false,
+  selectedIds = [],
+  onSelectedChange,
+  getRowLabel,
+  sort = null,
+  onSortChange,
 }: PaginatedDataTableProps<T>) {
   const pages = Math.max(0, Math.ceil(total / pageSize));
+  const selected = React.useMemo(() => new Set(selectedIds), [selectedIds]);
+  const rowKey = (row: T, index: number): string =>
+    getRowId?.(row, index) ?? String((row as any)?.id ?? index);
+  const allVisibleSelected =
+    rows.length > 0 && rows.every((row, index) => selected.has(rowKey(row, index)));
+  const someVisibleSelected = rows.some((row, index) =>
+    selected.has(rowKey(row, index)),
+  );
+
+  function toggleAll() {
+    if (!onSelectedChange) return;
+    if (allVisibleSelected) {
+      const visible = new Set(rows.map((row, index) => rowKey(row, index)));
+      onSelectedChange(selectedIds.filter((id) => !visible.has(id)));
+    } else {
+      const next = new Set(selectedIds);
+      rows.forEach((row, index) => next.add(rowKey(row, index)));
+      onSelectedChange([...next]);
+    }
+  }
+
+  function toggleRow(row: T, index: number) {
+    if (!onSelectedChange) return;
+    const id = rowKey(row, index);
+    onSelectedChange(
+      selected.has(id)
+        ? selectedIds.filter((selectedId) => selectedId !== id)
+        : [...selectedIds, id],
+    );
+  }
+
+  function changeSort(column: DataTableColumn<T>) {
+    if (!onSortChange || !column.sortable) return;
+    // A first click asks ascending, the second reverses the same field. The
+    // server's default (`created_at desc`) is therefore reachable by asking
+    // descending explicitly, never by a third state the UI only implies.
+    const direction: "asc" | "desc" =
+      sort?.field === column.key && sort.direction === "asc" ? "desc" : "asc";
+    onSortChange({ field: column.key, direction });
+  }
 
   const [colWidths, setColWidths] = React.useState<Record<string, number>>(() => {
     if (typeof window === "undefined") return {};
@@ -179,6 +255,7 @@ export function PaginatedDataTable<T = any>({
 
   const SkeletonRow = (
     <TableRow>
+      {selectable && <TableCell style={{ width: 44 }}><div className="h-4 w-4 rounded bg-muted animate-pulse" /></TableCell>}
       {columns.map(c => (
         <TableCell key={c.key} style={{ width: getColWidth(c), minWidth: c.minWidth ?? 60 }}>
           <div className="h-5 w-full rounded animate-pulse bg-muted" style={{ maxWidth: c.width ? c.width * 0.8 : undefined }} />
@@ -214,12 +291,36 @@ export function PaginatedDataTable<T = any>({
         <Table aria-label={ariaLabel} style={{ tableLayout: "fixed" }}>
           <TableHeader>
             <TableRow>
+              {selectable && (
+                <TableHead style={{ width: 44, minWidth: 44 }}>
+                  <input
+                    type="checkbox"
+                    className="h-4 w-4 accent-primary align-middle"
+                    aria-label="Select all rows on this page"
+                    checked={allVisibleSelected}
+                    disabled={rows.length === 0}
+                    ref={(element) => {
+                      // `indeterminate` is a DOM property, not an attribute: it
+                      // is how a partial page selection is shown without
+                      // claiming that every row is selected.
+                      if (element) {
+                        element.indeterminate = someVisibleSelected && !allVisibleSelected;
+                      }
+                    }}
+                    onChange={toggleAll}
+                  />
+                </TableHead>
+              )}
               {columns.map(col => {
                 const w = getColWidth(col);
+                const sorted = sort?.field === col.key;
                 return (
                   <TableHead
                     key={col.key}
                     style={{ width: w, minWidth: col.minWidth ?? 60 }}
+                    aria-sort={
+                      sorted ? (sort.direction === "asc" ? "ascending" : "descending") : undefined
+                    }
                     className={cn(
                       "relative",
                       col.align === "right" && "text-right",
@@ -232,7 +333,24 @@ export function PaginatedDataTable<T = any>({
                         col.align === "center" && "flex justify-center"
                       )}
                     >
-                      {col.title}
+                      {col.sortable && onSortChange ? (
+                        <button
+                          type="button"
+                          onClick={() => changeSort(col)}
+                          aria-label={`Sort by ${String(col.title)}`}
+                          className="inline-flex items-center gap-1 hover:text-foreground"
+                        >
+                          {col.title}
+                          {sorted &&
+                            (sort.direction === "asc" ? (
+                              <ArrowUp className="h-3 w-3" aria-hidden="true" />
+                            ) : (
+                              <ArrowDown className="h-3 w-3" aria-hidden="true" />
+                            ))}
+                        </button>
+                      ) : (
+                        col.title
+                      )}
                     </div>
                     <div
                       role="separator"
@@ -260,13 +378,24 @@ export function PaginatedDataTable<T = any>({
             ))}
             {!showSkeleton && rows.length === 0 && (
               <TableRow>
-                <TableCell colSpan={columns.length} className="py-12 text-center text-muted-foreground">
+                <TableCell colSpan={columns.length + (selectable ? 1 : 0)} className="py-12 text-center text-muted-foreground">
                   {emptyText}
                 </TableCell>
               </TableRow>
             )}
             {!showSkeleton && rows.map((row: any, ri) => (
               <TableRow key={getRowId?.(row, ri) ?? row.id ?? ri} id={getRowId?.(row, ri)} className={getRowClassName?.(row, ri)}>
+                {selectable && (
+                  <TableCell style={{ width: 44 }}>
+                    <input
+                      type="checkbox"
+                      className="h-4 w-4 accent-primary align-middle"
+                      aria-label={`Select ${getRowLabel?.(row, ri) ?? rowKey(row, ri)}`}
+                      checked={selected.has(rowKey(row, ri))}
+                      onChange={() => toggleRow(row, ri)}
+                    />
+                  </TableCell>
+                )}
                 {columns.map(col => (
                   <TableCell
                     key={col.key}

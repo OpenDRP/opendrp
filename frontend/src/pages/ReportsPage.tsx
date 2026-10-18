@@ -74,7 +74,7 @@ export default function ReportsPage() {
     }
   }, [generationJobs, generationJobIds, qc]);
 
-  const { data, isLoading, isError, refetch, isFetching } = useQuery<Paginated<Report>>({
+  const { data, isLoading, isPlaceholderData, isError, refetch, isFetching } = useQuery<Paginated<Report>>({
     queryKey: ["reports", page, size],
     queryFn: () => endpoints.listReports({ page, size }),
     staleTime: 10_000,
@@ -320,7 +320,7 @@ export default function ReportsPage() {
             onPageChange={setPage}
             onPageSizeChange={(s) => { setSize(s); setPage(1); }}
             storageKey="reports-table-widths-v1"
-            loading={isLoading}
+            loading={isLoading || isPlaceholderData}
             isError={isError}
             errorDescription="The report list could not be loaded, so previously generated reports may exist without being shown here."
             onRetry={() => refetch()}

@@ -13,16 +13,24 @@ Two route groups:
   their tokens.
 """
 
+import re
 import uuid
 from datetime import datetime, timedelta, timezone
 
 import structlog
 from fastapi import APIRouter, Body, Depends, Header, HTTPException, Query, Request, Response
 from pydantic import BaseModel, Field, StrictBool, StrictInt, ValidationError, field_validator
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import extract_ip, get_db, require_admin, require_viewer_plus
-from app.core.audit import AuditLogger
+from app.api.deps import (
+    enforce_connector_protocol_rate_limit,
+    extract_ip,
+    get_db,
+    require_admin,
+    require_active_account,
+)
+from app.core.audit import AuditLogger, bound_details
 from app.core.config import settings
 from app.core.exceptions import (
     BadRequestException,
@@ -31,7 +39,11 @@ from app.core.exceptions import (
 )
 from app.models import Connector
 from app.schemas.common import MAX_PAGE_SIZE, PaginatedResponse
-from app.schemas.connector import MAX_FINDINGS_PER_BATCH
+from app.schemas.connector import (
+    MAX_CATALOGUE_ENTRIES_PER_BATCH,
+    MAX_FINDINGS_PER_BATCH,
+    BreachCatalogueEntry,
+)
 from app.schemas.job import JobResponse
 from app.services.connector_manifest import (
     ConfigField,
@@ -111,7 +123,11 @@ async def require_connector(
     A refusal is recorded in the log with the name the *token* carries, so the
     operator who has to replace a credential reads which connector needs it,
     rather than a 401 with no subject (see `_note_rejected_credential`).
+
+    The per-address bound runs first, before the credential lookup: a flood of
+    made-up tokens must not cost one database query per request.
     """
+    await enforce_connector_protocol_rate_limit(request)
     credentials = ConnectorCredentials(db)
     connector = await credentials.resolve(x_connector_token or "")
     if connector is None:
@@ -192,6 +208,20 @@ class ConnectorCompleteRequest(BaseModel):
     ok: bool = True
     summary: dict[str, object] | None = Field(default=None, max_length=64)
     error: str | None = Field(default=None, max_length=4000)
+
+    @field_validator("summary")
+    @classmethod
+    def _bound_summary(cls, value: dict[str, object] | None) -> dict[str, object] | None:
+        """A connector's own account of a scan is bounded before it is stored.
+
+        The summary is written to the job record and copied into the audit
+        trail, so its size is decided by a half-trusted caller unless the wire
+        schema decides it. The number of keys was already capped; strings,
+        lists and nesting were not.
+        """
+        if value is None:
+            return None
+        return bound_details(value)  # type: ignore[return-value]
     #: The token this claim returned. Required: it is the proof that the claim
     #: being finalized is still the current one.
     lease_token: str = Field(min_length=16, max_length=64)
@@ -248,6 +278,18 @@ class ConnectorOut(BaseModel):
     token_last_used_at: datetime | None = None
 
     model_config = {"from_attributes": True}
+
+
+#: What a source may report as its last provider error. The write endpoint
+#: validates this already; the read repeats it because a row written before that
+#: constraint existed, or restored from a backup, is still served to viewers, and
+#: this field is meant to be a closed vocabulary with no provider prose in it.
+_PROVIDER_ERROR_RE = re.compile(
+    r"^(invalid_credentials|ip_restricted|access_denied|credits_exhausted|rate_limited|"
+    r"provider_application_error|provider_rejected_request|network_or_invalid_response|"
+    r"http_[0-9]{3})$"
+)
+_CREDENTIAL_STATES = frozenset({"valid", "invalid", "unsupported", "unknown"})
 
 
 class ConnectorStatusUpdate(BaseModel):
@@ -357,6 +399,27 @@ class SourceReadiness(BaseModel):
     provider_error: str | None = Field(default=None, pattern="^(invalid_credentials|ip_restricted|access_denied|credits_exhausted|rate_limited|provider_application_error|provider_rejected_request|network_or_invalid_response|http_[0-9]{3})$", max_length=64)
     capabilities: list[str] = Field(default_factory=list, max_length=32)
     operations: list[str] = Field(default_factory=list, max_length=32)
+    #: The source's own names for the classes of data it reports, when it publishes them
+    #: (``{"Email addresses": "Email addresses"}``): the page renders a stored class
+    #: through this map so an analyst reads the provider's vocabulary instead of a label
+    #: the platform invented (F-04). Bounded, because it is a provider's list.
+    data_class_labels: dict[str, str] = Field(default_factory=dict)
+
+    @field_validator("data_class_labels")
+    @classmethod
+    def _bounded_labels(cls, value: dict) -> dict:
+        if len(value) > 200:
+            raise ValueError("data_class_labels carries more than 200 entries")
+        cleaned: dict[str, str] = {}
+        for key, label in value.items():
+            if not isinstance(key, str) or not isinstance(label, str):
+                raise ValueError("data_class_labels is a map of strings to strings")
+            if not key.strip() or not label.strip():
+                raise ValueError("data_class_labels entries must not be empty")
+            if len(key) > 128 or len(label) > 256:
+                raise ValueError("data_class_labels entry is too long")
+            cleaned[key.strip()] = label.strip()
+        return cleaned
 
     @field_validator("capabilities", "operations")
     @classmethod
@@ -457,6 +520,12 @@ async def submit_findings(
     job_id: uuid.UUID,
     payload: list[dict] = Body(..., max_length=MAX_FINDINGS_PER_BATCH),
     x_connector_lease: str = Header(..., min_length=16, max_length=64),
+    #: The batch's position in this job, sent by the SDK. Optional: a connector
+    #: built against the older protocol still submits, it just cannot be ordered.
+    x_connector_batch_index: int | None = Header(default=None, ge=1, le=100_000),
+    #: How many batches this scan will send. Known only when the SDK submits a
+    #: complete list; a worker that streams as it scans honestly sends none.
+    x_connector_batch_total: int | None = Header(default=None, ge=1, le=100_000),
     db: AsyncSession = Depends(get_db),
     caller: Connector = Depends(require_connector),
 ):
@@ -516,14 +585,97 @@ async def submit_findings(
         action="connector.findings.ingested",
         ip_address=extract_ip(request),
         user_id=None,
-        details={"connector": conn_name, "job_id": str(job_id), "accepted": accepted, "rejected": rejected},
+        details={
+            "connector": conn_name,
+            "job_id": str(job_id),
+            # The batch is the unit this row records: without its size a reader
+            # cannot tell one 10-finding delivery from one 500-finding delivery,
+            # and the scan's row count has no denominator.
+            "batch_size": len(payload),
+            "batch_index": x_connector_batch_index,
+            "batch_total": x_connector_batch_total,
+            "accepted": accepted,
+            "rejected": rejected,
+        },
     )
     await db.commit()
     return result.payload()
 
 
+@router.post("/me/catalogue/{job_id}")
+async def submit_catalogue(
+    request: Request,
+    job_id: uuid.UUID,
+    payload: list[BreachCatalogueEntry] = Body(
+        ..., max_length=MAX_CATALOGUE_ENTRIES_PER_BATCH
+    ),
+    x_connector_lease: str = Header(..., min_length=16, max_length=64),
+    db: AsyncSession = Depends(get_db),
+    caller: Connector = Depends(require_connector),
+):
+    """Accept a bounded batch of a source's own incident catalogue (F-09, WI-13).
+
+    The connector's read of its source's catalogue, not a finding: an entry describes an
+    incident at large, and whether any address of ours is in it is what makes it this
+    installation's incident. The core owns the diff — the provider has no "added since"
+    question to ask — so what arrives is stored against ":attr:`BreachCatalogue` and an
+    incident naming a monitored domain is announced from here.
+
+    Bound to the job's lease exactly as a findings batch is: a worker whose claim
+    expired cannot write catalogue rows under the old claim's name, and a module other
+    than the one that stores incidents has no catalogue to report.
+    """
+    from app.services.breach_catalogue import sync_catalogue
+    from app.services.source_observations import source_identity
+
+    svc = ConnectorService(db)
+    conn = caller
+    job = await svc._owned_job(conn, job_id, lease_token=x_connector_lease)
+    specs = await load_modules(db)
+    manifest = (
+        (job.params if isinstance(job.params, dict) else {}).get("manifest_snapshot")
+        or _manifest_of(conn, specs)
+    )
+    if manifest.get("module") != "breaches":
+        raise BadRequestException(
+            f"connector '{conn.name}' belongs to module '{manifest.get('module')}', "
+            "which has no incident catalogue to report"
+        )
+
+    conn_name = conn.name
+    source = source_identity(conn)
+    summary = await sync_catalogue(
+        db,
+        source=source,
+        entries=[entry.model_dump() for entry in payload],
+        job_id=job.id,
+    )
+    # The ingest is acknowledged before the audit line is written, for the same reason a
+    # findings batch is: a failed audit must not roll back rows the connector was told
+    # were accepted.
+    await db.commit()
+    await AuditLogger.emit_background(
+        db,
+        action="connector.catalogue.ingested",
+        ip_address=extract_ip(request),
+        user_id=None,
+        details={
+            "connector": conn_name,
+            "job_id": str(job_id),
+            "source": source,
+            "received": summary["received"],
+            "created": summary["created"],
+            "updated": summary["updated"],
+            "new_incidents": summary["new_incidents"],
+        },
+    )
+    await db.commit()
+    return summary
+
+
 @router.post("/me/complete/{job_id}", response_model=dict)
 async def complete_job(
+    request: Request,
     job_id: uuid.UUID,
     payload: ConnectorCompleteRequest,
     db: AsyncSession = Depends(get_db),
@@ -538,7 +690,10 @@ async def complete_job(
     await AuditLogger.emit_background(
         db,
         action="connector.scan.completed" if payload.ok else "connector.scan.failed",
-        ip_address="internal:connector",
+        # The same attribution the batch rows carry. A placeholder here made the
+        # completion of a scan the one event in the chain whose address could not
+        # be correlated with the deliveries that belong to it.
+        ip_address=extract_ip(request),
         user_id=None,
         details={
             "connector": conn.name,
@@ -567,25 +722,60 @@ async def heartbeat(
 # ---------------------------------------------------------------------------
 
 
-@router.get("/health", response_model=dict, dependencies=[Depends(require_viewer_plus)])
-async def connector_health(
-    request: Request,
-    db: AsyncSession = Depends(get_db),
-    user=Depends(require_viewer_plus),
-):
-    """Return generic, secret-free health information for registered connectors.
+async def connector_health_items(
+    db: AsyncSession, *, user, now: datetime | None = None
+) -> tuple[list[dict], datetime]:
+    """Generic, secret-free health rows for every registered connector.
 
-    The raw ``last_error`` text is admin-only. Connector messages routinely echo
-    the upstream request URL, and upstream APIs commonly carry their key as a
-    query parameter, so an unfiltered message can hand a credential to any
-    signed-in viewer. Non-admin callers get the derived ``health`` state, which
-    is what the status page needs.
+    Shared by ``GET /connectors/health`` and the dashboard overview (DHP-10).
+    The overview calls this function rather than the endpoint, which is what
+    keeps a page load at one HTTP request and one audit row: a health row is a
+    reading, not an event, so the caller decides which trail entry it makes.
     """
-    now = datetime.now(timezone.utc)
+    now = now or datetime.now(timezone.utc)
     stale_after = timedelta(seconds=settings.CONNECTOR_HEALTH_STALE_AFTER_SECONDS)
     # ``role`` may be a plain string or a ``UserRole`` enum member, so compare
     # the value rather than its ``str()`` representation.
     is_admin = getattr(user.role, "value", user.role) == "admin"
+    # The remainder is read from the account's own counter, never from the
+    # provider: an operator checking health must not spend a request to find out
+    # how many requests are left.
+    from app.models.source_account import SourceAccount
+    from app.services.provider_quota import remaining_today
+
+    async def _blocked_reason(conn: Connector) -> str | None:
+        """Why the core would refuse this provider's next scan, if it would.
+
+        The worker's readiness row says what the *worker* observed about its
+        key; this says what the *core* decided about the account. The two can
+        disagree, and when no account row exists the worker cannot know at all -
+        it reports an unconfigured key, while the reason work is refused is
+        ``provider_account_missing``. Keeping the answer here means an operator
+        reads one field instead of inferring it from a refusal in the job list.
+        """
+        if not conn.provider:
+            return None
+        account = None
+        if conn.source_account_id:
+            account = await db.get(SourceAccount, conn.source_account_id)
+        if account is None:
+            # Admission falls back to the account an installation declares by
+            # provider and quota group; health must look the same way, or it
+            # would report a block that a scan does not actually meet.
+            account = (
+                await db.execute(
+                    select(SourceAccount).where(
+                        SourceAccount.source_id == conn.provider,
+                        SourceAccount.name == (conn.quota_group or "default"),
+                    )
+                )
+            ).scalar_one_or_none()
+        if account is None:
+            return "provider_account_missing"
+        if (account.policy or {}).get("approved") is not True:
+            return "account_policy_unapproved"
+        return None
+
     items = []
     for conn in await ConnectorService(db).list_connectors():
         if conn.status == "disabled":
@@ -603,20 +793,94 @@ async def connector_health(
             else:
                 last_seen = last_seen.astimezone(timezone.utc)
             health = "degraded" if now - last_seen > stale_after else "healthy"
+        quota = await remaining_today(conn) if is_admin else None
+        blocked_reason = await _blocked_reason(conn) if is_admin else None
+        # The source's own readiness report, reduced to the closed vocabulary
+        # every role may see (D5). It answers the question `health` does not:
+        # a worker can be online and healthy while its provider key is invalid,
+        # and until this was published the dashboard showed only the badge.
+        readiness = conn.readiness or {}
+        credential_state = str(readiness.get("credential_state") or "unknown")
+        if credential_state not in _CREDENTIAL_STATES:
+            credential_state = "unknown"
+        provider_error = readiness.get("provider_error")
+        if provider_error is not None and not (
+            isinstance(provider_error, str) and _PROVIDER_ERROR_RE.fullmatch(provider_error)
+        ):
+            provider_error = None
+        ready_checked_at = readiness.get("checked_at")
+        if not isinstance(ready_checked_at, str):
+            ready_checked_at = None
+        last_success = conn.last_success_at
+        if last_success is not None:
+            if last_success.tzinfo is None:
+                last_success = last_success.replace(tzinfo=timezone.utc)
+            else:
+                last_success = last_success.astimezone(timezone.utc)
         items.append({
             "name": conn.name,
             "connector_type": conn.connector_type,
             "status": conn.status,
             "health": health,
+            # Liveness, not an overall verdict: a worker whose last scan failed
+            # still answers here, and the DNS page refuses to queue a scan to a
+            # source whose heartbeat this says is missing. ``health`` cannot
+            # stand in for it, because a stale heartbeat with an older provider
+            # error is ``failed`` while the worker is in fact offline.
             "online": ConnectorService.is_online(conn),
             "last_seen_at": conn.last_seen_at,
             "last_error": conn.last_error if is_admin else None,
+            # Admin-only, like ``last_error``: the page that shows the budget is
+            # the operator's, and a viewer has no decision to make with it. The
+            # keys stay present and null for a viewer so the shape is stable.
+            "quota_remaining": quota["remaining_today"] if quota else None,
+            "quota_budget": quota["request_budget"] if quota else None,
+            "quota_reason": quota["reason"] if quota else None,
+            # Admin-only, like ``last_error``: it names an operator action. The
+            # key stays present and null for a viewer so the shape is stable.
+            "blocked_reason": blocked_reason,
+            # Readiness, in the closed vocabulary. `credentials_configured` is
+            # what the worker can see for itself; a key stored in the core is
+            # not visible there, which is why the state beside it is the
+            # authoritative answer when the two disagree.
+            "credentials_configured": readiness.get("credentials_configured") is True,
+            "credential_state": credential_state,
+            "provider_error": provider_error,
+            "checked_at": ready_checked_at,
+            # When collection last succeeded, separate from the heartbeat: a
+            # live worker that has never completed a scan is online and idle.
+            "last_success_at": last_success,
+            "last_success_age_seconds": (
+                int((now - last_success).total_seconds()) if last_success else None
+            ),
+            # Admin-only: the broad readiness document (capabilities, operations,
+            # provider's data-class labels). The derived fields above are for
+            # every role; this one is for the operator who acts on it.
+            "readiness": conn.readiness if is_admin else None,
             "info": {
                 key: value for key, value in (conn.info or {}).items()
                 if key in {"api_version", "version", "hostname", "python_version", "capabilities"}
                 and isinstance(value, (str, int, float, bool, list, dict, type(None)))
             },
         })
+    return items, now
+
+
+@router.get("/health", response_model=dict, dependencies=[Depends(require_active_account)])
+async def connector_health(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    user=Depends(require_active_account),
+):
+    """Return generic, secret-free health information for registered connectors.
+
+    The raw ``last_error`` text is admin-only. Connector messages routinely echo
+    the upstream request URL, and upstream APIs commonly carry their key as a
+    query parameter, so an unfiltered message can hand a credential to any
+    signed-in viewer. Non-admin callers get the derived ``health`` state, which
+    is what the status page needs.
+    """
+    items, now = await connector_health_items(db, user=user)
     await AuditLogger.emit_background(
         db, action="connectors.health.view", ip_address=extract_ip(request),
         user_id=user.id, details={"count": len(items)},
@@ -641,11 +905,11 @@ async def list_connectors(
     return [_connector_out(conn, specs) for conn in items]
 
 
-@router.get("/modules", response_model=dict, dependencies=[Depends(require_viewer_plus)])
+@router.get("/modules", response_model=dict, dependencies=[Depends(require_active_account)])
 async def list_modules(
     request: Request,
     db: AsyncSession = Depends(get_db),
-    user=Depends(require_viewer_plus),
+    user=Depends(require_active_account),
 ):
     """Modules and the job types their connectors declare.
 

@@ -58,7 +58,12 @@ in `ENCRYPTION_PREVIOUS_KEYS`, `python -m scripts.rotate_keys rewrap`, then drop
 key once `status` reports nothing depends on it ([upgrading.md](upgrading.md)). A value
 that is not a valid Fernet key is a startup failure in every environment: a derived key
 cannot read what the real key wrote, and tolerating the typo turns "the stored secrets
-became unreadable" into a mystery.
+became unreadable" into a mystery. The one-time second-factor recovery codes are
+HMAC-SHA256 digests keyed from the same value under a label of its own (previous keys
+verify, so a printed list survives a rotation that still lists the old key): a copy of
+the database alone is not enough to produce a code that verifies, and the codes are
+checked without a slow hash, which is why they are not `bcrypt` — [description.md](description.md)
+records that choice beside the rest of the second-factor behaviour.
 
 **Connector credentials are digests.** A connector token is issued by the core and
 stored only as a digest; the connector name reported back is a diagnostic hint, and
@@ -68,6 +73,28 @@ makes a mis-keyed connector findable:
 ```bash
 docker compose logs --tail=50 backend | grep connector_credential_rejected
 ```
+
+**An invitation link is a digest, and it is spent once.** The account an administrator
+creates by invitation carries no password the administrator ever knows: the core stores
+only the SHA-256 digest of a 256-bit token and shows the plaintext once, so a database
+copy holds no usable link. Accepting the invitation is what sets the first password, and
+it clears the digest, resets the sign-in lockout, revokes any refresh family that already
+existed and writes `auth.invitation.accepted` in the same transaction; an unknown link and
+an expired one answer identically, because a difference between the two would let the
+public endpoint test whether an address was invited. The link is mailed only when SMTP
+and a non-loopback origin are configured, since a link to `localhost` in a mail is a link
+to the reader's own machine.
+
+**The connector segment is a trusted segment, and its transport must be `https` outside
+it.** A connector holds a token that can claim and report work, and the core reads it as
+that connector — so anything able to read the segment's traffic can replay the token, and
+anything able to rewrite it can answer as the core. The Compose file set puts connectors on
+`opendrp-connectors`, which by design does not reach a datastore, but that is a network
+boundary, not a cryptographic one: on one host it is one trust domain, and plain `http`
+there is a statement about who else runs on the host. Any `CORE_URL` that reaches the core
+across another host or another network must be `https`; the connector SDK warns at startup
+when it is given a plain `http` URL that is neither loopback nor a single-label container
+name, because a token sent in clear on a shared network is already disclosed.
 
 **Sessions are cookie-bound and MFA is available.** `AUTH_COOKIE_SECURE=true` is
 required in production, the refresh cookie is not sent over plain HTTP, and
@@ -81,11 +108,16 @@ each row is chained with HMAC keys from `AUDIT_CHAIN_KEYS`. `make verify-audit-c
 re-verifies the chain, and the chain is *detect-only*: it makes tampering evident, it
 does not prevent it — see the accepted risks below.
 
-**Rate limiting has three layers, and the outermost one is in this repository.** Login
+**Rate limiting has four layers, and the outermost one is in this repository.** Login
 attempts are bounded per IP (`app/core/rate_limit.py`), manual actions per user and
-scope (`app/core/manual_rate_limit.py`, from `users.rate_limit_minutes`), and
+scope (`app/core/manual_rate_limit.py`, from `users.rate_limit_minutes`),
 authenticated request volume per account (`app/core/request_rate_limit.py`, from
-`AUTHENTICATED_RATE_LIMIT_PER_MINUTE`). All three are **fail-open** on a Redis outage,
+`AUTHENTICATED_RATE_LIMIT_PER_MINUTE`), and connector-protocol traffic per source
+address (`600` requests a minute, checked before the connector token is resolved, so
+an invented token costs no database lookup; `app/api/deps.py`). The connector bound is
+sized against normal polling — twelve workers polling every five seconds is 144
+requests a minute — so it never throttles a healthy installation. All four are
+**fail-open** on a Redis outage,
 by their own design, on the grounds that locking every operator out is worse than
 losing the throttle for the duration; that is why the nginx edge limits in
 `docker/nginx/` exist as the bound that does not depend on Redis. The values are
@@ -101,6 +133,61 @@ certificate would become unreachable for every browser that had already seen it.
 each container at 10 MB × 5 files. That bound is a debugging convenience, not a
 retention policy — durable audit history belongs in the collector and the SIEM
 ([observability.md](observability.md)).
+
+## Roles, and what each may do
+
+Three roles, four capabilities, one table. `backend/app/core/permissions.py` is
+the only place the mapping lives; a route names a capability through a dependency
+in `backend/app/api/deps.py` instead of repeating a list of roles, so “what may an
+analyst do?” is answered by reading one file rather than the route table. The
+previous shape was three predicates — and the one named `require_viewer_plus`
+accepted every role, so it read like a boundary while checking nothing.
+
+| Capability | viewer | analyst | admin | What it reaches |
+|---|---|---|---|---|
+| `self_service` | yes | yes | yes | Your own account only: password, second factor, sessions, own security activity. Every role holds it, including a role added later, because the holder's own credential is their business; the sign-in gate already refuses the account everywhere else while that credential is out of order |
+| `view_platform` | yes | yes | yes | Reads: dashboard, inventory, findings, reports, alert lists, exports. The audit trail is *not* in this set — its read routes are administrator-only |
+| `analyse` | no | yes | yes | Running scans, triaging a finding, promoting an observation into a monitored asset, deleting a breach, phishing or DNS finding |
+| `administer` | no | no | yes | Accounts and roles, settings, connector tokens, the audit trail, deleting an asset, a report or a job |
+
+The split stops at four because those are the levels the platform enforces. A
+narrower audience is a capability added to that table and pointed at the route —
+not a fifth `if` in a router.
+
+**Every route is checked on every run, not remembered once.**
+`backend/tests/test_route_access_gate.py` walks the application's real route
+table — following the routers FastAPI includes lazily, and including the alias
+the DNS module serves with `include_in_schema=False`, which is exactly where a
+missing gate would hide — and fails a route that carries neither a capability nor
+one of six named public reasons (liveness, readiness, sign-in, refresh, logout,
+the metrics scraper). The connector protocol is recognised by its own
+dependency and asserted to stay under `/api/v1/connectors`, so that exemption
+cannot spread to a browser route. The exception list is checked in both
+directions, because a stale entry is where the next ungated route gets buried,
+and every `UserRole` member has to appear in the capability table: a fourth role
+added to the enum without being placed there fails the gate instead of silently
+inheriting everything that used to read “viewer+”. The `Access` column in
+[api.md](api.md) is compared with the same table, so the reference cannot drift
+from the code in either direction.
+
+**A refusal leaves a trace.** A `403` used to be invisible in the audit trail: a
+viewer asking for an administrator route was answered and forgotten.
+`authz.denied` now records `path`, `method`, the account's `role` and the
+`required` capability, **once per account, method and route per five-minute
+window** — the cheaper it is to be refused, the more rows a client ignoring the
+`403` would otherwise write, and those rows land on the database that serves the
+rest of the platform. When Redis is unavailable the window is enforced
+in-process instead, so an outage duplicates a signal rather than losing it. A
+second factor refused by policy keeps its own action, `auth.mfa.required`.
+
+**A host operator is not an administrator.** `manage_admin` writes its own audit
+rows (`user.created`, `user.password_reset`, `user.unlocked`, `user.mfa.reset`,
+`user.onboarding.cleared`) with `details.source = "cli"` and the operating-system
+user that ran the command, and a mutating command whose row cannot be written
+fails instead of applying. It also changes no role and no active flag unless it
+is asked to with `--role`, `--ensure-admin` or `--activate`: a password reset
+used to promote the account and reactivate it, which meant a support reset was
+silently a grant of administration.
 
 ## What the operator must verify after deploying
 

@@ -27,6 +27,8 @@ from pydantic import ValidationError
 
 from app.core.config import _INSECURE_SECRET_MARKERS, Settings
 
+pytestmark = pytest.mark.usefixtures("without_testing_switch")
+
 _ROOT = Path(__file__).resolve().parents[2]
 _SETUP = _ROOT / "setup.py"
 TEMPLATE = _ROOT / ".env.example"

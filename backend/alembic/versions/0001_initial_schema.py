@@ -199,6 +199,11 @@ _CONNECTOR_SEED = (
             "config_schema": {},
         },
         "aliases": ["hibp", "hibp-breaches-default"],
+        # The key this worker reads is an account credential, not a container
+        # setting: with a provider the core can gate the scan on readiness, draw
+        # the requests from one budget and name a refusal instead of returning a
+        # short list that reads like "no breaches".
+        "source": "hibp",
     },
     {
         "name": "dns-rdap",
@@ -255,6 +260,44 @@ _CONNECTOR_SEED = (
         "status": "enabled",
     },
     {
+        # The provider read of our *own* addresses. Its free host lookup is the
+        # independent confirmation that an address of ours serves a certificate (and
+        # carries the organisation, ASN, JARM, title and favicon hash the deployment
+        # rules score on); its per-scan capped search answers where else that
+        # certificate is being served. It takes both inventory sections because an
+        # address is a target in its own right, not only a domain's answer.
+        "name": "dns-shodan",
+        "connector_type": "dns",
+        "default_job_type": "dns.shodan",
+        "manifest": {
+            "module": "dns",
+            "job_type": "dns.shodan",
+            "finding_kind": "dns_observation",
+            "asset_types": ["domain", "ip_address"],
+            "config_schema": {},
+        },
+        "aliases": ["dns-shodan", "shodan-dns-security-default"],
+        "source": "shodan",
+        "status": "enabled",
+    },
+    {
+        # The active probe: it asks the service itself what certificate it serves, so
+        # the expiry monitor is not limited to what Certificate Transparency happened
+        # to index. It needs no provider credential and no source account - the only
+        # network traffic is our own handshake against our own asset.
+        "name": "dns-tlsprobe",
+        "connector_type": "dns",
+        "default_job_type": "dns.tlsprobe",
+        "manifest": {
+            "module": "dns",
+            "job_type": "dns.tlsprobe",
+            "finding_kind": "dns_observation",
+            "asset_types": ["domain"],
+            "config_schema": {},
+        },
+        "aliases": ["dns-tlsprobe", "tlsprobe-dns-security-default"],
+    },
+    {
         "name": "phishing-netlas",
         "connector_type": "phishing",
         "default_job_type": "phishing.netlas",
@@ -301,7 +344,12 @@ _CONNECTOR_SEED = (
 #: Provider-backed connectors are seeded switched off: they carry no key until an
 #: operator approves the account and supplies one, and a connector row that
 #: cannot run should not be advertised as ready.
-_SOURCE_ACCOUNTS = ("netlas", "shodan", "virustotal")
+#: Providers that own an account row from the first start. HIBP is here for the
+#: same reason as the rest: its key, its readiness and the requests a scan spends
+#: are facts about an account, and a worker outside that mechanism cannot be
+#: refused, paced or explained. The row ships unapproved like the others — an
+#: operator approves the policy that allows spending.
+_SOURCE_ACCOUNTS = ("netlas", "shodan", "virustotal", "hibp")
 
 
 def upgrade() -> None:
@@ -365,7 +413,7 @@ def upgrade() -> None:
     )
     op.create_table(
         "assets",
-        sa.Column("id", sa.UUID(), nullable=False, server_default=sa.text("uuid_generate_v4()")),
+        sa.Column("id", sa.Uuid(), nullable=False, server_default=sa.text("uuid_generate_v4()")),
         sa.Column("asset_type", asset_type, nullable=False),
         sa.Column("asset_value", sa.String(length=512), nullable=False),
         sa.Column("normalized_value", sa.String(length=512)),
@@ -406,7 +454,7 @@ def upgrade() -> None:
     )
     op.create_table(
         "dns_security_observations",
-        sa.Column("id", sa.UUID(), nullable=False),
+        sa.Column("id", sa.Uuid(), nullable=False),
         sa.Column("observation_key", sa.String(length=64), nullable=False),
         sa.Column("observation_type", sa.String(length=32), nullable=False),
         sa.Column("subject", sa.String(length=253), nullable=False),
@@ -454,9 +502,9 @@ def upgrade() -> None:
     )
     op.create_table(
         "drp_audit_logs",
-        sa.Column("id", sa.UUID(), nullable=False, server_default=sa.text("uuid_generate_v4()")),
+        sa.Column("id", sa.Uuid(), nullable=False, server_default=sa.text("uuid_generate_v4()")),
         sa.Column("timestamp", sa.DateTime(timezone=True), nullable=False),
-        sa.Column("user_id", sa.UUID()),
+        sa.Column("user_id", sa.Uuid()),
         sa.Column("action", sa.String(length=120), nullable=False),
         sa.Column("ip_address", sa.String(length=64), nullable=False),
         sa.Column("details", sa.JSON(), nullable=False, server_default=sa.text("'{}'::json")),
@@ -477,7 +525,7 @@ def upgrade() -> None:
     op.create_index("ix_drp_audit_logs_user_timestamp", "drp_audit_logs", ["user_id", "timestamp"])
     op.create_table(
         "drp_breaches",
-        sa.Column("id", sa.UUID(), nullable=False, server_default=sa.text("uuid_generate_v4()")),
+        sa.Column("id", sa.Uuid(), nullable=False, server_default=sa.text("uuid_generate_v4()")),
         sa.Column("breach_name", sa.String(length=255), nullable=False),
         sa.Column("title", sa.String(length=255), nullable=False),
         sa.Column("domain", sa.String(length=255), nullable=False),
@@ -488,13 +536,29 @@ def upgrade() -> None:
         sa.Column("matched_email", sa.String(length=255)),
         sa.Column("matched_domain", sa.String(length=255)),
         sa.Column("status", sa.String(length=50), nullable=False, server_default="active"),
+        # Which kind of exposure the row records (breach, paste, stealer log). The
+        # module's unique pairs are unchanged by it: the class is also encoded in
+        # breach_name, so an installation that adopts the column keeps its indexes
+        # (WI-21).
+        sa.Column("exposure_kind", sa.String(length=32), nullable=False, server_default="breach"),
+        # How loud the row is, from the classes of data it exposed (F-13). Stored so the
+        # list can filter and sort on it as it does on any other column; ``unknown`` is
+        # what a row written before the rule existed honestly is.
+        sa.Column("severity", sa.String(length=16), nullable=False, server_default="unknown"),
         sa.Column("attributes", sa.JSON(), nullable=False, server_default=sa.text("'{}'::json")),
+        # When the source last reported the incident, and when it first confirmed it
+        # (WI-08, WI-11). Separate from ``updated_at``, which moves when anything on
+        # the row is rewritten - including a scan that found the same facts again.
+        sa.Column("last_seen_at", sa.DateTime(timezone=True)),
+        sa.Column("verified_at", sa.DateTime(timezone=True)),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.text("now()")),
         sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.text("now()")),
         sa.Column("source_id", sa.String(length=100), nullable=False),
         sa.PrimaryKeyConstraint("id", name="pk_drp_breaches"),
         sa.UniqueConstraint("source_id", "breach_name", "matched_email", name="uq_breach_email"),
     )
+    op.create_index("ix_drp_breaches_exposure_kind", "drp_breaches", ["exposure_kind"])
+    op.create_index("ix_drp_breaches_severity", "drp_breaches", ["severity"])
     op.create_index("ix_drp_breaches_matched_domain", "drp_breaches", ["matched_domain"])
     op.create_index("ix_drp_breaches_matched_domain_key", "drp_breaches", [sa.text("lower(rtrim(TRIM(BOTH FROM matched_domain), '.'::text))")])
     op.create_index("ix_drp_breaches_matched_email", "drp_breaches", ["matched_email"])
@@ -502,6 +566,32 @@ def upgrade() -> None:
     op.create_index("ix_drp_breaches_matched_email_key", "drp_breaches", [sa.text("lower(rtrim(TRIM(BOTH FROM matched_email), '.'::text))")])
     op.create_index("ix_drp_breaches_status", "drp_breaches", ["status"])
     op.create_index("uq_breach_domain_only", "drp_breaches", ["source_id", "breach_name", "matched_domain"], unique=True, postgresql_where=sa.text("((matched_domain IS NOT NULL) AND (matched_email IS NULL))"))
+    op.create_table(
+        "breach_catalogue",
+        sa.Column("id", sa.Uuid(), nullable=False, server_default=sa.text("uuid_generate_v4()")),
+        sa.Column("source", sa.String(length=100), nullable=False),
+        sa.Column("breach_name", sa.String(length=255), nullable=False),
+        sa.Column("title", sa.String(length=255), nullable=False, server_default=""),
+        sa.Column("domain", sa.String(length=255), nullable=False, server_default=""),
+        sa.Column("breach_date", sa.Date()),
+        # The source's own catalogue timestamps: when it added the incident and when
+        # it last changed it. Distinct from ``created_at``/``updated_at``, which are
+        # when this platform first saw and last refreshed the row - a source that
+        # corrects ``added_date`` must not make an old incident look new (F-09).
+        sa.Column("added_date", sa.DateTime(timezone=True)),
+        sa.Column("modified_date", sa.DateTime(timezone=True)),
+        sa.Column("pwn_count", sa.Integer(), nullable=False, server_default=sa.text("0")),
+        sa.Column("data_classes", sa.JSON(), nullable=False, server_default=sa.text("'[]'::json")),
+        sa.Column("attributes", sa.JSON(), nullable=False, server_default=sa.text("'{}'::json")),
+        # When a sync last confirmed the incident is still in the source's catalogue,
+        # which is also what the window handed to the connector is measured from.
+        sa.Column("last_synced_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.text("now()")),
+        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.text("now()")),
+        sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.text("now()")),
+        sa.PrimaryKeyConstraint("id", name="pk_breach_catalogue"),
+        sa.UniqueConstraint("source", "breach_name", name="uq_breach_catalogue_incident"),
+    )
+    op.create_index("ix_breach_catalogue_source_domain", "breach_catalogue", ["source", "domain"])
     op.create_table(
         "drp_modules",
         sa.Column("id", sa.String(length=32), nullable=False),
@@ -522,7 +612,7 @@ def upgrade() -> None:
     )
     op.create_table(
         "drp_phishing_domains",
-        sa.Column("id", sa.UUID(), nullable=False, server_default=sa.text("uuid_generate_v4()")),
+        sa.Column("id", sa.Uuid(), nullable=False, server_default=sa.text("uuid_generate_v4()")),
         sa.Column("phishing_domain", sa.String(length=512), nullable=False),
         sa.Column("matched_asset", sa.String(length=512), nullable=False),
         sa.Column("ip_address", sa.String(length=255)),
@@ -533,6 +623,16 @@ def upgrade() -> None:
         sa.Column("whois_abuse_email", sa.String(length=255)),
         sa.Column("domain_created_at", sa.DateTime(timezone=True)),
         sa.Column("status", sa.String(length=50), nullable=False, server_default="active"),
+        sa.Column("confidence", sa.SmallInteger(), nullable=False, server_default="0"),
+        sa.Column("signals", sa.JSON(), nullable=False, server_default=sa.text("'{}'::json")),
+        sa.Column("digest_queued_at", sa.DateTime(timezone=True)),
+        # WI-12 (W1.6): the analyst's decision and who made it. Nullable with no
+        # default, because "nobody has decided" is the ordinary state and a default
+        # verdict would make every candidate look reviewed.
+        sa.Column("verdict", sa.String(length=32)),
+        sa.Column("verdict_reason", sa.String(length=2000)),
+        sa.Column("verdict_by", sa.Uuid()),
+        sa.Column("verdict_at", sa.DateTime(timezone=True)),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.text("now()")),
         sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.text("now()")),
         sa.PrimaryKeyConstraint("id", name="pk_drp_phishing_domains"),
@@ -542,11 +642,64 @@ def upgrade() -> None:
     op.create_index("ix_drp_phishing_domains_matched_asset_key", "drp_phishing_domains", [sa.text("lower(rtrim(TRIM(BOTH FROM matched_asset), '.'::text))")])
     op.create_index("ix_drp_phishing_domains_phishing_domain", "drp_phishing_domains", ["phishing_domain"], unique=True)
     op.create_index("ix_drp_phishing_domains_status", "drp_phishing_domains", ["status"])
+    # Substring search on the candidate list (AST-47): the list asks
+    # `ILIKE '%term%'` of the domain, the matched asset and the address, and a
+    # btree cannot answer a leading wildcard. Without these every search reads
+    # the whole table, which is the platform's most expensive search once
+    # candidates accumulate. Same shape as the asset list's search indexes.
+    op.create_index(
+        "ix_drp_phishing_domains_phishing_domain_trgm",
+        "drp_phishing_domains",
+        ["phishing_domain"],
+        postgresql_using="gin",
+        postgresql_ops={"phishing_domain": "gin_trgm_ops"},
+    )
+    op.create_index(
+        "ix_drp_phishing_domains_matched_asset_trgm",
+        "drp_phishing_domains",
+        ["matched_asset"],
+        postgresql_using="gin",
+        postgresql_ops={"matched_asset": "gin_trgm_ops"},
+    )
+    op.create_index(
+        "ix_drp_phishing_domains_ip_address_trgm",
+        "drp_phishing_domains",
+        ["ip_address"],
+        postgresql_using="gin",
+        postgresql_ops={"ip_address": "gin_trgm_ops"},
+    )
+    # The candidate list's own access paths (WI-08/WI-11). `confidence` leads both
+    # because every read that uses either index starts there: the confidence band
+    # of the alert budget, the `min_confidence` filter, and the list ordered by
+    # what the scoring decided. `status` rides along in the composite as a
+    # filter-only column, so "active, high confidence" does not fall back to the
+    # status index and then sort.
+    op.create_index("ix_phishing_confidence", "drp_phishing_domains", ["confidence"])
+    op.create_index("ix_phishing_domains_confidence_status", "drp_phishing_domains", ["confidence", "status"])
+    # The evidence behind a candidate's score, one row per signal that fired. A
+    # child table rather than more columns on the candidate: a signal is a fact
+    # about a candidate with its own source and time, several of them accumulate
+    # over the candidate's life, and the map on the row above is only their
+    # summary (WI-08). The cascade is what keeps a deleted candidate from leaving
+    # its explanations behind.
+    op.create_table(
+        "phishing_candidate_signals",
+        sa.Column("id", sa.Uuid(), nullable=False),
+        sa.Column("candidate_id", sa.Uuid(), nullable=False),
+        sa.Column("name", sa.String(length=64), nullable=False),
+        sa.Column("value", sa.JSON(), nullable=False),
+        sa.Column("confidence", sa.SmallInteger(), nullable=False, server_default="0"),
+        sa.Column("observed_at", sa.DateTime(timezone=True)),
+        sa.Column("source", sa.String(length=100)),
+        sa.PrimaryKeyConstraint("id", name="phishing_candidate_signals_pkey"),
+        sa.ForeignKeyConstraint(["candidate_id"], ["drp_phishing_domains.id"], name="phishing_candidate_signals_candidate_id_fkey", ondelete="CASCADE"),
+    )
+    op.create_index("ix_phishing_candidate_signals_candidate", "phishing_candidate_signals", ["candidate_id"])
     op.create_table(
         "drp_refresh_families",
-        sa.Column("id", sa.UUID(), nullable=False, server_default=sa.text("uuid_generate_v4()")),
-        sa.Column("family_id", sa.UUID(), nullable=False),
-        sa.Column("user_id", sa.UUID(), nullable=False),
+        sa.Column("id", sa.Uuid(), nullable=False, server_default=sa.text("uuid_generate_v4()")),
+        sa.Column("family_id", sa.Uuid(), nullable=False),
+        sa.Column("user_id", sa.Uuid(), nullable=False),
         sa.Column("last_jti", sa.String(length=120)),
         sa.Column("last_issued_at", sa.DateTime(timezone=True)),
         sa.Column("revoked", sa.Boolean(), nullable=False, server_default=sa.text("false")),
@@ -566,18 +719,18 @@ def upgrade() -> None:
         sa.Column("available_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.text("now()")),
         sa.Column("attempts", sa.Integer(), nullable=False, server_default=sa.text("0")),
         sa.Column("last_error", sa.Text()),
-        sa.Column("report_id", sa.UUID()),
+        sa.Column("report_id", sa.Uuid()),
         sa.PrimaryKeyConstraint("artifact_name", name="pk_report_artifact_cleanup"),
     )
     op.create_index("ix_report_artifact_cleanup_available_at", "report_artifact_cleanup", ["available_at"])
     op.create_index("ix_report_artifact_cleanup_report_id", "report_artifact_cleanup", ["report_id"])
     op.create_table(
         "report_audit_outbox",
-        sa.Column("id", sa.UUID(), nullable=False),
+        sa.Column("id", sa.Uuid(), nullable=False),
         sa.Column("event_key", sa.String(length=255), nullable=False),
         sa.Column("action", sa.String(length=80), nullable=False),
-        sa.Column("report_id", sa.UUID(), nullable=False),
-        sa.Column("job_id", sa.UUID()),
+        sa.Column("report_id", sa.Uuid(), nullable=False),
+        sa.Column("job_id", sa.Uuid()),
         sa.Column("details", sa.JSON(), nullable=False),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.text("now()")),
         sa.Column("available_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.text("now()")),
@@ -596,7 +749,7 @@ def upgrade() -> None:
     )
     op.create_table(
         "source_accounts",
-        sa.Column("id", sa.UUID(), nullable=False),
+        sa.Column("id", sa.Uuid(), nullable=False),
         sa.Column("source_id", sa.String(length=32), nullable=False),
         sa.Column("name", sa.String(length=64), nullable=False),
         sa.Column("credential_ref", sa.String(length=128)),
@@ -611,7 +764,7 @@ def upgrade() -> None:
     )
     op.create_table(
         "system_settings",
-        sa.Column("id", sa.UUID(), nullable=False, server_default=sa.text("uuid_generate_v4()")),
+        sa.Column("id", sa.Uuid(), nullable=False, server_default=sa.text("uuid_generate_v4()")),
         sa.Column("smtp_host", sa.String(length=255)),
         sa.Column("smtp_user", sa.String(length=255)),
         sa.Column("smtp_password", sa.String(length=1024)),
@@ -626,6 +779,22 @@ def upgrade() -> None:
         sa.Column("alert_email_user_ids", sa.JSON()),
         sa.Column("schedule_phishing", sa.JSON()),
         sa.Column("schedule_breaches", sa.JSON()),
+        # The operator's half of the alert budget (WI-07/WI-10). Nullable by
+        # design: NULL is "the deployment's environment answers this one", so an
+        # installation that never saved the Settings page keeps the values its
+        # Compose file states, and a save that sets one of them leaves the rest
+        # alone. See app/services/alert_policy.py for how the two are merged.
+        sa.Column("alert_confidence_direct", sa.SmallInteger()),
+        sa.Column("alert_confidence_digest", sa.SmallInteger()),
+        sa.Column("alert_phishing_digest_enabled", sa.Boolean()),
+        sa.Column("alert_phishing_digest_hour_utc", sa.SmallInteger()),
+        sa.Column("alert_no_channel_retry_hours", sa.SmallInteger()),
+        sa.Column("alert_candidate_change_notifications", sa.Boolean()),
+        # The breach module's half of the budget: which incidents the source's own
+        # spam/fabricated flags silence, and how many new incidents one scan reports
+        # before the rest wait for the digest (WI-05, WI-06).
+        sa.Column("alert_breach_noise_policy", sa.String(length=32)),
+        sa.Column("alert_breach_digest_threshold", sa.SmallInteger()),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.text("now()")),
         sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.text("now()")),
         sa.Column("schedule_dns_security", sa.JSON()),
@@ -643,7 +812,7 @@ def upgrade() -> None:
     )
     op.create_table(
         "users",
-        sa.Column("id", sa.UUID(), nullable=False, server_default=sa.text("uuid_generate_v4()")),
+        sa.Column("id", sa.Uuid(), nullable=False, server_default=sa.text("uuid_generate_v4()")),
         sa.Column("email", sa.String(length=255), nullable=False),
         sa.Column("password_hash", sa.String(length=255), nullable=False),
         sa.Column("role", user_role, nullable=False, server_default=sa.text("'viewer'::user_role")),
@@ -661,16 +830,49 @@ def upgrade() -> None:
         sa.Column("mfa_recovery_codes", sa.JSON()),
         sa.Column("must_change_password", sa.Boolean(), nullable=False, server_default=sa.text("false")),
         sa.Column("must_enrol_mfa", sa.Boolean(), nullable=False, server_default=sa.text("false")),
+        # U-7: an outstanding invitation keeps only a digest of its token, so a
+        # database copy carries no usable link.
+        sa.Column("invitation_token_hash", sa.String(length=64), nullable=True),
+        sa.Column("invitation_expires_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.text("now()")),
         sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.text("now()")),
         sa.PrimaryKeyConstraint("id", name="pk_users"),
         sa.UniqueConstraint("email", name="uq_users_email"),
     )
     op.create_index("ix_users_email", "users", ["email"], unique=True)
+    op.create_index(
+        "ix_users_invitation_token_hash", "users", ["invitation_token_hash"]
+    )
+    # The verdict's author (WI-12) is the one foreign key this revision cannot state
+    # inline: ``drp_phishing_domains`` is created before ``users`` exists, so the
+    # constraint is added here, after the table it points at. ``SET NULL`` matches
+    # the review columns of the certificate sightings — a deleted account leaves the
+    # decision in place, and the audit trail keeps who made it.
+    op.create_foreign_key(
+        "drp_phishing_domains_verdict_by_fkey",
+        "drp_phishing_domains",
+        "users",
+        ["verdict_by"],
+        ["id"],
+        ondelete="SET NULL",
+    )
+    # The refresh family's owner, stated here for the same reason: the family
+    # table is created before ``users`` exists. ``CASCADE`` rather than the
+    # router's hand-written DELETE, because a family that outlives its account is
+    # a session nobody can revoke — the retention sweep deletes by ``revoked_at``
+    # and an orphan has no reason recorded to sweep on.
+    op.create_foreign_key(
+        "fk_drp_refresh_families_user_id_users",
+        "drp_refresh_families",
+        "users",
+        ["user_id"],
+        ["id"],
+        ondelete="CASCADE",
+    )
     op.create_table(
         "dns_expiry_monitors",
-        sa.Column("id", sa.UUID(), nullable=False),
-        sa.Column("asset_id", sa.UUID(), nullable=False),
+        sa.Column("id", sa.Uuid(), nullable=False),
+        sa.Column("asset_id", sa.Uuid(), nullable=False),
         sa.Column("kind", sa.String(length=32), nullable=False),
         sa.Column("subject", sa.String(length=253), nullable=False),
         sa.Column("state", sa.String(length=32), nullable=False),
@@ -679,9 +881,10 @@ def upgrade() -> None:
         sa.Column("expires_at", sa.DateTime(timezone=True)),
         sa.Column("certificate_id", sa.String(length=128)),
         sa.Column("not_before", sa.DateTime(timezone=True)),
-        sa.Column("observation_id", sa.UUID()),
+        sa.Column("observation_id", sa.Uuid()),
         sa.Column("cycle", sa.String(length=64)),
         sa.Column("alerted_thresholds", sa.JSON(), nullable=False),
+        sa.Column("stale_alerted_at", sa.DateTime(timezone=True)),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.text("now()")),
         sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.text("now()")),
         sa.PrimaryKeyConstraint("id", name="dns_expiry_monitors_pkey"),
@@ -691,8 +894,74 @@ def upgrade() -> None:
     )
     op.create_index("ix_dns_expiry_monitor_due", "dns_expiry_monitors", ["state", "expires_at"])
     op.create_table(
+        "tls_certificate_identities",
+        sa.Column("id", sa.Uuid(), nullable=False),
+        sa.Column("fingerprint_sha256", sa.String(length=64), nullable=False),
+        sa.Column("fingerprint_sha1", sa.String(length=40)),
+        sa.Column("spki_sha256", sa.String(length=64)),
+        sa.Column("serial_hex", sa.String(length=128)),
+        sa.Column("subject_dn", sa.String(length=1000)),
+        sa.Column("issuer_dn", sa.String(length=1000)),
+        sa.Column("not_before", sa.DateTime(timezone=True)),
+        sa.Column("not_after", sa.DateTime(timezone=True)),
+        sa.Column("san_dns", sa.JSON(), nullable=False, server_default=sa.text("'[]'::json")),
+        sa.Column("key_algo", sa.String(length=64)),
+        sa.Column("origin", sa.String(length=32), nullable=False),
+        sa.Column("first_seen_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("last_seen_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.text("now()")),
+        sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.text("now()")),
+        sa.PrimaryKeyConstraint("id", name="tls_certificate_identities_pkey"),
+        sa.UniqueConstraint("fingerprint_sha256", name="uq_tls_identity_fingerprint_sha256"),
+    )
+    op.create_index("ix_tls_identity_serial", "tls_certificate_identities", ["serial_hex"])
+    op.create_index("ix_tls_identity_spki", "tls_certificate_identities", ["spki_sha256"])
+    op.create_table(
+        "tls_certificate_sightings",
+        sa.Column("id", sa.Uuid(), nullable=False),
+        sa.Column("identity_id", sa.Uuid(), nullable=False),
+        sa.Column("subject", sa.String(length=253)),
+        sa.Column("ip", sa.String(length=64)),
+        sa.Column("port", sa.Integer()),
+        sa.Column("source", sa.String(length=32), nullable=False),
+        sa.Column("observed_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("first_seen_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("last_seen_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("is_ours", sa.Boolean(), nullable=False, server_default=sa.text("false")),
+        sa.Column("confidence", sa.SmallInteger(), nullable=False, server_default="0"),
+        sa.Column("signals", sa.JSON(), nullable=False, server_default=sa.text("'{}'::json")),
+        sa.Column("verdict", sa.String(length=32), nullable=False, server_default="candidate"),
+        sa.Column("reviewed_by", sa.Uuid()),
+        sa.Column("reviewed_at", sa.DateTime(timezone=True)),
+        sa.Column("review_note", sa.String(length=2000)),
+        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.text("now()")),
+        sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.text("now()")),
+        sa.PrimaryKeyConstraint("id", name="tls_certificate_sightings_pkey"),
+        sa.UniqueConstraint("identity_id", "ip", "port", "source", name="uq_tls_sighting_identity_endpoint_source"),
+        sa.ForeignKeyConstraint(["identity_id"], ["tls_certificate_identities.id"], name="tls_certificate_sightings_identity_id_fkey", ondelete="CASCADE"),
+        sa.ForeignKeyConstraint(["reviewed_by"], ["users.id"], name="tls_certificate_sightings_reviewed_by_fkey", ondelete="SET NULL"),
+    )
+    op.create_index("ix_tls_sighting_identity", "tls_certificate_sightings", ["identity_id"])
+    op.create_index("ix_tls_sighting_ip", "tls_certificate_sightings", ["ip"])
+    op.create_index("ix_tls_sighting_verdict", "tls_certificate_sightings", ["verdict"])
+    op.create_table(
+        "certificate_scope_exceptions",
+        sa.Column("id", sa.Uuid(), nullable=False),
+        sa.Column("match_kind", sa.String(length=16), nullable=False),
+        sa.Column("match_value", sa.String(length=255), nullable=False),
+        sa.Column("reason", sa.String(length=1000)),
+        sa.Column("created_by", sa.Uuid()),
+        sa.Column("expires_at", sa.DateTime(timezone=True)),
+        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.text("now()")),
+        sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.text("now()")),
+        sa.PrimaryKeyConstraint("id", name="certificate_scope_exceptions_pkey"),
+        sa.UniqueConstraint("match_kind", "match_value", name="uq_certificate_scope_exception"),
+        sa.ForeignKeyConstraint(["created_by"], ["users.id"], name="certificate_scope_exceptions_created_by_fkey", ondelete="SET NULL"),
+    )
+    op.create_index("ix_tls_exception_kind_value", "certificate_scope_exceptions", ["match_kind", "match_value"])
+    op.create_table(
         "drp_connectors",
-        sa.Column("id", sa.UUID(), nullable=False, server_default=sa.text("uuid_generate_v4()")),
+        sa.Column("id", sa.Uuid(), nullable=False, server_default=sa.text("uuid_generate_v4()")),
         sa.Column("name", sa.String(length=100), nullable=False),
         sa.Column("connector_type", sa.String(length=32), nullable=False),
         sa.Column("status", sa.String(length=32), nullable=False, server_default="enabled"),
@@ -713,7 +982,7 @@ def upgrade() -> None:
         sa.Column("quota_group", sa.String(length=64)),
         sa.Column("readiness", sa.JSON()),
         sa.Column("last_success_at", sa.DateTime(timezone=True)),
-        sa.Column("source_account_id", sa.UUID()),
+        sa.Column("source_account_id", sa.Uuid()),
         sa.Column("aliases", sa.JSON(), nullable=False, server_default=sa.text("'[]'::json")),
         sa.PrimaryKeyConstraint("id", name="pk_drp_connectors"),
         sa.UniqueConstraint("name", name="uq_drp_connectors_name"),
@@ -725,11 +994,11 @@ def upgrade() -> None:
     op.create_index("ix_drp_connectors_token_hash", "drp_connectors", ["token_hash"], unique=True)
     op.create_table(
         "drp_findings",
-        sa.Column("id", sa.UUID(), nullable=False),
+        sa.Column("id", sa.Uuid(), nullable=False),
         sa.Column("module", sa.String(length=32), nullable=False),
         sa.Column("finding_kind", sa.String(length=32), nullable=False),
         sa.Column("connector_name", sa.String(length=100), nullable=False),
-        sa.Column("job_id", sa.UUID()),
+        sa.Column("job_id", sa.Uuid()),
         sa.Column("dedup_key", sa.String(length=512), nullable=False),
         sa.Column("title", sa.String(length=512), nullable=False),
         sa.Column("matched_asset", sa.String(length=512)),
@@ -748,9 +1017,9 @@ def upgrade() -> None:
     op.create_index("ix_drp_findings_status", "drp_findings", ["status"])
     op.create_table(
         "reports",
-        sa.Column("id", sa.UUID(), nullable=False, server_default=sa.text("uuid_generate_v4()")),
+        sa.Column("id", sa.Uuid(), nullable=False, server_default=sa.text("uuid_generate_v4()")),
         sa.Column("report_name", sa.String(length=255), nullable=False),
-        sa.Column("created_by", sa.UUID()),
+        sa.Column("created_by", sa.Uuid()),
         sa.Column("file_path", sa.String(length=512), nullable=False),
         sa.Column("status", sa.String(length=50), nullable=False, server_default="pending"),
         sa.Column("is_truncated", sa.Boolean(), nullable=False, server_default=sa.text("false")),
@@ -765,10 +1034,10 @@ def upgrade() -> None:
     op.create_index("ix_reports_status", "reports", ["status"])
     op.create_table(
         "jobs",
-        sa.Column("id", sa.UUID(), nullable=False),
+        sa.Column("id", sa.Uuid(), nullable=False),
         sa.Column("job_type", sa.String(length=50), nullable=False),
         sa.Column("status", sa.String(length=32), nullable=False, server_default="pending"),
-        sa.Column("created_by", sa.UUID()),
+        sa.Column("created_by", sa.Uuid()),
         sa.Column("task_id", sa.String(length=128)),
         sa.Column("title", sa.String(length=255)),
         sa.Column("error_message", sa.Text()),
@@ -783,7 +1052,7 @@ def upgrade() -> None:
         sa.Column("lease_token", sa.String(length=64)),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
-        sa.Column("connector_id", sa.UUID()),
+        sa.Column("connector_id", sa.Uuid()),
         sa.Column("schedule_key", sa.String(length=128)),
         sa.PrimaryKeyConstraint("id", name="pk_jobs"),
         sa.UniqueConstraint("schedule_key", name="uq_jobs_schedule_key"),
@@ -806,14 +1075,14 @@ def upgrade() -> None:
     op.create_index("ix_jobs_status_created", "jobs", ["status", "created_at"])
     op.create_table(
         "source_observations",
-        sa.Column("id", sa.UUID(), nullable=False),
+        sa.Column("id", sa.Uuid(), nullable=False),
         sa.Column("module", sa.String(length=32), nullable=False),
         sa.Column("source", sa.String(length=100), nullable=False),
         sa.Column("observation_key", sa.String(length=64), nullable=False),
         sa.Column("subject", sa.String(length=253), nullable=False),
         sa.Column("matched_asset", sa.String(length=512), nullable=False),
-        sa.Column("candidate_id", sa.UUID()),
-        sa.Column("job_id", sa.UUID()),
+        sa.Column("candidate_id", sa.Uuid()),
+        sa.Column("job_id", sa.Uuid()),
         sa.Column("first_seen_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("last_seen_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("observed_at", sa.DateTime(timezone=True)),
@@ -821,8 +1090,8 @@ def upgrade() -> None:
         sa.Column("payload", sa.JSON(), nullable=False),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.text("now()")),
         sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.text("now()")),
-        sa.Column("connector_id", sa.UUID()),
-        sa.Column("source_account_id", sa.UUID()),
+        sa.Column("connector_id", sa.Uuid()),
+        sa.Column("source_account_id", sa.Uuid()),
         sa.Column("provenance", sa.JSON(), nullable=False, server_default=sa.text("'{}'::json")),
         sa.PrimaryKeyConstraint("id", name="source_observations_pkey"),
         sa.UniqueConstraint("module", "source", "observation_key", name="uq_source_observation"),
@@ -835,8 +1104,8 @@ def upgrade() -> None:
     op.create_index("ix_source_observations_module_seen", "source_observations", ["module", "last_seen_at"])
     op.create_table(
         "alert_deliveries",
-        sa.Column("id", sa.UUID(), nullable=False, server_default=sa.text("uuid_generate_v4()")),
-        sa.Column("job_id", sa.UUID()),
+        sa.Column("id", sa.Uuid(), nullable=False, server_default=sa.text("uuid_generate_v4()")),
+        sa.Column("job_id", sa.Uuid()),
         sa.Column("threat_type", sa.String(length=100), nullable=False),
         sa.Column("channel", sa.String(length=20), nullable=False),
         sa.Column("target", sa.String(length=512)),
@@ -866,12 +1135,12 @@ def upgrade() -> None:
     op.create_index("ix_alert_delivery_due", "alert_deliveries", ["status", "next_attempt_at", "created_at"])
     op.create_table(
         "ingestion_events",
-        sa.Column("id", sa.UUID(), nullable=False),
+        sa.Column("id", sa.Uuid(), nullable=False),
         sa.Column("event_key", sa.String(length=128), nullable=False),
         sa.Column("kind", sa.String(length=32), nullable=False),
         sa.Column("module", sa.String(length=32), nullable=False),
-        sa.Column("entity_id", sa.UUID(), nullable=False),
-        sa.Column("job_id", sa.UUID()),
+        sa.Column("entity_id", sa.Uuid(), nullable=False),
+        sa.Column("job_id", sa.Uuid()),
         sa.Column("payload", sa.JSON(), nullable=False),
         sa.Column("processed_at", sa.DateTime(timezone=True)),
         sa.Column("attempts", sa.Integer(), nullable=False, server_default=sa.text("0")),
@@ -896,7 +1165,7 @@ def upgrade() -> None:
     op.create_table(
         "schedule_occurrences",
         sa.Column("key", sa.String(length=128), nullable=False),
-        sa.Column("job_id", sa.UUID()),
+        sa.Column("job_id", sa.Uuid()),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
         sa.PrimaryKeyConstraint("key", name="schedule_occurrences_pkey"),
         sa.ForeignKeyConstraint(["job_id"], ["jobs.id"], name="schedule_occurrences_job_id_fkey", ondelete="SET NULL"),
@@ -974,7 +1243,7 @@ def upgrade() -> None:
         sa.column("config", sa.JSON),
         sa.column("provider", sa.String),
         sa.column("quota_group", sa.String),
-        sa.column("source_account_id", sa.UUID),
+        sa.column("source_account_id", sa.Uuid),
         sa.column("aliases", sa.JSON),
     )
     #: A provider-backed row ships switched off when it needs an operator's key
@@ -1046,6 +1315,9 @@ def downgrade() -> None:
     op.drop_table("drp_findings")
     op.drop_table("drp_connectors")
     op.drop_table("dns_expiry_monitors")
+    op.drop_table("tls_certificate_sightings")
+    op.drop_table("certificate_scope_exceptions")
+    op.drop_table("tls_certificate_identities")
     op.drop_table("users")
     op.drop_table("system_settings")
     op.drop_table("source_accounts")
@@ -1053,8 +1325,10 @@ def downgrade() -> None:
     op.drop_table("report_audit_outbox")
     op.drop_table("report_artifact_cleanup")
     op.drop_table("drp_refresh_families")
+    op.drop_table("phishing_candidate_signals")
     op.drop_table("drp_phishing_domains")
     op.drop_table("drp_modules")
+    op.drop_table("breach_catalogue")
     op.drop_table("drp_breaches")
     op.drop_table("drp_audit_logs")
     op.drop_table("drp_audit_chain")

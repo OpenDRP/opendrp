@@ -35,7 +35,9 @@ async def test_registry_independent_source_admission(client, db_session, auth_he
     body = response.json()
     assert len(body["job_ids"]) == 1
     states = {source["connector"]: source["status"] for source in body["sources"]}
-    assert states == {"shodan-exposure": "unconfigured", "netlas-exposure": "queued"}
+    # The sibling has no account row at all, which the core reports before it
+    # looks at credentials: nothing could be queued for it until one exists.
+    assert states == {"shodan-exposure": "provider_account_missing", "netlas-exposure": "queued"}
     from app.models import Job
     from app.services.connector_service import ConnectorService
     from app.services.ingestion_service import ingest_exposure
@@ -77,3 +79,72 @@ async def test_candidate_evidence_keeps_multiple_sources(client, db_session, aut
     assert {row["source"] for row in response.json()["items"]} == {"netlas", "shodan"}
     assert candidate.status == "investigating"
     assert (await client.get(f"/api/v1/phishing/threats/{uuid.uuid4()}/evidence", headers=auth_headers_viewer)).status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_candidate_evidence_shows_the_facts_the_decisions_are_made_from(
+    client, db_session, auth_headers_viewer
+):
+    """W2.5: the endpoint flattens an allowlisted half of the payload.
+
+    A discovery and a fact about a name the platform already had reached the list as
+    the same shape - a source and a timestamp - so the page could not tell a
+    certificate claiming the brand from a registration record. The payload itself
+    stays published for a reader that wants it whole; what is added is the named
+    subset the module's own rules and alerts read.
+    """
+    candidate = PhishingDomain(
+        phishing_domain="lookalike.example.net",
+        matched_asset="example.com",
+        detection_source="netlas",
+        status="investigating",
+    )
+    db_session.add(candidate)
+    await db_session.commit()
+    await persist(
+        db_session,
+        module="phishing",
+        source="netlas",
+        finding={
+            "phishing_domain": candidate.phishing_domain,
+            "matched_asset": "example.com",
+            "metadata": {
+                "capability": "certificate_brand",
+                "verdict": "candidate_not_verified",
+                "title": "Sign in",
+                "association": "hostname_match",
+                # Not on the allowlist, and not published as a named field.
+                "internal_notes": "do-not-publish",
+            },
+        },
+        candidate_id=candidate.id,
+    )
+    await persist(
+        db_session,
+        module="phishing",
+        source="netlas",
+        finding={
+            "phishing_domain": candidate.phishing_domain,
+            "matched_asset": "example.com",
+            "metadata": {
+                "capability": "mx",
+                "mail_capable": False,
+                "association": "confirmed_candidate",
+            },
+        },
+        candidate_id=candidate.id,
+    )
+
+    response = await client.get(
+        f"/api/v1/phishing/threats/{candidate.id}/evidence",
+        headers=auth_headers_viewer,
+    )
+    assert response.status_code == 200
+    rows = {row["fields"].get("capability"): row for row in response.json()["items"]}
+    assert rows["certificate_brand"]["fields"]["title"] == "Sign in"
+    assert rows["certificate_brand"]["fields"]["verdict"] == "candidate_not_verified"
+    assert "internal_notes" not in rows["certificate_brand"]["fields"]
+    # A negative answer is a fact: the look-alike receives no mail, and the row says so
+    # rather than leaving the reader to read absence as "unknown".
+    assert rows["mx"]["fields"]["mail_capable"] is False
+    assert rows["mx"]["fields"]["association"] == "confirmed_candidate"

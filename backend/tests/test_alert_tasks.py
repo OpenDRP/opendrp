@@ -141,7 +141,7 @@ def test_alert_task_does_not_hide_worker_errors(monkeypatch):
 
 
 def test_enrichment_task_reports_what_it_processed(monkeypatch):
-    """`process_enrichment_events`, the beat-scheduled WHOIS drain."""
+    """`process_enrichment_events`, the beat-scheduled registration pass."""
     from app.tasks.alert_tasks import process_enrichment_events_task
 
     session = object()
@@ -149,10 +149,15 @@ def test_enrichment_task_reports_what_it_processed(monkeypatch):
         "app.core.database.AsyncSessionLocal",
         lambda: _SessionContext(session),
     )
-    enrich = AsyncMock(return_value=True)
-    monkeypatch.setattr("app.services.ingestion_events.enrich_one_event", enrich)
+    summary = {"claimed": 3, "completed": 2, "held": 1, "answered": 2}
+    enrich = AsyncMock(return_value=summary)
+    monkeypatch.setattr(
+        "app.services.ingestion_events.enrich_pending_events", enrich
+    )
 
-    assert process_enrichment_events_task.run() == {"processed": True}
+    # The pass answers with what it did by outcome, not with a boolean: a quiet
+    # day and a registry that refuses us are different results now (WI-25).
+    assert process_enrichment_events_task.run() == summary
     # The session the task opens is the one the service is handed: a wrapper that
     # opened its own and passed nothing would otherwise still look right.
     assert enrich.await_args.args[0] is session
@@ -166,14 +171,23 @@ def test_enrichment_task_reports_nothing_to_do(monkeypatch):
         lambda: _SessionContext(object()),
     )
     monkeypatch.setattr(
-        "app.services.ingestion_events.enrich_one_event", AsyncMock(return_value=False)
+        "app.services.ingestion_events.enrich_pending_events",
+        AsyncMock(return_value={"claimed": 0, "completed": 0, "held": 0}),
     )
 
-    assert process_enrichment_events_task.run() == {"processed": False}
+    assert process_enrichment_events_task.run() == {
+        "claimed": 0,
+        "completed": 0,
+        "held": 0,
+    }
 
 
 def test_dns_expiry_task_reports_the_queued_count(monkeypatch):
-    """`check_dns_expiry_alerts`, the scheduled registration/certificate check."""
+    """`check_dns_expiry_alerts`, the scheduled registration/certificate check.
+
+    The daily sweep has two halves - the reminders and the stale-control warning -
+    and both run on the one session the task owns.
+    """
     from app.tasks.alert_tasks import check_dns_expiry_alerts_task
 
     session = object()
@@ -182,10 +196,24 @@ def test_dns_expiry_task_reports_the_queued_count(monkeypatch):
         lambda: _SessionContext(session),
     )
     queue = AsyncMock(return_value=3)
+    stale = AsyncMock(return_value=1)
+    certificates = AsyncMock(return_value={"identities": 1, "sightings": 2, "queued": {"R1": 1}})
     monkeypatch.setattr("app.services.dns_expiry_service.queue_expiry_alerts", queue)
+    monkeypatch.setattr(
+        "app.services.dns_expiry_service.queue_stale_monitor_alerts", stale
+    )
+    monkeypatch.setattr(
+        "app.services.tls_identity_service.run_certificate_sweep", certificates
+    )
 
-    assert check_dns_expiry_alerts_task.run() == {"queued": 3}
+    assert check_dns_expiry_alerts_task.run() == {
+        "queued": 3,
+        "stale": 1,
+        "certificates": {"identities": 1, "sightings": 2, "queued": {"R1": 1}},
+    }
     assert queue.await_args.args[0] is session
+    assert stale.await_args.args[0] is session
+    assert certificates.await_args.args[0] is session
 
 
 def test_dns_expiry_task_reports_an_idle_sweep(monkeypatch):
@@ -198,5 +226,17 @@ def test_dns_expiry_task_reports_an_idle_sweep(monkeypatch):
     monkeypatch.setattr(
         "app.services.dns_expiry_service.queue_expiry_alerts", AsyncMock(return_value=0)
     )
+    monkeypatch.setattr(
+        "app.services.dns_expiry_service.queue_stale_monitor_alerts",
+        AsyncMock(return_value=0),
+    )
+    monkeypatch.setattr(
+        "app.services.tls_identity_service.run_certificate_sweep",
+        AsyncMock(return_value={"identities": 0, "sightings": 0, "queued": {}}),
+    )
 
-    assert check_dns_expiry_alerts_task.run() == {"queued": 0}
+    assert check_dns_expiry_alerts_task.run() == {
+        "queued": 0,
+        "stale": 0,
+        "certificates": {"identities": 0, "sightings": 0, "queued": {}},
+    }

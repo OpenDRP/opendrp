@@ -42,6 +42,22 @@ async def update_monitor(db: AsyncSession, row: DNSObservation, *, now: datetime
         kind = "registration"
         state = "failed" if row.metadata_json.get("check_state") == "failed" else "verified" if row.expires_at else "unknown"
         cert_id, issued = None, None
+    elif row.observation_type == "tls_probe":
+        # The one control kind that answers "what is served now" instead of "what was
+        # issued": its evidence is a handshake this platform performed against its own
+        # asset, which is what makes a reminder actionable (F-05 in the DNS & TLS audit).
+        kind = "tls"
+        state = str(row.metadata_json.get("check_state", ""))
+        if state not in {"verified", "expired", "failed", "incomplete", "skipped_no_public_address"}:
+            raise ValueError("invalid tls probe state")
+        cert_id = row.metadata_json.get("certificate_id")
+        issued = parse_date(row.metadata_json.get("not_before"))
+        if state == "verified" and (
+            not isinstance(cert_id, str) or not cert_id or len(cert_id) > 128
+            or issued is None or issued > utc(now)
+            or row.expires_at is None or utc(row.expires_at) <= issued
+        ):
+            raise ValueError("invalid served certificate")
     elif row.source == "ctlogs" and row.observation_type == "certificate_check":
         kind = "certificate"
         state = str(row.metadata_json.get("check_state", ""))
@@ -69,8 +85,10 @@ async def update_monitor(db: AsyncSession, row: DNSObservation, *, now: datetime
         return
     monitor.checked_at = checked
     monitor.state = state
-    if state in {"failed", "incomplete"}:
-        # Preserve prior evidence and cycle, but never alert from a failed check.
+    if state in {"failed", "incomplete", "skipped_no_public_address"}:
+        # Preserve prior evidence and cycle, but never alert from a check that did not
+        # produce a certificate: a failed handshake and a host with no public address
+        # are both silence about the served certificate, not evidence about it.
         return
     expiry = utc(row.expires_at) if row.expires_at else None
     cycle = hashlib.sha256(f"{kind}|{cert_id or ''}|{expiry.isoformat() if expiry else ''}".encode()).hexdigest()
@@ -81,6 +99,9 @@ async def update_monitor(db: AsyncSession, row: DNSObservation, *, now: datetime
     elif cycle != monitor.cycle:
         monitor.alerted_thresholds = []
     monitor.cycle = cycle
+    # A successful check ends a staleness episode, so the "control has not been
+    # checked" warning is owed again the next time this control goes quiet.
+    monitor.stale_alerted_at = None
     monitor.successful_at = checked
     monitor.expires_at = expiry
     monitor.certificate_id = cert_id if isinstance(cert_id, str) else None

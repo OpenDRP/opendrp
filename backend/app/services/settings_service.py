@@ -19,6 +19,7 @@ from app.core.outbound import OutboundBlocked, ensure_allowed
 from app.core.safe_errors import sanitize_external_error
 from app.models.settings import SystemSettings
 from app.schemas.settings import SystemSettingsUpdate
+from app.services.alert_policy import ROW_FIELDS, policy_from_row
 
 
 # Only alert-channel secrets are owned by the core. Provider credentials belong
@@ -66,6 +67,31 @@ def looks_like_a_mask(value: str) -> bool:
     supported flow.
     """
     return bool(_MASK_RUN_RE.search(value))
+
+
+def delivery_is_configured(row: SystemSettings) -> bool:
+    """Whether an installation can deliver a notification at all right now.
+
+    Asked of the row's own fields rather than of the destinations the delivery
+    service resolves, because the settings service needs the answer *before* and
+    *after* a save to recognise the save that first makes delivery possible — the
+    recipients a destination resolves to would mean reading the database in the
+    middle of the update that is deciding whether to report a backlog. The two
+    questions agree except where email is enabled with only recipients that
+    resolve to nothing (an inactive user, say): there this answers yes while the
+    delivery service still queues nothing, and the deferral window covers it — the
+    held rows keep being retried until the configuration actually works.
+    """
+    email_ready = bool(
+        row.email_alerts_enabled
+        and row.smtp_host
+        and row.smtp_port
+        and (row.alert_recipient_email_decrypted or row.alert_email_user_ids)
+    )
+    telegram_ready = bool(
+        row.telegram_alerts_enabled and row.telegram_bot_token and row.telegram_chat_ids
+    )
+    return email_ready or telegram_ready
 
 
 class SettingsService:
@@ -126,6 +152,11 @@ class SettingsService:
             unknown = sorted(set(update_data["schedules"]) - module_ids)
             if unknown:
                 raise BadRequestException(f"Schedules reference unknown modules: {unknown}")
+        # Read before the update is applied: a save that makes this installation
+        # able to deliver for the first time is the moment the findings held while
+        # it could not become reportable, and they leave as one digest rather than
+        # as the stream the deferral window exists to prevent (WI-04).
+        delivering = delivery_is_configured(settings)
         for field, value in update_data.items():
             if field in _ENCRYPTED_FIELDS:
                 current_plain = getattr(settings, _ENCRYPTED_FIELDS[field], None)
@@ -144,8 +175,38 @@ class SettingsService:
                 setattr(settings, field, value)
         if settings.smtp_security_mode == "plain" and settings.smtp_user and settings.smtp_password:
             raise BadRequestException("SMTP credentials require STARTTLS or implicit TLS")
+        # The columns, not the policy field names: ``update_data`` is keyed by the
+        # names the API uses (``alert_confidence_direct`` and friends), and a guard
+        # written against the resolver's own field names would never match — the
+        # contradiction would be saved and then ignored by every reader.
+        if update_data.keys() & {column for column, _ in ROW_FIELDS}:
+            # The budget as it will be saved, checked as a whole. The one
+            # relationship that matters is *between* two fields (the digest
+            # threshold stays below the direct one), and a save may state only one
+            # of them, so a per-field check cannot see it: the pair is evaluated
+            # against the row the update is about to produce. A row that still
+            # contradicts itself is refused rather than half-applied — the resolver
+            # would ignore it and the operator would be left with a save that
+            # silently did nothing.
+            policy = policy_from_row(settings)
+            if policy.invalid:
+                stated = ", ".join(
+                    f"{column}={getattr(settings, column)}"
+                    for column, field in ROW_FIELDS
+                    if field in policy.invalid
+                )
+                raise BadRequestException(
+                    "The alert budget does not hold together: the digest threshold must "
+                    f"stay below the direct one, and every value within its own range ({stated})"
+                )
         try:
             await self.db.flush()
+            if not delivering and delivery_is_configured(settings):
+                # Same transaction as the save: a settings update that fails must
+                # not leave a digest claiming a channel that does not exist.
+                from app.services.ingestion_events import queue_backlog_digest
+
+                await queue_backlog_digest(self.db)
             if commit:
                 await self.db.commit()
                 await self.db.refresh(settings)

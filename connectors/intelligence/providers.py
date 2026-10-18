@@ -34,9 +34,25 @@ CAPABILITIES = {
     "netlas": (
         "hostname",
         "ip",
+        #: Which endpoints name our domain. Discovery for the DNS and exposure
+        #: modules, and a partial answer for phishing: a certificate that carries our
+        #: name *and* someone else's proves a shared certificate, not a double.
         "certificate",
+        #: The same collection asked from the *brand* instead: who else claims to be
+        #: us. A double does not name our domain - it names something that looks like
+        #: it - so this is the question that finds one, and it is deliberately a
+        #: capability of its own rather than a rewrite of the one above.
+        "certificate_brand",
         "title",
         "body",
+        #: Our icon found elsewhere: the same image byte for byte, and - from the same
+        #: capability - an image the provider considers one edit away from ours (a
+        #: recoloured or resized copy), which evidence names ``favicon_similar``.
+        "favicon",
+        #: Registration facts and mail capability of a domain the platform already
+        #: knows: both are evidence about a candidate, never a way to discover one.
+        "whois",
+        "mx",
         "lookup",
         "passive_dns",
     ),
@@ -49,6 +65,216 @@ class ProviderError(RuntimeError):
     def __init__(self, code, retry_after=None):
         super().__init__(code)
         self.retry_after = retry_after
+
+
+#: Where a Netlas response document keeps the facts the certificate rules score on.
+#:
+#: Several spellings are accepted because these names are confirmed by the provider spike
+#: (docs/dns-security.md) rather than by a schema this repository ships, and the map is the
+#: single place a confirmed name goes. A field that arrives under none of them is absent
+#: from the observation - never invented - and a response that yields no signal at all is
+#: reported by the worker as an unreadable shape instead of a clean scan.
+#:
+#: Why these keys matter at all: R4 compares a JARM plus a title or favicon between our
+#: service and a copy of it, the shared-infrastructure suppression needs ``org``/``asn``
+#: to recognise a CDN, and an ``asn`` scope exception reads ``asn``. Nothing in the
+#: platform wrote any of them, so all three decisions were unreachable (F-10/F-11).
+SIGNAL_PATHS = {
+    "org": ("organization", "org", "autonomous_system.name", "net.name", "asn.name"),
+    "asn": ("asn", "asn_number", "autonomous_system.number", "net.asn", "asn.number"),
+    "jarm": ("jarm", "jarm_hash", "tls.jarm", "jarm.fingerprint"),
+    "title": ("title", "http.title", "http_title"),
+    "favicon_hash": ("favicon.hash", "http.favicon.hash", "favicon_hash"),
+}
+
+#: Where a Netlas response document keeps the icon hashes, and where a WHOIS document
+#: keeps the two registration facts. The same rule as :data:`SIGNAL_PATHS` applies: a
+#: field that arrives under none of these names is absent from the observation rather
+#: than invented, and a document that carries none of them is reported as an unreadable
+#: shape instead of as a clean answer.
+FAVICON_PATHS = {
+    "sha256": (
+        "http.favicon.hash_sha256",
+        "favicon.hash_sha256",
+        "favicon_hash_sha256",
+    ),
+    "perceptual": (
+        "http.favicon.perceptual_hash",
+        "favicon.perceptual_hash",
+        "favicon_perceptual_hash",
+    ),
+}
+
+#: A certificate or WHOIS organisation is a bounded string, never a structure the
+#: platform has to walk: ``registrar`` is documented as sharing the registrant group's
+#: shape, and that group's ``name``/``organization`` is what an operator reads.
+WHOIS_PATHS = {
+    "created": ("created_date", "created", "registration_date", "domain.created_date"),
+    "registrar": ("registrar.name", "registrar.organization", "registrar"),
+}
+
+#: A fingerprint or serial taken from provider data is interpolated into a search
+#: expression, so it is validated as hex first and refused otherwise: provider data is
+#: untrusted input, exactly like a value an operator typed.
+_HEX_VALUE = re.compile(r"^[0-9a-fA-F]{4,128}$")
+
+#: A favicon hash as the provider reports it, under the same rule as a fingerprint.
+#: Hex only, so a value that arrived as base64 or as shodan's integer hash is refused
+#: instead of being searched for - an expression built from the wrong alphabet answers
+#: "nothing matched", which is indistinguishable from a real absence.
+_FAVICON_HASH = re.compile(r"^[0-9a-fA-F]{8,64}$")
+
+#: A brand as an operator typed it: one letter or digit first, then letters, digits,
+#: spaces, dots, underscores, ampersands and hyphens, 2..100 characters. Anything else
+#: (a quote, a colon, a wildcard, a control character) is refused rather than escaped
+#: into a query nobody asked for.
+_BRAND = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._&-]{1,99}$")
+
+
+def brand_parts(value):
+    """A brand as the two halves of one certificate expression.
+
+    The phrase half keeps the spelling an operator chose and is escaped by
+    :func:`quoted`. The wildcard half is *generated*: everything that is not a letter,
+    a digit or a hyphen is removed, so no metacharacter of the query grammar can
+    survive into a part that is not a quoted phrase. A brand with fewer than three
+    usable characters has no wildcard half worth searching for and is refused.
+    """
+    candidate = value.strip() if isinstance(value, str) else ""
+    if not _BRAND.fullmatch(candidate):
+        raise ProviderError("invalid_brand_value")
+    token = re.sub(r"[^a-z0-9-]+", "", candidate.lower())
+    if len(token) < 3:
+        raise ProviderError("invalid_brand_value")
+    return candidate, token
+
+
+def dig(document, path):
+    """A dotted path's value, or ``None`` when any step is missing."""
+    current = document
+    for step in path.split("."):
+        if not isinstance(current, dict):
+            return None
+        current = current.get(step)
+    return current
+
+
+def certificate_signals(row):
+    """The scored facts a response row carries, by the map above.
+
+    Only values of the expected shape survive: an organisation or title is a bounded
+    string, an ASN is an integer inside the legal range, and a JARM or favicon hash is a
+    bounded token. Anything else is dropped rather than stored as a signal a rule would
+    score on, because a rule that fires on a malformed value is worse than one that never
+    fires.
+    """
+    signals = {}
+    for signal, paths in SIGNAL_PATHS.items():
+        for path in paths:
+            value = dig(row, path)
+            if signal == "asn":
+                if isinstance(value, str) and value.isdecimal():
+                    value = int(value)
+                if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 4294967295:
+                    continue
+            elif not isinstance(value, str) or not value.strip() or len(value) > 200 or any(ord(c) < 32 for c in value):
+                continue
+            else:
+                value = value.strip()
+            signals[signal] = value
+            break
+    return signals
+
+
+def whois_facts(rows, adapter=None):
+    """The registration facts a candidate is judged on, kept only when well formed.
+
+    Two facts and no more: when the domain was registered, and who registered it. A
+    registrar name that is not a bounded string, or a date the platform cannot read, is
+    dropped rather than stored as a fact a rule would score on - the same rule the
+    certificate signals follow.
+    """
+    facts = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            if adapter:
+                adapter.record_error("invalid_whois_record")
+            continue
+        for key, paths in WHOIS_PATHS.items():
+            if key in facts:
+                continue
+            for path in paths:
+                value = dig(row, path)
+                if value is None:
+                    continue
+                # The first spelling that carries a value decides the fact - accepted or
+                # rejected. Continuing past it would let the *whole* ``registrar`` object
+                # (a later spelling of the same fact) overwrite the name that was just
+                # read, which is how a well-formed document came to be reported as an
+                # unreadable registrar.
+                if key == "created":
+                    try:
+                        facts["created"] = observed(value)
+                    except ProviderError as exc:
+                        if adapter:
+                            adapter.record_error(str(exc))
+                    break
+                if (
+                    not isinstance(value, str)
+                    or not value.strip()
+                    or len(value) > 255
+                    or any(ord(char) < 32 for char in value)
+                ):
+                    if adapter:
+                        adapter.record_error("invalid_whois_registrar")
+                    break
+                facts["registrar"] = value.strip()
+                break
+        if facts.get("created") and facts.get("registrar"):
+            break
+    return facts
+
+
+def mail_facts(rows, adapter=None):
+    """Whether a domain receives mail, and under which hostnames.
+
+    The absence of an ``mx`` list on every row is a real answer - the domain does not
+    receive mail - and it is reported as one. A row whose ``mx`` is not a list is not an
+    answer at all and is recorded as an unreadable shape.
+    """
+    hosts = []
+    timestamp = None
+    for row in rows:
+        if not isinstance(row, dict):
+            if adapter:
+                adapter.record_error("invalid_mail_record")
+            continue
+        values = row.get("mx")
+        if isinstance(values, str):
+            values = [values]
+        if values is None:
+            values = []
+        if not isinstance(values, list):
+            if adapter:
+                adapter.record_error("invalid_mail_record")
+            continue
+        for value in values[:20]:
+            try:
+                hosts.append(host(value))
+            except ProviderError:
+                if adapter:
+                    adapter.record_error("invalid_mail_host")
+        if timestamp is None:
+            try:
+                timestamp = observed(row.get("last_updated") or row.get("@timestamp"))
+            except ProviderError as exc:
+                if adapter:
+                    adapter.record_error(str(exc))
+    return {
+        "mail_capable": bool(hosts),
+        "mx_hosts": sorted(set(hosts))[:10],
+        "provider_observed_at": timestamp or "unknown",
+    }
 
 
 def quoted(value):
@@ -77,6 +303,44 @@ def query(provider, capability, value):
     if field is None:
         raise ProviderError("unsupported_capability")
     return field + ":" + quoted(value)
+
+
+def brand_certificate_expression(brand):
+    """The documented brand question, in one expression.
+
+    ``certificate.subject.organization`` is the provider's own example of an
+    organisation query, and ``certificate.names`` is a full-text field, so a wildcard
+    on it is the documented way to ask "which certificates name us at all". Both halves
+    are needed: a certificate that claims our organisation but names nothing like us,
+    and one that names us without claiming our organisation, are both worth seeing, and
+    asking either half alone hides the other.
+    """
+    phrase, token = brand_parts(brand)
+    return (
+        "certificate.subject.organization:"
+        + quoted(phrase)
+        + " OR certificate.names:*"
+        + token
+        + "*"
+    )
+
+
+def favicon_expression(algorithm, value):
+    """The icon question, exact or fuzzy, from a hash the provider reported.
+
+    The fuzzy operator belongs to a *term*, not to a quoted phrase: ``field:value~1``
+    is one edit away from ``value``, which is exactly what a recoloured or resized copy
+    of our icon is. Quoting it would turn the search into "an icon whose hash is
+    literally this string", which is the question the exact search already asks.
+    """
+    if not isinstance(value, str) or not _FAVICON_HASH.fullmatch(value):
+        raise ProviderError("invalid_favicon_hash")
+    digest = value.lower()
+    if algorithm == "sha256":
+        return "http.favicon.hash_sha256:" + quoted(digest)
+    if algorithm == "perceptual":
+        return "http.favicon.perceptual_hash:" + digest + "~1"
+    raise ProviderError("unsupported_capability")
 
 
 def host(value):
@@ -197,10 +461,38 @@ class Adapter:
         return batch[:limit]
 
     async def search_certificates(self, value, *, max_pages=3, max_results=100):
-        """Search Netlas' documented certificate collection, with its own quota."""
+        """Which certificates name this domain, from the keyed field only.
+
+        The keyed field is the exact question and the sparse one: a certificate that
+        names our domain somewhere in its SAN list. It stays the DNS and exposure
+        module's discovery query - and it is *not* the phishing question, which is what
+        :meth:`search_brand_certificates` is for.
+        """
+        return await self.certificate_pages(
+            "certificate.names.keyword:" + quoted(host(value)),
+            max_pages=max_pages,
+            max_results=max_results,
+        )
+
+    async def search_brand_certificates(self, brand, *, max_pages=3, max_results=100):
+        """Who else claims this brand in a certificate.
+
+        Netlas rate-limits the certificate collections to three requests a minute, so
+        this is declared as the certificate operation it is: the reservation comes from
+        the certificate bucket and the account's certificate budget is what pays for it.
+        A brand search is also the broadest query this connector makes, which is why the
+        worker counts its result set before it pages through it.
+        """
+        return await self.certificate_pages(
+            brand_certificate_expression(brand),
+            max_pages=max_pages,
+            max_results=max_results,
+        )
+
+    async def certificate_pages(self, expression, *, max_pages=3, max_results=100):
+        """Page Netlas' documented certificate collection under one expression."""
         if self.provider != "netlas":
             raise ProviderError("unsupported_capability")
-        target = host(value)
         if max_pages < 1 or max_results < 1:
             raise ProviderError("invalid_search_limit")
         certificates, start = [], 0
@@ -211,8 +503,8 @@ class Adapter:
                     "GET",
                     "/certs/",
                     params={
-                        "q": f'certificate.names.keyword:"{target}"',
-                        "fields": "names,fingerprint_sha256,subject_dn,issuer_dn,validity,extensions.subject_alt_name.dns_names",
+                        "q": expression,
+                        "fields": "names,fingerprint_sha256,serial_number,subject_dn,issuer_dn,validity,extensions.subject_alt_name.dns_names",
                         "start": start,
                     },
                     bucket="certificate",
@@ -279,6 +571,283 @@ class Adapter:
                 start += 20
             self.truncated = True
         return rows
+
+    async def search_mail_records(self, value, *, max_pages=1, max_results=20):
+        """Whether a domain receives mail, from the passive DNS collection.
+
+        ``domain:`` with ``mx:*`` is the documented existence test for the field, so the
+        question is asked in the collection's own query language instead of downloading
+        address rows and guessing from them. A look-alike that answers mail is one a
+        campaign can be run from, which is a different fact from one that merely resolves.
+        """
+        if self.provider != "netlas":
+            raise ProviderError("unsupported_capability")
+        if max_pages < 1 or max_results < 1:
+            raise ProviderError("invalid_search_limit")
+        expression = "domain:" + quoted(host(value)) + " AND mx:*"
+        rows, start = [], 0
+        async with self.client() as client:
+            for _ in range(max_pages):
+                response = await self.request(
+                    client,
+                    "GET",
+                    "/domains/",
+                    params={
+                        "q": expression,
+                        "fields": "domain,mx,ns,last_updated",
+                        "start": start,
+                    },
+                    bucket="search",
+                )
+                items = response.get("items")
+                if not isinstance(items, list):
+                    raise ProviderError("invalid_response")
+                batch = self._validated_result_batch(items, limit=max_results)
+                rows.extend(batch)
+                more = len(items) == 20
+                if len(rows) >= max_results:
+                    self.truncated = self.truncated or more or len(rows) > max_results
+                    return rows[:max_results]
+                if not more:
+                    return rows
+                start += 20
+            self.truncated = True
+        return rows
+
+    async def search_whois(self, value, *, max_pages=1, max_results=20):
+        """Registration facts for one domain, from the WHOIS collection.
+
+        Passive on purpose. The platform's own WHOIS enrichment opens a connection to
+        the registrar on port 43, once, when a candidate first appears - and an
+        installation whose environment refuses that connection stores no registration
+        facts at all. This asks the provider's stored copy instead, which is what lets an
+        analyst re-read the same fact later and read it for a domain the registrar itself
+        will not answer for.
+        """
+        if self.provider != "netlas":
+            raise ProviderError("unsupported_capability")
+        if max_pages < 1 or max_results < 1:
+            raise ProviderError("invalid_search_limit")
+        expression = "domain:" + quoted(host(value))
+        rows, start = [], 0
+        async with self.client() as client:
+            for _ in range(max_pages):
+                response = await self.request(
+                    client,
+                    "GET",
+                    "/whois_domains/",
+                    params={
+                        "q": expression,
+                        "fields": "domain,created_date,registrar,registrant.organization",
+                        "start": start,
+                    },
+                    bucket="search",
+                )
+                items = response.get("items")
+                if not isinstance(items, list):
+                    raise ProviderError("invalid_response")
+                batch = self._validated_result_batch(items, limit=max_results)
+                rows.extend(batch)
+                more = len(items) == 20
+                if len(rows) >= max_results:
+                    self.truncated = self.truncated or more or len(rows) > max_results
+                    return rows[:max_results]
+                if not more:
+                    return rows
+                start += 20
+            self.truncated = True
+        return rows
+
+    async def count_responses(self, expression, *, bucket="search"):
+        """How many rows an expression would return, before any of them is fetched.
+
+        A brand or a body expression can match a hundred thousand endpoints, and paging
+        through them is neither useful nor affordable. The count route answers with the
+        size of the result set on its own - exact below a thousand, and an estimate the
+        provider documents as within three percent above it - so the caller can decide
+        to skip the expression instead of spending the scan's budget on a query nobody
+        can read to the end.
+        """
+        if self.provider != "netlas":
+            raise ProviderError("unsupported_capability")
+        if (
+            not isinstance(expression, str)
+            or not expression
+            or len(expression) > 512
+            or any(ord(char) < 32 for char in expression)
+        ):
+            raise ProviderError("invalid_search_value")
+        async with self.client() as client:
+            response = await self.request(
+                client,
+                "GET",
+                "/responses_count/",
+                params={"q": expression},
+                bucket=bucket,
+            )
+        count = response.get("count")
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            raise ProviderError("invalid_response")
+        return count
+
+    async def own_favicon_hashes(self, value, *, max_results=20):
+        """The icon hashes the provider reports for one of our own endpoints.
+
+        The perceptual hash is the provider's own view of the image, and that is the
+        whole reason it is read from here instead of computed: a hash this connector
+        calculated with its own algorithm would be compared against the provider's by
+        Hamming distance, and two different algorithms make that distance meaningless.
+        So the fuzzy search takes its value from the provider or it is not asked at all.
+        """
+        target = host(value)
+        async with self.client() as client:
+            response = await self.request(
+                client,
+                "GET",
+                "/responses/",
+                params={
+                    "q": "host:" + quoted(target),
+                    "fields": "http.favicon.hash_sha256,http.favicon.perceptual_hash,host",
+                    "start": 0,
+                },
+                bucket="search",
+            )
+        batch = self._validated_result_batch(
+            response.get("items"), limit=max_results
+        )
+        found = {}
+        for document in batch:
+            for algorithm, paths in FAVICON_PATHS.items():
+                if algorithm in found:
+                    continue
+                for path in paths:
+                    candidate = dig(document, path)
+                    if candidate is None:
+                        continue
+                    if not isinstance(candidate, str) or not _FAVICON_HASH.fullmatch(
+                        candidate.strip()
+                    ):
+                        self.record_error("unreadable_favicon_hash")
+                        continue
+                    found[algorithm] = candidate.strip().lower()
+                    break
+        return found
+
+    async def search_favicon(self, algorithm, value, *, max_pages=1, max_results=100):
+        """Who else serves this icon: byte for byte, or one edit away from it."""
+        return await self.responses_pages(
+            favicon_expression(algorithm, value),
+            max_pages=max_pages,
+            max_results=max_results,
+        )
+
+    async def search_certificate_responses(
+        self, fingerprint, *, max_pages=3, max_results=100
+    ):
+        """Every endpoint an index says serves this certificate.
+
+        This is the reverse of discovery. Discovery asks "which certificates name our
+        domain"; a copy of our service is found by the opposite question - "where else is
+        the certificate we serve being served" - and the answer is the collection that
+        carries the serving address together with the JARM and HTTP facts R4 compares and
+        the organisation that tells a CDN from a copy.
+        """
+        if self.provider != "netlas":
+            raise ProviderError("unsupported_capability")
+        if not isinstance(fingerprint, str) or not _HEX_VALUE.fullmatch(fingerprint):
+            raise ProviderError("invalid_certificate_fingerprint")
+        if max_pages < 1 or max_results < 1:
+            raise ProviderError("invalid_search_limit")
+        rows, start = [], 0
+        expression = 'certificate.fingerprint_sha256:' + quoted(fingerprint.lower())
+        async with self.client() as client:
+            for _ in range(max_pages):
+                response = await self.request(
+                    client,
+                    "GET",
+                    "/responses/",
+                    params={
+                        "q": expression,
+                        "fields": "host,ip,port,protocol,organization,asn,jarm,http.title,certificate",
+                        "start": start,
+                    },
+                    bucket="certificate",
+                )
+                items = response.get("items")
+                if not isinstance(items, list):
+                    raise ProviderError("invalid_response")
+                batch = self._validated_result_batch(items, limit=max_results)
+                rows.extend(batch)
+                more = len(items) == 20
+                if len(rows) >= max_results:
+                    self.truncated = self.truncated or more or len(rows) > max_results
+                    return rows[:max_results]
+                if not more:
+                    return rows
+                start += 20
+            self.truncated = True
+        return rows
+
+    def certificate_responses(self, target, rows):
+        """One observation per endpoint that serves the searched certificate.
+
+        Our own endpoint is in this answer too, and that is deliberate: the core decides
+        what is ours (an address its own probe verified, or an ``ip_address`` asset), and a
+        connector that filtered the answer here would hide the copy it cannot name.
+        """
+        target = host(target)
+        observations = []
+        for row in rows:
+            raw_name = row.get("host") or row.get("domain") or row.get("ip")
+            try:
+                name = host(raw_name)
+            except ProviderError:
+                self.record_error("invalid_response_endpoint")
+                continue
+            ip = row.get("ip")
+            if ip is not None:
+                try:
+                    ip = str(ipaddress.ip_address(ip))
+                except (ValueError, TypeError):
+                    self.record_error("invalid_response_ip")
+                    ip = None
+            port = row.get("port")
+            if isinstance(port, str) and port.isdecimal():
+                port = int(port)
+            if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+                port = None
+            certificate = row.get("certificate") if isinstance(row.get("certificate"), dict) else {}
+            fingerprint = certificate.get("fingerprint_sha256") or certificate.get("fingerprint")
+            if not isinstance(fingerprint, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", fingerprint):
+                fingerprint = None
+            signals = certificate_signals(row)
+            if fingerprint is None and not signals:
+                # An endpoint that carries nothing the rules can score: a shape the spike
+                # has not confirmed yet, reported rather than read as a clean answer.
+                self.record_error("unreadable_certificate_response")
+            metadata = {
+                "evidence": "netlas_certificate_response",
+                "source_domain": target,
+                "wildcard": name.startswith("*."),
+                **signals,
+            }
+            if ip:
+                metadata["ip"] = ip
+            if port:
+                metadata["port"] = port
+            if fingerprint:
+                metadata["fingerprint_sha256"] = fingerprint.lower()
+            observations.append(
+                {
+                    "observation_type": "certificate_response",
+                    "subject": name,
+                    "record_type": "TLS",
+                    "value": f"https://{name}" + (f":{port}" if port else ""),
+                    "status": "historical",
+                    "metadata": metadata,
+                }
+            )
+        return observations
 
     def dns_observations(self, target, rows):
         """Normalize DNS RRsets without treating provider data as ownership."""
@@ -442,7 +1011,20 @@ class Adapter:
             return await self.search_certificates(
                 value, max_pages=max_pages, max_results=max_results
             )
-        expression = query(self.provider, capability, value)
+        if self.provider == "netlas" and capability == "certificate_brand":
+            return await self.search_brand_certificates(
+                value, max_pages=max_pages, max_results=max_results
+            )
+        return await self.responses_pages(
+            query(self.provider, capability, value),
+            max_pages=max_pages,
+            max_results=max_results,
+        )
+
+    async def responses_pages(self, expression, *, max_pages=3, max_results=100):
+        """Page the responses collection under one already-built expression."""
+        if max_pages < 1 or max_results < 1:
+            raise ProviderError("invalid_search_limit")
         rows = []
         async with self.client() as client:
             for page in range(max_pages):

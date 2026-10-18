@@ -266,6 +266,71 @@ async def test_too_many_targets_are_truncated_and_reported(netlas):
     assert summary["requests"] == 2
 
 
+@pytest.mark.asyncio
+async def test_one_target_failing_does_not_throw_away_the_rest(netlas, monkeypatch):
+    """A flaky lookup is one skipped target, not a scan that stops early.
+
+    The loop used to `break` on the first `ProviderError`, so a single 5xx on the
+    second target left every target after it unasked — and the summary could not
+    say how many were never reached, which read like "nothing is exposed".
+    """
+    monkeypatch.setattr(endpoint_providers.asyncio, "sleep", AsyncMock())
+
+    def handler(request):
+        path = request.url.path
+        if "192.0.2.11" in path:
+            return httpx.Response(503, text="upstream unavailable")
+        address = "192.0.2.10" if "192.0.2.10" in path else "192.0.2.12"
+        return httpx.Response(
+            200,
+            json={"ip": address, "ports": [{"port": 443, "prot4": "tcp", "prot7": "https"}]},
+        )
+
+    netlas.transport = httpx.MockTransport(handler)
+    work = {
+        "job_id": "55555555-5555-5555-5555-555555555555",
+        "config": {"max_requests": 20, "max_targets": 5},
+        "params": {"ips": ["192.0.2.10", "192.0.2.11", "192.0.2.12"], "domains": []},
+    }
+    _, summary = await netlas.run_scan(work)
+
+    submitted = [item for call in netlas.submit_findings.await_args_list for item in call.args[1]]
+    assert {item["subject"] for item in submitted} == {"192.0.2.10", "192.0.2.12"}
+    assert summary["targets_total"] == 3
+    assert summary["targets_skipped"] == 1
+    assert "network_or_invalid_response" in summary["errors"]
+    # Two targets answered once, and the failed one spent all three attempts.
+    assert summary["requests"] == 5
+    assert summary["status"] == "partial"
+    assert netlas.credential_state == "valid"
+
+
+@pytest.mark.asyncio
+async def test_invalid_credentials_stop_the_scan_and_are_reported(netlas):
+    """A bad key fails every target for the same reason; the scan stops at one."""
+
+    def handler(request):
+        return httpx.Response(401, json={"detail": "API key not found"})
+
+    netlas.transport = httpx.MockTransport(handler)
+    work = {
+        "job_id": "66666666-6666-6666-6666-666666666666",
+        "config": {"max_requests": 20, "max_targets": 5},
+        "params": {"ips": ["192.0.2.20", "192.0.2.21", "192.0.2.22"], "domains": []},
+    }
+    _, summary = await netlas.run_scan(work)
+
+    assert summary["requests"] == 1
+    assert summary["targets_skipped"] == 3
+    assert summary["status"] == "error"
+    assert summary["error_code"] == "invalid_credentials"
+    assert netlas.credential_state == "invalid"
+    netlas.submit_findings.assert_not_awaited()
+    # The readiness row has to carry the verdict: the next poll is refused on it.
+    readiness = netlas._request.await_args_list[-1].kwargs["json"]
+    assert readiness["credential_state"] == "invalid"
+
+
 def test_connector_refuses_a_module_other_than_exposure(monkeypatch):
     _env(monkeypatch, "netlas", "exposure-netlas-endpoints")
     monkeypatch.setenv("CONNECTOR_TYPE", "phishing")

@@ -20,7 +20,8 @@ These tests double as the documented SDK contract:
 * ``_execute_job``: findings submission + summary merging, failure reporting
   with the exception type prefix;
 * ``run_forever``: drains the queue before sleeping, recovers from
-  ``ConnectorAPIError`` with backoff doubling capped at ``backoff_max``, treats
+  ``ConnectorAPIError`` with backoff doubling capped at ``backoff_max`` (the
+  computed delay is what is slept and is clamped to the cap), treats
   a refused credential (401/403) as fatal with an actionable message instead of
   retrying (identity comes from the token), and stops cleanly via ``stop()``.
 """
@@ -30,6 +31,7 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
+import time
 from typing import Any
 from unittest.mock import AsyncMock
 
@@ -58,6 +60,8 @@ else:
     )
 
 from opendrp_connector.base import (  # noqa: E402
+    DEFAULT_CATALOGUE_BATCH,
+    DEFAULT_SUBMIT_BATCH,
     ConnectorAPIError,
     ConnectorBase,
     ConnectorCredentialError,
@@ -201,6 +205,44 @@ class TestConstruction:
         assert c2.poll_interval == 1.5
         assert c2.backoff_max == 7.0
 
+    def _record_log(self, monkeypatch):
+        events: list[tuple[str, str, dict]] = []
+
+        class _Recorder:
+            def __getattr__(self, level):
+                def _record(event, **kwargs):
+                    events.append((level, event, kwargs))
+
+                return _record
+
+        monkeypatch.setattr("opendrp_connector.base.log", _Recorder())
+        return events
+
+    def test_plain_http_to_a_remote_core_warns_at_startup(self, monkeypatch):
+        """The token travels on every call; clear http outside the segment leaks it."""
+        for key, value in _ENV.items():
+            monkeypatch.setenv(key, value)
+        monkeypatch.setenv("CORE_URL", "http://core.example.com")
+        events = self._record_log(monkeypatch)
+
+        ConnectorBase()
+
+        insecure = [kw for _, event, kw in events if event == "connector_core_url_insecure"]
+        assert len(insecure) == 1
+        assert "https" in insecure[0]["reason"]
+
+    def test_plain_http_inside_the_connector_segment_does_not_warn(self, monkeypatch):
+        """Loopback and Compose service names are the declared trust boundary."""
+        for key, value in _ENV.items():
+            monkeypatch.setenv(key, value)
+        events = self._record_log(monkeypatch)
+
+        for url in ("http://core:8000", "http://127.0.0.1:8000", "http://localhost:8000"):
+            monkeypatch.setenv("CORE_URL", url)
+            ConnectorBase()
+
+        assert not [event for _, event, _ in events if event == "connector_core_url_insecure"]
+
 
 class TestHttpLayer:
     @pytest.mark.asyncio
@@ -322,7 +364,24 @@ class TestProtocolOperations:
 
         assert json.loads(requests[0].content) == findings
         assert requests[0].headers["X-Connector-Lease"] == _LEASE
+        # The first batch of a job says where it sits; a streamed submission does
+        # not know the total, so it must not invent one.
+        assert requests[0].headers["X-Connector-Batch-Index"] == "1"
+        assert "X-Connector-Batch-Total" not in requests[0].headers
         assert "job-1" in requests[0].url.path
+
+    @pytest.mark.asyncio
+    async def test_submit_findings_refuses_a_batch_larger_than_the_core_accepts(
+        self, connector
+    ):
+        """An oversized body would be refused whole, losing every finding in it."""
+        _claim(connector)
+        requests = _mk_client(connector, lambda req: _ok({"accepted": 1, "rejected": 0}))
+        with pytest.raises(ValueError, match="exceeds the core limit"):
+            await connector.submit_findings(
+                "job-1", [{"type": "phishing"}] * (DEFAULT_SUBMIT_BATCH + 1)
+            )
+        assert requests == []
 
     @pytest.mark.asyncio
     async def test_a_job_scoped_call_without_a_claim_never_reaches_the_core(self, connector):
@@ -396,6 +455,17 @@ class _StubConnector(ConnectorBase):
         return self.kw.get("findings", []), dict(self.kw.get("summary", {"scanned": 1}))
 
 
+def test_the_default_batch_sizes_are_the_cores_own_limits() -> None:
+    """The SDK cannot import the core, so a test keeps the two numbers equal."""
+    from app.schemas.connector import (
+        MAX_CATALOGUE_ENTRIES_PER_BATCH,
+        MAX_FINDINGS_PER_BATCH,
+    )
+
+    assert DEFAULT_SUBMIT_BATCH == MAX_FINDINGS_PER_BATCH
+    assert DEFAULT_CATALOGUE_BATCH == MAX_CATALOGUE_ENTRIES_PER_BATCH
+
+
 class TestExecuteJob:
     @pytest.mark.asyncio
     async def test_success_submits_findings_merges_summary_and_completes(self):
@@ -418,6 +488,68 @@ class TestExecuteJob:
         assert complete_body["summary"]["accepted"] == 1
         assert complete_body["summary"]["rejected"] == 0
         assert "duration_sec" in complete_body["summary"]
+
+    @pytest.mark.asyncio
+    async def test_findings_are_submitted_in_batches_the_core_accepts(self):
+        """501 findings are two accepted requests, not one refused body."""
+        c = _StubConnector(findings=[{"type": "phishing"}] * 501)
+        batches: list[tuple[int, str | None, str | None]] = []
+
+        async def _req(method, path, **kwargs):
+            if "findings" in path:
+                body = kwargs["json"]
+                headers = kwargs.get("headers") or {}
+                batches.append(
+                    (
+                        len(body),
+                        headers.get("X-Connector-Batch-Index"),
+                        headers.get("X-Connector-Batch-Total"),
+                    )
+                )
+                return _ok({"accepted": len(body), "rejected": 0})
+            return _ok()
+
+        c._request = _req  # type: ignore[method-assign]
+        await c._execute_job({"job_id": "j5", "lease_token": _LEASE})
+        # Two requests the core accepts, numbered 1..2 of a known 2-batch scan.
+        assert batches == [
+            (DEFAULT_SUBMIT_BATCH, "1", "2"),
+            (1, "2", "2"),
+        ]
+        assert c.scans == 1
+
+    @pytest.mark.asyncio
+    async def test_a_scan_republishes_readiness_after_it_completes(self):
+        """A worker that says nothing mid-scan still leaves a current row."""
+        c = _StubConnector(findings=[])
+        seen: list[str] = []
+
+        async def _req(method, path, **kwargs):
+            seen.append(path)
+            return _ok()
+
+        c._request = _req  # type: ignore[method-assign]
+        await c._execute_job({"job_id": "j6", "lease_token": _LEASE})
+        assert seen[-1] == "/api/v1/connectors/me/readiness"
+
+    @pytest.mark.asyncio
+    async def test_a_worker_that_reported_mid_scan_is_not_posted_twice(self):
+        c = _StubConnector(findings=[])
+        readiness_posts: list[str] = []
+
+        async def scan(work):
+            assert await c.report_readiness() is True
+            return [], {"scanned": 0}
+
+        async def _req(method, path, **kwargs):
+            if path.endswith("/me/readiness"):
+                readiness_posts.append(path)
+            return _ok()
+
+        c.run_scan = scan  # type: ignore[method-assign]
+        c._request = _req  # type: ignore[method-assign]
+        await c._execute_job({"job_id": "j7", "lease_token": _LEASE})
+        assert readiness_posts == ["/api/v1/connectors/me/readiness"]
 
     @pytest.mark.asyncio
     async def test_no_findings_completes_without_submit(self):
@@ -490,7 +622,7 @@ class TestLeaseCancellation:
         submitted = asyncio.Event()
         cancelled = asyncio.Event()
         connector.run_scan = AsyncMock(return_value=([{"phishing_domain": "bad.example.com"}], {}))
-        async def submit(job_id, findings):
+        async def submit(job_id, findings, **kwargs):
             submitted.set()
             try:
                 await asyncio.sleep(10)
@@ -583,6 +715,50 @@ class TestRunForever:
         c.stop()
         await asyncio.wait_for(task, timeout=2)
         assert calls["n"] >= 2  # retried after backoff
+
+    @pytest.mark.asyncio
+    async def test_backoff_doubles_to_the_cap_and_resets_after_success(self):
+        """The computed delay must be the one slept, or the setting is decorative."""
+        c = _StubConnector()
+        c.backoff_max = 4.0
+        delays: list[float | None] = []
+        work_results: list[Exception | None] = [
+            ConnectorAPIError(503, "unavailable"),
+            ConnectorAPIError(503, "unavailable"),
+            ConnectorAPIError(503, "unavailable"),
+            ConnectorAPIError(503, "unavailable"),
+            None,  # core reachable again: the next error starts from 1 s
+            ConnectorAPIError(503, "unavailable"),
+        ]
+
+        async def _req(method, path, **kwargs):
+            if path.endswith("/work"):
+                result = work_results.pop(0)
+                if result is not None:
+                    raise result
+                return _ok(status_code=204)
+            return _ok()
+
+        async def _sleep(delay=None):
+            delays.append(delay)
+            if not work_results:
+                c.stop()
+            await asyncio.sleep(0)
+
+        c._request = _req  # type: ignore[method-assign]
+        c._sleep_backoff = _sleep  # type: ignore[method-assign]
+        await asyncio.wait_for(c.run_forever(), timeout=2)
+        assert delays == [1.0, 2.0, 4.0, 4.0, 1.0]
+
+    @pytest.mark.asyncio
+    async def test_retry_wait_is_clamped_to_the_configured_maximum(self):
+        """``RECONNECT_BACKOFF_MAX_SEC`` reaches the sleep, not just the counter."""
+        c = _StubConnector()
+        c.poll_interval = 10.0
+        c.backoff_max = 0.02
+        started = time.monotonic()
+        await c._sleep_backoff(5.0)
+        assert time.monotonic() - started < 1.0
 
     @pytest.mark.asyncio
     async def test_401_is_fatal_and_names_the_fix(self):

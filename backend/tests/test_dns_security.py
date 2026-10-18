@@ -29,6 +29,55 @@ def test_dns_observation_payload_normalizes_idna_and_rejects_bad_hostnames():
         DNSObservationPayload.model_validate(
             {"observation_type": "dns_record", "subject": "singlelabel"}
         )
+    # RFC 8552 service labels address records that are not hostnames - the DMARC
+    # policy, a DKIM selector, an ACME challenge - so they are names, while an
+    # underscore anywhere else is still refused.
+    assert DNSObservationPayload.model_validate(
+        {"observation_type": "dns_record", "subject": "_DMARC.Example.COM.", "record_type": "TXT"}
+    ).subject == "_dmarc.example.com"
+    for rejected in ("_dmarc", "example._dmarc", "a_b.example.com", "_dmarc._tcp"):
+        with pytest.raises(ValidationError):
+            DNSObservationPayload.model_validate(
+                {"observation_type": "dns_record", "subject": rejected}
+            )
+
+
+@pytest.mark.asyncio
+async def test_vt_domain_reputation_refreshes_in_place_and_keeps_the_flag(db_session):
+    """F-09: the provider's reputation is a current fact, not one row per scan."""
+    def observation(reputation: int, malicious: int) -> dict:
+        return {
+            "observation_type": "vt_domain",
+            "subject": "example.com",
+            "value": "example.com",
+            "status": "current",
+            "metadata": {
+                "evidence": "virustotal_domain_reputation",
+                "source_domain": "example.com",
+                "reputation": reputation,
+                "analysis_malicious": malicious,
+                "analysis_suspicious": 0,
+                "analysis_harmless": 70,
+                "categories": ["Sophos: government"],
+                "certificate_fingerprint_sha256": "ab" * 32,
+            },
+        }
+
+    async def stored() -> list[DNSObservation]:
+        # The upsert is a Core statement, so the read asks for the stored row rather
+        # than the identity map's copy of it.
+        return list((await db_session.execute(select(DNSObservation).execution_options(populate_existing=True))).scalars())
+
+    assert await ingest_dns_observations(db_session, source="virustotal", findings=[observation(0, 0)]) == 1
+    rows = await stored()
+    assert len(rows) == 1 and rows[0].metadata_json["reputation"] == 0
+    assert rows[0].metadata_json["certificate_fingerprint_sha256"] == "ab" * 32
+
+    assert await ingest_dns_observations(db_session, source="virustotal", findings=[observation(-40, 4)]) == 1
+    rows = await stored()
+    assert len(rows) == 1, "a re-scan refreshes the reputation row instead of accumulating one per scan"
+    assert rows[0].metadata_json["reputation"] == -40
+    assert rows[0].metadata_json["analysis_malicious"] == 4
 
 
 @pytest.mark.asyncio
@@ -260,6 +309,34 @@ def test_passive_dns_distinct_resolution_dates_remain_distinct():
     assert observation_key("virustotal", payload) != observation_key(
         "virustotal", other
     )
+
+
+def test_two_addresses_serving_one_certificate_stay_two_observations():
+    """Where an endpoint was seen is part of the observation's identity.
+
+    A provider asked "where else is this certificate served" names the same host at
+    several addresses (a CDN name, a load balancer). Collapsing those rows would leave
+    the projection with one sighting and hide the other address from the deployment
+    rules, which score one address at a time.
+    """
+    payload = {
+        "observation_type": "certificate_response",
+        "subject": "edge.example.net",
+        "record_type": "TLS",
+        "value": "https://edge.example.net:443",
+        "metadata": {"ip": "198.51.100.7", "port": 443, "fingerprint_sha256": "a" * 64},
+    }
+    other = {**payload, "metadata": {**payload["metadata"], "ip": "198.51.100.8"}}
+    assert observation_key("shodan", payload) != observation_key("shodan", other)
+    # A re-scan of the same endpoint is the same observation, not a second one.
+    assert observation_key("shodan", payload) == observation_key(
+        "shodan", {**payload, "status": "current"}
+    )
+    # A value the platform does not recognise as an address cannot split the identity
+    # either: it is dropped, not used.
+    bare = {**payload, "metadata": {k: v for k, v in payload["metadata"].items() if k != "ip"}}
+    junk = {**payload, "metadata": {**payload["metadata"], "ip": "not-an-ip"}}
+    assert observation_key("shodan", bare) == observation_key("shodan", junk)
 
 
 def test_passive_dns_bounds_are_scoped_by_observation_window():

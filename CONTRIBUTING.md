@@ -100,6 +100,22 @@ report-store volumes. `make restore` is destructive too, and refuses without
 Backend targets run pytest with `COVERAGE_CORE=sysmon`; running pytest by hand
 without it mis-attributes coverage in async handlers and understates the result.
 
+A few tests need a live service: Redis for the scheduler's `SET NX` dispatch guard
+and the provider-quota Lua script, PostgreSQL for the row locks and the migrated
+schema. Inside the tooling stack they run; run by hand without that service they
+skip with the reason in the report — `live_redis` in `backend/tests/conftest.py`
+for the broker, `INTEGRATION_*` for PostgreSQL — and
+`make test-backend-integration` is where they are executed for real. Setting
+`REQUIRE_INTEGRATION=1`, as CI's `production-integration` job does, turns a missing
+service back into a failure, so a job that was given one cannot pass on tests that
+never ran.
+
+A test you add that opens a broker connection takes the `live_redis` fixture rather
+than reading `REDIS_URL` itself, and `backend/tests/test_broker_suites_gate.py`
+fails the build when one does not — including a test that reaches the client
+through a helper instead of calling it. PostgreSQL tests gate themselves the same
+way, on `INTEGRATION_DATABASE_URL`.
+
 ### Every target
 
 | Target | What it does | Needs `make up-tools`? |

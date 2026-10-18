@@ -88,8 +88,11 @@ class User(Base, UUIDMixin, TimestampMixin):
     mfa_locked_until: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
-    # bcrypt hashes of one-time recovery codes. The plaintext codes are returned
-    # exactly once after enrolment and are never persisted.
+    # One-time recovery codes, stored as digests: HMAC-SHA256 values keyed from
+    # the environment (`app/core/recovery_codes.py`), plus any bcrypt hash an
+    # account still holds from before that change — which verifies and is spent on
+    # use. The plaintext codes are returned exactly once after enrolment and are
+    # never persisted.
     mfa_recovery_codes: Mapped[list[str] | None] = mapped_column(
         JSON, nullable=True
     )
@@ -117,6 +120,29 @@ class User(Base, UUIDMixin, TimestampMixin):
         Boolean, default=False, server_default="false", nullable=False
     )
 
+    # --- Invitation (U-7) ------------------------------------------------------
+    # An account created without a password the administrator knows: the owner
+    # receives a single-use link, chooses their own password, and no shared secret
+    # ever travels through a chat or a mail thread. Only the digest is stored, so
+    # a database copy does not contain a usable link; the plaintext token is
+    # returned exactly once, to the administrator who created it.
+    invitation_token_hash: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, index=True
+    )
+    invitation_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
     reports: Mapped[list["Report"]] = relationship(
-        "Report", back_populates="created_by_user", cascade="all, delete-orphan"
+        "Report",
+        back_populates="created_by_user",
+        # The schema owns the outcome, not the ORM. ``reports.created_by`` is
+        # declared ``ON DELETE SET NULL``, so deleting an account leaves its
+        # reports in place and clears their creator. ``cascade="all,
+        # delete-orphan"`` said the opposite — it deleted the reports, and it did
+        # so for any report merely detached from its account — which made the
+        # database constraint advisory and the correct behaviour a property of
+        # one hand-written DELETE in the user router. ``passive_deletes`` hands
+        # the decision back to the constraint that is visible in the schema.
+        passive_deletes=True,
     )

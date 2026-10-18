@@ -11,14 +11,26 @@ Set ``INTEGRATION_MIGRATION_DATABASE_URL`` to a dedicated, migrated PostgreSQL
 database to run it. ``REQUIRE_INTEGRATION=1`` (what CI sets) turns a database
 that is missing into a failure instead of a skip, so a misconfigured job cannot
 report this file as green without having run it.
+
+AWI-06 lives here too: ``test_the_has_findings_filter_is_measured_on_postgres``
+is the measurement harness the assets plan requires before the filter's shape is
+changed. It seeds a dataset sized by ``ASSET_MEASURE_ASSETS`` (default 200) and
+``ASSET_MEASURE_FINDINGS`` (default 500), times the three service reads the plan
+names (``has_findings=true``, ``has_findings=false``, an unfiltered page) and
+prints ``EXPLAIN (ANALYZE, BUFFERS)`` for a page and for the candidate
+``NOT EXISTS`` semi-join. It asserts only that the plans were produced and the
+filter's answers are correct; timings are printed, never asserted. Run it with
+``-s`` and record the numbers (and the dataset size) in
+``docs/internal/assets-remediation-plan-2026-10-17.md`` §9.
 """
 
 import os
+import time
 import uuid
 from datetime import date, datetime, timezone
 
 import pytest
-from sqlalchemy import delete
+from sqlalchemy import delete, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.models import Asset
@@ -156,5 +168,189 @@ async def test_the_involvement_summary_and_filter_work_on_postgres():
             await db.execute(delete(SourceObservation).where(SourceObservation.id == exposure.id))
             await db.execute(delete(Finding).where(Finding.id == generic.id))
             await db.execute(delete(Asset).where(Asset.id.in_([involved.id, quiet.id])))
+            await db.commit()
+        await engine.dispose()
+
+
+#: AWI-06 dataset size. The default keeps CI bounded; an operator repeating the
+#: plan's measurement sets these to the documented 50000 and 1000000.
+_MEASURE_ASSETS = max(10, min(int(os.environ.get("ASSET_MEASURE_ASSETS", "200")), 50_000))
+_MEASURE_FINDINGS = max(
+    10, min(int(os.environ.get("ASSET_MEASURE_FINDINGS", "500")), 1_000_000)
+)
+
+
+async def _explain(db, label: str, statement: str) -> str:
+    """Print one ``EXPLAIN (ANALYZE, BUFFERS)`` and return the plan text."""
+    rows = (
+        await db.execute(text(f"EXPLAIN (ANALYZE, BUFFERS) {statement}"))
+    ).scalars().all()
+    plan = "\n".join(rows)
+    print(f"\n[AWI-06 {label}]\n{plan}")
+    # ANALYZE is what makes the numbers real; a plain EXPLAIN would end with the
+    # plan and no execution line, which is exactly the case a planner-only
+    # report would silently hide.
+    assert "Execution Time" in plan, f"EXPLAIN did not ANALYZE {label}"
+    return plan
+
+
+async def test_the_has_findings_filter_is_measured_on_postgres():
+    """AWI-06: the numbers that decide the filter's shape, on a real database.
+
+    The three service reads the plan names are timed on the same dataset
+    (``has_findings=true``, ``has_findings=false`` and a plain page), and the
+    page and candidate ``NOT EXISTS`` statements are printed as plans. The
+    harness asserts only that every plan was produced and that the filter's
+    answers are still correct — a wall-clock threshold on shared CI hardware
+    would fail for reasons unrelated to the query. The numbers belong in the
+    plan's §9.1, with the dataset size, because the absolute milliseconds depend
+    on the host.
+    """
+    from app.models.phishing import PhishingDomain
+
+    engine = create_async_engine(_DATABASE_URL)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    marker = f"measure-{uuid.uuid4().hex[:8]}"
+    involved_value = f"{marker}-involved.example"
+    quiet_value = f"{marker}-quiet.example"
+    involved = Asset(
+        asset_type="domain",
+        asset_value=involved_value,
+        normalized_value=involved_value,
+        is_active=True,
+    )
+    quiet = Asset(
+        asset_type="domain",
+        asset_value=quiet_value,
+        normalized_value=quiet_value,
+        is_active=True,
+    )
+    link = PhishingDomain(
+        phishing_domain=f"look-alike-{marker}.example",
+        matched_asset=involved_value,
+        detection_source="dnstwist",
+    )
+    try:
+        async with factory() as db:
+            db.add_all([involved, quiet, link])
+            await db.commit()
+            # The filler is written set-based rather than as ORM objects: the
+            # plan's dataset is 50k assets and 1M findings, and a million
+            # `PhishingDomain` instances would cost more memory than the query
+            # under measurement. `generate_series` is PostgreSQL-only, which is
+            # what this file already requires. Both tables carry server
+            # defaults for `id`, `created_at` and the row defaults below.
+            #
+            # The measurement database is a throwaway seed, so durability is not
+            # worth its cost here: with `synchronous_commit` on, flushing the
+            # million-row insert through the trigram index took longer than the
+            # dataset outlives. This affects only the seeding transaction.
+            await db.execute(text("SET LOCAL synchronous_commit = off"))
+            await db.execute(
+                text(
+                    "INSERT INTO assets (asset_type, asset_value, normalized_value) "
+                    "SELECT 'domain', "
+                    "       :marker || '-' || to_char(i, 'FM00000') || '.example', "
+                    "       :marker || '-' || to_char(i, 'FM00000') || '.example' "
+                    "FROM generate_series(1, :count) AS i"
+                ),
+                {"marker": marker, "count": _MEASURE_ASSETS},
+            )
+            # Findings are spread over the seeded assets, so the semi-join has to
+            # answer for a table that is much larger than the page and not
+            # trivially empty.
+            await db.execute(
+                text(
+                    "INSERT INTO drp_phishing_domains "
+                    "       (phishing_domain, matched_asset, detection_source) "
+                    "SELECT 'filler-' || :marker || '-' || to_char(i, 'FM000000') || '.example', "
+                    "       :marker || '-' || to_char((i % :count) + 1, 'FM00000') || '.example', "
+                    "       'dnstwist' "
+                    "FROM generate_series(1, :findings) AS i"
+                ),
+                {"marker": marker, "count": _MEASURE_ASSETS, "findings": _MEASURE_FINDINGS},
+            )
+            await db.commit()
+
+        async with factory() as db:
+            print(
+                f"\n[AWI-06 dataset] assets={_MEASURE_ASSETS + 2} "
+                f"phishing_findings={_MEASURE_FINDINGS + 1}"
+            )
+            # 1. The three reads the plan names, through the service the API
+            #    calls. Timed rather than EXPLAINed: the cost of the old filter
+            #    was mostly outside SQL (every asset row loaded into Python and
+            #    summarised), and a plan of `SELECT * FROM assets` would have
+            #    missed it entirely.
+            service = AssetService(db)
+
+            async def _timed(label: str, call) -> None:
+                started = time.perf_counter()
+                await call
+                elapsed = (time.perf_counter() - started) * 1000
+                print(f"\n[AWI-06 service {label}] {elapsed:.0f} ms")
+
+            await _timed(
+                "filter=true",
+                service.list_assets(has_findings=True, limit=20),
+            )
+            await _timed(
+                "filter=false",
+                service.list_assets(has_findings=False, limit=20),
+            )
+            await _timed("page", service.list_assets(limit=20))
+
+            # 2. A page of the list, which the filter wraps in an IN (...).
+            await _explain(
+                db,
+                "page",
+                "SELECT * FROM assets ORDER BY created_at DESC, id DESC LIMIT 20",
+            )
+            # 3. The candidate shape: one set-based NOT EXISTS, whose inner side
+            #    compares the expression `ix_drp_phishing_domains_matched_asset_key`
+            #    indexes. This is what AWI-07 would replace the inventory load with.
+            await _explain(
+                db,
+                "filter=candidate NOT EXISTS",
+                "SELECT a.id FROM assets a WHERE NOT EXISTS ("
+                "SELECT 1 FROM drp_phishing_domains p "
+                "WHERE lower(rtrim(trim(p.matched_asset), '.')) = "
+                "lower(rtrim(trim(coalesce(a.normalized_value, a.asset_value)), '.'))"
+                ")",
+            )
+
+            # The answers must stay correct whichever shape AWI-07 picks; asking
+            # for each seeded value keeps the assertion independent of the page
+            # size and of the number of fixture assets.
+            involved_true, _ = await service.list_assets(
+                has_findings=True, search=involved_value, limit=200
+            )
+            quiet_true, _ = await service.list_assets(
+                has_findings=True, search=quiet_value, limit=200
+            )
+            quiet_false, _ = await service.list_assets(
+                has_findings=False, search=quiet_value, limit=200
+            )
+            involved_false, _ = await service.list_assets(
+                has_findings=False, search=involved_value, limit=200
+            )
+
+            assert [asset.asset_value for asset in involved_true] == [involved_value]
+            assert quiet_true == []
+            assert [asset.asset_value for asset in quiet_false] == [quiet_value]
+            assert involved_false == []
+    finally:
+        async with factory() as db:
+            await db.execute(
+                delete(PhishingDomain).where(
+                    PhishingDomain.matched_asset.like(f"{marker}%")
+                )
+            )
+            await db.execute(
+                delete(PhishingDomain).where(
+                    PhishingDomain.phishing_domain.like(f"%{marker}%")
+                )
+            )
+            await db.execute(delete(Asset).where(Asset.asset_value.like(f"{marker}%")))
             await db.commit()
         await engine.dispose()

@@ -13,8 +13,10 @@
 # `scripts/check_dependency_sources.py` (CI job `repo-hygiene`) fails the build
 # if dependency tables reappear here or if a requirements pin is not exact.
 #
-# The `[tool.poetry]` table is kept for `version` only: it is one of the three
-# version readings `scripts/check_version_consistency.py` compares.
+# The `[tool.poetry]` table is kept for `version` only: it is one of the
+# version readings `scripts/check_version_consistency.py` compares (the others
+# are this app's `__version__`, the newest CHANGELOG entry, the connector SDK
+# and `frontend/package.json`).
 # ==============================================================================
 
 [tool.poetry]

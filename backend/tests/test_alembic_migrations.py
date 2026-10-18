@@ -141,6 +141,9 @@ async def test_clean_database_upgrades_to_head_and_seeds_required_registry(monke
             "dns_security_observations",
             "source_observations",
             "dns_expiry_monitors",
+            "tls_certificate_identities",
+            "tls_certificate_sightings",
+            "certificate_scope_exceptions",
             "ingestion_events",
             "source_accounts",
         } <= tables
@@ -171,6 +174,8 @@ async def test_clean_database_upgrades_to_head_and_seeds_required_registry(monke
                     ("dns-netlas", "dns", "dns.netlas"),
                     ("dns-rdap", "dns", "dns.rdap"),
                     ("dns-resolver", "dns", "dns.resolver"),
+                    ("dns-shodan", "dns", "dns.shodan"),
+                    ("dns-tlsprobe", "dns", "dns.tlsprobe"),
                     ("dns-virustotal", "dns", "dns.virustotal"),
                     ("exposure-netlas", "exposure", "exposure.netlas"),
                     ("phishing-dnstwist", "phishing", "phishing.dnstwist"),
@@ -198,11 +203,19 @@ async def test_clean_database_upgrades_to_head_and_seeds_required_registry(monke
             assert _json_value(shipped["dns-netlas"].config) == {}
             assert shipped["phishing-shodan"].config is None
             assert shipped["dns-virustotal"].config is None
+            # The provider-backed DNS workers are enabled by the profile that starts
+            # them, so each ships with no settings of its own for an operator to fill
+            # in: the credential lives on the account their quota is drawn from.
+            assert shipped["dns-shodan"].config is None
             assert shipped["phishing-dnstwist"].config is None
             assert shipped["phishing-dnstwist"].token_hash is None
             assert shipped["phishing-dnstwist"].status == "enabled"
 
             assert aliases["breaches-hibp"] == ["hibp", "hibp-breaches-default"]
+            #: The active probe carries no provider credential, so its row declares no
+            #: source account and no config: an operator turns it on by token alone.
+            assert shipped["dns-tlsprobe"].config is None
+            assert aliases["dns-tlsprobe"] == ["dns-tlsprobe", "tlsprobe-dns-security-default"]
             assert aliases["dns-rdap"] == ["dns-rdap", "rdap-dns-security-default"]
             assert aliases["dns-resolver"] == [
                 "dns-resolver",
@@ -213,6 +226,7 @@ async def test_clean_database_upgrades_to_head_and_seeds_required_registry(monke
                 "dns-virustotal",
                 "virustotal-dns-security-default",
             ]
+            assert aliases["dns-shodan"] == ["dns-shodan", "shodan-dns-security-default"]
             #: Every connector carries at least one alias. Together with the name
             #: they are the spellings a worker may authenticate under, so a label
             #: that stops being accepted breaks tokens and source identity without
@@ -230,6 +244,7 @@ async def test_clean_database_upgrades_to_head_and_seeds_required_registry(monke
                 )
             ).all()
             assert [(row.source_id, row.name) for row in accounts] == [
+                ("hibp", "default"),
                 ("netlas", "default"),
                 ("shodan", "default"),
                 ("virustotal", "default"),
@@ -257,18 +272,39 @@ async def test_clean_database_upgrades_to_head_and_seeds_required_registry(monke
             #: for an operator's key, an approved quota and explicit enablement.
             #: Shodan and VirusTotal are provider-backed too, and are enabled by
             #: the profile that starts them rather than by a seeded registry row.
-            assert len(opt_in) == 5
+            assert len(opt_in) == 7
             assert all(row.quota_group == "default" for row in opt_in)
             assert sorted(row.provider for row in opt_in) == [
+                "hibp",
                 "netlas",
                 "netlas",
                 "netlas",
+                "shodan",
                 "shodan",
                 "virustotal",
             ]
             assert sorted(
                 row.provider for row in opt_in if row.status == "disabled"
             ) == ["netlas", "netlas", "netlas"]
+            #: The breach worker reads a provider key, so it is one of the
+            #: provider-backed rows and is gated the same way: a scan waits for a
+            #: readiness row and an approved account instead of returning a short
+            #: list that reads like "no breaches". It ships enabled because the
+            #: account policy, not the row's status, is the approval step.
+            hibp = (
+                await connection.execute(
+                    text(
+                        "SELECT provider, quota_group, status, source_account_id "
+                        "FROM drp_connectors WHERE name = 'breaches-hibp'"
+                    )
+                )
+            ).one()
+            assert (hibp.provider, hibp.quota_group, hibp.status) == (
+                "hibp",
+                "default",
+                "enabled",
+            )
+            assert hibp.source_account_id is not None
             #: A fresh installation seeds the platform's own declarations and
             #: nothing else. Everything that carries an observation, a finding or
             #: a queue position starts empty, so the operator's first scan is the
@@ -277,6 +313,9 @@ async def test_clean_database_upgrades_to_head_and_seeds_required_registry(monke
                 "source_observations",
                 "dns_security_observations",
                 "dns_expiry_monitors",
+                "tls_certificate_identities",
+                "tls_certificate_sightings",
+                "certificate_scope_exceptions",
                 "drp_findings",
                 "drp_phishing_domains",
                 "drp_breaches",
@@ -393,6 +432,9 @@ async def test_full_migration_round_trip_to_base_and_back(monkeypatch):
             "dns_security_observations",
             "source_observations",
             "dns_expiry_monitors",
+            "tls_certificate_identities",
+            "tls_certificate_sightings",
+            "certificate_scope_exceptions",
             "ingestion_events",
             "source_accounts",
         } <= tables_at_head
@@ -505,7 +547,8 @@ async def test_asset_matching_order_and_search_indexes_exist(monkeypatch):
     column, and every page of the asset list orders by ``created_at, id`` — both
     were sequential scans (AST-17/18). Substring search (``ILIKE '%term%'``) keeps
     its own access path, a trigram GIN index (AST-19), which is why the
-    ``pg_trgm`` extension has to be installable by the migrating role.
+    ``pg_trgm`` extension has to be installable by the migrating role. The same
+    applies to the phishing list's three searched columns (AST-47).
     """
     monkeypatch.setattr(settings, "DATABASE_URL", _DATABASE_URL)
     engine = create_async_engine(_DATABASE_URL, poolclass=NullPool)
@@ -518,6 +561,12 @@ async def test_asset_matching_order_and_search_indexes_exist(monkeypatch):
     trigram_indexes = (
         "ix_assets_normalized_value_trgm",
         "ix_assets_asset_value_trgm",
+        # AST-47: the phishing list's substring search over the domain, the
+        # matched asset and the address. Without these every search reads the
+        # candidate table, exactly as the asset search did before its indexes.
+        "ix_drp_phishing_domains_phishing_domain_trgm",
+        "ix_drp_phishing_domains_matched_asset_trgm",
+        "ix_drp_phishing_domains_ip_address_trgm",
     )
     try:
         await asyncio.to_thread(_run_migration, "downgrade", "base")
@@ -568,6 +617,72 @@ async def test_asset_matching_order_and_search_indexes_exist(monkeypatch):
                 )
             ).scalar_one()
             assert installed == 1, "downgrade removed the shared pg_trgm extension"
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_the_candidate_scoring_schema_is_created_and_removed(monkeypatch):
+    """WI-07/WI-08: the scoring columns, the signal table and their indexes.
+
+    Scoring reads `confidence` on every page of the candidate list and on every
+    alert decision, and answers "why is this candidate at 85?" from
+    `phishing_candidate_signals` — so both have to exist after a real migration,
+    and the downgrade has to take them away again. The unit suite cannot see
+    either: it builds its schema from the same models the drift gate compares, and
+    this revision's dialect is not SQLite.
+    """
+    monkeypatch.setattr(settings, "DATABASE_URL", _DATABASE_URL)
+    engine = create_async_engine(_DATABASE_URL, poolclass=NullPool)
+    candidate_columns = {
+        "confidence",
+        "signals",
+        "digest_queued_at",
+        # WI-12 (W1.6): the manual verdict, its reason and its author.
+        "verdict",
+        "verdict_reason",
+        "verdict_by",
+        "verdict_at",
+    }
+    signal_columns = {
+        "id",
+        "candidate_id",
+        "name",
+        "value",
+        "confidence",
+        "observed_at",
+        "source",
+    }
+    indexes = {
+        "drp_phishing_domains": (
+            "ix_phishing_confidence",
+            "ix_phishing_domains_confidence_status",
+        ),
+        "phishing_candidate_signals": ("ix_phishing_candidate_signals_candidate",),
+    }
+    try:
+        await asyncio.to_thread(_run_migration, "downgrade", "base")
+        await asyncio.to_thread(_run_migration, "upgrade", "head")
+
+        assert candidate_columns <= await _column_names(engine, "drp_phishing_domains")
+        assert signal_columns <= await _column_names(
+            engine, "phishing_candidate_signals"
+        )
+        async with engine.connect() as connection:
+            for table, expected in indexes.items():
+                names = await connection.run_sync(
+                    lambda sync, table=table: {
+                        item["name"] for item in inspect(sync).get_indexes(table)
+                    }
+                )
+                missing = set(expected) - names
+                assert not missing, f"{table} is missing {sorted(missing)}"
+
+        # The child table goes first: dropping the candidate table with a signal
+        # row still referencing it is what a downgrade must not attempt.
+        await asyncio.to_thread(_run_migration, "downgrade", "base")
+        remaining = await _table_names(engine)
+        assert "phishing_candidate_signals" not in remaining
     finally:
         await engine.dispose()
 

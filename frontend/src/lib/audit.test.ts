@@ -148,6 +148,31 @@ describe("describeAuditEntry", () => {
     ).toBe("Viewed the findings of asset example.com");
   });
 
+  it("reads a certificate verdict as the decision and the address it was about", () => {
+    expect(
+      describeAuditEntry({
+        action: "tls.sighting.confirmed_foreign",
+        details: { ip: "198.51.100.7", port: 443, subject: "mail.example.com" },
+      }),
+    ).toBe("Confirmed that this certificate of ours is served by 198.51.100.7:443");
+    // A sighting a provider indexed without an address still names what it was about.
+    expect(
+      describeAuditEntry({
+        action: "tls.sighting.expected",
+        details: { ip: null, subject: "mail.example.com" },
+      }),
+    ).toBe("Marked as expected the certificate served at mail.example.com");
+    expect(describeAuditEntry({ action: "tls.sighting.rejected", details: null })).toBe(
+      "Rejected the evidence that we serve a certificate at an address a provider did not record",
+    );
+    expect(
+      describeAuditEntry({
+        action: "tls.exception.removed",
+        details: { match_value: "ab".repeat(32), match_kind: "fingerprint" },
+      }),
+    ).toBe(`Removed a certificate scope exception: ${"ab".repeat(32)}`);
+  });
+
   it("keeps the values of an action it does not know", () => {
     // The graceful path: a module or connector added later still produces a
     // readable line, never a bare code and never nothing at all.
@@ -173,6 +198,24 @@ describe("describeAuditEntry", () => {
       expect(action).toMatch(/^[a-z][a-z0-9._]*$/);
     }
     expect(describedActions().length).toBeGreaterThanOrEqual(ACCOUNT_SECURITY_ACTIONS.length);
+  });
+});
+
+describe("user.unlocked", () => {
+  it("says whether the account was activated or a lockout was lifted", () => {
+    // Both operations write one action name; the method is what happened.
+    expect(
+      describeAuditEntry({
+        action: "user.unlocked",
+        details: { target_email: "a@example.com", method: "brute_force_unlock" },
+      }),
+    ).toContain("Unlocked user");
+    expect(
+      describeAuditEntry({
+        action: "user.unlocked",
+        details: { target_email: "a@example.com", method: "api_update" },
+      }),
+    ).toContain("Activated user");
   });
 });
 

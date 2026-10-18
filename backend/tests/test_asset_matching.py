@@ -156,6 +156,29 @@ class TestSqlPredicates:
         assert email_suffix_predicate(Breach.matched_email, ["2001:db8::1"]) is None
         assert email_suffix_predicate(Breach.matched_email, ["example.com"]) is not None
 
+    def test_the_email_to_domain_rule_is_an_indexable_equality(self):
+        """AST-46: the rule must not be a correlated ``LIKE '%@' || key``.
+
+        That form compares the address against an expression built from the
+        asset row, so no index on the breach table can serve it. The equality on
+        ``EmailDomain`` is the form ``ix_drp_breaches_matched_email_domain``
+        indexes.
+        """
+        from sqlalchemy.dialects import postgresql
+
+        from app.models.breach import Breach
+
+        compiled = str(
+            email_suffix_predicate(Breach.matched_email, ["example.com"]).compile(
+                dialect=postgresql.dialect(),
+                compile_kwargs={"literal_binds": True},
+            )
+        )
+        # The domain part is an expression the index covers, not a pattern built
+        # from the asset key (the old form's `'%@' || asset_key`).
+        assert "split_part" in compiled
+        assert "||" not in compiled
+
 
 class TestTheThreeCallersAgree:
     """The DoD of WI-08: resolver, cascade and cleanup answer the same question."""
@@ -321,6 +344,29 @@ class TestTheThreeCallersAgree:
         assert await AssetService(db_session).clean_orphan_breach_findings() == 1
         remaining = list((await db_session.execute(select(Breach.id))).scalars())
         assert remaining == [unicode_row.id]
+
+    @pytest.mark.asyncio
+    async def test_a_unicode_mailbox_at_a_punycode_domain_is_not_orphaned(self, db_session):
+        """The indexed branch keeps exactly the rows the correlated one kept.
+
+        SQL compares the lowercased domain part and cannot convert IDNA, so the
+        punycode asset and the Unicode address only meet in the Python re-check.
+        The equality form must therefore narrow candidates without ever deleting
+        a row that check would call linked.
+        """
+        from sqlalchemy import select
+
+        from app.models.breach import Breach
+        from app.services.asset_service import AssetService
+
+        await self._asset(db_session, value="xn--mnchen-3ya.de")
+        kept = await self._breach(db_session, matched_email="Analyst@münchen.de")
+        orphan = await self._breach(db_session, matched_email="analyst@nowhere.test")
+
+        assert await AssetService(db_session).clean_orphan_breach_findings() == 1
+        remaining = list((await db_session.execute(select(Breach.id))).scalars())
+        assert remaining == [kept.id]
+        assert orphan.id not in remaining
 
     @pytest.mark.asyncio
     async def test_cleanup_deletes_more_rows_than_one_batch(self, db_session, monkeypatch):

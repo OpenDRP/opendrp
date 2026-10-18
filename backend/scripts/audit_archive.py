@@ -17,12 +17,22 @@ async def export(limit):
         return await archive_prefix(db, cutoff=datetime.now(timezone.utc) - timedelta(days=settings.AUDIT_RETENTION_DAYS), limit=limit)
 
 
-def main(argv=None):
+def build_parser():
+    """The command line this script accepts, as an object a caller can inspect.
+
+    Separate from `main` so the documentation gate can compare what a page tells
+    an operator to type with the flags that exist.
+    """
     parser = argparse.ArgumentParser(description=__doc__)
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--verify", type=Path, metavar="MANIFEST")
     group.add_argument("--export-expired", action="store_true")
     parser.add_argument("--limit", type=int, default=1000)
+    return parser
+
+
+def main(argv=None):
+    parser = build_parser()
     args = parser.parse_args(argv)
     if not 1 <= args.limit <= 10000:
         parser.error("limit must be 1..10000")

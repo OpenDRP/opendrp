@@ -58,6 +58,7 @@ operator-side equivalents are JWT-authenticated and documented in the
 | `POST` | `/connectors/register` | `register()` — at start-up |
 | `GET` | `/connectors/me/work` | `poll_work()` — claims one job, `204` when idle |
 | `POST` | `/connectors/me/findings/{job_id}` | `submit_findings()` |
+| `POST` | `/connectors/me/catalogue/{job_id}` | `submit_catalogue()` — a source's own incident catalogue |
 | `POST` | `/connectors/me/complete/{job_id}` | `complete()` / `report_failure()` |
 | `POST` | `/connectors/me/heartbeat` | `heartbeat()` and the job-lease loop |
 | `POST` | `/connectors/me/quota/provider` | `reserve_provider_request(bucket)` |
@@ -77,15 +78,22 @@ connector's row (registration upserts by name).
 {
   "name": "phishing-dnstwist",
   "connector_type": "phishing",
-  "api_version": "1.2.0",
+  "api_version": "0.2.0",
   "protocol_version": 2,
-  "info": {"version": "1.2.0", "python": "3.12.11", "hostname": "…", "platform": "linux"},
+  "info": {"version": "0.2.0", "python": "3.12.11", "hostname": "…", "platform": "linux"},
   "default_job_type": "phishing.dnstwist",
   "finding_kind": "phishing",
   "asset_types": ["domain"],
   "config_schema": {"scan_certificates": {"type": "bool", "label": "…", "default": true}}
 }
 ```
+
+`api_version` (and `info.version`) is the release the worker was built from:
+connector images are built and tagged with the platform's own version, the SDK
+defaults the value to its `SDK_VERSION`, and the core records it on the row as
+the version of the build that last registered. `protocol_version` is a different
+thing — an integer describing the shape of this protocol — and
+`scripts/check_version_consistency.py` compares the release, not the protocol.
 
 The response is the connector's registry row — including `token_prefix`, the
 public prefix of the credential in use, and never its digest. Registering again
@@ -121,7 +129,12 @@ is the one thing a worker must never do.
 
 ### `POST /connectors/me/findings/{job_id}`
 
-Header `X-Connector-Lease: <lease_token>`, body a JSON **array** of findings.
+Headers `X-Connector-Lease: <lease_token>`, optional `X-Connector-Batch-Index`
+and `X-Connector-Batch-Total`, body a JSON **array** of findings. The SDK numbers
+every batch of a job and sends the total when it submits a complete list, so the
+core's audit rows for one scan are an ordered sequence with a denominator; a
+worker that streams as it scans sends the index and leaves the total out rather
+than guessing.
 The batch is bounded at 500 items (a longer array is `400`), and every item is
 validated against the finding kind the connector's own manifest declares before
 anything is persisted — a payload outside that schema is refused, never reshaped.
@@ -141,6 +154,49 @@ could help:
 
 The SDK treats `rejected > 0` or `accepted != <batch length>` as a protocol error
 and fails the job, so a silent partial write cannot be reported as a clean scan.
+
+`DEFAULT_SUBMIT_BATCH` (500) is what the SDK uses when `run_scan` returns findings
+instead of submitting them itself, and `submit_findings` refuses a larger body
+locally rather than letting the core reject it whole. A worker may choose a
+smaller batch, but the reason has to be stated, because each batch costs one HTTP
+request and one audit row: dnstwist returns its findings and takes the default;
+shodan streams 25-row batches while paginating a wide search and the DNS Security
+workers submit 50 observations at a time, both so a long scan shows progress; HIBP
+submits its paste and stealer-log phases in 200-row batches so a sweep cut short
+by the scan budget keeps every batch already delivered, and its catalogue path
+uses `DEFAULT_CATALOGUE_BATCH` (the core's own 500).
+
+### `POST /connectors/me/catalogue/{job_id}`
+
+Header `X-Connector-Lease: <lease_token>`, body a JSON **array** of catalogue
+entries — the incidents a source knows about, whether or not any address of the
+platform's is in them. Bounded at 500 items per batch, validated against the
+entry schema before anything is stored, and answered with the diff the **core**
+computed:
+
+```json
+{"received": 200, "created": 3, "updated": 1, "unchanged": 196, "new_incidents": 1, "empty": false}
+```
+
+The diff is the core's because the provider has no "added since" question to
+ask: a worker reads the catalogue (HIBP answers `/breaches` with its whole corpus,
+so the worker bounds how many entries it stores with `max_catalogue_entries`) and
+the platform decides which incidents it has never seen. The job's params carry the
+checkpoint to sweep against, under `params.catalogue`:
+
+```json
+{"catalogue": {"source": "hibp", "incidents": 812, "last_synced_at": "2026-10-16T03:00:00+00:00", "stale": false}}
+```
+
+With `last_synced_at` set, a worker asks the cheap question first (HIBP's
+`/latestBreach`) and only sweeps when the answer is newer than the checkpoint; with
+it `null` — a source this installation has never synced — the sweep is what tells
+the core where it stands. `new_incidents` counts the entries that named a domain
+somebody monitors and had never been stored before: each one queues **one**
+notification, before an address of that domain has been scanned, and a repeated
+sweep of the same catalogue announces nothing. `empty: true` is the source
+answering a catalogue with nothing in it, which is not the same sentence as "this
+domain is clean" — the platform keeps both apart on purpose.
 
 ### `POST /connectors/me/complete/{job_id}`
 
@@ -212,6 +268,30 @@ names are namespaced lowercase identifiers and are deduplicated core-side. A
 later readiness signal does **not** erase a recent actionable error unless the
 connector reports `credential_state: "valid"`, so an idle report cannot quietly
 clear a real failure. Response: `{"status": "ok", "enabled": true}`.
+
+A connector may also publish **the source's own names for the classes of data it
+reports**, which is how a page shows a provider's vocabulary instead of one this
+platform invented:
+
+```json
+{"data_class_labels": {"Passwords": "Passwords", "Browser histories": "Browser histories"}}
+```
+
+It is optional — a source that publishes none contributes nothing and the reader
+falls back to the stored name — bounded (200 entries, 128 characters a key and 256
+a label), merged across the module's enabled connectors, and never vendor-specific
+in the core: the field is a map of plain strings, so the same payload serves a
+breach source, a phishing source or one this release has never seen.
+
+The *shape* is the SDK's, not each worker's: `ConnectorBase.report_readiness()`
+builds it from `CAPABILITIES`, `OPERATIONS` and `CREDENTIAL_ENV`, and every
+shipped worker declares at start-up and again after a scan (once per job: a
+worker that already reported mid-scan does not post twice). A worker with no
+provider key declares an empty `CREDENTIAL_ENV` — dnstwist is compute-only — so
+`credentials_configured: false` there means "this source needs none" rather than
+"somebody forgot the key". `tests/test_connector_readiness_contract.py` runs all
+six workers through this contract, including that a refused readiness post never
+fails the scan that produced findings.
 
 ### `GET /connectors/me/control`
 
@@ -359,15 +439,31 @@ docker compose logs --tail=50 backend | grep connector_credential_rejected
 That line is the fastest way to answer "which key stopped working", because the
 label it reads is what an operator typed wrong, not what a connector claimed.
 
+**The health page answers two different questions.** `GET /api/v1/connectors/health`
+reports, per connector, what the worker said about itself and what the core decided
+about its account. The worker's report is `readiness` (`credential_state`,
+`provider_error`, declared capabilities); the core's decision is `blocked_reason`,
+admin-only like `last_error`, which is `provider_account_missing` when a provider
+connector has no bound source account, `account_policy_unapproved` when the account
+exists but no operator approved it, and `null` otherwise — including for a
+compute-only worker such as dnstwist, which needs no key. The same response also
+carries `quota_remaining`, `quota_budget` and `quota_reason`, read from the
+account's own counter rather than from the provider, so an operator checking health
+spends no request; `quota_reason` names `provider_account_missing` or
+`quota_backend_unavailable` instead of showing a fake zero. The four keys stay
+present and null for a viewer.
+
 ## Enabling connectors
 
 Connectors are enabled by defining their container in `docker-compose.yml`
-(twelve connector services ship pre-configured) and controlled at runtime from
-the **Settings → Connectors** panel. Four of them are part of the installation,
+(fourteen connector services ship pre-configured) and controlled at runtime from
+the **Settings → Connectors** panel. Five of them are part of the installation,
 because they need no provider credential: `connector-phishing-dnstwist`,
-`connector-dns-rdap`, `connector-dns-resolver` and `connector-dns-ctlogs`. The
-other eight are gated by a Compose profile, so a keyed worker is never created
-until the operator asks for it: `connector-phishing-shodan` by `shodan`,
+`connector-dns-rdap`, `connector-dns-resolver`, `connector-dns-ctlogs` and
+`connector-dns-tlsprobe`. The
+other nine are gated by a Compose profile, so a keyed worker is never created
+until the operator asks for it: `connector-phishing-shodan` and
+`connector-dns-shodan` by `shodan`,
 `connector-breaches-hibp` by `hibp`, `connector-phishing-netlas`,
 `connector-dns-netlas` and `connector-exposure-netlas` by `netlas`,
 `connector-exposure-netlas-endpoints` by `netlas-endpoints`,
@@ -379,21 +475,27 @@ Connector-specific secrets are passed via `.env` (never hardcoded):
 | Variable | Used by | Purpose |
 |---|---|---|
 | `CONNECTOR_TOKEN` | all | this connector's own credential (issued by the core for it, per connector) |
-| `SHODAN_API_KEY` | phishing-shodan | Shodan API key |
-| `HIBP_API_KEY` | breaches-hibp | HaveIBeenPwned API key |
+| `SHODAN_API_KEY` | phishing-shodan, dns-shodan | Shodan API key (the DNS worker prefers a key stored on its approved source account) |
+| `HIBP_API_KEY` | breaches-hibp | HaveIBeenPwned API key; a key stored on this connector's provider account takes precedence and this is the fallback |
 | `SHODAN_SCAN_SSL_TEXT` | phishing-shodan | fallback default for the `scan_ssl_text` capability |
 | `SHODAN_SCAN_HTTP_TITLE` | phishing-shodan | fallback default for the `scan_http_title` capability |
 | `SHODAN_SCAN_FAVICON` | phishing-shodan | fallback default for the `scan_favicon` capability |
-| `SHODAN_MIN_REQUEST_INTERVAL_SECONDS` | phishing-shodan | minimum delay between sequential provider requests (default `1`; increase for a stricter plan/quota) |
-| `SHODAN_REQUEST_TIMEOUT_SECONDS` | phishing-shodan | per-request provider timeout (default `30`, bounded to `5..120`) |
+| `SHODAN_SCAN_HTTP_BODY`, `SHODAN_SCAN_CERT_SUBJECT`, `SHODAN_SCAN_HTML_HASH`, `SHODAN_SCAN_PIVOTS`, `SHODAN_SCAN_HOST_LOOKUP` | phishing-shodan | fallback defaults for the five capabilities added with the budget wave; all default to `false` because each spends query credits on a question an operator confirms against their own account first |
+| `SHODAN_MIN_REQUEST_INTERVAL_SECONDS` | phishing-shodan, dns-shodan | minimum delay between sequential provider requests (default `1`; increase for a stricter plan/quota) |
+| `SHODAN_REQUEST_TIMEOUT_SECONDS` | phishing-shodan, dns-shodan | per-request provider timeout (default `30`, bounded to `5..120`) |
 | `DNS_NAMESERVERS` | phishing-dnstwist, dns-resolver | optional comma-separated resolver IPs; empty uses the Docker/system resolver; DNS Security allows at most 8 |
-| `DNSTWIST_FUZZERS` | phishing-dnstwist | bounded comma-separated fuzzer list; the expensive full set is opt-in |
-| `DNSTWIST_TLD_DICTIONARY` | phishing-dnstwist | optional TLD dictionary path; disabled by default because it greatly expands DNS work |
+| `DNSTWIST_FUZZER_CLASSES` | phishing-dnstwist | comma-separated technique classes (`typo`, `idn`, `bitsquatting`, `plural`, `subdomain`, `dictionary`, `various`, `tld`); a class brings its fuzzer *and* the dictionary the CLI requires beside it; default `typo`, the expensive classes are opt-in |
+| `DNSTWIST_TLD_DICTIONARY` | phishing-dnstwist | optional TLD dictionary for the `tld` class; empty means the packaged `common_tlds.dict`, and a missing file is a named per-domain skip |
+| `DNSTWIST_DICTIONARY` | phishing-dnstwist | optional word list for the `dictionary` class; empty means the packaged `english.dict` |
+| `DNSTWIST_MAX_CANDIDATES` | phishing-dnstwist | how many permutations one domain may ask about (1-5000, default `250`); applied before resolution, where it costs no DNS request, and reported as `domains_truncated` |
+| `DNSTWIST_MX_CHECK` | phishing-dnstwist | pass `--mxcheck` and ask the candidate's TXT records for SPF, so `mx_without_spf` is reported from an answer the platform has (default `false`: it connects to the candidate's mail server) |
+| `DNSTWIST_CONTENT_INSPECTION` | phishing-dnstwist | pass `--lsh tlsh` for page similarity (default `false`); reported as `content_inspection_unavailable` when the TLSh module is not in the image, and `--phash`/screenshots are never used |
 | `DNSTWIST_THREADS` | phishing-dnstwist | subprocess concurrency, clamped to 1-32 (default 8) |
 | `DNSTWIST_TIMEOUT_SECONDS` | phishing-dnstwist | per-scan subprocess timeout in seconds (default `120`) |
 | `INTELLIGENCE_PROVIDER` | phishing-netlas, dns-netlas, exposure-netlas | selects the passive-intelligence provider (`netlas`); any other value refuses to start |
 | `EXPOSURE_PROVIDER` | exposure-netlas-endpoints, exposure-shodan-endpoints | selects the endpoint-lookup provider (`netlas` or `shodan`); any other value refuses to start |
 | `NETLAS_API_TOKEN` | phishing-netlas, dns-netlas, exposure-netlas, exposure-netlas-endpoints | Netlas API token, read by the workers that speak to Netlas |
+| `INTELLIGENCE_HTTP_BODY_ACKNOWLEDGED` | phishing-netlas | the operator's statement that the plan permits `http.body` searches; without it the question is refused and counted as `licence_acknowledgement_required` (F-12) |
 | `CONNECTOR_TOKEN_NETLAS_PHISHING`, `CONNECTOR_TOKEN_NETLAS_DNS_SECURITY`, `CONNECTOR_TOKEN_NETLAS_EXPOSURE`, `CONNECTOR_TOKEN_EXPOSURE_NETLAS_ENDPOINTS`, `CONNECTOR_TOKEN_EXPOSURE_SHODAN_ENDPOINTS` | the matching Netlas or endpoint worker | that worker's own core credential (see the tables below) |
 
 A connector-scoped setting is namespaced after its connector (`SHODAN_*`,
@@ -406,16 +508,23 @@ its reason, is `DNS_NAMESERVERS`.
 ### DNS Security workers
 
 The module id is `dns` (the earlier `dns_security` stays a recognized alias), and
-all four services share the DNS Security image: RDAP, resolver and CT Logs start
-with the installation, VirusTotal is gated by the `virustotal` profile. They consume active `domain` assets
-and submit `dns_observation` payloads, not phishing threats or generic findings.
+all six services share the DNS Security image: RDAP, resolver, CT Logs and the
+keyless TLS probe start
+with the installation, while VirusTotal is gated by the `virustotal` profile and
+the Shodan confirmation worker by `shodan` (shared with `phishing-shodan`). They
+consume active `domain` assets
+and submit `dns_observation` payloads, not phishing threats or generic findings;
+`dns-shodan` also consumes active `ip_address` assets, because it asks the index
+about our own addresses as well as their names.
 
 | Identity | Service | Core token variable |
 |---|---|---|
 | `dns-rdap` | `connector-dns-rdap` | `CONNECTOR_TOKEN_DNS_RDAP` |
 | `dns-resolver` | `connector-dns-resolver` | `CONNECTOR_TOKEN_DNS_RESOLVER` |
 | `dns-ctlogs` | `connector-dns-ctlogs` | `CONNECTOR_TOKEN_DNS_CTLOGS` |
+| `dns-tlsprobe` | `connector-dns-tlsprobe` | `CONNECTOR_TOKEN_DNS_TLSPROBE` |
 | `dns-virustotal` | `connector-dns-virustotal` | `CONNECTOR_TOKEN_DNS_VIRUSTOTAL` |
+| `dns-shodan` | `connector-dns-shodan` | `CONNECTOR_TOKEN_DNS_SHODAN` |
 
 For each desired source, issue a credential with `--type dns`, save its
 one-time output in the corresponding local `.env` entry, configure provider
@@ -433,11 +542,16 @@ CT's optional `DNS_SECURITY_CTLOGS_API_TOKEN` is a **provider** Bearer token,
 not the core worker token above. VirusTotal requires `DNS_SECURITY_VT_API_KEY`
 and the explicit `DNS_SECURITY_VT_PUBLIC_NONCOMMERCIAL=true` acknowledgement;
 its public tier cannot be used for business purposes. Both provider credentials
-stay in the matching worker, never the core settings. Resolver knobs are
+stay in the matching worker, never the core settings. `dns-shodan` reads
+`SHODAN_API_KEY` as a fallback and prefers the key stored on its approved source
+account; its per-scan budgets (`max_host_lookups`, `max_searches`) are connector
+settings, not environment variables. The TLS probe's allowlist and budget are
+`DNS_SECURITY_TLS_PORTS`, `DNS_SECURITY_TLS_PATH` and
+`DNS_SECURITY_TLS_MAX_PROBES`. Resolver knobs are
 `DNS_SECURITY_RESOLVER_TIMEOUT_SECONDS` and `DNS_SECURITY_RESOLVER_EXTENDED`.
 
 [Full DNS setup, rotation, verification and API guide](../docs/dns-security.md)
-includes all four issuance commands, the complete environment table, quota
+includes all six issuance commands, the complete environment table, quota
 limits and pending-job troubleshooting. A running worker can claim previously
 queued work immediately. Disable unused sources in Settings to stop schedules
 from queueing them; stopping a container does not disable its registry row.
@@ -480,8 +594,147 @@ key can exercise. `SHODAN_MIN_REQUEST_INTERVAL_SECONDS` exists because a stricte
 tier enforces its own rate limit — raise it rather than discovering the limit as
 `429`s.
 
-**HIBP.** For validating an installation without a subscription, HIBP publishes
-an integration key that only ever returns fixture data:
+**HIBP.** The worker asks the core for the key bound to its provider account
+(`GET /connectors/me/credential`) at registration and at the start of every scan,
+so a rotated key takes effect on the next scan rather than on the next container
+recreation; `HIBP_API_KEY` answers when no account is bound, which is how the
+worker ran before accounts existed. Binding one is what makes the account's
+budget the authority: with an account the worker reserves one `lookup` per
+provider request against that account's minute/day/job budget and stops the scan
+with a named reason when the account refuses — exhausted, revoked or disabled —
+whereas an environment key is a budget nobody can see and is therefore not
+reserved against at all. The readiness row it publishes says whether a key exists
+and what the last scan saw of it (`valid`, `invalid` on a `401`), so a source that
+cannot scan is distinguishable from an incident that was not found.
+
+Every scan opens by asking the account two questions — `/subscription/status` and
+`/subscribedDomains` — because both answers are about the *key* rather than about
+an address, and both are provider requests like any other: paced, counted, and
+reserved against the account. The subscription's `Rpm`, when it states one, is a
+ceiling on the operator's `requests_per_minute` and never a replacement for it:
+the minimum of the two is applied, and the summary reports both under `pacing`
+with `adjusted: true` when they differed. An answer without an `Rpm`, or one that
+could not be read, leaves the operator's pace alone: a field that is absent is not
+a pace of zero, and it is not a guess either. A `403` on `/breacheddomain` is then
+told apart by `/subscribedDomains`: a domain the account has verified but the plan
+refuses is `domain_outside_allowance`, a domain it has not verified is
+`domain_not_verified`, and a domain list that could not be read at all leaves the
+refusal unnamed (`domain_access_denied`). Each refused domain appears in the job
+summary as `domains_unscanned: [{"domain", "reason"}]` and in `skipped_reasons`,
+so a page or a job reader cannot present "we were not allowed to ask" as "there
+is nothing to find". What the scan was entitled to (`SubscriptionName`, `Rpm`,
+`IncludesStealerLogs`, `IncludesKAnon`, the number of verified domains) rides in
+the same summary as `provider_readiness` and reaches the page through
+`GET /api/v1/breaches/provider-readiness`, which reports the *scan's* own account
+of itself rather than asking the provider again — the page and the job history
+read the same run, and an installation whose sources are something other than this
+worker gets the same endpoint.
+
+Once per worker, and not once per scan, the worker asks `/dataClasses/descriptions`
+for the source's own names for the classes of data it reports and republishes them
+in its readiness row as `data_class_labels`: the platform then renders a stored
+class through the provider's wording instead of a label it made up, and a source
+that answers with nothing leaves the stored name in place rather than failing the
+scan.
+
+The scan then reads the source's own incident catalogue, before it asks about a
+single address: `/latestBreach` when the core's checkpoint says this source has been
+synced before, and `/breaches` when the answer is newer than the checkpoint or when
+there is no checkpoint at all. Both are `search` requests rather than `lookup` ones —
+they are questions about the provider's whole corpus, not about one identifier — and
+both reserve against the account like everything else. The provider answers `/breaches`
+with its entire corpus in one body, so the worker bounds what it stores per sweep with
+the operator-editable `max_catalogue_entries` (default 2000) and reports
+`catalogue.truncated: true` plus a `catalogue_truncated` skip reason when the bound was
+reached, rather than passing a short catalogue off as the whole of it. Between sweeps a
+scan pays one request, and a scan whose catalogue phase was refused reports
+`catalogue.status: "failed"` — an unanswered sweep is never an empty catalogue.
+
+Two more classes of exposure ride in the same module, because they are findings about
+the same identifiers and belong on the same page, schedule and notification path rather
+than in modules of their own.
+
+**Pastes (WI-17).** One `/pasteAccount/{email}` request per monitored address, and one
+finding per paste: `exposure_kind: "paste"`, `breach_name: "paste:<id>"`, the paste's own
+`Date` as `breach_date`, and `attributes.paste_source` / `paste_id` / `paste_title` /
+`paste_email_count` / `paste_date` for the rest. The dedup key does not change — an id
+is part of the name, so a second paste of the same address is a second row — and an
+entry without an `Id` is counted (`paste_without_id`) rather than stored, because two
+nameless pastes would collapse into one row. A refused lookup is reported
+(`pastes.unavailable`) and makes the job `partial`: an unanswered question is not an
+address with no pastes.
+
+**Stealer logs (WI-18).** `/stealerLogsByEmail/{email}` for addresses and
+`/stealerLogsByEmailDomain/{domain}` for monitored domains, each answering with website
+names: one finding per site, `exposure_kind: "stealer_log"`, `breach_name:
+"stealerlog:<site>"`, the site in `domain` and `attributes.stealer_log_site`. The routes
+return no incident, date, count or data classes, so the finding declares
+`metadata_incomplete` and the core stores the observation instant instead of inventing
+any of them. The pass is off unless the operator turns on `stealer_logs_enabled`, and it
+still asks nothing unless `/subscription/status` explicitly said
+`IncludesStealerLogs: true` — an unknown answer is not permission — reporting
+`stealer_logs.reason` as `disabled`, `not_in_subscription` or `subscription_unknown`.
+Inside `stealer_logs_interval_hours` (default 168) the scan says `not_due` and spends
+nothing; the moment travels in the job's `params.stealer_logs.last_seen_at`, which the
+core reads from the rows it holds, so a restarted worker does not repeat the week. The
+domain route waits on a second, lower bucket
+(`stealer_logs_domain_requests_per_minute`, default 3) in addition to the key's pace,
+and `max_stealer_log_sites_per_asset` (default 50) bounds what one address may
+contribute; the rest is counted as `sites_over_limit`, never silently dropped.
+
+**Address searches without the address (WI-19).** When `/subscription/status` states
+`IncludesKAnon: true`, the breach lookup stops being `/breachedaccount/{email}` and
+becomes `/breachedaccount/range/{prefix}`: only the first six characters of the SHA-1 of
+the address travel, the response is a bucket of `{hashSuffix, websites}` entries, and the
+row is built from the entry whose suffix is ours — a prefix is shared by every account in
+it, so matching without the suffix would attribute a stranger's incidents to us. Each
+named incident is then read from the catalogue (`/breach/{name}`, once per incident per
+scan) and normalized by the same function as before, so both forms store the same rows;
+the summary reports which form ran under `email_lookup.form`, whose decision it was
+(`reason`: `disabled_by_operator`, `not_in_subscription`, `subscription_unknown`), and
+what the bucket did (`range.prefixes_asked`, `matched`, `unmatched`, `case_retries`,
+`metadata_missing`). Two consequences are stated rather than left to be discovered: a
+range answer that was refused is **never** replaced by the address form (`emails_unavailable`
+is counted and the job is `partial`), and the paste route — `/pasteAccount/{email}` — is
+address-shaped with no hash equivalent, so it is listed in `email_lookup.address_routes`
+and can be turned off with `pastes_enabled: false`, which is what makes "no address leaves
+in a URL" an achievable state. The provider does not document how the address is
+normalized before hashing; a mixed-case address whose lowercased digest matches nothing is
+asked once more with the raw-case digest, so the ambiguity costs one request rather than a
+silent "not breached".
+
+**Enrolling a domain (WI-20).** A domain the account has not verified is one a scan
+cannot ask about, so the platform can carry that step as a job like any other: the core
+queues a normal `breaches.<source>` job whose `params.domain_verification` names one
+`action` and one `domain`, with `emails` and `domains` empty so a worker that ignored the
+flag could not quietly scan anything. The worker answers in its summary under
+`domain_verification: {action, domain, status, reason, txt_record_value}`:
+
+| `status` | means | what the operator does next |
+|---|---|---|
+| `generated` | the source issued a record | publish `txt_record_value` **exactly** as stated, then ask for a `verify` |
+| `verified` | the source accepted the published record | nothing — the next scan may ask about the domain |
+| `not_verified` | the record is not visible yet | wait for DNS; a `400` here is propagation, not a failure |
+| `failed` | the question could not be asked or answered | read `reason` |
+
+`reason` is a word from the worker's own vocabulary (`invalid_credentials`,
+`access_denied`, `unknown_domain`, `rate_limited`, `provider_refused`, `not_answered`,
+`malformed_answer`, `token_not_found`, `no_credential`), never the provider's prose: the
+same field reaches the page and the job history, and a refusal is described once. The
+value is passed through rather than reformatted, because a record that differs from what
+the source stated by one character verifies nothing. A verification stores no finding —
+it changes what a *later* scan is allowed to ask — so `GET /api/v1/breaches/provider-readiness`
+reports the newest attempt per domain under `verifications` and leaves the scan's own
+domains, pace and entitlements alone.
+
+Deliberately not called is `/stealerLogsByWebsiteDomain/{domain}`. It answers with the
+*accounts* of a website rather than with the sites an identifier appears on, so using it
+would import third-party addresses of a monitored site into the inventory in bulk — a
+privacy decision this platform does not make on an operator's behalf, and one the row
+model (a site in `attributes`) was not designed for.
+
+For validating an installation without a subscription, HIBP publishes an
+integration key that only ever returns fixture data:
 
 ```text
 HIBP_API_KEY=00000000000000000000000000000000
@@ -494,19 +747,106 @@ domain lookup returns the fixtures for that domain. Both are the addresses HIBP
 documents for its integration tests, and the key is a test identity rather than
 a secret — real results need a real key from the HIBP account page.
 
+### Provider terms and what a connector may send back
+
+A connector is the only part of the platform that talks to a vendor, which makes it the
+place where that vendor's licence is either respected or broken. Four rules follow from
+the Shodan and Netlas terms, and they are what the shipped connectors do:
+
+- **Findings are facts, not responses.** A connector submits the bounded fields the
+  module's schema declares — a name, an address, a port, a title, a hash, a registrar —
+  and never a raw provider document. The core stores what a finding says and nothing
+  else, so a connector that pasted a response body into `attributes` would be putting a
+  copy of someone else's data into the operator's database.
+- **Nothing is republished.** Shodan permits the API to be integrated into a product
+  *with attribution to Shodan* and reserves reproduction, resale and redistribution for
+  a separate agreement ([Terms of Service](https://static.shodan.io/legal/terms.html),
+  [API plans](https://account.shodan.io/billing)); Netlas permits commercial client
+  services and "derived findings" on a paid plan, reserves resale and white-label use
+  for an Enterprise add-on, and forbids use that builds or supports a competing product
+  ([Terms & Conditions](https://netlas.io/legal/terms_and_conditions/)). A connector
+  therefore serves matches for the operator's own inventory, not a browsable mirror of
+  the provider's records.
+- **A credential belongs to one provider account, and one worker.** Netlas credentials
+  may not be shared or transferred, and Shodan's key is shareable inside your own
+  organization rather than resold. The core's shape follows: one source account, one
+  encrypted key, released only to the connector bound to that account
+  (`GET /connectors/me/credential`), never echoed into a job result or a log.
+- **A rate limit is the vendor's, and the quota is reserved before the request.**
+  Netlas publishes 60 searches a minute and 3 a minute over certificate collections;
+  Shodan bills filtered searches and pages separately. The connector charges the
+  matching bucket first (`POST /connectors/me/quota/provider`) and reports refusals as
+  named skip reasons, so an installation cannot discover a limit by exhausting someone
+  else's account.
+
+Neither vendor publishes a customer-side retention limit, so how long a fact is kept is
+the platform's own retention policy. Confirm your plan's entitlement — and any
+attribution you have taken on — in the vendor's console before enabling a capability.
+
+That confirmation is a setting, not a hope. The Shodan worker refuses every
+capability added with the budget wave until `provider_terms_acknowledged` is true in
+its registry config (or `SHODAN_TERMS_ACKNOWLEDGED=true` in its environment), and the
+Netlas phishing worker refuses `http.body` searches until
+`http_body_acknowledged` / `INTELLIGENCE_HTTP_BODY_ACKNOWLEDGED` says so. A refusal is
+reported in the job summary as `licence_acknowledgement_required`; nothing is sent to
+the provider, and the three historical Shodan questions keep running because they were
+already being asked when the gate arrived. The switches and the acknowledgement are
+deliberately separate: turning a capability on says what the operator wants to ask,
+and the acknowledgement says their plan allows asking it.
+
 ### Shodan capabilities
 
-The Shodan connector supports three individually togglable capabilities.
-The **registry config** (editable in Settings → Connectors) takes precedence
-over the env-var fallbacks:
+The Shodan connector supports eight individually togglable capabilities — one
+provider question each. The **registry config** (editable in Settings →
+Connectors) takes precedence over the env-var fallbacks:
 
-```json
-{ "scan_ssl_text": true, "scan_http_title": true, "scan_favicon": true }
+| capability | provider query | env fallback | default |
+|---|---|---|---|
+| `scan_ssl_text` | `ssl:"<domain>"` | `SHODAN_SCAN_SSL_TEXT` | on |
+| `scan_http_title` | `http.title:"<keyword>"` | `SHODAN_SCAN_HTTP_TITLE` | on |
+| `scan_favicon` | `http.favicon.hash:<mmh3 of our icon>` | `SHODAN_SCAN_FAVICON` | on |
+| `scan_http_body` | `http.html:"<brand>"` | `SHODAN_SCAN_HTTP_BODY` | off |
+| `scan_cert_subject` | `ssl.cert.subject.cn:"<confirmed candidate>"` | `SHODAN_SCAN_CERT_SUBJECT` | off |
+| `scan_html_hash` | `http.html_hash:<our page's hash>` | `SHODAN_SCAN_HTML_HASH` | off |
+| `scan_pivots` | `org:"<organization>"` / `net:<ip>/24` | `SHODAN_SCAN_PIVOTS` | off |
+| `scan_host_lookup` | `GET /shodan/host/{ip}` (free) | `SHODAN_SCAN_HOST_LOOKUP` | off |
+
+The five new questions are opt-in for two reasons an operator can act on: Shodan
+bills a filtered search one query credit and every 100 results past the first page
+another, and the two that rest on a filter name nobody has confirmed against *this*
+account are confirmed first:
+
+```text
+SHODAN_API_KEY=... python connectors/shodan/live_check.py --question cert_subject --value look-alike.example
+SHODAN_API_KEY=... python connectors/shodan/live_check.py --question cert_subject_org --value "ACME Corp."
+SHODAN_API_KEY=... python connectors/shodan/live_check.py --question host --value 203.0.113.10
 ```
 
+The vendor's filter reference lists `ssl.cert.subject.cn` and **no** organisation
+variant — the spike asks both, because a filter the grammar refuses answers with
+`errors=` there and with a silent zero in a scan. The `host` question answers which
+of `asn=`, `org=`, `title=`, `favicon_hash=`, `jarm=`, `cert_subject_cn=` and
+`html_hash=` this account's host documents actually carry: the connector reads those
+paths and reports a missing one as an *absent* fact rather than inventing a value,
+so an unconfirmed path shows up as thinner evidence and not as a wrong one. `live_check.py` reads the key from
+the environment only, makes at most four requests (retries included) and prints
+counters: never the key, a request URL or a response body.
+
+What a scan may spend is part of the connector's own declared config, so the core
+renders it in the same form as the capability toggles and validates every name
+before it reserves: `max_pages` (the operator's page ceiling, default 3 — it
+replaces the connector's old hardcoded constant), `max_broad_results` (a result set
+larger than this is refused by name, after one `/shodan/host/count`), `max_pivots`
+(how many `org:`/`net:` follow-ups one scan may run) and `max_exclusions` (how many
+of our own names are written into the paid query as `-domain:`/`-hostname:`
+negatives; the rest are still filtered locally and counted in
+`exclusions_dropped`). `max_requests`, `max_results` and the time budget come from
+the account policy as they do for every provider connector.
+
 With `scan_ssl_text=false` the connector skips all `ssl:"…"` searches
-(no wasted API credits); disabling all three completes the scan immediately
-with a `no_capabilities_enabled` summary. Shodan requests are serialized and
+(no wasted API credits); disabling all of them completes the scan set without an
+external search and completes the job immediately with a `no_capabilities_enabled`
+summary. Shodan requests are serialized and
 paced by default, and transient `429`/`5xx` responses are retried with bounded
 backoff honoring `Retry-After`. A final quota, provider, or timeout error is
 reported in the job summary as a partial scan rather than being mistaken for
@@ -520,9 +860,24 @@ read from the job that produced it instead of re-run by hand:
 "capability_results": {
   "ssl":     {"queries": 2, "matches": 21, "candidates": 10, "stored": 10, "skipped": null},
   "title":   {"queries": 1, "matches": 1,  "candidates": 1,  "stored": 0,  "skipped": null},
-  "favicon": {"queries": 0, "matches": 0,  "candidates": 0,  "stored": 0,  "skipped": "favicon_unavailable"}
-}
+  "favicon": {"queries": 0, "matches": 0,  "candidates": 0,  "stored": 0,  "skipped": "favicon_unavailable"},
+  "body":    {"queries": 0, "matches": 0,  "candidates": 0,  "stored": 0,  "skipped": null}
+},
+"skipped": {"expression_too_broad": 1},
+"spent": 3, "budget_left": 17, "daily_budget": 100, "daily_budget_left": 98,
+"pages": 3, "billed_pages": 1, "free_lookups": 4
 ```
+
+The `body` row above is a counted capability: the brand matched more than
+`max_broad_results` hosts, so no page of it was fetched and the refusal is named in
+`skipped` — one request instead of the whole page budget. `billed_pages` counts the
+pages past the first, the unit the vendor's credit guide charges, and `spent` /
+`budget_left` are the job's own budget (one reservation per provider request), while
+`daily_budget_left` is what the account has left today. `free_lookups` counts the
+`/shodan/host/{ip}` calls, which reserve nothing because the vendor bills no query
+credit for them; their facts are submitted as evidence about the look-alike the scan
+already found (`capability: host_lookup`), including the page title's brand match,
+which the connector compares itself and reports as `brand_in_title`.
 
 `matches` is what the provider returned, `candidates` the findings built from
 them, `stored` the ones the core kept, and `skipped` names a capability that
@@ -550,6 +905,11 @@ retried.
 from opendrp_connector import ConnectorBase
 
 class MyConnector(ConnectorBase):
+    # What the core may queue to this worker, and the provider buckets it charges.
+    CAPABILITIES = ("domain",)
+    OPERATIONS = ("search",)
+    CREDENTIAL_ENV = ("MY_CONNECTOR_API_KEY",)
+
     async def run_scan(self, work: dict):
         # work = {"job_id", "job_type", "connector", "config", "params"}
         findings = [
@@ -586,7 +946,16 @@ the connector name) and `metadata`.
 **Breaches** (`connector_type=breaches`): provider-neutral fields plus
 `matched_email` and/or `matched_domain` (at least one required).
 Core fields: `breach_name` (required), `title`, `domain`, `breach_date`,
-`pwn_count`, `description`, `data_classes`.
+`pwn_count`, `description`, `data_classes`, and
+`exposure_kind` (`breach` — the default and the only class that existed before the
+field did — `paste` or `stealer_log`). The class is a *closed* set: a value outside
+it fails validation, because a class nothing recognizes would be stored on the page
+under a heading nobody chose. Declare it whenever your source reports more than one
+kind of exposure, and put the source's own identifier for the exposure inside
+`breach_name` (`paste:<id>`, `stealerlog:<site>`) — the module's dedup keys are
+`(source_id, breach_name, matched_email)` and `(source_id, breach_name,
+matched_domain)`, so the class travels beside the identity rather than replacing it,
+and a re-report of the same paste updates its row instead of adding another one.
 
 **DNS observations** (`connector_type=dns`): `observation_type` (required, one of
 `dns_record`, `rdap`, `certificate`, `certificate_check`, `vt_subdomain`,

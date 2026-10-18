@@ -149,7 +149,12 @@ async def cmd_list() -> None:
             )
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
+    """The command line this script accepts, as an object a caller can inspect.
+
+    Separate from `main` so the documentation gate can compare the commands an
+    operator is told to run with the subcommands and flags that exist.
+    """
     parser = argparse.ArgumentParser(
         prog="manage_connector_tokens",
         description="Issue, rotate and revoke per-connector credentials.",
@@ -189,6 +194,11 @@ def main() -> None:
 
     sub.add_parser("list", help="List connectors and their credential state")
 
+    return parser
+
+
+def main() -> None:
+    parser = build_parser()
     args = parser.parse_args()
 
     if args.command == "issue":

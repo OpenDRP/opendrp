@@ -11,7 +11,8 @@ import { fetchModules, updateModule } from "@/lib/modules";
 import type { RegistryModule } from "@/types/api";
 import { TIME_ZONE_HINT, formatDateTimeOrNever } from "@/lib/datetime";
 import { humanizeKey } from "@/lib/labels";
-import type { Connector, ConnectorConfigField, RuntimeConfiguration, TelegramChatValidationResponse } from "@/types/api";
+import { AlertBudgetPanel } from "@/components/AlertBudgetPanel";
+import type { AlertPolicy, Connector, ConnectorConfigField, RuntimeConfiguration, TelegramChatValidationResponse } from "@/types/api";
 import { ErrorState } from "@/components/ui/error-state";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -28,6 +29,19 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { toast } from "@/components/ui/use-toast";
 
 const WEEKDAY_LABELS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+
+/** A budget number that may be left blank.
+ *
+ * Blank is not zero: it means "this installation has not decided this one", and the
+ * deployment's `ALERT_*` environment answers it. The empty string is turned into
+ * `undefined` *before* the coercion — `z.coerce.number()` would turn `""` into `0`,
+ * which is a value (and, for the digest threshold, a legal one), so the blank would
+ * silently become a decision nobody made. */
+const optionalBudgetNumber = (min: number, max: number) =>
+  z.preprocess(
+    (v) => (v === "" || v === null ? undefined : v),
+    z.coerce.number().int().min(min).max(max).optional(),
+  );
 
 const settingsSchema = z.object({
   telegram_bot_token: z.string().optional(),
@@ -51,6 +65,18 @@ const settingsSchema = z.object({
   telegram_alerts_enabled: z.boolean(),
   alert_email_user_ids: z.array(z.string()),
   telegram_chat_ids: z.string(), // newline/comma-separated in the UI, parsed server-side
+  // The alert budget (WI-13). Bounds mirror the API schema and the environment;
+  // blank means the deployment answers that one value.
+  alert_confidence_direct: optionalBudgetNumber(1, 100),
+  alert_confidence_digest: optionalBudgetNumber(0, 99),
+  alert_phishing_digest_hour_utc: optionalBudgetNumber(0, 23),
+  alert_no_channel_retry_hours: optionalBudgetNumber(0, 8760),
+  alert_phishing_digest_enabled: z.enum(["default", "on", "off"]),
+  alert_candidate_change_notifications: z.enum(["default", "on", "off"]),
+  // The breach module's two values. The noise policy is an enum rather than a
+  // switch: four states, and "deployment default" is deliberately one of them.
+  alert_breach_noise_policy: z.enum(["default", "store_only_spam", "verified_only", "all"]),
+  alert_breach_digest_threshold: optionalBudgetNumber(0, 500),
   schedule_phishing_enabled: z.boolean(),
   schedule_breaches_enabled: z.boolean(),
   schedule_dns_security_enabled: z.boolean(),
@@ -72,6 +98,19 @@ const settingsSchema = z.object({
 
 type SettingsForm = z.infer<typeof settingsSchema>;
 
+/** The stored tri-state of a budget switch, as the form holds it. `null` is the
+ * row's own state for "not decided" — it is not `false`. */
+function budgetChoice(value: boolean | null | undefined): "default" | "on" | "off" {
+  if (value === null || value === undefined) return "default";
+  return value ? "on" : "off";
+}
+
+/** The wire value of a budget switch: `null` clears the override so the
+ * deployment's environment answers that switch again. */
+function budgetValue(choice: "default" | "on" | "off"): boolean | null {
+  return choice === "default" ? null : choice === "on";
+}
+
 export default function SettingsPage() {
   const qc = useQueryClient();
   const [testTo, setTestTo] = useState("");
@@ -91,6 +130,14 @@ export default function SettingsPage() {
     queryFn: endpoints.getRuntimeConfiguration || (() => Promise.resolve(null)),
     staleTime: 60_000,
   });
+  // What is routing findings right now, which is not what is stored: a value the
+  // operator never stated is the deployment's. Failure is tolerated — the fields
+  // still save — so the section says so instead of not rendering.
+  const { data: alertPolicy } = useQuery<AlertPolicy | null>({
+    queryKey: ["alert-policy"],
+    queryFn: endpoints.getAlertPolicy || (() => Promise.resolve(null)),
+    staleTime: 60_000,
+  });
 
   const form = useForm<SettingsForm>({
     resolver: zodResolver(settingsSchema),
@@ -107,6 +154,14 @@ export default function SettingsPage() {
       telegram_alerts_enabled: false,
       alert_email_user_ids: [],
       telegram_chat_ids: "",
+      alert_confidence_direct: undefined,
+      alert_confidence_digest: undefined,
+      alert_phishing_digest_hour_utc: undefined,
+      alert_no_channel_retry_hours: undefined,
+      alert_phishing_digest_enabled: "default",
+      alert_candidate_change_notifications: "default",
+      alert_breach_noise_policy: "default",
+      alert_breach_digest_threshold: undefined,
       schedule_phishing_enabled: false,
       schedule_breaches_enabled: false,
       schedule_dns_security_enabled: false,
@@ -138,6 +193,14 @@ export default function SettingsPage() {
       telegram_alerts_enabled: !!data.telegram_alerts_enabled,
       alert_email_user_ids: data.alert_email_user_ids || [],
       telegram_chat_ids: (data.telegram_chat_ids || []).join("\n"),
+      alert_confidence_direct: data.alert_confidence_direct ?? undefined,
+      alert_confidence_digest: data.alert_confidence_digest ?? undefined,
+      alert_phishing_digest_hour_utc: data.alert_phishing_digest_hour_utc ?? undefined,
+      alert_no_channel_retry_hours: data.alert_no_channel_retry_hours ?? undefined,
+      alert_phishing_digest_enabled: budgetChoice(data.alert_phishing_digest_enabled),
+      alert_candidate_change_notifications: budgetChoice(data.alert_candidate_change_notifications),
+      alert_breach_noise_policy: data.alert_breach_noise_policy ?? "default",
+      alert_breach_digest_threshold: data.alert_breach_digest_threshold ?? undefined,
       schedule_phishing_enabled: Boolean(data.schedule_phishing),
       schedule_breaches_enabled: Boolean(data.schedule_breaches),
       schedule_dns_security_enabled: Boolean(data.schedule_dns_security),
@@ -320,6 +383,14 @@ export default function SettingsPage() {
 
   const settingsPayload = (v: SettingsForm) => {
     const {
+      alert_confidence_direct,
+      alert_confidence_digest,
+      alert_phishing_digest_hour_utc,
+      alert_no_channel_retry_hours,
+      alert_phishing_digest_enabled,
+      alert_candidate_change_notifications,
+      alert_breach_noise_policy,
+      alert_breach_digest_threshold,
       schedule_phishing_enabled,
       schedule_breaches_enabled,
       schedule_dns_security_enabled,
@@ -351,6 +422,17 @@ export default function SettingsPage() {
       schedule_dns_security: schedule_dns_security_enabled ? { days: schedule_dns_security_days, hour: schedule_dns_security_hour, minute: schedule_dns_security_minute } : null,
       schedule_exposure: schedule_exposure_enabled ? { days: schedule_exposure_days, hour: schedule_exposure_hour, minute: schedule_exposure_minute } : null,
       schedules: schedules ?? {},
+      // A blank budget number is sent as `null`, which is how the platform clears
+      // an override back to the deployment's value. Omitting the key instead would
+      // keep the old value while the operator is looking at an empty input.
+      alert_confidence_direct: alert_confidence_direct ?? null,
+      alert_confidence_digest: alert_confidence_digest ?? null,
+      alert_phishing_digest_hour_utc: alert_phishing_digest_hour_utc ?? null,
+      alert_no_channel_retry_hours: alert_no_channel_retry_hours ?? null,
+      alert_phishing_digest_enabled: budgetValue(alert_phishing_digest_enabled),
+      alert_candidate_change_notifications: budgetValue(alert_candidate_change_notifications),
+      alert_breach_noise_policy: alert_breach_noise_policy === "default" ? null : alert_breach_noise_policy,
+      alert_breach_digest_threshold: alert_breach_digest_threshold ?? null,
     };
     const dirty = form.formState.dirtyFields as Record<string, unknown>;
     return Object.fromEntries(Object.entries(payload).filter(([key]) =>
@@ -712,6 +794,11 @@ export default function SettingsPage() {
                 </div>
               </CardContent>
             </Card>
+
+            {/* What the channel is allowed to say, and how loudly (WI-13). It sits
+                with the channels because it is the same decision seen from the other
+                side: who receives a message, and which finding is worth one. */}
+            <AlertBudgetPanel policy={alertPolicy} />
 
             <Card>
               <CardHeader className="pb-3">

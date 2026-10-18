@@ -232,7 +232,7 @@ export default function AuditPage() {
     return g;
   }, [actionsData]);
 
-  const { data, isLoading, isError, refetch, isFetching } = useQuery({
+  const { data, isLoading, isPlaceholderData, isError, refetch, isFetching } = useQuery({
     queryKey: ["audit-logs", appliedFilters],
     queryFn: () => endpoints.listAuditLogs(appliedFilters),
     staleTime: 15_000,
@@ -512,7 +512,7 @@ export default function AuditPage() {
               setPage(1);
             }}
             storageKey="audit-table-widths-v1"
-            loading={isLoading}
+            loading={isLoading || isPlaceholderData}
             isError={isError}
             errorDescription="The audit trail could not be loaded. This is an evidence gap, not an empty trail."
             onRetry={() => refetch()}

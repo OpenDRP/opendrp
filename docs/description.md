@@ -31,19 +31,123 @@ an operator declares instead uses the generic `drp_findings` path.
 
 Stored in `drp_phishing_domains`. The DNSTwist connector reads active `domain`
 assets, runs mutations and DNS resolution, and submits candidates with
-`detection_source=dnstwist`; the Shodan connector searches its three capabilities
-and submits with `detection_source` naming the capability that matched. Accepted
-findings may be enriched with WHOIS data by the core (`app/services/phishing/`).
+`detection_source=dnstwist`; the Shodan connector asks its configured questions and
+submits with `detection_source` naming the one that matched. Accepted findings may be
+enriched with WHOIS data by the core (`app/services/phishing/`).
 
-Shodan capabilities are independent and configured per connector:
-`scan_ssl_text`, `scan_http_title` and `scan_favicon`. The connector registry is
-the source of truth — an administrator's choice in the connector configuration
-takes precedence, and the `SHODAN_SCAN_*` environment values are the fallback
-until one is set. Disabling a capability stops that query; disabling all three
-completes the job without an external search. Shodan receives active `domain`,
-`keyword_domain` and `keyword_title` assets as targets, and active domains and IP
-addresses as exclusions, so infrastructure the operator already monitors is not
-reported back as a look-alike.
+What the DNSTwist worker asks for is chosen in **classes** (`typo`, `idn`,
+`bitsquatting`, `plural`, `subdomain`, `dictionary`, `various`, `tld`, default `typo`)
+rather than as a raw fuzzer list, because several techniques are useless — or refused
+by the CLI — without their companion dictionary: a class brings both. The candidate
+bound (`DNSTWIST_MAX_CANDIDATES`) is applied where it costs nothing, before any name is
+resolved, and a shortened set is reported. Two further options are off by default
+because they widen the scan's network footprint rather than a provider bill: the CLI's
+MX check plus one free SPF TXT question (so `mx_without_spf` is answered rather than
+inferred) and page similarity (`--lsh tlsh`, reported as unavailable when the TLSh
+module is absent — `--phash` and screenshots are deliberately never used).
+
+Shodan capabilities are independent and configured per connector: the three
+original questions (`scan_ssl_text`, `scan_http_title`, `scan_favicon`) and the
+five added with the budget-and-filters wave, which default to *off* because each
+spends query credits on a question an operator confirms against their own account
+first (`connectors/shodan/live_check.py`):
+
+| capability | the question | costs |
+|---|---|---|
+| `scan_http_body` | the brand in a page body | 1 credit per search, counted before it is paged |
+| `scan_cert_subject` | a **confirmed** candidate's own certificate name (`ssl.cert.subject.cn`) | 1 credit per candidate |
+| `scan_html_hash` | other hosts serving our page's HTML (`http.html_hash`, read from the free lookup — Shodan computes the hash, so the platform can never recompute it) | 1 credit per pivot |
+| `scan_pivots` | what else the actor behind a found host runs (`org:`/`net:`), capped by `max_pivots` | 1 credit per pivot, the `org:` one counted first |
+| `scan_host_lookup` | what a host *is* (`/shodan/host/{ip}`: ASN, organisation, title, icon hash, JARM, certificate names) | **no query credits** |
+
+The connector registry is the source of truth — an administrator's choice in the
+connector configuration takes precedence, and the `SHODAN_SCAN_*` environment
+values are the fallback until one is set. Disabling a capability stops that query;
+disabling all of them completes the job without an external search. Shodan receives
+active `domain`, `keyword_domain` and `keyword_title` assets as targets, confirmed
+candidates as certificate targets, and active domains and IP addresses as
+exclusions: excluded names become `-domain:`/`-hostname:` negatives *inside* the
+paid query (capped by `max_exclusions`), so infrastructure the operator already
+monitors is neither paid for nor reported back as a look-alike, and the local
+filter still guarantees one is never stored.
+
+What a scan may spend is a per-connector policy rather than a constant: `max_pages`
+replaces the connector's old three-page ceiling, and a broad expression is counted
+(`/shodan/host/count`) before any page of it is fetched, so a result set an operator
+cannot read to the end is refused by name (`expression_too_broad`) and an empty one
+costs no search request at all. The summary says what the scan could not do
+(`skipped`) and what the allowed work cost — `spent`, `budget_left`, `daily_budget`,
+`daily_budget_left`, `retry_after_seconds`, `pages`, `billed_pages` (the pages past
+the first, which is the unit the vendor bills) and `free_lookups` — and a budget
+refusal stops the scan with a named reason instead of failing it as a provider
+error.
+
+Every accepted candidate also carries the platform's own confidence in it, scored from
+the facts it observed (`young_domain`, `mx_without_spf`, `title_match`,
+`favicon_perceptual_match`, `html_similarity`, `brand_in_body`, `source_corroboration`,
+`parked_hint`, `aged_domain`, `tls_issuer_reuse`) and stored on the row with the trail
+of signal rows behind it, so "why is this candidate at 80?" is answered from data
+rather than by re-deriving the weights of whatever build happened to run. The score
+decides how the candidate is reported: at or above `ALERT_CONFIDENCE_DIRECT` it is
+announced, between that and `ALERT_CONFIDENCE_DIGEST` it waits for one daily digest, and
+below is list-only.
+
+The facts a *provider* reported are scored from the evidence the platform already
+stored, not by asking again: a page a connector found by matching the brand in its
+title is a `title_match`, one it found through the page body is a `brand_in_body`,
+and one matched by the provider's own perceptual icon hash is a
+`favicon_perceptual_match` (`app/services/phishing_score_service.py`,
+`OBSERVATION_SIGNALS`). The derivation runs with every accepted finding and
+reconciles rather than appends: a signal whose evidence is gone is retracted, so a
+candidate the module stops seeing in a title search does not keep the twenty points a
+title match is worth.
+
+Registration facts — the registrar, an abuse contact, the date the name was registered —
+are resolved by the core after a candidate is stored, and the pass that resolves them
+paces itself the way registries require (`backend/app/services/phishing/whois_service.py`,
+`backend/app/services/ingestion_events.py`). The candidate row is the cache: a candidate
+that already carries its registrar and registration date is never asked about again. Each
+*answering server* — the registry behind the name's top-level domain — is asked at most
+once per pass, so a scan's forty look-alikes under one TLD reach it as a trickle instead
+of a burst. A registry that answers “limit exceeded” is not retried once per candidate:
+the event and every other pending event of that registry wait out a pause measured in
+minutes, because that refusal was about our address rather than about the name. Each
+outcome is written on the outbox row as its own reason: `whois_facts_known` (nothing to
+ask), `whois_pacing` (this pass's slot went to another name at the same registry),
+`whois_no_record` (the registry says nobody has registered the name — re-asked twice a day,
+because a name nobody owns can be registered), `whois_rate_limited` (the pause),
+`whois_unavailable` (no answer arrived: thirty seconds doubling to an hour),
+`whois_target_refused` (our own destination policy refused the target, which is terminal),
+and `*_exhausted` once a best-effort lookup has spent its eight attempts. Nothing of this
+appears in a connector's job summary: the enrichment is core-side, and the outbox row and
+the log are where it is read.
+
+Which sources reported a candidate is read from the evidence rows and shown beside the
+score it corroborates: the candidate list and the candidate's own response carry `sources`
+(the distinct names) and `source_count`, and the alert message prints the same fact as
+`Sources`. The names are the connector-declared identities, so “two providers reported
+this” is a claim a reader can check — and a candidate with no evidence rows says so
+instead of reprinting the single connector that *found* it, which is `detection_source`.
+
+The budget itself is an installation's own decision, not only the deployment's. The
+Settings page's **Alert budget** section stores six values in `system_settings` — the two
+thresholds, whether the digest runs and at which UTC hour, how long a finding that no
+configured channel can receive is held, and whether a *revision* of an already reported
+candidate is a second message. A field left blank is not zero: it is “not decided here”,
+and the deployment's `ALERT_*` environment keeps answering that one, which is why the
+page prints the values in force next to the fields that override them. A saved row that
+contradicts itself — a digest threshold at or above the direct one — is refused as a
+whole, by the save that would create it and by every reader that finds one, and the
+environment answers until it is fixed. The digest's hour is read when the digest runs,
+not when a worker starts, so the hourly tick only sends in the hour the operator chose.
+
+A person who has looked at the candidate outranks that number. An analyst's **verdict**
+(`confirmed` or `rejected`, with the reason recorded, and its author and time) is stored
+on the same row and read before the score: a confirmed candidate is announced however
+low it scores *and* re-announced when the thing changes, while a rejected one is silent —
+in every later scan and in the digest — without leaving the list an operator works from.
+Every decision and un-decision is one row in the audit trail naming the verdict it
+replaced and the score it overrode.
 
 Status is `active`, `investigating` or `resolved`, in `drp_phishing_domains.status`.
 A detection that matched a monitored keyword or domain is not a takeover: there is
@@ -64,12 +168,88 @@ knows — its own classification flags, catalog timestamps, a secret sample. A
 source declares its own payload shape instead of being fitted into another
 vendor's fields, and the UI renders declared attributes generically.
 
+Not every row is a breach of an account. A name in a paste and an address on a
+stealer-log site are exposure of the same identifier in a different kind of
+document, and the row says which: `exposure_kind` is `breach`, `paste` or
+`stealer_log`, and the module's identity does not move for it — a paste or a
+stealer-log entry carries its identifier inside `breach_name` (`paste:<id>`,
+`stealerlog:<site>`), so the unique pairs stay `(source_id, breach_name,
+matched_email)` and `(source_id, breach_name, matched_domain)`. Neither class
+arrives with a disclosure date; the row records the instant the platform first saw
+it, marked `attributes.metadata_incomplete`, and re-reads of the same undated row
+leave that instant alone — otherwise every scan would report its own clock as a
+corrected date. The page filters by class, and the message says which class it is
+about.
+
+An address need not be sent to ask about it. When the subscription says it includes the
+hash-range search, the breach lookup becomes the first six characters of the address's
+SHA-1 and the answer is matched back on the remaining suffix, so the platform learns the
+same incidents without putting the address in a URL; each incident is then read from the
+catalogue exactly as a domain alias reads it, and both forms store the same row. The job
+summary says which form ran and whose decision that was, a refused range answer is never
+downgraded to the address form, and the one route that only exists in address form — the
+paste lookup — is named in the summary and can be switched off, which is what makes "no
+address leaves" a state an operator can actually reach.
+
+The HIBP worker's stealer-log pass is not part of every scan: the routes are sold
+with a separate, much lower allowance, so the worker asks only when the operator
+turned `stealer_logs_enabled` on, the subscription explicitly includes stealer
+logs, and `stealer_logs_interval_hours` (default a week) has elapsed since the
+newest stealer-log sighting the core holds. The interval is read from the core's
+job params, so a restarted worker does not spend the week twice. Pastes are asked
+per monitored address on every scan; stealer-log rows are asked per address and
+per domain, with the site list bounded per identifier and the remainder counted.
+
 Deduplication is per source account: the identity of a breach row is
 `(source_id, breach_name, matched_email)`, with a partial unique index on
 `(source_id, breach_name, matched_domain)` where `matched_email IS NULL`
 (`backend/app/models/breach.py`). Two
 sources reporting the same incident about the same address are therefore two rows:
 the same breach seen by two providers is evidence, not a duplicate.
+
+Each row also says which class of exposure it records — `exposure_kind`: an account
+compromised (`breach`, the default and the only class the module could represent before
+the column existed), a name that appeared in a paste, or a site found in a stealer log.
+The class is a closed vocabulary that ingestion validates a finding against: a value
+outside it is refused by name rather than stored under a heading nobody chose. It is
+*not* part of any identity — a paste or a stealer log carries its own identifier inside
+`breach_name` (`paste:<id>`, `stealerlog:<site>`) — so the unique pairs above, and the
+indexes behind them, are unchanged by it. `GET /api/v1/breaches?exposure_kind=…` keeps
+one class, the list page offers the same set, and the column is shown so a list filtered
+to one class still says what each row is.
+
+A domain a source will not search because the account has not enrolled it is a
+different answer from a domain with no findings, and the readiness card says which —
+so it can also carry the remedy. `POST /api/v1/breaches/domain-verification` queues one
+step of the source's own enrolment flow as an ordinary `breaches.<source>` job: `generate`
+answers with the TXT value a person has to publish, `verify` checks whether the source
+can now see it. The request names the source when several enabled connectors could be
+asked, because the domain is enrolled in one account's dashboard and not in every
+source's; the step is queued outside the connector's scan admission slot, so verifying a
+domain is possible while a scheduled scan is running — which is when an operator is
+waiting; and it is audited whether or not it could be queued, because "nobody asked" and
+"nobody could ask" are different states. The attempt stores no finding: it is a fact
+about the account's access to the domain, reported per domain in
+`provider-readiness.verifications` with the record exactly as the source stated it and a
+reason from the worker's own vocabulary when it was refused. A verification job is never
+read as "the last scan", so a record issued by hand cannot replace the domains, pace and
+entitlements a real scan reported.
+
+A morning's findings are triaged, not just listed. `severity` is derived by the core
+from the classes of data a row exposed — plaintext credentials, security questions and
+payment data are `critical`, hashed credentials `high`, addresses and phone numbers
+`medium`, an address list `low`, and a class the rule has never seen leaves the row
+`unknown` rather than calling it harmless — and it is written when the row is written
+(`backend/app/services/breach_severity.py`), so the badge, `?severity=` and
+`?sort=severity` read one value instead of three computations. The list also filters by
+the operator's `status`, by the source's own flag (`verified`, `spam`, `fabricated`,
+`sensitive`, asked of the stored payload), by source and by domain, and orders by finding
+date, incident date, size or severity rank — loudest first, because the letters of the
+severity names would put an address list above a password leak. Each row names
+`email_incident_count`, how many incidents the platform already holds about that address
+across all filters: one account handled once is the difference between triage and four
+independent decisions. The PDF's breach section uses the same order and the same severity
+column as the page.
 
 For display and for the cascade delete, a breach row resolves against the current
 inventory in this order: an exact `email_account` asset matching `matched_email`
@@ -82,21 +262,39 @@ The rule itself is section 3.
 The `dns` module stores evolving, source-scoped observations in
 `dns_security_observations` rather than immutable findings: a resolver RRset is
 refreshed in place as it changes, and provenance is the connector and source
-account that observed it. Four workers consume active `domain` assets —
+account that observed it. Six workers consume the active inventory —
 `dns-rdap` (registration and expiry), `dns-resolver` (current RRsets),
-`dns-ctlogs` (historical certificate evidence, including wildcards) and
-`dns-virustotal` (historical passive DNS and subdomains) — and each declares its
-own `dns.*` job type and holds its own core-issued credential. Their token and
-provider configuration, quotas and source limits are in `dns-security.md`.
+`dns-ctlogs` (historical certificate evidence, including wildcards),
+`dns-virustotal` (historical passive DNS and subdomains), `dns-tlsprobe` (the
+certificate each host and port serves right now, from one bounded handshake per
+address) and `dns-shodan` (what each of our own addresses serves as an independent
+index saw it, plus a per-scan capped search for where else a certificate of ours is
+being served; the only DNS worker that also consumes `ip_address` assets) — and each
+declares its own `dns.*` job type and holds its own core-issued credential. Their token and provider configuration, quotas and source limits are in
+`dns-security.md`.
 
 Expiry is an alertable fact only where a check establishes it. Registration-expiry
 reminders need a successful, fresh RDAP check (`DNS_EXPIRY_MAX_AGE_HOURS`), and
-exact-certificate expiry reminders need a separately verified, completed CT check;
-both use 30/14/7/3/1-day thresholds plus one reminder after expiry. Historical CT
+exact-certificate expiry reminders need a separately verified, completed CT check,
+and served-certificate reminders (`kind="tls"`) need a fresh successful handshake;
+all three kinds use 30/14/7/3/1-day thresholds plus one reminder after expiry. Historical CT
 evidence, DNS TTLs and provider-supplied expiry metadata do not establish an
 alertable expiry, and wildcard CT evidence can never establish a concrete asset or
 ownership — which is why promoting an observation is an explicit, audited
 operator action.
+
+The evidence the five workers collect is also read as a *certificate* rather than as
+a row: `tls_certificate_identities` holds one row per fingerprint — the same
+fingerprint is never two certificates — and `tls_certificate_sightings` holds one row
+per certificate, address, port and observing source, so re-observing a fact refreshes
+it instead of stacking a duplicate. The daily sweep projects the observations into
+that shape and then scores it, which is what turns "a certificate of ours" and "an
+address that is not ours" into one alert naming the foreign address, the organisation
+and the signals that fired. A verdict (`expected`, `shared_infrastructure`,
+`confirmed_foreign`, `rejected`) or a `certificate_scope_exceptions` row is what keeps
+a judged sighting from being re-alerted, and no provider read in this path sends
+traffic to third-party infrastructure. The tables, the rules and the review API are in
+`dns-security.md`.
 
 The module id is `dns`. `dns_security` is accepted as an alias wherever a module
 id is read (`app/services/module_aliases.py`), which keeps a connector or a script
@@ -228,6 +426,18 @@ the same unique index, and refuses a subnet wider than 4096 addresses rather tha
 answering it in part. A page and its `total` come from one statement
 (`count(*) OVER ()`), so they cannot describe two different snapshots.
 
+The inventory page drives the batch endpoint from row selection on the current
+page: activate, deactivate and one criticality change travel as a single request
+over at most 500 ids, and a batch delete stays administrator-only and requires the
+operator to type `DELETE` first. Selection is deliberately limited to the page —
+a batch names ids, and "everything matching the filter" would need the filter, not
+the page, to define it. An asset's own page reads its record once (`GET /assets/{id}`,
+which is also what writes `asset.view`) and shows criticality, creation and update
+times; the findings tabs remain paged reads. A breach or phishing finding can be
+taken under monitoring from its row: the value the module already matched becomes
+an asset through the same throttle and audit path as the DNS and exposure
+promotions, including for a value that was already monitored.
+
 ## 4. Jobs and the connector protocol
 
 ### 4.1 Job types and statuses
@@ -343,11 +553,29 @@ report in process: without Celery the job is marked failed and the request answe
 authenticated account in the installation by design — `created_by` records
 provenance, not an authorization boundary — and only administrators delete one.
 
+The report's breach figures and the dashboard's are one computation
+(`app/services/breach_kpi.py`), because two implementations of "how bad is it"
+already drifted apart once: the KPI counts stored findings at any status, the active
+count is findings that are active or under investigation and were created inside the
+window, and `new_breach_incidents_7d` is what the sources added to their own incident
+catalogues in that same window — incidents that exist whether or not any address of
+ours is in them, which is the only number that answers "is there new trouble out there"
+rather than "did a scan meet a new address". Every figure travels with a caption naming
+what it counts, and both surfaces print the caption the rule wrote beside the number it
+describes, so the PDF and the page cannot explain one figure two ways. The findings total
+travels split by class of exposure as well (`findings_by_exposure_kind`, summing to the
+total it splits), because "how much exposure do we have" and "which exposure is it" are
+answered by one computation rather than by a second count that could disagree with it.
+
 Finding alerts are durable before they are announced: ingestion writes a delivery
 event and moves on. `app/services/alert_delivery_service.py` and
 `app/tasks/alert_tasks.py` group events by completed connector job, render one
 bounded message per job, finding type and channel, and keep per-recipient state, so
-a channel's failure never marks another recipient as delivered. The delivery row is
+a channel's failure never marks another recipient as delivered. A finding whose
+installation has no channel configured yet is held rather than dropped — for
+`ALERT_NO_CHANNEL_RETRY_HOURS`, because the channel may be configured tomorrow —
+and the save that first makes delivery possible reports everything held as one
+digest rather than replaying it. The delivery row is
 `pending`, `delivering`, `sent`, `failed` or `ambiguous`; transient failures are
 retried within the attempt budget with the provider's `Retry-After` honoured, while
 a configuration or authentication refusal is terminal and needs an operator.
@@ -429,7 +657,10 @@ each accepted code is single-use (the matched counter is stored in
 `totp_last_used_step`, closing the replay window the ±1-step tolerance opens), and
 invalid or missing codes consume their own MFA lockout budget so guessing cannot
 exhaust the password budget. Enrolment is self-service and shows ten one-time
-recovery codes exactly once, of which only bcrypt hashes are stored; removal needs
+recovery codes exactly once, of which only HMAC-SHA256 digests are stored — keyed
+from `ENCRYPTION_KEY` and its previous values, so the slow password hash and the
+per-code `bcrypt` comparison are not spent on values that are already 59 random
+bits; a hash written by an earlier release still verifies and is spent on use. Removal needs
 the password and a live code, an administrator can clear another account's factor
 (`POST /api/v1/users/{user_id}/mfa/reset`, refused for the caller's own account),
 and a locked-out administrator is released from the host with

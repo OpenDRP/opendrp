@@ -193,6 +193,7 @@ class TestStorageContract:
             {
                 "breach_name": "DirectRisky",
                 "matched_email": "risky@direct.example",
+                "breach_date": "2026-02-03",
                 # A service caller can hand over anything; the payload is still
                 # filtered before it reaches the JSON column.
                 "attributes": {"ok_key": "value", "Bad-Key": "dropped", "nested": {"a": 1}},
@@ -285,6 +286,7 @@ class TestApiSurface:
                 {
                     "breach_name": "Newsource Leak",
                     "matched_domain": "newsource.example",
+                    "breach_date": "2026-02-03",
                     "attributes": {"feed": "underground-forum", "records": 1200},
                 }
             ],

@@ -5,19 +5,30 @@ import { MemoryRouter, Route, Routes } from "react-router";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import AssetDetailPage from "@/pages/AssetDetailPage";
 
-const { findingsMock, connectorModulesMock } = vi.hoisted(() => ({
+const { findingsMock, getAssetMock, connectorModulesMock } = vi.hoisted(() => ({
   findingsMock: vi.fn(),
+  getAssetMock: vi.fn(),
   connectorModulesMock: vi.fn(),
 }));
 
 vi.mock("@/lib/api", () => ({
-  endpoints: { assetFindings: findingsMock },
+  endpoints: { assetFindings: findingsMock, getAsset: getAssetMock },
   describeApiError: (error: any) => String(error?.message ?? error ?? "Request failed"),
 }));
 // WI-20: what consumes the asset type comes from the connector registry.
 vi.mock("@/lib/connectors", () => ({ fetchConnectorModules: connectorModulesMock }));
 
 const asset = { id: "asset-1", asset_type: "domain", asset_value: "example.com", is_active: true };
+
+// What `GET /assets/{id}` answers: the record the card shows, including the two
+// fields the findings view never carried (AST-45).
+const record = {
+  ...asset,
+  criticality: "high",
+  normalized_value: "example.com",
+  created_at: "2026-01-01T09:30:00Z",
+  updated_at: "2026-02-03T18:45:00Z",
+};
 
 const counts = { phishing: 1, breaches: 2, dns: 0, exposure: 0, findings: 0, total: 3 };
 
@@ -81,6 +92,7 @@ function renderPage() {
 describe("AssetDetailPage", () => {
   beforeEach(() => {
     findingsMock.mockReset().mockResolvedValue(response());
+    getAssetMock.mockReset().mockResolvedValue(record);
     connectorModulesMock.mockReset().mockResolvedValue(connectorModules);
   });
 
@@ -105,6 +117,27 @@ describe("AssetDetailPage", () => {
     const table = screen.getByRole("table", { name: /findings for this asset/ });
     expect(within(table).getByText("dnstwist")).toBeInTheDocument();
     expect(findingsMock).toHaveBeenCalledWith("asset-1", { module: "phishing", page: 1, size: 20 });
+    // AST-44/AST-45: the card reads the asset's own record once, and shows what
+    // the findings endpoint never carried — criticality and both dates.
+    expect(getAssetMock).toHaveBeenCalledTimes(1);
+    expect(getAssetMock).toHaveBeenCalledWith("asset-1");
+    expect(await screen.findByText("high")).toBeInTheDocument();
+    expect(screen.getByText(/Created 2026-01-01 09:30:00/)).toBeInTheDocument();
+    expect(screen.getByText(/Updated 2026-02-03 18:45:00/)).toBeInTheDocument();
+  });
+
+  it("does not re-read the asset record for every module tab (AWI-03)", async () => {
+    const user = userEvent.setup();
+    renderPage();
+    await screen.findByText("look-alike.example");
+
+    await user.click(screen.getByRole("tab", { name: /Breaches/ }));
+    await waitFor(() =>
+      expect(findingsMock).toHaveBeenCalledWith("asset-1", expect.objectContaining({ module: "breaches" })),
+    );
+
+    // `asset.view` is one read per open; the tab asks a different question.
+    expect(getAssetMock).toHaveBeenCalledTimes(1);
   });
 
   it("asks the backend for the module the operator opened and resets to page one", async () => {
@@ -176,6 +209,11 @@ describe("AssetDetailPage", () => {
     findingsMock.mockResolvedValue(
       response({ asset: { ...asset, asset_type: "ip_address", asset_value: "203.0.113.9" } }),
     );
+    getAssetMock.mockResolvedValue({
+      ...record,
+      asset_type: "ip_address",
+      asset_value: "203.0.113.9",
+    });
     renderPage();
 
     expect(

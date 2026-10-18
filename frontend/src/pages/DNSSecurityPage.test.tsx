@@ -2,12 +2,12 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import DNSSecurityPage from "@/pages/DNSSecurityPage";
+import DNSSecurityPage, { DNS_SOURCES, DNS_SOURCE_LABELS } from "@/pages/DNSSecurityPage";
 import { useAuthStore } from "@/store/auth";
 
-const mocks = vi.hoisted(() => ({ list: vi.fn(), scan: vi.fn(), cleanup: vi.fn(), health: vi.fn(), promote: vi.fn(), remove: vi.fn(), toast: vi.fn() }));
+const mocks = vi.hoisted(() => ({ list: vi.fn(), scan: vi.fn(), cleanup: vi.fn(), health: vi.fn(), promote: vi.fn(), remove: vi.fn(), certs: vi.fn(), exceptions: vi.fn(), toast: vi.fn() }));
 vi.mock("@/lib/api", () => ({
-  endpoints: { listDNSObservations: mocks.list, scanDNSSecurity: mocks.scan, cleanOrphanDNSObservations: mocks.cleanup, connectorsHealth: mocks.health, promoteDNSObservation: mocks.promote, deleteDNSObservation: mocks.remove },
+  endpoints: { listDNSObservations: mocks.list, scanDNSSecurity: mocks.scan, cleanOrphanDNSObservations: mocks.cleanup, connectorsHealth: mocks.health, promoteDNSObservation: mocks.promote, deleteDNSObservation: mocks.remove, listTLSCertificates: mocks.certs, listCertificateExceptions: mocks.exceptions },
   describeApiError: (error: Error) => error.message,
 }));
 vi.mock("@/hooks/useModuleJobTypes", () => ({ useModuleJobTypes: () => ["dns.resolver"] }));
@@ -27,6 +27,8 @@ describe("DNSSecurityPage", () => {
     mocks.health.mockResolvedValue({ items: [{ name: "dns-resolver", connector_type: "dns", status: "enabled", health: "healthy" }] });
     mocks.scan.mockResolvedValue({ status: "scheduled", job_ids: ["job-1"], offline_connectors: [] });
     mocks.cleanup.mockResolvedValue({ deleted: 2 });
+    mocks.certs.mockResolvedValue({ items: [], total: 0, page: 1, size: 25, pages: 0 });
+    mocks.exceptions.mockResolvedValue([]);
   });
 
   it("uses a primary Rescan button and reports queued rather than started jobs", async () => {
@@ -188,8 +190,26 @@ describe("DNSSecurityPage", () => {
     renderPage();
     expect(await screen.findByText("2034-11-13 09:08:33")).toBeInTheDocument();
     expect(screen.getByText(/Last successful check: 2026-01-01 00:00:00/)).toBeInTheDocument();
-    expect(screen.getByText(/All times are UTC/)).toBeInTheDocument();
+    // More than one card on the page states the zone, so this asserts presence
+    // rather than uniqueness.
+    expect(screen.getAllByText(/All times are UTC/).length).toBeGreaterThan(0);
     expect(screen.getByRole("columnheader", { name: /Validity \/ Expiry \(UTC\)/ })).toBeInTheDocument();
+  });
+
+  it("shows the Shodan confirmation worker as a source of its own (F-14)", async () => {
+    // A provider's independent view of our own address is evidence an operator has
+    // to be able to tell apart from our own handshake and from passive CT history,
+    // so the row names the source and the filter offers it.
+    mocks.list.mockResolvedValue({ items: [{ id: "sh-1", subject: "example.com", observation_type: "host_lookup", record_type: "TLS:443", value: "203.0.113.9", source: "shodan", status: "historical", metadata: {} }], total: 1, page: 1, size: 20, pages: 1 });
+    renderPage();
+    expect(await screen.findByText("example.com")).toBeInTheDocument();
+    expect(screen.getByText("Shodan")).toBeInTheDocument();
+    // The filter's options are rendered from this vocabulary, so the vocabulary is
+    // what the test reads: opening a Radix portal under jsdom is not drivable here
+    // (the pointer-capture API it needs is absent), and a test that opens one is
+    // asserting the library rather than the page.
+    expect(DNS_SOURCES).toContain("shodan");
+    expect(DNS_SOURCE_LABELS.shodan).toBe("Shodan");
   });
 
   it("announces a failed load instead of silently showing nothing", async () => {

@@ -12,7 +12,7 @@ from app.api.deps import (
     extract_ip,
     get_db,
     require_admin,
-    require_viewer_plus,
+    require_active_account,
 )
 from app.core.config import settings
 from app.core.artifact_path import (
@@ -49,7 +49,7 @@ async def generate_report(
     request: Request,
     data_in: ReportCreate,
     db: AsyncSession = Depends(get_db),
-    u=Depends(require_viewer_plus),
+    u=Depends(require_active_account),
 ):
     from app.models import ReportQueueControl
     from app.models.job import JobType
@@ -157,7 +157,7 @@ async def list_reports(
     page: int = Query(1, ge=1),
     size: int = Query(50, ge=1, le=MAX_PAGE_SIZE),
     db: AsyncSession = Depends(get_db),
-    user=Depends(require_viewer_plus),
+    user=Depends(require_active_account),
 ):
     skip = (page - 1) * size
     visible_reports = Report.status != "deleted"
@@ -225,7 +225,7 @@ async def download_report(
     request: Request,
     report_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    user=Depends(require_viewer_plus),
+    user=Depends(require_active_account),
 ):
     from fastapi.responses import FileResponse
     from app.models import Report

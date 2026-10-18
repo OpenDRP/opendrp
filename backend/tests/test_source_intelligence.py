@@ -120,6 +120,22 @@ async def test_shared_account_budget_and_fail_closed(db_session, monkeypatch):
     assert not any(
         ":cert-minute" in key for key in general_keys[2 : 2 + general_keys[1]]
     )
+    # The script reads each window from the key's suffix, so the names are part of
+    # the contract rather than decoration: a key renamed to `:daily` would be
+    # charged as a minute one.
+    quota_keys = general_keys[2 : 2 + general_keys[1]]
+    assert quota_keys[0].endswith(":minute") and quota_keys[1].endswith(":day")
+    assert any(":job:" in key for key in quota_keys)
+    # What the account has left today is part of the answer, so a worker reports spend
+    # as a remainder an operator can plan around instead of only as a ceiling.
+    redis.eval.return_value = [1, 0, 7]
+    payload = await reserve(db_session, a, "search", job=job)
+    assert payload["remaining_today"] == 7
+    assert payload["request_budget"] == 20
+    # A quota backend that answered without the third value (an older script) is not a
+    # failure: the ceiling is still reported and the remainder says it is unknown.
+    redis.eval.return_value = [1, 0]
+    assert (await reserve(db_session, a, "search", job=job))["remaining_today"] is None
     monkeypatch.setattr(RateLimiter, "_get_client", lambda: None)
     with pytest.raises(HTTPException) as error:
         await reserve(db_session, a, "search", job=job)
@@ -134,13 +150,17 @@ async def test_shared_account_budget_and_fail_closed(db_session, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_real_redis_atomic_account_and_job_limits(db_session):
-    import os
+async def test_real_redis_atomic_account_and_job_limits(db_session, live_redis):
+    """The script's atomicity is the property under test.
+
+    A real broker is what makes it assertable, and ``live_redis`` skips the test
+    with a reason where there is none instead of failing on a connection.
+    """
     import uuid
     from redis.asyncio import Redis
     from app.services.provider_quota import SCRIPT
 
-    client = Redis.from_url(os.environ.get("REDIS_URL", "redis://localhost:6379/0"))
+    client = Redis.from_url(live_redis)
     prefix = "test:source-quota:" + uuid.uuid4().hex
     keys = [prefix + ":minute", prefix + ":day", prefix + ":job:one"]
     now = str(int(datetime.now(timezone.utc).timestamp() * 1000))
@@ -148,7 +168,10 @@ async def test_real_redis_atomic_account_and_job_limits(db_session):
         await client.ping()
         first = await client.eval(SCRIPT, 3, *keys, now, "10", "10", "1", "one")
         blocked = await client.eval(SCRIPT, 3, *keys, now, "10", "10", "1", "two")
-        assert first == [1, 0] and blocked[0] == 0
+        # The third value is what the account has left today after this charge: the day
+        # limit is ten, one request is now spent, so nine remain.
+        assert first[0] == 1 and first[1] == 0 and first[2] == 9
+        assert blocked[0] == 0
         assert [await client.zcard(key) for key in keys] == [1, 1, 1]
         other_job = prefix + ":job:two"
         keys.append(other_job)
@@ -158,9 +181,213 @@ async def test_real_redis_atomic_account_and_job_limits(db_session):
             )
         )[0] == 0
         assert await client.zcard(other_job) == 0
+
+        # Key order is presentation, not meaning: the day bucket passed first is
+        # still a day, and a fourth window does not push it into a minute.
+        reordered = "test:source-quota:" + uuid.uuid4().hex
+        reordered_keys = [
+            reordered + ":day",
+            reordered + ":minute",
+            reordered + ":cert-minute",
+            reordered + ":job:four",
+        ]
+        keys.extend(reordered_keys)
+        first_reordered = await client.eval(
+            SCRIPT, 4, *reordered_keys, now, "2", "10", "3", "5", "four-a"
+        )
+        assert first_reordered[0] == 1 and first_reordered[2] == 1
+        second_reordered = await client.eval(
+            SCRIPT, 4, *reordered_keys, now, "2", "10", "3", "5", "four-b"
+        )
+        assert second_reordered[0] == 1 and second_reordered[2] == 0
+        blocked_by_day = await client.eval(
+            SCRIPT, 4, *reordered_keys, now, "2", "10", "3", "5", "four-c"
+        )
+        # The retry delay is the proof: a day window answers ~86400 seconds, a
+        # minute window at most 60. Positional selection would fail here.
+        assert blocked_by_day[0] == 0 and int(blocked_by_day[1]) > 3600
+
+        minute_only = "test:source-quota:" + uuid.uuid4().hex + ":minute"
+        keys.append(minute_only)
+        await client.eval(SCRIPT, 1, minute_only, now, "1", "m-a")
+        minute_blocked = await client.eval(SCRIPT, 1, minute_only, now, "1", "m-b")
+        assert minute_blocked[0] == 0 and 0 < int(minute_blocked[1]) <= 60
     finally:
         try:
             await client.delete(*keys)
         except Exception:
             pass
         await client.aclose()
+
+
+def _phishing_connector(name, capabilities, account_id):
+    return Connector(
+        name=name,
+        connector_type="phishing",
+        default_job_type="phishing.netlas",
+        provider="netlas",
+        quota_group="default",
+        status="enabled",
+        source_account_id=account_id,
+        config={"max_requests": 20},
+        readiness={
+            "credentials_configured": True,
+            "credential_state": "valid",
+            "capabilities": capabilities,
+            "operations": ["search", "certificate"],
+        },
+        last_seen_at=datetime.now(timezone.utc),
+    )
+
+
+@pytest.mark.asyncio
+async def test_confirmed_candidates_and_brands_reach_a_phishing_scan(db_session):
+    import uuid
+
+    from app.models import Asset
+    from app.models.phishing import PhishingDomain
+    from app.models.source_account import SourceAccount
+    from app.services.connector_service import ConnectorService
+
+    account = SourceAccount(
+        source_id="netlas",
+        name="default",
+        policy={"approved": True, "daily_budget": 500, "requests_per_minute": 60},
+    )
+    db_session.add(account)
+    await db_session.flush()
+    db_session.add_all(
+        [
+            Asset(asset_type="domain", asset_value="acme.example"),
+            Asset(asset_type="keyword_domain", asset_value="acme"),
+            Asset(asset_type="keyword_title", asset_value="ACME portal"),
+        ]
+    )
+    connector = _phishing_connector(
+        "phishing-netlas",
+        ["certificate", "certificate_brand", "body", "title", "hostname"],
+        account.id,
+    )
+    db_session.add(connector)
+    await db_session.flush()
+    db_session.add_all(
+        [
+            # Only a verdict a person made qualifies: the platform asks the provider
+            # again about a *confirmed* name, never about its own open guesses.
+            PhishingDomain(
+                phishing_domain="acme-login.example.net",
+                matched_asset="acme",
+                detection_source="dnstwist",
+                verdict="confirmed",
+                confidence=88,
+            ),
+            PhishingDomain(
+                phishing_domain="acme-support.example.net",
+                matched_asset="acme",
+                detection_source="dnstwist",
+                verdict=None,
+                confidence=91,
+            ),
+            PhishingDomain(
+                phishing_domain="acme.example",
+                matched_asset="acme",
+                detection_source="dnstwist",
+                verdict="confirmed",
+                confidence=99,
+            ),
+        ]
+    )
+    await db_session.commit()
+
+    result = await ConnectorService(db_session).enqueue_ready_sources(
+        connector_type="phishing", created_by=None, title="T"
+    )
+    assert result["status"] == "scheduled"
+    params = (
+        await db_session.execute(
+            select(Job.params).where(Job.id == uuid.UUID(result["job_ids"][0]))
+        )
+    ).scalar_one()
+
+    assert params["candidates"] == [
+        {"value": "acme-login.example.net", "matched_asset": "acme"}
+    ]
+    # An owned name is never a candidate even when a verdict says so, and it stays in the
+    # exclude list that keeps a brand scan from reporting us to ourselves.
+    assert "acme.example" in params["exclude"]
+    assert [item["value"] for item in params["keyword_domains"]] == [
+        "acme.example",
+        "acme",
+    ]
+    assert params["keyword_titles"] == ["ACME portal"]
+
+    await db_session.delete(connector)
+    await db_session.commit()
+
+
+@pytest.mark.asyncio
+async def test_a_brand_or_candidate_configuration_is_enough_to_scan(db_session):
+    from app.models import Asset
+    from app.models.phishing import PhishingDomain
+    from app.models.source_account import SourceAccount
+    from app.services.connector_service import ConnectorService
+
+    account = SourceAccount(
+        source_id="netlas",
+        name="default",
+        policy={"approved": True, "daily_budget": 500, "requests_per_minute": 60},
+    )
+    db_session.add(account)
+    await db_session.flush()
+    # No domain asset at all: the playlist here is a brand and a confirmed candidate.
+    db_session.add(Asset(asset_type="keyword_domain", asset_value="acme"))
+    connector = _phishing_connector(
+        "phishing-netlas", ["certificate_brand", "body", "hostname"], account.id
+    )
+    db_session.add(connector)
+    await db_session.flush()
+    db_session.add(
+        PhishingDomain(
+            phishing_domain="acme-login.example.net",
+            matched_asset="acme",
+            detection_source="dnstwist",
+            verdict="confirmed",
+            confidence=88,
+        )
+    )
+    await db_session.commit()
+
+    result = await ConnectorService(db_session).enqueue_ready_sources(
+        connector_type="phishing", created_by=None, title="T"
+    )
+    assert result["status"] == "scheduled"
+
+    # The same installation with a connector that only knows the domain question has
+    # nothing to scan, and says so instead of queueing an empty job.
+    connector.readiness = {
+        "credentials_configured": True,
+        "credential_state": "valid",
+        "capabilities": ["certificate"],
+        "operations": ["search", "certificate"],
+    }
+    await db_session.delete(
+        (
+            await db_session.execute(
+                select(PhishingDomain).where(
+                    PhishingDomain.phishing_domain == "acme-login.example.net"
+                )
+            )
+        ).scalar_one()
+    )
+    db_session.add(Asset(asset_type="keyword_domain", asset_value="acme"))
+    await db_session.commit()
+    blocked = await ConnectorService(db_session).enqueue_ready_sources(
+        connector_type="phishing", created_by=None, title="T"
+    )
+    assert blocked["status"] == "blocked"
+    assert blocked["sources"][0]["reason"] == (
+        "No active assets or capabilities match this request"
+    )
+
+    await db_session.delete(connector)
+    await db_session.commit()

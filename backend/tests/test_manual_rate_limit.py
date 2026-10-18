@@ -311,6 +311,103 @@ class TestThrottledEndpoints:
         assert rows and rows[-1].details["scope"] == "breaches"
 
     @pytest.mark.asyncio
+    async def test_dns_promotion_charges_the_assets_scope(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        client,
+        db_session,
+        auth_headers_analyst,
+        test_analyst,
+    ):
+        """Promoting an observation creates an asset, so it pays the same price."""
+        from datetime import datetime, timezone
+
+        from app.models.dns_observation import DNSObservation
+
+        _activate_fake(monkeypatch, _FakeRedis())
+        test_analyst.rate_limit_minutes = 1
+        now = datetime.now(timezone.utc)
+        observation = DNSObservation(
+            observation_key="promotion-rate-limit",
+            observation_type="dns_record",
+            subject="promotion-rate-limit.example.com",
+            source="resolver",
+            first_seen_at=now,
+            last_seen_at=now,
+            metadata_json={},
+        )
+        db_session.add(observation)
+        await db_session.commit()
+        url = f"/api/v1/dns/observations/{observation.id}/asset"
+
+        first = await client.post(url, headers=auth_headers_analyst)
+        assert first.status_code == 201, first.text
+        # The second request is a repeat on an already-monitored value; the
+        # decision is that it counts, because it still writes an audit row.
+        second = await client.post(url, headers=auth_headers_analyst)
+        assert second.status_code == 429, second.text
+        assert second.headers.get("retry-after") == "60"
+
+        rows = list(
+            (
+                await db_session.execute(
+                    select(AuditLog).where(
+                        AuditLog.action == "rate_limit.manual_action_blocked"
+                    )
+                )
+            ).scalars()
+        )
+        assert rows and rows[-1].details["scope"] == "assets"
+        assert rows[-1].details["action"] == "asset promotion"
+
+    @pytest.mark.asyncio
+    async def test_exposure_promotion_charges_the_assets_scope(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        client,
+        db_session,
+        auth_headers_analyst,
+        test_analyst,
+    ):
+        from datetime import datetime, timezone
+
+        from app.models.source_observation import SourceObservation
+
+        _activate_fake(monkeypatch, _FakeRedis())
+        test_analyst.rate_limit_minutes = 1
+        now = datetime.now(timezone.utc)
+        observation = SourceObservation(
+            module="exposure",
+            source="netlas",
+            observation_key="promotion-rate-limit",
+            subject="promotion-rate-limit.example.com",
+            matched_asset="promotion-rate-limit.example.com",
+            first_seen_at=now,
+            last_seen_at=now,
+            provenance={},
+            payload={},
+        )
+        db_session.add(observation)
+        await db_session.commit()
+        url = f"/api/v1/exposure/observations/{observation.id}/asset"
+
+        first = await client.post(url, headers=auth_headers_analyst)
+        assert first.status_code == 201, first.text
+        second = await client.post(url, headers=auth_headers_analyst)
+        assert second.status_code == 429, second.text
+
+        rows = list(
+            (
+                await db_session.execute(
+                    select(AuditLog).where(
+                        AuditLog.action == "rate_limit.manual_action_blocked"
+                    )
+                )
+            ).scalars()
+        )
+        assert rows and rows[-1].details["scope"] == "assets"
+
+    @pytest.mark.asyncio
     async def test_asset_creation_asks_the_assets_scope_throttle(
         self,
         monkeypatch: pytest.MonkeyPatch,

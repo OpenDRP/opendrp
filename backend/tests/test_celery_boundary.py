@@ -12,7 +12,9 @@ Step-7 refactor:
 * eager ``apply()`` fires the task_prerun/postrun signals -> ``task.started``
   and ``task.completed`` audit rows;
 * ``schedule_matches`` cron semantics (0=Sunday) incl. invalid specs;
-* ``_redis_dedup_key`` format and real-Redis ``SET NX`` dedup behavior;
+* ``_redis_dedup_key`` format and real-Redis ``SET NX`` dedup behavior — the
+  tests of the latter take the ``live_redis`` fixture, so a run without a broker
+  skips them with a reason instead of failing (see tests/conftest.py);
 * ``_load_schedules`` DB read with the 60s in-process cache;
 * ``refresh_scan_schedules_task`` fires only on a matching minute and the
   dedup guard prevents double dispatch;
@@ -745,7 +747,7 @@ class TestRedisDedup:
         assert _redis_dedup_key("phishing", now) == "sched:phishing:203001020304"
 
     @pytest.mark.asyncio
-    async def test_set_nx_allows_once_per_minute(self):
+    async def test_set_nx_allows_once_per_minute(self, live_redis):
         module = f"test-{uuid.uuid4().hex[:8]}"
         now = datetime(2030, 5, 6, 7, 8, tzinfo=timezone.utc)
         try:
@@ -758,11 +760,7 @@ class TestRedisDedup:
         finally:
             import redis as redis_lib
 
-            from app.core.config import settings as core_settings
-
-            client = redis_lib.Redis.from_url(
-                core_settings.REDIS_URL, decode_responses=True
-            )
+            client = redis_lib.Redis.from_url(live_redis, decode_responses=True)
             for minute in (8, 9):
                 client.delete(_redis_dedup_key(module, now.replace(minute=minute)))
             client.close()
@@ -899,7 +897,7 @@ class TestLoadSchedulesAndTick:
 
     @pytest.mark.asyncio
     async def test_tick_fires_on_match_and_dedup_blocks_second_dispatch(
-        self, db_session
+        self, db_session, live_redis
     ):
         from app.tasks import scheduler_tasks as st
 
@@ -919,9 +917,7 @@ class TestLoadSchedulesAndTick:
         key = _redis_dedup_key("schedule_phishing", now)
         import redis as redis_lib
 
-        from app.core.config import settings as core_settings
-
-        client = redis_lib.Redis.from_url(core_settings.REDIS_URL, decode_responses=True)
+        client = redis_lib.Redis.from_url(live_redis, decode_responses=True)
         try:
             assert client.get(key) is None
         finally:
@@ -1467,7 +1463,7 @@ def _count_jobs_on_task_engine(title_like: str) -> int:
 class TestSchedulerEnqueue:
     @pytest.mark.asyncio
     async def test_tick_enqueues_jobs_audits_and_dedup_blocks_second(
-        self, db_session
+        self, db_session, live_redis
     ):
         from app.tasks import scheduler_tasks as st
 
@@ -1513,9 +1509,7 @@ class TestSchedulerEnqueue:
 
         import redis as redis_lib
 
-        from app.core.config import settings as core_settings
-
-        client = redis_lib.Redis.from_url(core_settings.REDIS_URL, decode_responses=True)
+        client = redis_lib.Redis.from_url(live_redis, decode_responses=True)
         client.delete(_redis_dedup_key("schedule_phishing", now))
         client.close()
         st._schedule_cache["data"] = None

@@ -28,3 +28,7 @@ class DNSExpiryMonitor(Base, UUIDMixin, TimestampMixin):
     observation_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("dns_security_observations.id", ondelete="SET NULL"))
     cycle: Mapped[str | None] = mapped_column(String(64))
     alerted_thresholds: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    # When the "this control has not been checked for too long" warning was queued.
+    # Silence and a quiet domain look identical from here (F-16), so the sweep says so
+    # once per staleness episode and a successful check clears the marker.
+    stale_alerted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

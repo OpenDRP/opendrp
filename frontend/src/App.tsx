@@ -7,6 +7,7 @@ import { endpoints } from "@/lib/api";
 import { toast } from "@/components/ui/use-toast";
 
 import LoginPage from "@/pages/LoginPage";
+import AcceptInvitationPage from "@/pages/AcceptInvitationPage";
 import DashboardPage from "@/pages/DashboardPage";
 import AssetsPage from "@/pages/AssetsPage";
 import AssetDetailPage from "@/pages/AssetDetailPage";
@@ -131,6 +132,9 @@ export default function App() {
 
       <Routes>
         <Route path="/login" element={<LoginPage />} />
+        {/* Public by design: the account cannot sign in until this page has run,
+            and the invitation token is the only credential it needs (U-7). */}
+        <Route path="/accept-invitation" element={<AcceptInvitationPage />} />
         <Route path="/logout" element={<LogoutHandler />} />
 
         {/* Outside the application shell on purpose: an account that owes a

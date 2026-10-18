@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import ReportsPage from "@/pages/ReportsPage";
@@ -225,20 +225,39 @@ describe("ReportsPage", () => {
   });
 
   it("revokes a download object URL only after the browser had time to consume it", async () => {
+    // The delay is the whole point of this test, so it is driven rather than waited
+    // for: on the real clock the assertion that the URL is still alive competed with
+    // the timer it was asserting about, and a loaded machine (the full suite) let the
+    // revocation win — the same test passed on its own and failed in a run of forty
+    // files. Fake timers make the two ends of the delay observable instead of racy.
     const anchorClick = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => {});
     const revokeObjectURL = vi.fn();
     const urlApi = { createObjectURL: vi.fn(() => "blob:report"), revokeObjectURL };
     vi.stubGlobal("URL", urlApi);
     Object.defineProperty(window, "URL", { configurable: true, value: urlApi });
-    const timeout = vi.spyOn(window, "setTimeout");
 
     renderPage();
     await screen.findByText("Weekly exposure report");
-    await userEvent.click(screen.getAllByRole("button", { name: /Download report/ }).find((button) => !button.hasAttribute("disabled"))!);
-    expect(revokeObjectURL).not.toHaveBeenCalled();
-    expect(timeout.mock.calls.some(([callback, delay]) => typeof callback === "function" && delay === 1000)).toBe(true);
-    anchorClick.mockRestore();
-    timeout.mockRestore();
+
+    vi.useFakeTimers();
+    try {
+      fireEvent.click(screen.getAllByRole("button", { name: /Download report/ }).find((button) => !button.hasAttribute("disabled"))!);
+      // The URL is created after the blob request resolves, so the timer that will
+      // revoke it does not exist until the microtask queue has drained. Advancing
+      // asynchronously is what lets that happen without moving the clock.
+      await vi.advanceTimersByTimeAsync(0);
+      // The object URL must outlive the synthetic click: revoking it synchronously
+      // cancels the download in some browsers.
+      expect(revokeObjectURL).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(999);
+      expect(revokeObjectURL).not.toHaveBeenCalled();
+      // ...and it must not be leaked either.
+      await vi.advanceTimersByTimeAsync(1);
+      expect(revokeObjectURL).toHaveBeenCalledWith("blob:report");
+    } finally {
+      vi.useRealTimers();
+      anchorClick.mockRestore();
+    }
   });
 
   it("lets a viewer generate a report but hides admin-only deletion", async () => {

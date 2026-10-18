@@ -122,6 +122,85 @@ async def test_alert_health_reports_disabled_channels_without_network_calls(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("naive", [True, False])
+async def test_connector_health_publishes_derived_readiness_and_last_success(
+    client, auth_headers_viewer, auth_headers_admin, db_session, naive
+):
+    """Readiness explains a refusal that `health` cannot: the worker is online,
+    but its provider key was rejected. The closed vocabulary reaches every role;
+    the raw readiness document stays administrator-only, like `last_error`."""
+    last_success = datetime.now(timezone.utc) - timedelta(hours=6)
+    if naive:
+        last_success = last_success.replace(tzinfo=None)
+    conn = Connector(
+        name=f"readiness-{naive}",
+        connector_type="phishing",
+        status="enabled",
+        default_job_type=f"phishing.readiness-{naive}",
+        readiness={
+            "credentials_configured": True,
+            "credential_state": "invalid",
+            "provider_error": "invalid_credentials",
+            "capabilities": ["certificate_search"],
+            "checked_at": "2026-01-01T00:00:00Z",
+        },
+        last_success_at=last_success,
+    )
+    db_session.add(conn)
+    await db_session.commit()
+
+    viewer_response = await client.get("/api/v1/connectors/health", headers=auth_headers_viewer)
+    viewer_item = next(
+        row for row in viewer_response.json()["items"] if row["name"] == conn.name
+    )
+    assert viewer_item["credentials_configured"] is True
+    assert viewer_item["credential_state"] == "invalid"
+    assert viewer_item["provider_error"] == "invalid_credentials"
+    assert viewer_item["checked_at"] == "2026-01-01T00:00:00Z"
+    assert viewer_item["readiness"] is None
+    assert 6 * 3600 - 5 <= viewer_item["last_success_age_seconds"] <= 6 * 3600 + 60
+
+    admin_response = await client.get("/api/v1/connectors/health", headers=auth_headers_admin)
+    admin_item = next(
+        row for row in admin_response.json()["items"] if row["name"] == conn.name
+    )
+    assert admin_item["readiness"]["capabilities"] == ["certificate_search"]
+
+
+@pytest.mark.asyncio
+async def test_connector_health_reduces_untrusted_readiness_to_the_closed_vocabulary(
+    client, auth_headers_viewer, db_session
+):
+    """A row written before the write-side constraint existed must not put
+    provider prose in front of a viewer through the derived fields."""
+    conn = Connector(
+        name="stale-readiness",
+        connector_type="phishing",
+        status="enabled",
+        default_job_type="phishing.stale-readiness",
+        readiness={
+            "credentials_configured": "yes",
+            "credential_state": "definitely-fine",
+            "provider_error": "<html>provider said no</html>",
+            "checked_at": 12345,
+        },
+    )
+    db_session.add(conn)
+    await db_session.commit()
+
+    response = await client.get("/api/v1/connectors/health", headers=auth_headers_viewer)
+    item = next(row for row in response.json()["items"] if row["name"] == conn.name)
+
+    assert item["credentials_configured"] is False
+    assert item["credential_state"] == "unknown"
+    assert item["provider_error"] is None
+    assert item["checked_at"] is None
+    # A connector that has never completed a scan has no collection age to report.
+    assert item["last_success_at"] is None
+    assert item["last_success_age_seconds"] is None
+
+
+@pytest.mark.asyncio
 async def test_alert_health_does_not_dial_a_disabled_but_configured_channel(
     client, auth_headers_viewer, db_session
 ):

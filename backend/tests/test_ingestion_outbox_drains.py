@@ -15,8 +15,10 @@ What the drain can get wrong while the schedule stays green:
 * a second worker claims the same row while the first is waiting on WHOIS, and
   the stale result is written over the newer claim (the re-check pins that too);
 * a failure is recorded as a terminal success, so an error leaves no retry;
-* a row with no delivery channel is retried forever every five minutes, or a
-  scheduled operations row is consumed as though it had been delivered.
+* a row whose channel does not exist yet is consumed as though it had been
+  delivered (F-03) or retried forever; the deferral window that replaced both is
+  pinned below, and the digest that reports the backlog it holds is pinned in
+  `test_alert_backlog_digest.py`.
 
 Every test here runs against the real models and the real session the tasks use.
 """
@@ -193,28 +195,72 @@ async def test_a_queued_notification_is_marked_processed_and_counted(db_session,
     assert event.last_error is None
 
 
+def _held_notifications() -> list[IngestionEvent]:
+    """One operations row and one finding row, both with no channel configured."""
+    return [
+        IngestionEvent(
+            event_key=f"notification:{module}:{uuid.uuid4()}",
+            kind="notification",
+            module=module,
+            entity_id=uuid.uuid4(),
+            payload={},
+        )
+        for module in ("module:operations", "phishing")
+    ]
+
+
 @pytest.mark.asyncio
-async def test_an_operations_row_retries_without_a_channel_where_a_finding_row_does_not(
+async def test_a_row_whose_channel_does_not_exist_waits_out_the_window(
     db_session, monkeypatch
 ):
+    """No channel holds every kind of notification for one window (WI-04).
+
+    Two answers to one question used to live here: a scheduled operations row was
+    retried every five minutes, and a finding row was consumed outright. A finding
+    is not less deliverable than an operations row — it simply arrived while the
+    installation had nowhere to send it — so both are held for the configured
+    window, and the save that configures a channel reports what was held once
+    (`test_alert_backlog_digest.py`). The window is also what keeps a
+    channel-less deployment from re-walking its whole backlog on every pass.
+    """
     monkeypatch.setattr(
         "app.services.ingestion_events.AlertDeliveryService.enqueue",
         AsyncMock(return_value=None),
     )
-    operations = IngestionEvent(
-        event_key=f"notification:module:operations:{uuid.uuid4()}",
-        kind="notification",
-        module="module:operations",
-        entity_id=uuid.uuid4(),
-        payload={},
+    operations, finding_row = _held_notifications()
+    db_session.add_all([operations, finding_row])
+    await db_session.commit()
+    before = datetime.now(timezone.utc)
+
+    assert await dispatch_notification_events(db_session) == 0
+
+    assert operations.processed_at is None and finding_row.processed_at is None
+    assert operations.last_error == "no_delivery_channel"
+    assert finding_row.last_error == "no_delivery_channel"
+    for row in (operations, finding_row):
+        hours = (_utc(row.next_attempt_at) - before).total_seconds() / 3600
+        assert 23 <= hours <= 25, f"{row.module} is due in {hours:.1f}h, not the window"
+
+    # A row that is still waiting is not claimed by the next pass, which is the
+    # whole point of the window rather than a five-minute retry.
+    assert await dispatch_notification_events(db_session) == 0
+    await db_session.refresh(finding_row)
+    assert finding_row.processed_at is None
+
+
+@pytest.mark.asyncio
+async def test_turning_the_window_off_keeps_the_behaviour_it_replaced(
+    db_session, monkeypatch
+):
+    """`ALERT_NO_CHANNEL_RETRY_HOURS=0` holds nothing, as the drain did before."""
+    from app.core.config import settings as core_settings
+
+    monkeypatch.setattr(core_settings, "ALERT_NO_CHANNEL_RETRY_HOURS", 0)
+    monkeypatch.setattr(
+        "app.services.ingestion_events.AlertDeliveryService.enqueue",
+        AsyncMock(return_value=None),
     )
-    finding_row = IngestionEvent(
-        event_key=f"notification:phishing:{uuid.uuid4()}",
-        kind="notification",
-        module="phishing",
-        entity_id=uuid.uuid4(),
-        payload={},
-    )
+    operations, finding_row = _held_notifications()
     db_session.add_all([operations, finding_row])
     await db_session.commit()
 
@@ -223,7 +269,7 @@ async def test_an_operations_row_retries_without_a_channel_where_a_finding_row_d
     assert operations.processed_at is None
     assert operations.last_error == "no_delivery_channel"
     assert operations.next_attempt_at is not None
-    # A delivery notification is terminal for a deployment with no channel; the
-    # row reports why instead of being retried every five minutes forever.
+    # A delivery notification is terminal with the window off; the row reports why
+    # instead of being retried every five minutes forever.
     assert finding_row.processed_at is not None
     assert finding_row.last_error == "no_delivery_channel"

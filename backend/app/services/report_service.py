@@ -4,6 +4,22 @@ import uuid
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.services.breach_severity import severity_label, severity_rank_case
+
+
+def _breach_kpi_caption(kpi: dict, key: str) -> str:
+    """The caption a breach KPI key carries, taken from the report's own data.
+
+    The caption travels with the number, so the sentence printed beside a figure is the
+    one the shared rule wrote for it (WI-16). A report rendered from data an older build
+    gathered has no captions; it falls back to this wording rather than printing a blank.
+    """
+    captions = (kpi.get("breach_kpi") or {}).get("captions") or {}
+    declared = captions.get(key)
+    if isinstance(declared, str) and declared:
+        return declared
+    return "incidents the configured sources added to their own catalogues in the last 7 days"
+
 
 def _report_pdf_text_values(report_data: dict, generated_by_email: str) -> list[str]:
     """Return row-field strings actually sent to PDF cells, tables, and footers."""
@@ -35,6 +51,11 @@ def _report_pdf_text_values(report_data: dict, generated_by_email: str) -> list[
                 getattr(breach, "matched_email", None),
                 getattr(breach, "breach_name", ""),
                 getattr(breach, "domain", ""),
+                # Rendered in their own columns, so the class and the severity are part
+                # of the text the PDF receives and are validated like every other value
+                # that reaches a cell.
+                getattr(breach, "exposure_kind", None) or "breach",
+                severity_label(getattr(breach, "severity", None)),
                 getattr(breach, "breach_date", ""),
             )
         )
@@ -105,6 +126,7 @@ class ReportService:
 
         from sqlalchemy import func, select, text
         from app.models import Asset, Breach, DrpPhishingDomain
+        from app.services.breach_kpi import breach_kpi
         from app.models.dns_observation import DNSObservation
         from app.models.source_observation import SourceObservation
         from app.core.config import settings
@@ -138,7 +160,11 @@ class ReportService:
                 select(func.count(Asset.id)).where(Asset.is_active.is_(True))
             )).scalar_one())
             total_phishing = int((await self.db.execute(select(func.count(DrpPhishingDomain.id)))).scalar_one())
-            total_breaches = int((await self.db.execute(select(func.count(Breach.id)))).scalar_one())
+            # The breach half of the KPI is the shared rule the dashboard reads too, read
+            # inside this snapshot: a report that disagreed with the page about the same
+            # installation would be worse than either number alone (WI-16).
+            breach = await breach_kpi(self.db, now=now)
+            total_breaches = breach["total_findings"]
             open_statuses = ("active", "investigating")
             active_phishing = int((await self.db.execute(
                 select(func.count(DrpPhishingDomain.id)).where(
@@ -146,17 +172,17 @@ class ReportService:
                     DrpPhishingDomain.status.in_(open_statuses),
                 )
             )).scalar_one())
-            active_breaches = int((await self.db.execute(
-                select(func.count(Breach.id)).where(
-                    Breach.created_at >= seven_days_ago,
-                    Breach.status.in_(open_statuses),
-                )
-            )).scalar_one())
             kpi = {
                 "total_assets": total_assets,
                 "total_phishing": total_phishing,
                 "total_breaches": total_breaches,
-                "active_threats_7d": active_phishing + active_breaches,
+                "active_threats_7d": active_phishing + int(breach["active_findings_7d"]),
+                # A finding is what happened to one of our accounts; an incident is what a
+                # source added to its catalogue, whether or not any address of ours is in
+                # it. Reporting only the first let a quiet week of scanning read as a quiet
+                # week of incidents (F-09).
+                "new_breach_incidents_7d": breach["new_incidents_7d"],
+                "breach_kpi": breach,
             }
 
             assets = list((await self.db.execute(
@@ -169,8 +195,15 @@ class ReportService:
                     DrpPhishingDomain.created_at.desc(), DrpPhishingDomain.id.desc()
                 ).limit(row_limit)
             )).scalars().all())
+            # Loudest first, the same order the list offers: a report read top-down is
+            # a triage, and alphabetical severity would put an address list above a
+            # plaintext credential (F-13, WI-28).
             breaches = list((await self.db.execute(
-                select(Breach).order_by(Breach.created_at.desc(), Breach.id.desc()).limit(row_limit)
+                select(Breach).order_by(
+                    severity_rank_case(Breach.severity).desc(),
+                    Breach.created_at.desc(),
+                    Breach.id.desc(),
+                ).limit(row_limit)
             )).scalars().all())
             exposure_query = select(SourceObservation).where(SourceObservation.module == "exposure")
             exposure_total = int((await self.db.execute(
@@ -343,6 +376,10 @@ class ReportService:
         kv(pdf, "Phishing Threats:", report_data['kpi']['total_phishing'])
         kv(pdf, "Breach Findings:", report_data['kpi']['total_breaches'])
         kv(pdf, "Active Threats (7d):", report_data['kpi']['active_threats_7d'])
+        # The two are not the same number and the report says so where the numbers are
+        # printed: findings are about our accounts, incidents are about what the sources
+        # added to their catalogues (WI-16).
+        kv(pdf, "New Breach Incidents (7d):", report_data['kpi'].get('new_breach_incidents_7d', 0))
         pdf.ln(30)
         pdf.set_font("Helvetica", "I", 9)
         pdf.set_text_color(150, 150, 150)
@@ -505,8 +542,12 @@ class ReportService:
         section_heading("BREACH FINDINGS", "4")
         breaches = report_data.get("breaches", [])
         section_counts("breaches", breaches)
-        headers = ["#", "Matched Email", "Breach", "Domain", "Breach Date"]
-        widths = [8, 60, 55, 40, 27]
+        # The class of exposure is its own column: a compromised account is a password
+        # reset and a stealer log is a session to revoke, so a report that names the
+        # incident without it leaves the reader to find out elsewhere (WI-21). The token
+        # printed is the one the API filters on, not a second vocabulary.
+        headers = ["#", "Matched Email", "Breach", "Domain", "Exposure", "Severity", "Breach Date"]
+        widths = [8, 44, 46, 28, 24, 22, 18]
         pdf.set_fill_color(17, 24, 39)
         pdf.set_text_color(255, 255, 255)
         pdf.set_font("Helvetica", "B", 10)
@@ -531,7 +572,15 @@ class ReportService:
                 pdf.set_fill_color(249, 250, 251)
             else:
                 pdf.set_fill_color(255, 255, 255)
-            cells = [idx, b.matched_email, b.breach_name, b.domain, str(b.breach_date)]
+            cells = [
+                idx,
+                b.matched_email,
+                b.breach_name,
+                b.domain,
+                getattr(b, "exposure_kind", None) or "breach",
+                severity_label(getattr(b, "severity", None)),
+                str(b.breach_date),
+            ]
             for i, c in enumerate(cells):
                 align = "L" if i in (1, 2, 3) else "C"
                 pdf.cell(widths[i], 8, str(c)[:60], border=1, align=align, fill=True)
@@ -542,12 +591,34 @@ class ReportService:
         section_heading("CONCLUSION & RECOMMENDATIONS", "5")
         pdf.set_font("Helvetica", "", 11)
         pdf.set_text_color(55, 65, 81)
+        breach_payload = kpi.get("breach_kpi") or {}
+        undated_incidents = int(breach_payload.get("undated_incidents", 0) or 0)
+        undated_note = (
+            f"    ({undated_incidents} stored incidents carry no date from their source, so they cannot be counted in that window.)\n"
+            if undated_incidents > 0
+            else ""
+        )
+        # The class of exposure behind the findings total, from the same payload the
+        # dashboard reads: a compromised account and a stealer-log row are one number to
+        # the KPI and two different jobs for the operator (WI-16).
+        kinds = breach_payload.get("findings_by_exposure_kind") or {}
+        kinds_note = (
+            f"  - {_breach_kpi_caption(kpi, 'findings_by_exposure_kind')}: "
+            + ", ".join(f"{kind} {int(count)}" for kind, count in kinds.items())
+            + ".\n"
+            if kinds
+            else ""
+        )
         pdf.multi_cell(0, 7,
             "SUMMARY: The OpenDRP platform has identified the following security posture:\n"
             f"  - {kpi['total_assets']} active asset records are present in the inventory.\n"
             f"  - {kpi['total_phishing']} phishing findings are stored (all statuses).\n"
             f"  - {kpi['total_breaches']} breach findings are stored (all configured sources).\n"
-            f"  - {kpi['active_threats_7d']} phishing and breach findings are active or under investigation and were created in the last 7 days.\n\n"
+            f"  - {kpi['active_threats_7d']} phishing and breach findings are active or under investigation and were created in the last 7 days.\n"
+            f"  - {kpi.get('new_breach_incidents_7d', 0)} {_breach_kpi_caption(kpi, 'new_incidents_7d')}.\n"
+            + undated_note
+            + kinds_note
+            + "\n"
             "RECOMMENDATIONS:\n"
             " 1. Validate high-priority findings against their source and current status before taking action.\n"
             " 2. For confirmed account exposure, follow the organization's credential-response policy.\n"

@@ -96,6 +96,47 @@ describe("lastSeenAt", () => {
     ).toBe("2026-01-02T00:00:00+00:00");
   });
 
+  it("compares instants, not text, when a date meets a timestamp", () => {
+    // `2026-10-15` as a date is midnight UTC. The timestamp below is 22:00 UTC
+    // on the 14th, so the date is the later observation — while text comparison
+    // picks the timestamp because `T` sorts after the end of the string. The
+    // helper must answer with the moment, not with the alphabetically longer
+    // value.
+    expect(
+      lastSeenAt({
+        total: 2, phishing: 1, breaches: 1, dns: 0, exposure: 0, findings: 0,
+        last_seen: {
+          breaches: "2026-10-15",
+          phishing: "2026-10-15T00:00:00+02:00",
+        },
+      }),
+    ).toBe("2026-10-15");
+    expect(
+      lastSeenAt({
+        total: 2, phishing: 1, breaches: 1, dns: 0, exposure: 0, findings: 0,
+        last_seen: {
+          breaches: "2026-10-15",
+          phishing: "2026-10-15T12:00:00+00:00",
+        },
+      }),
+    ).toBe("2026-10-15T12:00:00+00:00");
+  });
+
+  it("ignores a value the browser cannot parse rather than letting it win", () => {
+    expect(
+      lastSeenAt({
+        total: 2, phishing: 1, breaches: 1, dns: 0, exposure: 0, findings: 0,
+        last_seen: { breaches: "not-a-date", phishing: "2026-01-02T00:00:00+00:00" },
+      }),
+    ).toBe("2026-01-02T00:00:00+00:00");
+    expect(
+      lastSeenAt({
+        total: 1, phishing: 0, breaches: 0, dns: 1, exposure: 0, findings: 0,
+        last_seen: { dns: "2026-13-45T99:99:99Z" },
+      }),
+    ).toBeNull();
+  });
+
   it("is null when nothing ever matched, or there is no summary", () => {
     const empty = {
       total: 0,

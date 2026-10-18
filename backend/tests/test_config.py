@@ -3,6 +3,8 @@ from pydantic import ValidationError
 
 from app.core.config import Settings, _parse_cors_origins
 
+pytestmark = pytest.mark.usefixtures("without_testing_switch")
+
 #: A production configuration that passes every other production check, so that
 #: the tests below fail only for the reason each one is about.
 _PRODUCTION = {
@@ -37,6 +39,32 @@ def test_production_requires_a_pinned_release_version():
 
 def test_production_accepts_a_pinned_release_version():
     assert _production(OPENDRP_VERSION="0.2.0").OPENDRP_VERSION == "0.2.0"
+
+
+class TestTestingFlag:
+    """`TESTING` is a test-suite switch, not a way to deploy without controls.
+
+    The flag turns scan admission fail-open and makes the rate limiter act as if
+    Redis were unreachable, which removes the login lockout. A test `.env` copied
+    into a deployment, or a debugging export inherited from a shell, would remove
+    both without a word; the production validator is where that has to be refused.
+    """
+
+    def test_the_testing_switch_is_refused_in_production(self, monkeypatch):
+        monkeypatch.setenv("TESTING", "1")
+        with pytest.raises(ValidationError, match="TESTING"):
+            _production()
+
+    @pytest.mark.parametrize("value", ["0", "false", "False", "no", "off", ""])
+    def test_an_explicit_off_value_is_accepted(self, monkeypatch, value):
+        """`TESTING=0` is the documented way to keep a shared environment file."""
+        monkeypatch.setenv("TESTING", value)
+        assert _production().APP_ENV == "production"
+
+    def test_development_may_still_use_the_testing_switch(self, monkeypatch):
+        """The suite and a developer's shell are the two places it belongs."""
+        monkeypatch.setenv("TESTING", "1")
+        assert Settings(APP_ENV="development").APP_ENV == "development"  # type: ignore[call-arg]
 
 
 
@@ -229,3 +257,23 @@ class TestSecondFactorPolicy:
 
     def test_it_can_be_turned_on(self):
         assert _production(REQUIRE_MFA_FOR_ADMINS=True).REQUIRE_MFA_FOR_ADMINS is True
+
+    def test_the_roles_list_is_empty_by_default(self):
+        assert Settings().REQUIRE_MFA_ROLES == ""  # type: ignore[call-arg]
+
+    def test_the_roles_list_is_normalised(self):
+        """Spacing and case are the operator's; the policy compares role names."""
+        assert Settings(REQUIRE_MFA_ROLES=" Admin , analyst ").REQUIRE_MFA_ROLES == "admin,analyst"  # type: ignore[call-arg]
+
+    def test_an_unknown_role_name_is_a_startup_failure(self):
+        """Otherwise a typo requires a factor from nobody and looks like it worked."""
+        with pytest.raises(ValidationError) as failure:
+            Settings(REQUIRE_MFA_ROLES="admin,root")  # type: ignore[call-arg]
+        assert "root" in str(failure.value)
+
+    def test_every_role_this_platform_has_is_accepted(self):
+        """The validator's name list and ``UserRole`` have to keep agreeing."""
+        from app.models.user import UserRole
+
+        for member in UserRole:
+            assert Settings(REQUIRE_MFA_ROLES=member.value).REQUIRE_MFA_ROLES == member.value  # type: ignore[call-arg]

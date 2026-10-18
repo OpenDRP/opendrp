@@ -13,7 +13,7 @@ import logging
 import os
 
 from opendrp_connector import ConnectorBase
-from opendrp_connector.base import ConnectorAPIError
+from opendrp_connector.base import DEFAULT_SUBMIT_BATCH, ConnectorAPIError
 
 from endpoint_providers import KEY_ENV, EndpointClient, ProviderError, host
 
@@ -25,10 +25,32 @@ POLICY = {
 }
 CAPABILITY = "endpoint_lookup"
 OPERATION = "lookup"
-SUBMIT_BATCH = 500
+
+#: Failures that say "this attempt failed", not "this account cannot scan":
+#: another target is worth trying, because the provider did answer the ones before
+#: it. `invalid_credentials`, `access_denied`, `quota_denied` and an exhausted
+#: request budget are deliberately absent — the next target would fail for the
+#: same reason, and trying it spends a request to learn nothing.
+RECOVERABLE_ERRORS = frozenset(
+    {
+        "network_or_invalid_response",
+        "rate_limited",
+        "provider_rejected_request",
+        "response_too_large",
+        "invalid_response",
+    }
+)
+
+#: How many targets in a row may fail before the scan stops. One flaky lookup must
+#: not throw away the rest of the inventory, and a provider that is down must not
+#: be asked about two hundred targets to prove it.
+MAX_CONSECUTIVE_FAILURES = 3
 
 
 class ExposureEndpointsConnector(ConnectorBase):
+    CAPABILITIES = (CAPABILITY,)
+    OPERATIONS = (OPERATION,)
+
     def __init__(self):
         self.provider = os.environ.get("EXPOSURE_PROVIDER", "")
         if self.provider not in KEY_ENV:
@@ -61,18 +83,13 @@ class ExposureEndpointsConnector(ConnectorBase):
         await super().register()
         await self.report_readiness()
 
-    async def report_readiness(self):
-        await self._request(
-            "POST",
-            "/api/v1/connectors/me/readiness",
-            json={
-                "credentials_configured": bool(os.environ.get(KEY_ENV[self.provider], "").strip()),
-                "credential_state": self.credential_state,
-                "provider_error": self.provider_error,
-                "capabilities": [CAPABILITY],
-                "operations": [OPERATION],
-            },
-        )
+    def credentials_configured(self) -> bool:
+        """Whether the selected provider's key is in this container's environment.
+
+        A key stored in the core is fetched per scan and is not visible here, so the
+        readiness row is refreshed after the credential read.
+        """
+        return bool((self.env.get(KEY_ENV[self.provider]) or "").strip())
 
     async def _reserve(self, job_id, bucket):
         try:
@@ -157,11 +174,15 @@ class ExposureEndpointsConnector(ConnectorBase):
 
         resolved = {}
         domain_targets = [value for kind, value in targets if kind == "domain"]
+        #: Targets the scan could not ask about. It is the denominator that makes
+        #: "nothing is exposed" different from "we never got there".
+        skipped = 0
+        consecutive = 0
         try:
             if self.provider == "shodan" and domain_targets:
                 resolved = await client.resolve(domain_targets)
             async with asyncio.timeout(300):
-                for kind, value in targets:
+                for position, (kind, value) in enumerate(targets):
                     try:
                         if kind == "ip":
                             add(value, value, None, await client.host_ports(value), "exact_ip")
@@ -172,26 +193,49 @@ class ExposureEndpointsConnector(ConnectorBase):
                             address = resolved.get(value)
                             if address is None:
                                 errors.append("unresolved_domain")
+                                skipped += 1
                                 continue
                             records = await client.host_ports(address)
                             add(value, value, value, records, "domain_resolved_ip")
                     except ProviderError as exc:
-                        errors.append(str(exc))
-                        if str(exc) == "invalid_credentials":
-                            self.credential_state = "invalid"
-                        self.provider_error = str(exc)
-                        break
+                        code = str(exc)
+                        errors.append(code)
+                        self.provider_error = code
+                        skipped += 1
+                        if code not in RECOVERABLE_ERRORS:
+                            # The account, the budget or the capability is the
+                            # problem: the remaining targets would fail the same
+                            # way, and each attempt would still be charged.
+                            skipped += len(targets) - position - 1
+                            if code == "invalid_credentials":
+                                self.credential_state = "invalid"
+                            break
+                        consecutive += 1
+                        if consecutive >= MAX_CONSECUTIVE_FAILURES:
+                            skipped += len(targets) - position - 1
+                            break
+                        continue
+                    consecutive = 0
         except ProviderError as exc:
+            # The batched resolve, before any target was asked about.
             errors.append(str(exc))
+            self.provider_error = str(exc)
+            skipped += len(domain_targets)
+            if str(exc) == "invalid_credentials":
+                self.credential_state = "invalid"
         except TimeoutError:
             errors.append("scan_deadline_exceeded")
+            skipped += len(targets)
 
-        if client.requests and not errors:
+        if client.requests and self.credential_state != "invalid":
+            # A provider that answered at least one target proved the key works,
+            # even when another target timed out: "invalid credentials" is a
+            # verdict about the account, not about the scan.
             self.credential_state = "valid"
-            self.provider_error = None
+        self.provider_error = errors[-1] if errors else None
 
-        for start in range(0, len(findings), SUBMIT_BATCH):
-            await self.submit_findings(job_id, findings[start : start + SUBMIT_BATCH])
+        for start in range(0, len(findings), DEFAULT_SUBMIT_BATCH):
+            await self.submit_findings(job_id, findings[start : start + DEFAULT_SUBMIT_BATCH])
         await self.report_readiness()
 
         if truncated or (errors and findings):
@@ -208,6 +252,8 @@ class ExposureEndpointsConnector(ConnectorBase):
             "requests": client.requests,
             "observations": len(findings),
             "truncated": truncated,
+            "targets_total": len(targets),
+            "targets_skipped": skipped,
             "errors": errors[:20],
         }
 

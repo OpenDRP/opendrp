@@ -6,11 +6,13 @@ from app.core.audit import AuditLogger
 from app.core.config import settings as core_settings
 from app.core.safe_errors import sanitize_external_error
 from app.schemas.settings import (
+    AlertPolicyResponse,
     SystemSettingsResponse,
     SystemSettingsUpdate,
     TestEmailRequest,
     TestTelegramRequest,
 )
+from app.services.alert_policy import resolve_alert_policy
 from app.services.settings_service import (
     _ENCRYPTED_FIELDS,
     SettingsService,
@@ -71,6 +73,20 @@ async def get_runtime_configuration(
         },
         "resource_limits_source": "docker-compose.yml",
     }
+
+
+@router.get("/alert-policy", response_model=AlertPolicyResponse)
+async def get_alert_policy(
+    db: AsyncSession = Depends(get_db),
+    user=Depends(require_admin),
+):
+    """The alert budget in force, resolved from the saved row and the environment.
+
+    Deliberately un-audited: it is a derived read of configuration the Settings
+    page has just fetched (and ``GET /settings`` is the audited row), so an audit
+    row here would double the log of every page visit without saying anything new.
+    """
+    return AlertPolicyResponse.model_validate(await resolve_alert_policy(db))
 
 
 @router.put("", response_model=SystemSettingsResponse)

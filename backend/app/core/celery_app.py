@@ -112,6 +112,7 @@ celery_app = Celery(
         "app.tasks.report_tasks",
         "app.tasks.retention_tasks",
         "app.tasks.scheduler_tasks",
+        "app.tasks.user_tasks",
     ],
 )
 
@@ -146,6 +147,14 @@ celery_app.conf.update(
             "soft_time_limit": _ALERT_TASK_SOFT_TIME_LIMIT,
             "time_limit": _ALERT_TASK_TIME_LIMIT,
         },
+        "send_phishing_digest": {
+            "soft_time_limit": _ALERT_TASK_SOFT_TIME_LIMIT,
+            "time_limit": _ALERT_TASK_TIME_LIMIT,
+        },
+        "send_breach_digest": {
+            "soft_time_limit": _ALERT_TASK_SOFT_TIME_LIMIT,
+            "time_limit": _ALERT_TASK_TIME_LIMIT,
+        },
     },
     task_publish_retry=True,
     task_publish_retry_policy={
@@ -169,6 +178,29 @@ celery_app.conf.update(
         "check-dns-expiry-alerts-daily": {
             "task": "check_dns_expiry_alerts",
             "schedule": crontab(hour=5, minute=30),
+            "options": {"queue": "alerts"},
+        },
+        # The phishing digest (WI-10): the candidates the alert budget decided not
+        # to interrupt anyone for, reported once. The entry ticks every hour and the
+        # task decides whether this is the hour the operator asked for
+        # (ALERT_PHISHING_DIGEST_HOUR_UTC, or the value saved in Settings), because a
+        # schedule is built when the worker starts and an hour held here could only
+        # change when a container was recreated. The quarter hour keeps the digest
+        # behind the 05:30 DNS sweep that shares its delivery queue: the tick inside
+        # a chosen hour is the only one that sends, so an hour of 6 means 06:15.
+        "send-phishing-digest-hourly": {
+            "task": "send_phishing_digest",
+            "schedule": crontab(minute=15),
+            "options": {"queue": "alerts"},
+        },
+        # The breach digest (WI-06): the scans whose size made them a backlog rather
+        # than a report. Its own task on the same hourly tick and the same quarter
+        # hour, because it answers the same question - what did the platform see that
+        # was not worth interrupting anyone for? - and an installation should have one
+        # summary hour, not two.
+        "send-breach-digest-hourly": {
+            "task": "send_breach_digest",
+            "schedule": crontab(minute=15),
             "options": {"queue": "alerts"},
         },
         "refresh-scan-schedules-every-minute": {
@@ -198,7 +230,14 @@ celery_app.conf.update(
         # the HTTP work-poll protocol.
         "deliver_pending_alerts": {"queue": "alerts"},
         "check_dns_expiry_alerts": {"queue": "alerts"},
+        "send_phishing_digest": {"queue": "alerts"},
+        "send_breach_digest": {"queue": "alerts"},
         "process_enrichment_events": {"queue": "default"},
+        # An account notice is small and must not wait behind a batch of alert
+        # deliveries, which is why it shares the default queue rather than
+        # `alerts`; its own limit is the platform default (RWI-15).
+        "send_user_notification": {"queue": "default"},
+        "send_user_invitation": {"queue": "default"},
         "generate_report": {"queue": "reports"},
         "refresh_scan_schedules": {"queue": "default"},
         "purge_expired_data": {"queue": "default"},

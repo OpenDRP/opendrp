@@ -63,6 +63,21 @@ export default function AssetDetailPage() {
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(20);
 
+  // The asset's own record, read once when the page opens (AST-44). It is what
+  // writes `asset.view` and what carries criticality and both dates; the
+  // findings endpoint only ever returned a four-field summary of the asset.
+  // A stable key with no remount refetch keeps the read count at one per open,
+  // rather than one per tab that re-renders the page.
+  const assetQuery = useQuery({
+    queryKey: ["asset", id],
+    queryFn: () => endpoints.getAsset(id),
+    enabled: Boolean(id),
+    staleTime: Infinity,
+    refetchOnMount: false,
+    refetchOnWindowFocus: false,
+    refetchOnReconnect: false,
+  });
+
   const { data, isLoading, isFetching, isError, error, refetch } = useQuery({
     queryKey: ["asset-findings", id, module, page, pageSize],
     queryFn: () => endpoints.assetFindings(id, { module, page, size: pageSize }),
@@ -82,7 +97,8 @@ export default function AssetDetailPage() {
     [coverage.data],
   );
 
-  const asset = data?.asset;
+  const record = assetQuery.data;
+  const asset = record ?? data?.asset;
   const counts = data?.counts;
   const selected = MODULES.find((entry) => entry.id === module) ?? MODULES[0];
   const typeCoverage = asset ? coverageForType(coverageMap, asset.asset_type) : undefined;
@@ -148,8 +164,16 @@ export default function AssetDetailPage() {
                 {asset.is_active ? "Active" : "Inactive"}
               </Badge>
             )}
+            {record && (
+              <Badge variant="outline" className="capitalize">{record.criticality}</Badge>
+            )}
             <span className="text-xs">{TIME_ZONE_HINT}</span>
           </div>
+          {record && (
+            <p className="text-xs text-muted-foreground mt-1">
+              Created {formatDateTime(record.created_at)} · Updated {formatDateTime(record.updated_at)}
+            </p>
+          )}
         </div>
         <Button variant="outline" onClick={() => refetch()} disabled={isFetching}>
           <RefreshCw className={`w-4 h-4 mr-2 ${isFetching ? "animate-spin" : ""}`} />

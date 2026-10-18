@@ -389,3 +389,242 @@ def test_netlas_dns_rows_keep_only_owned_well_formed_a_and_aaaa_records():
     assert observations[0]["metadata"]["source_domain"] == "example.com"
     assert observations[0]["metadata"]["evidence"] == "netlas_passive_dns_dataset"
     assert source.record_errors == 3
+
+
+def test_brand_expression_keeps_the_phrase_and_generates_the_wildcard():
+    # One expression, two halves: the organisation the certificate claims and the names
+    # it carries. The phrase is escaped as a phrase, and the wildcard half is generated
+    # from the same value, so a metacharacter can never reach the part that is not quoted.
+    assert providers.brand_certificate_expression("ACME Corp.") == (
+        'certificate.subject.organization:"ACME Corp." OR certificate.names:*acmecorp*'
+    )
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        'ACME" OR certificate.names:*',
+        "ACME*",
+        # The wildcard half is generated: this one leaves two usable characters, which
+        # match everything and mean nothing.
+        "a. b",
+        "\x01ACME",
+        "",
+        "ACME\nCorp",
+        None,
+    ],
+)
+def test_a_brand_the_grammar_cannot_carry_is_refused(value):
+    with pytest.raises(providers.ProviderError) as error:
+        providers.brand_certificate_expression(value)
+    assert str(error.value) == "invalid_brand_value"
+
+
+@pytest.mark.asyncio
+async def test_brand_certificate_search_uses_the_certificate_collection_and_quota():
+    seen = []
+
+    def handler(request):
+        seen.append(request)
+        assert request.url.path == "/api/certs/"
+        assert request.headers["Authorization"] == "Bearer fixture-secret"
+        return httpx.Response(200, json={"items": []})
+
+    source = adapter("netlas", handler)
+    assert await source.search_brand_certificates("ACME Corp.") == []
+    assert seen[0].url.params["q"] == (
+        'certificate.subject.organization:"ACME Corp." OR certificate.names:*acmecorp*'
+    )
+    # The provider rate-limits certificate queries to three a minute, so a brand search
+    # is reserved from the certificate bucket rather than from the general one.
+    source.reserve.assert_awaited_once_with("certificate")
+
+
+@pytest.mark.asyncio
+async def test_the_result_set_is_counted_before_a_page_is_fetched():
+    def handler(request):
+        assert request.url.path == "/api/responses_count/"
+        assert request.url.params["q"] == 'http.body:"ACME"'
+        return httpx.Response(200, json={"count": 4200})
+
+    source = adapter("netlas", handler)
+    assert await source.count_responses('http.body:"ACME"') == 4200
+    source.reserve.assert_awaited_once_with("search")
+
+
+@pytest.mark.asyncio
+async def test_a_count_that_is_not_a_number_is_not_a_count():
+    source = adapter(
+        "netlas", lambda request: httpx.Response(200, json={"count": "many"})
+    )
+    with pytest.raises(providers.ProviderError) as error:
+        await source.count_responses("host:example.com")
+    assert str(error.value) == "invalid_response"
+
+
+@pytest.mark.asyncio
+async def test_icon_hashes_are_read_from_the_providers_own_view_of_our_endpoint():
+    def handler(request):
+        assert request.url.path == "/api/responses/"
+        assert request.url.params["q"] == 'host:"example.com"'
+        assert "http.favicon.perceptual_hash" in request.url.params["fields"]
+        return httpx.Response(
+            200,
+            json={
+                "items": [
+                    {
+                        "data": {
+                            "http": {
+                                "favicon": {
+                                    "hash_sha256": "A" * 64,
+                                    "perceptual_hash": "00763c383c3c6e00",
+                                }
+                            }
+                        }
+                    },
+                    {"data": {"host": "example.com"}},
+                ]
+            },
+        )
+
+    source = adapter("netlas", handler)
+    assert await source.own_favicon_hashes("example.com") == {
+        "sha256": "a" * 64,
+        "perceptual": "00763c383c3c6e00",
+    }
+    assert source.record_errors == 0
+
+
+@pytest.mark.asyncio
+async def test_an_icon_hash_in_another_alphabet_is_recorded_not_searched():
+    source = adapter(
+        "netlas",
+        lambda request: httpx.Response(
+            200,
+            json={
+                "items": [
+                    {"data": {"http": {"favicon": {"perceptual_hash": "not-a-hash"}}}}
+                ]
+            },
+        ),
+    )
+    assert await source.own_favicon_hashes("example.com") == {}
+    assert source.record_error_codes == ["unreadable_favicon_hash"]
+
+
+@pytest.mark.parametrize(
+    ("algorithm", "value", "expected"),
+    [
+        ("sha256", "a" * 64, 'http.favicon.hash_sha256:"' + "a" * 64 + '"'),
+        ("perceptual", "00763c383c3c6e00", "http.favicon.perceptual_hash:00763c383c3c6e00~1"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_icon_searches_keep_the_fuzzy_operator_on_the_term(
+    algorithm, value, expected
+):
+    seen = {}
+
+    def handler(request):
+        seen["q"] = request.url.params["q"]
+        return httpx.Response(200, json={"items": []})
+
+    source = adapter("netlas", handler)
+    assert await source.search_favicon(algorithm, value) == []
+    assert seen["q"] == expected
+    source.reserve.assert_awaited_once_with("search")
+
+
+def test_an_icon_search_refuses_a_value_it_cannot_use():
+    with pytest.raises(providers.ProviderError) as error:
+        providers.favicon_expression("perceptual", "zzzz")
+    assert str(error.value) == "invalid_favicon_hash"
+    with pytest.raises(providers.ProviderError) as error:
+        providers.favicon_expression("mmh3", "a" * 8)
+    assert str(error.value) == "unsupported_capability"
+
+
+@pytest.mark.asyncio
+async def test_whois_search_uses_the_documented_collection_and_fields():
+    def handler(request):
+        assert request.url.path == "/api/whois_domains/"
+        assert request.url.params["q"] == 'domain:"acme-login.example.net"'
+        assert request.url.params["fields"] == (
+            "domain,created_date,registrar,registrant.organization"
+        )
+        return httpx.Response(
+            200,
+            json={
+                "items": [
+                    {
+                        "data": {
+                            "domain": "acme-login.example.net",
+                            "created_date": "2026-01-02T00:00:00Z",
+                            "registrar": {"name": "Fixture Registrar"},
+                        }
+                    }
+                ]
+            },
+        )
+
+    source = adapter("netlas", handler)
+    rows = await source.search_whois("acme-login.example.net")
+    assert rows[0]["domain"] == "acme-login.example.net"
+    assert providers.whois_facts(rows, source) == {
+        "created": "2026-01-02T00:00:00+00:00",
+        "registrar": "Fixture Registrar",
+    }
+    assert source.record_errors == 0
+    source.reserve.assert_awaited_once_with("search")
+
+
+def test_whois_facts_drop_a_registrar_no_rule_could_read():
+    source = adapter("netlas", lambda request: httpx.Response(200, json={}))
+    facts = providers.whois_facts(
+        [{"created_date": "2026-01-02T00:00:00Z", "registrar": {"name": 17}}], source
+    )
+    assert facts == {"created": "2026-01-02T00:00:00+00:00"}
+    assert source.record_error_codes == ["invalid_whois_registrar"]
+
+
+@pytest.mark.asyncio
+async def test_mail_records_ask_the_documented_existence_test():
+    def handler(request):
+        assert request.url.path == "/api/domains/"
+        assert request.url.params["q"] == 'domain:"acme-login.example.net" AND mx:*'
+        assert request.url.params["fields"] == "domain,mx,ns,last_updated"
+        return httpx.Response(
+            200,
+            json={
+                "items": [
+                    {
+                        "data": {
+                            "domain": "acme-login.example.net",
+                            "mx": ["mx1.evil.example"],
+                            "last_updated": "2026-01-02T00:00:00Z",
+                        }
+                    }
+                ]
+            },
+        )
+
+    source = adapter("netlas", handler)
+    rows = await source.search_mail_records("acme-login.example.net")
+    assert providers.mail_facts(rows, source) == {
+        "mail_capable": True,
+        "mx_hosts": ["mx1.evil.example"],
+        "provider_observed_at": "2026-01-02T00:00:00+00:00",
+    }
+    assert source.record_errors == 0
+    source.reserve.assert_awaited_once_with("search")
+
+
+def test_a_domain_without_mail_is_an_answer_and_a_broken_record_is_not():
+    source = adapter("netlas", lambda request: httpx.Response(200, json={}))
+    assert providers.mail_facts([{"domain": "acme-login.example.net"}], source) == {
+        "mail_capable": False,
+        "mx_hosts": [],
+        "provider_observed_at": "unknown",
+    }
+    assert providers.mail_facts([{"mx": {"a": 1}}], source)["mail_capable"] is False
+    assert source.record_error_codes == ["invalid_mail_record"]

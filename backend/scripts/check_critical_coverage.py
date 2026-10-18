@@ -89,6 +89,38 @@ THRESHOLDS: dict[str, float] = {
     "app/services/source_accounts.py": 80.0,
     "app/services/alert_content.py": 80.0,
     "app/services/module_aliases.py": 90.0,
+    # The candidate's score and the band it routes into (WI-08/WI-12, W1.7). Every
+    # alert decision reads this number — the budget asks it what to send, the digest
+    # asks it what to hold, and the list shows it as the reason a candidate is worth
+    # a morning — so a regression here is a message an operator never got or a channel
+    # that never stops, not a wrong pixel. Measured at 96% by the phishing tests alone
+    # (158 statements), so 90 is a floor rather than a target; the gate exists to keep
+    # a later change from quietly spending that margin.
+    "app/services/phishing_score_service.py": 90.0,
+    # The other half of that decision (W1.8): which values the budget routes by,
+    # where each came from, and whether a stored row is allowed to be honoured at
+    # all. A defect here does not produce a wrong number — it produces a threshold
+    # nobody saved, or a contradictory row that is obeyed instead of refused, and
+    # both read on the channel as "the platform got quieter today". Measured at 100%
+    # by the alert-policy and phishing-digest suites (47 statements), so 95 is a
+    # floor the module already clears on its own tests.
+    "app/services/alert_policy.py": 95.0,
+    # The breach triage and catalogue rules the list, the report and the dashboard read
+    # (F-09, F-13, WI-16). Severity decides what an operator handles first, the KPI rule
+    # decides what number two surfaces print for the same fact, and the catalogue diff is
+    # what makes a new incident visible before an address is added. A regression in any
+    # of them is a quieter platform or a number that disagrees with itself, not a wrong
+    # pixel. Measured at 98%, 100% and 91% by their own suites, so these are floors.
+    "app/services/breach_catalogue.py": 90.0,
+    "app/services/breach_kpi.py": 95.0,
+    "app/services/breach_severity.py": 85.0,
+    # The invitation is a credential that never passes through the administrator
+    # who creates the account (U-7): the token is issued here, only its digest is
+    # stored, and spending it is what sets the first password. A regression either
+    # mails a link that does not work or accepts one that should have expired, so
+    # it is gated with the other issuers. Measured at 91% by
+    # tests/test_user_invitations.py (46 statements), so 90 is a floor.
+    "app/services/invitations.py": 90.0,
 }
 
 

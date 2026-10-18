@@ -1,0 +1,24 @@
+{% extends "emails/base.html" %}
+{#- The only message that carries a token: it is a single-use invitation whose
+    whole purpose is to let the owner choose their own password. It is not a
+    credential to an existing account, and it expires. -#}
+{% block content %}
+  <h2 style="margin: 0 0 8px;">You have been invited to OpenDRP</h2>
+  <p style="margin: 0 0 16px;">
+    {{ actor_email }} created an account for this address. Choose your password
+    with the button below; the link works once and expires {{ expires_at }}.
+  </p>
+
+  <a class="btn" href="{{ invitation_url }}">Choose your password</a>
+
+  <p style="margin: 16px 0 0; font-size: 13px; color: #6b7280;">
+    If the button does not work, copy this address into your browser:<br>
+    <span class="mono">{{ invitation_url }}</span>
+  </p>
+
+  <p style="margin: 20px 0 0; color: #6b7280; font-size: 13px;">
+    If you were not expecting this, contact your administrator and ignore the
+    link. This message contains no password, and the platform will never ask for
+    one by mail.
+  </p>
+{% endblock %}

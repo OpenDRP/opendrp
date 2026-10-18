@@ -427,14 +427,55 @@ class TestDeleteUser:
         # and its identity-map snapshot of `report` predates the delete.
         from sqlalchemy import text
 
-        value = (
+        rows = (
             await db_session.execute(
-                text("SELECT created_by FROM reports WHERE id = :i"),
-                {"i": str(report.id)},
+                text("SELECT created_by FROM reports WHERE report_name = :n"),
+                {"n": "Quarterly DRP"},
             )
-        ).scalar_one_or_none()
-        assert value is None
-        assert report.report_name == "Quarterly DRP"
+        ).all()
+        # One row, still present, creator cleared. A query that matched nothing
+        # would also return None, which is how this assertion used to pass.
+        assert rows == [(None,)], rows
+
+    @pytest.mark.asyncio
+    async def test_orm_delete_uses_the_schema_cascade(self, db_session):
+        """RWI-09: deleting through the ORM must not destroy reports.
+
+        The relationship used to carry ``cascade="all, delete-orphan"`` while the
+        schema said ``ON DELETE SET NULL``. The HTTP path was correct only because
+        it issued an explicit ``DELETE``; any other caller that loaded the user and
+        called ``session.delete`` silently deleted every report the account had
+        written. ``passive_deletes`` hands the decision to the constraint, so this
+        test asserts the database's answer rather than the router's.
+        """
+        from sqlalchemy import text
+
+        user = User(
+            email="orm-delete@example.com",
+            password_hash="not-used-in-this-test",
+            role="viewer",
+        )
+        db_session.add(user)
+        await db_session.commit()
+        report = Report(
+            report_name="Kept by the schema",
+            created_by=user.id,
+            file_path="/tmp/kept.pdf",
+            status="done",
+        )
+        db_session.add(report)
+        await db_session.commit()
+
+        await db_session.delete(user)
+        await db_session.commit()
+
+        rows = (
+            await db_session.execute(
+                text("SELECT report_name, created_by FROM reports WHERE report_name = :n"),
+                {"n": "Kept by the schema"},
+            )
+        ).all()
+        assert rows == [("Kept by the schema", None)], rows
 
     @pytest.mark.asyncio
     async def test_delete_second_admin_ok_but_single_admin_guarded(

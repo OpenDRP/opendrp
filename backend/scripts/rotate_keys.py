@@ -283,7 +283,12 @@ async def _rewrap() -> int:
     return 0
 
 
-def main(argv: list[str]) -> int:
+def build_parser() -> argparse.ArgumentParser:
+    """The command line this script accepts, as an object a caller can inspect.
+
+    Separate from `main` so the documentation gate can compare the commands
+    `docs/upgrading.md` tells an operator to run with the parser that exists.
+    """
     parser = argparse.ArgumentParser(
         description="Rotate the OpenDRP encryption key or JWT signing secret."
     )
@@ -305,6 +310,11 @@ def main(argv: list[str]) -> int:
     subparsers.add_parser("status", help="report which configured key reads what")
     subparsers.add_parser("rewrap", help="re-encrypt stored secrets with the newest key")
 
+    return parser
+
+
+def main(argv: list[str]) -> int:
+    parser = build_parser()
     args = parser.parse_args(argv)
 
     if args.command == "generate":

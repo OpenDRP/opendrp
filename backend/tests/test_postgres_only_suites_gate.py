@@ -34,7 +34,15 @@ import yaml
 _ROOT = Path(__file__).resolve().parents[2]
 _TESTS = Path(__file__).resolve().parent
 _WORKFLOW = _ROOT / ".github/workflows/ci.yml"
-_SUITES = ("test_asset_involvement_postgres.py", "test_dns_expiry_postgres.py")
+_SUITES = (
+    "test_asset_involvement_postgres.py",
+    "test_dns_expiry_postgres.py",
+    # The user/RBAC wave's PostgreSQL half: the refresh-family cascade (RWI-10)
+    # and the administrator-set advisory lock (RWI-11). Both are properties SQLite
+    # cannot host, so a suite that exists and is never selected is the same defect
+    # this gate was written for.
+    "test_users_rbac_postgres.py",
+)
 _JOB = "production-integration"
 
 if not _WORKFLOW.is_file():

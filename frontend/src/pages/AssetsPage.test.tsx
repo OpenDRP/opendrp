@@ -16,6 +16,7 @@ const {
   importMock,
   importCsvMock,
   connectorModulesMock,
+  bulkMock,
   toastMock,
 } = vi.hoisted(() => ({
   listMock: vi.fn(),
@@ -27,6 +28,7 @@ const {
   importMock: vi.fn(),
   importCsvMock: vi.fn(),
   connectorModulesMock: vi.fn(),
+  bulkMock: vi.fn(),
   toastMock: vi.fn(),
 }));
 
@@ -40,6 +42,7 @@ vi.mock("@/lib/api", () => ({
     exportAssets: exportMock,
     importAssets: importMock,
     importAssetsCsv: importCsvMock,
+    bulkAssets: bulkMock,
   },
   describeApiError: (error: any) => String(error?.message ?? error ?? ""),
 }));
@@ -69,8 +72,78 @@ vi.mock("@/components/ui/select", () => ({
   SelectItem: ({ value, children }: any) => <option value={value}>{children}</option>,
 }));
 vi.mock("@/components/DataTable", () => ({
-  PaginatedDataTable: ({ columns, rows }: any) => (
-    <div>{rows.map((row: any) => <div key={row.id}>{columns.map((column: any) => <span key={column.key}>{column.render ? column.render(row) : row[column.key]}</span>)}</div>)}</div>
+  // The stand-in keeps the contracts the page depends on: a sortable header
+  // reports the field it names, and a checkbox reports the same ids the server
+  // would receive (AWI-04, AWI-11). Rendering the real table here would test
+  // column resizing instead of what the page asks the API for.
+  PaginatedDataTable: ({
+    columns,
+    rows,
+    selectable = false,
+    selectedIds = [],
+    onSelectedChange,
+    onSortChange,
+    sort,
+    getRowId,
+    getRowLabel,
+    loading,
+    emptyText,
+  }: any) => (
+    <div>
+      <div>
+        {selectable && (
+          <input
+            type="checkbox"
+            aria-label="Select all rows on this page"
+            checked={rows.length > 0 && rows.every((row: any) => selectedIds.includes(getRowId?.(row) ?? row.id))}
+            onChange={() => onSelectedChange?.(rows.map((row: any) => getRowId?.(row) ?? row.id))}
+          />
+        )}
+        {columns.map((column: any) =>
+          column.sortable ? (
+            <button
+              key={column.key}
+              onClick={() =>
+                onSortChange?.({
+                  field: column.key,
+                  direction: sort?.field === column.key && sort.direction === "asc" ? "desc" : "asc",
+                })
+              }
+            >
+              {column.title}
+            </button>
+          ) : (
+            <span key={column.key}>{column.title}</span>
+          ),
+        )}
+      </div>
+      {loading && <span>Loading assets…</span>}
+      {!loading && rows.length === 0 && emptyText && <span>{emptyText}</span>}
+      {rows.map((row: any) => {
+        const id = getRowId?.(row) ?? row.id;
+        return (
+          <div key={id}>
+            {selectable && (
+              <input
+                type="checkbox"
+                aria-label={`Select ${getRowLabel?.(row) ?? id}`}
+                checked={selectedIds.includes(id)}
+                onChange={() =>
+                  onSelectedChange?.(
+                    selectedIds.includes(id)
+                      ? selectedIds.filter((selected: string) => selected !== id)
+                      : [...selectedIds, id],
+                  )
+                }
+              />
+            )}
+            {columns.map((column: any) => (
+              <span key={column.key}>{column.render ? column.render(row) : row[column.key]}</span>
+            ))}
+          </div>
+        );
+      })}
+    </div>
   ),
 }));
 vi.mock("@/components/ui/confirm-dialog", () => ({
@@ -126,13 +199,13 @@ const connectorModules = {
   },
 };
 
-function renderPage() {
+function renderPage(initialEntries: string[] = ["/assets"]) {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
   // The value column links to the asset's own page (WI-12), so the page needs a
   // router in scope.
   return render(
     <QueryClientProvider client={queryClient}>
-      <MemoryRouter>
+      <MemoryRouter initialEntries={initialEntries}>
         <AssetsPage />
       </MemoryRouter>
     </QueryClientProvider>,
@@ -149,6 +222,14 @@ describe("AssetsPage", () => {
     exportMock.mockReset().mockResolvedValue(new Blob(["asset_type,asset_value\n"], { type: "text/csv" }));
     importMock.mockReset();
     connectorModulesMock.mockReset().mockResolvedValue(connectorModules);
+    bulkMock.mockReset().mockResolvedValue({
+      operation: "deactivate",
+      requested: 2,
+      applied: 2,
+      missing: [],
+      cascade_findings: false,
+      findings_deleted: {},
+    });
     importCsvMock.mockReset().mockResolvedValue({
       dry_run: false,
       created: 1,
@@ -421,6 +502,99 @@ describe("AssetsPage", () => {
     expect(within(dialog).getByText(/deactivation is not a delete/)).toBeInTheDocument();
     await user.click(within(dialog).getByRole("button", { name: "Confirm action" }));
     await waitFor(() => expect(updateMock).toHaveBeenCalledWith("asset-1", { is_active: false }));
+  });
+
+  it("shows the skeleton, not an empty inventory, while the first request is unanswered (AWI-01)", async () => {
+    // A placeholder row set makes React Query report `isPlaceholderData` with
+    // `isLoading` already false. Reading only `isLoading` showed "No assets yet"
+    // — a conclusion about the inventory drawn from a request that had not
+    // finished.
+    listMock.mockReturnValue(new Promise(() => {}));
+    renderPage();
+    expect(await screen.findByText("Loading assets…")).toBeInTheDocument();
+    expect(screen.queryByText(/No assets yet/)).not.toBeInTheDocument();
+  });
+
+  it("sends the ordering the header names and resets to page one (AWI-04)", async () => {
+    const user = userEvent.setup();
+    renderPage(["/assets?page=3"]);
+    await screen.findByText("example.com");
+
+    // The server's default is created_at desc; clicking the same header asks
+    // ascending, and the page number must not survive a reorder.
+    await user.click(screen.getByRole("button", { name: "Created" }));
+    await waitFor(() =>
+      expect(listMock).toHaveBeenCalledWith(
+        expect.objectContaining({ sort: "created_at", order: "asc", page: 1 }),
+      ),
+    );
+    await user.click(screen.getByRole("button", { name: "Value" }));
+    await waitFor(() =>
+      expect(listMock).toHaveBeenCalledWith(
+        expect.objectContaining({ sort: "asset_value", order: "asc", page: 1 }),
+      ),
+    );
+  });
+
+  it("reads the ordering from the address, so a shared link keeps it (AWI-04)", async () => {
+    renderPage(["/assets?sort=criticality&order=desc"]);
+    await screen.findByText("example.com");
+    expect(listMock).toHaveBeenCalledWith(
+      expect.objectContaining({ sort: "criticality", order: "desc" }),
+    );
+  });
+
+  it("ignores a sort field the server would refuse (AWI-04)", async () => {
+    renderPage(["/assets?sort=password&order=asc"]);
+    await screen.findByText("example.com");
+    // An unknown field is not forwarded, and its paired direction means nothing
+    // without the field: the whole ordering falls back to the server default.
+    expect(listMock).toHaveBeenCalledWith(
+      expect.objectContaining({ sort: "created_at", order: "desc" }),
+    );
+  });
+
+  it("applies one batch action to the ticked rows (AWI-11)", async () => {
+    const user = userEvent.setup();
+    renderPage();
+    await screen.findByText("example.com");
+
+    // Nothing is offered before something is selected: a batch action with an
+    // empty set is a button that can only fail.
+    expect(screen.queryByRole("region", { name: "Batch actions" })).not.toBeInTheDocument();
+    await user.click(screen.getByRole("checkbox", { name: "Select example.com" }));
+    const panel = screen.getByRole("region", { name: "Batch actions" });
+    expect(within(panel).getByText("1 selected")).toBeInTheDocument();
+
+    await user.click(within(panel).getByRole("button", { name: "Deactivate" }));
+    await waitFor(() =>
+      expect(bulkMock).toHaveBeenCalledWith({ ids: ["asset-1"], operation: "deactivate" }),
+    );
+  });
+
+  it("makes a batch delete name DELETE before it sends anything (AWI-11)", async () => {
+    const user = userEvent.setup();
+    renderPage();
+    await screen.findByText("example.com");
+    await user.click(screen.getByRole("checkbox", { name: "Select example.com" }));
+    await user.click(screen.getByRole("button", { name: "Delete" }));
+
+    const dialog = screen.getByRole("dialog");
+    // The cascade itself is off by default; the warning says what it would do.
+    expect(within(dialog).getByText(/phishing, breach and generic/)).toBeInTheDocument();
+    const confirm = within(dialog).getByRole("button", { name: "Confirm action" });
+    expect(confirm).toBeDisabled();
+
+    await user.type(within(dialog).getByLabelText(/Type DELETE/), "delete");
+    expect(confirm).toBeEnabled();
+    await user.click(confirm);
+    await waitFor(() =>
+      expect(bulkMock).toHaveBeenCalledWith({
+        ids: ["asset-1"],
+        operation: "delete",
+        cascade_findings: false,
+      }),
+    );
   });
 
   it("confirms activation and promises rescanning, not restored findings", async () => {

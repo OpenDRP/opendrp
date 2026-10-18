@@ -113,6 +113,13 @@ AUDIT_ALLOWED_ACTIONS = frozenset(
         "auth.session.revoked",
         "auth.sessions.revoked_others",
         "auth.mfa.recovery_codes.rotated",
+        # An authenticated account was refused by a role gate. One row per account,
+        # method and route inside a window (app/core/authorization_audit.py): the
+        # event is the signal that somebody is trying the boundary, and a row per
+        # refused request would let a client ignoring the 403 write its own load.
+        # The second-factor policy refusal stays `auth.mfa.required` — one refusal
+        # with two names is one a SIEM rule cannot be written against.
+        "authz.denied",
         "asset.create",
         "asset.update",
         "asset.delete",
@@ -175,8 +182,18 @@ AUDIT_ALLOWED_ACTIONS = frozenset(
         "phishing.threat.list",
         "phishing.threat.view",
         "phishing.threat.update",
+        # The analyst's decision about a candidate (WI-12, W1.6). Declared rather than
+        # written as a free string: the decision is what a later reader asks about
+        # ("who dismissed this, and why?"), and an undeclared action is one a SIEM
+        # rule cannot be written against without reading the source.
+        "phishing.threat.verdict",
         "phishing.threat.delete",
         "phishing.threat.orphans.cleaned",
+        # Taking a finding's own value under monitoring (AWI-13/U-1). The
+        # already-exists pair is separate because "the inventory already covered
+        # this" is a different answer from "this request added it".
+        "phishing.asset.promoted",
+        "phishing.asset.already_exists",
         "phishing.scan.scheduled",
         "breach.scan.scheduled",
         "dns_security.scan.scheduled",
@@ -187,14 +204,32 @@ AUDIT_ALLOWED_ACTIONS = frozenset(
         "dns_security.observations.list",
         "dns_security.asset.promoted",
         "dns_security.asset.already_exists",
+        "dns_security.certificates.list",
+        "dns_security.certificate_exceptions.list",
+        # One action per verdict rather than a template: the allowlist is what a SIEM
+        # rule is built from, and `tls.sighting.*` would match nothing an operator can
+        # write a rule against.
+        "tls.sighting.candidate",
+        "tls.sighting.expected",
+        "tls.sighting.shared_infrastructure",
+        "tls.sighting.confirmed_foreign",
+        "tls.sighting.rejected",
+        "tls.exception.added",
+        "tls.exception.removed",
         "breach.list",
         "breach.view",
         "breach.delete",
         "breach.update",
         "breach.orphans.cleaned",
+        "breaches.asset.promoted",
+        "breaches.asset.already_exists",
         "breach.scan.start",
         "breach.scan.email",
         "breach.scan.domain",
+        # A domain enrolled in the source's own dashboard (WI-20). Recorded before
+        # the step is queued, because "nobody asked" and "nobody could ask" are
+        # different answers to why a domain is still unscannable.
+        "breach.domain_verification.requested",
         "alert.dispatch.success",
         "alert.dispatch.failed",
         "task.started",
@@ -212,6 +247,37 @@ AUDIT_ALLOWED_ACTIONS = frozenset(
         # user update: it is the one action that removes a factor from an account
         # the administrator does not own.
         "user.mfa.reset",
+        # The host-side escape hatch clearing an account's onboarding flags. Its
+        # own action rather than a `user.updated`: releasing an account from the
+        # forced password change leaves a password somebody else chose in force,
+        # so the release has to be findable without reading prose out of details.
+        "user.onboarding.cleared",
+        # The account holder was told what an administrator did to their account.
+        # The outcome is part of the event: "we tried" and "we could not reach
+        # SMTP" are different, and an installation whose notification silently
+        # never sends would otherwise look exactly like one that works (RWI-15).
+        "user.notification.sent",
+        "user.notification.failed",
+        "user.notification.skipped",
+        # Reading the user table as a file is a read, but it is the read that
+        # leaves the platform with names, roles and sign-in history in it, which
+        # is why an export names itself and its filter (U-1).
+        "users.export",
+        # One activation change over a selection, recorded once for the batch:
+        # "who was deactivated in this operation" is one decision, and N rows
+        # would make an off-boarding look like N unrelated events (U-5).
+        "users.bulk",
+        # An administrator ending somebody else's sessions. Distinct from
+        # `auth.sessions.revoked_others`, where the account ends its own (U-2).
+        "user.sessions.revoked",
+        # An account created without a password the administrator knows (U-7).
+        # The invitation mail's outcome is its own event, because "invited" and
+        # "the owner was actually told" are different facts.
+        "user.invited",
+        "user.invitation.sent",
+        "user.invitation.failed",
+        "user.invitation.skipped",
+        "auth.invitation.accepted",
         "audit.log.view",
         # The retention sweep is itself a security-relevant event: deleting audit
         # history is exactly the action an attacker with database access would
@@ -247,6 +313,9 @@ AUDIT_ALLOWED_ACTIONS = frozenset(
         "exposure.asset.already_exists",
         "connector.registered",
         "connector.findings.ingested",
+        # The incident catalogue a breach connector submits (WI-13): the other half
+        # of the picture, about incidents no monitored address is in yet.
+        "connector.catalogue.ingested",
         "connector.scan.completed",
         "connector.scan.failed",
         "connector.status.updated",
@@ -296,6 +365,68 @@ def _safe_jsonable_key(key: Any) -> str:
     return str(key)
 
 
+#: The bounds a half-trusted caller cannot raise. A connector's `summary` reaches
+#: the audit trail, and an immutable chain entry whose size is chosen by the
+#: connector is an entry the connector can make unreadable — or expensive to
+#: export. These are defense in depth beside the wire schema, not formatting.
+MAX_DETAIL_STRING = 200
+MAX_DETAIL_ITEMS = 20
+MAX_DETAIL_DEPTH = 4
+MAX_DETAIL_KEYS = 64
+MAX_DETAILS_JSON = 8_000
+
+
+def bound_details(value: Any, *, _depth: int = 0) -> Any:
+    """Cut a details tree down to the shape the audit trail promises.
+
+    Strings lose their tail, lists keep their head, and nesting stops at a fixed
+    depth. The cut is silent here because the caller records the fact once, at
+    the level where it is observable: `_stdout_event` marks the event
+    `details_truncated` when the cap below actually dropped something.
+    """
+    if isinstance(value, str):
+        return value if len(value) <= MAX_DETAIL_STRING else value[:MAX_DETAIL_STRING]
+    if isinstance(value, dict):
+        if _depth >= MAX_DETAIL_DEPTH:
+            return "…"
+        items = list(value.items())
+        if len(items) > MAX_DETAIL_KEYS:
+            items = items[:MAX_DETAIL_KEYS]
+        return {_safe_jsonable_key(k): bound_details(v, _depth=_depth + 1) for k, v in items}
+    if isinstance(value, (list, tuple, set, frozenset)):
+        if _depth >= MAX_DETAIL_DEPTH:
+            return "…"
+        return [bound_details(item, _depth=_depth + 1) for item in list(value)[:MAX_DETAIL_ITEMS]]
+    return value
+
+
+def _fit_details(details: dict) -> tuple[dict, bool]:
+    """Apply the bounds, then the total-size cap, and say whether anything was cut.
+
+    The per-value bounds leave a tree that is small in practice; the serialized
+    cap is the hard stop behind them, because sixty-four values of two hundred
+    characters still add up. When it bites, the fields are kept in name order
+    while they fit and the event says so -- a truncated record that claims to be
+    complete is worse than a small one that admits the cut.
+    """
+    bounded = bound_details(details)
+    if not isinstance(bounded, dict):
+        return details, False
+    if len(json.dumps(bounded, ensure_ascii=False, default=str)) <= MAX_DETAILS_JSON:
+        return bounded, bounded != details
+
+    kept: dict[str, Any] = {}
+    budget = MAX_DETAILS_JSON - 200
+    for key in sorted(bounded):
+        chunk = json.dumps({key: bounded[key]}, ensure_ascii=False, default=str)
+        if len(chunk) > budget:
+            continue
+        kept[key] = bounded[key]
+        budget -= len(chunk)
+    kept["details_truncated"] = True
+    return kept, True
+
+
 class AuditPersistenceError(RuntimeError):
     """A required audit event could not be durably committed."""
 
@@ -336,6 +467,9 @@ class AuditLogger:
         ip = (ip_address or "unknown").strip() or "unknown"
         normalized_action = AuditLogger._normalize_action(action)
         det = {k: _safe_jsonable(v) for k, v in (details or {}).items()}
+        det, cut = _fit_details(det)
+        if cut:
+            det["details_truncated"] = True
         # Correlation goes *inside* details, never beside it: the five top-level
         # fields are a published contract (see logging_config.AUDIT_FIELDS), and a
         # sixth would reach a SIEM index that maps the documented shape and

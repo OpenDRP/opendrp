@@ -383,6 +383,124 @@ class AlertDeliveryService:
         rows = (await self.db.execute(statement)).scalars().all()
         return [row for row in rows if self.recipient_key(row.channel, row.target) == key]
 
+    async def channel_delivery_summary(
+        self, *, stuck_after_seconds: int
+    ) -> tuple[dict[str, dict[str, Any]], int]:
+        """Per-channel delivery counters, and the recipients currently waiting.
+
+        A probe answers "can this installation reach the provider?", not "are the
+        messages leaving?". The queue is a second, independent fact: a channel can
+        pass its probe while every notification sits behind a hold. These numbers
+        are what lets the health card say which one is true.
+
+        Numbers only — no target, batch id or recipient digest leaves this
+        method, so the same aggregate is safe for a viewer. A delivery counts as
+        *stuck* when it is ``ambiguous`` or ``failed`` and older than the
+        recipient-hold window; that is the age at which the queue has stopped
+        being able to resolve it by itself (D10).
+
+        Returns ``(by_channel, waiting_recipients)``. A recipient is waiting when
+        its next send is in the future: either an ambiguous hold or an ordinary
+        retry window. A live lease is a send in progress, not a wait.
+        """
+        now = datetime.now(timezone.utc)
+        unresolved = (
+            AlertDeliveryStatus.pending,
+            AlertDeliveryStatus.delivering,
+            AlertDeliveryStatus.ambiguous,
+            AlertDeliveryStatus.failed,
+        )
+        statuses = (
+            AlertDeliveryStatus.pending,
+            AlertDeliveryStatus.delivering,
+            AlertDeliveryStatus.sent,
+            AlertDeliveryStatus.failed,
+            AlertDeliveryStatus.cancelled,
+            AlertDeliveryStatus.ambiguous,
+        )
+        rows = (
+            await self.db.execute(
+                select(
+                    AlertDelivery.channel,
+                    AlertDelivery.status,
+                    func.count(AlertDelivery.id),
+                    func.min(AlertDelivery.created_at),
+                ).group_by(AlertDelivery.channel, AlertDelivery.status)
+            )
+        ).all()
+
+        by_channel: dict[str, dict[str, Any]] = {}
+        for channel, status, count, oldest in rows:
+            summary = by_channel.setdefault(
+                str(channel),
+                {
+                    "counts": {name: 0 for name in statuses},
+                    "oldest_unresolved_at": None,
+                },
+            )
+            if status in summary["counts"]:
+                summary["counts"][status] = int(count)
+            if status in unresolved and oldest is not None:
+                if oldest.tzinfo is None:
+                    # SQLite hands back naive values for a timezone-aware column.
+                    oldest = oldest.replace(tzinfo=timezone.utc)
+                current = summary["oldest_unresolved_at"]
+                if current is None or oldest < current:
+                    summary["oldest_unresolved_at"] = oldest
+
+        cutoff = now - timedelta(seconds=stuck_after_seconds)
+        stuck_rows = (
+            await self.db.execute(
+                select(AlertDelivery.channel, func.count(AlertDelivery.id))
+                .where(
+                    AlertDelivery.status.in_(
+                        [AlertDeliveryStatus.ambiguous, AlertDeliveryStatus.failed]
+                    ),
+                    AlertDelivery.created_at < cutoff,
+                )
+                .group_by(AlertDelivery.channel)
+            )
+        ).all()
+        stuck_by_channel = {str(channel): int(count) for channel, count in stuck_rows}
+
+        # A retry window is a delivery the queue will attempt again by itself;
+        # counting it separately is what lets the card say "waiting to retry"
+        # instead of lumping it in with rows that are due now.
+        retry_rows = (
+            await self.db.execute(
+                select(AlertDelivery.channel, func.count(AlertDelivery.id))
+                .where(
+                    AlertDelivery.status.in_(
+                        [AlertDeliveryStatus.pending, AlertDeliveryStatus.failed]
+                    ),
+                    AlertDelivery.next_attempt_at > now,
+                )
+                .group_by(AlertDelivery.channel)
+            )
+        ).all()
+        retrying_by_channel = {str(channel): int(count) for channel, count in retry_rows}
+
+        waiting = (
+            await self.db.execute(
+                select(func.count())
+                .select_from(AlertRecipientState)
+                .where(AlertRecipientState.next_send_at > now)
+            )
+        ).scalar_one()
+
+        for channel, summary in by_channel.items():
+            oldest = summary["oldest_unresolved_at"]
+            summary["oldest_unresolved_at"] = oldest.isoformat() if oldest else None
+            summary["oldest_unresolved_age_seconds"] = (
+                int((now - oldest).total_seconds()) if oldest else None
+            )
+            summary["stuck"] = stuck_by_channel.get(channel, 0)
+            summary["retrying"] = retrying_by_channel.get(channel, 0)
+            summary["degraded_reason"] = (
+                "delivery_stuck" if summary["stuck"] else None
+            )
+        return by_channel, int(waiting or 0)
+
     async def held_recipients(self, *, limit: int = 100) -> list[dict[str, Any]]:
         """Recipients the queue is not delivering to, and the reason for each.
 
@@ -530,7 +648,13 @@ class AlertDeliveryService:
         try:
             s = await service._get_settings()
             destinations = await self._configured_destinations()
-            from app.services.alert_service import AlertDeliveryCancelledError, AlertDeliveryPermanentError, _plain_text
+            from app.services.alert_service import (
+                AlertDeliveryCancelledError,
+                AlertDeliveryPermanentError,
+                _breach_subject_class,
+                _plain_text,
+                digest_heading,
+            )
             if target is None or (channel, target.lower()) not in {(kind, str(value).lower()) for kind, value in destinations}:
                 raise AlertDeliveryCancelledError("Destination disabled or removed")
             parts = rows[0].parts
@@ -539,7 +663,34 @@ class AlertDeliveryService:
                 from app.services.alert_content import telegram_parts
                 group_job = AlertDelivery.job_id == rows[0].job_id if rows[0].job_id else AlertDelivery.job_id.is_(None)
                 group_total = int((await self.db.scalar(select(func.count(AlertDelivery.id)).where(group_job, AlertDelivery.threat_type == rows[0].threat_type, AlertDelivery.channel == channel, AlertDelivery.target == target))) or len(rows))
-                notification = service._build_notification(total_count=group_total, threat_type=rows[0].threat_type, label=rows[0].threat_type.removeprefix("module:"), subject=f"[OpenDRP Alert] {len(rows)} new findings", findings=[row.payload for row in rows], bounded=[row.payload for row in rows], job_id=rows[0].job_id, link=service._platform_link(rows[0].threat_type))
+                # The facts are read from the module's own rows as they stand now,
+                # not from the payload captured when the finding arrived: a delivery
+                # that was retried sends the state of the world it is sent in.
+                # A digest batch says what it is. `digest` is set by the pass that
+                # built the band (WI-10), and the group it lands in is the ordinary
+                # one — same queue, same retry policy, same recipient rotation — so
+                # only the words change: a summary of eighty look-alikes is not "80
+                # new findings" and must not read as though eighty things happened.
+                # `all`, not `rows[0]`: the digest shares the queue's aggregation
+                # key, so a job-less batch can hold a digest and an arrival at once.
+                # A batch that is not entirely a digest is an alert — calling it a
+                # summary of candidates below the threshold would be a lie about its
+                # own contents.
+                if all(row.payload.get("digest") for row in rows):
+                    label, subject = digest_heading(len(rows), rows[0].threat_type)
+                else:
+                    label, subject = (
+                        rows[0].threat_type.removeprefix("module:"),
+                        f"[OpenDRP Alert] {len(rows)} new findings",
+                    )
+                    if rows[0].threat_type == "breach":
+                        # The class, when the batch agrees on one: a breach alert is
+                        # read in a mail list first, and "it grew" is a different
+                        # triage decision from "it appeared" (WI-08).
+                        change = _breach_subject_class([row.payload for row in rows])
+                        if change is not None:
+                            subject = f"{subject} ({change})"
+                notification = service._build_notification(total_count=group_total, threat_type=rows[0].threat_type, label=label, subject=subject, findings=[row.payload for row in rows], bounded=[row.payload for row in rows], job_id=rows[0].job_id, link=service._platform_link(rows[0].threat_type), stored_facts=await service._stored_message_facts(rows[0].threat_type, [row.payload for row in rows]))
                 if channel == "telegram":
                     parts = [{"text": text} for text in telegram_parts(notification, settings.ALERT_MAX_TELEGRAM_MESSAGE_LENGTH, rows[0].batch_id)]
                 else:

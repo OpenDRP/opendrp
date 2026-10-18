@@ -158,6 +158,48 @@ class TestReportServiceUnit:
         assert data["truncation"]["truncated"] is False
 
     @pytest.mark.asyncio
+    async def test_breach_section_orders_loudest_first_like_the_list(self, db_session):
+        """A report is read top-down, so its order is the list's order (WI-28)."""
+        from datetime import datetime, timedelta, timezone
+        from sqlalchemy import text
+        from tests.conftest import safe_sql_identifier
+
+        await db_session.execute(text(f"DELETE FROM {safe_sql_identifier('drp_breaches')}"))
+        await db_session.commit()
+
+        now = datetime.now(timezone.utc)
+        suffix = uuid.uuid4().hex[:10]
+        # The quiet finding is newer, so created_at alone would put it first.
+        quiet = Breach(
+            id=uuid.uuid4(),
+            breach_name=f"Quiet-{suffix}",
+            title="Quiet",
+            domain="zombo.com",
+            breach_date=now.date(),
+            matched_email=f"quiet-{suffix}@example.com",
+            data_classes=["Email addresses"],
+            severity="low",
+            created_at=now,
+        )
+        loud = Breach(
+            id=uuid.uuid4(),
+            breach_name=f"Loud-{suffix}",
+            title="Loud",
+            domain="zombo.com",
+            breach_date=now.date(),
+            matched_email=f"loud-{suffix}@example.com",
+            data_classes=["Passwords"],
+            severity="critical",
+            created_at=now - timedelta(days=1),
+        )
+        db_session.add_all([quiet, loud])
+        await db_session.commit()
+
+        data = await ReportService(db_session).gather_report_data()
+
+        assert [breach.severity for breach in data["breaches"]] == ["critical", "low"]
+
+    @pytest.mark.asyncio
     async def test_gather_rejects_uncommitted_caller_changes_without_discarding_them(self, db_session):
         asset = Asset(
             asset_type=AssetType.domain,

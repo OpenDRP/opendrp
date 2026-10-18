@@ -49,7 +49,9 @@ connector-breaches-hibp      --> core connector API (module: breaches; profile h
 connector-dns-rdap           --> core connector API (module: dns)
 connector-dns-resolver       --> core connector API (module: dns)
 connector-dns-ctlogs         --> core connector API (module: dns)
+connector-dns-tlsprobe       --> core connector API (module: dns)
 connector-dns-virustotal     --> core connector API (module: dns; profile virustotal)
+connector-dns-shodan         --> core connector API (module: dns; profile shodan)
 connector-phishing-netlas    --> core connector API (module: phishing; profile netlas)
 connector-dns-netlas         --> core connector API (module: dns; profile netlas)
 connector-exposure-netlas    --> core connector API (module: exposure; profile netlas)
@@ -69,9 +71,11 @@ The core performs all database writes and applies deduplication, enrichment, ale
 
 ### First-party connectors
 
-A bare `make up` starts four connector services: `connector-phishing-dnstwist`,
-`connector-dns-rdap`, `connector-dns-resolver` and `connector-dns-ctlogs`. Every
-other connector service is behind a Compose profile — `shodan`, `hibp`, `netlas`,
+A bare `make up` starts five connector services: `connector-phishing-dnstwist`,
+`connector-dns-rdap`, `connector-dns-resolver`, `connector-dns-ctlogs` and
+`connector-dns-tlsprobe`. Every
+other connector service is behind a Compose profile — `shodan` (the phishing and
+DNS Security Shodan workers), `hibp`, `netlas`,
 `netlas-endpoints`, `shodan-endpoints`, `virustotal`, and `backup` for the
 one-shot backup runner — and `COMPOSE_PROFILES` in `.env` is what starts it with
 the stack. Naming a gated service explicitly starts it for that command, but the
@@ -85,10 +89,13 @@ next `make up` leaves it down again unless its profile is listed.
 | `dns-rdap` | `dns` | Registration/registrar/expiry via RDAP | `CONNECTOR_TOKEN_DNS_RDAP` |
 | `dns-resolver` | `dns` | Current DNS RRsets for active domains | `CONNECTOR_TOKEN_DNS_RESOLVER`, `DNS_NAMESERVERS`, `DNS_SECURITY_RESOLVER_*` |
 | `dns-ctlogs` | `dns` | Historical certificate/subdomain evidence | `CONNECTOR_TOKEN_DNS_CTLOGS`, optional `DNS_SECURITY_CTLOGS_API_TOKEN` |
+| `dns-tlsprobe` | `dns` | The certificate a host serves now, from one bounded handshake per asset and port | `CONNECTOR_TOKEN_DNS_TLSPROBE`, `DNS_SECURITY_TLS_*` |
 | `dns-virustotal` | `dns` | Historical passive-DNS/subdomain intelligence (profile `virustotal`) | `CONNECTOR_TOKEN_DNS_VIRUSTOTAL`, `DNS_SECURITY_VT_API_KEY`, explicit noncommercial opt-in |
+| `dns-shodan` | `dns` | What our own addresses serve as an independent index saw it, and where else a certificate of ours is served (profile `shodan`, shared with `phishing-shodan`) | `CONNECTOR_TOKEN_DNS_SHODAN`, `SHODAN_API_KEY` or the approved source account's stored key |
 
-The three keyless DNS workers start with the installation, and `dns-virustotal` is
-gated by the `virustotal` profile like every other keyed connector. See
+The four keyless DNS workers start with the installation; `dns-virustotal` is
+gated by the `virustotal` profile and `dns-shodan` by `shodan`, like every other
+keyed connector. See
 [DNS Security connection guide](docs/dns-security.md#connect-the-workers)
 for per-worker tokens, environment configuration, selective startup and quotas.
 Settings also provides setup controls for provider-backed intelligence workers (core-token issuance, readiness, enabling and account quotas); it does not install provider API secrets or start containers. DNS Security workers use the separate manual token and Compose steps in the guide.
@@ -108,20 +115,69 @@ Provider-side limits are worth knowing before the first scan:
   new installation a working end-to-end scan. It is a test identity, not a
   secret: it only ever returns fixture data, and real results need a real key.
 
+  A monitored `domain` is a different lookup from a monitored address: HIBP
+  answers `GET /breacheddomain/{domain}` only for a domain that is **verified**
+  with HIBP and inside the subscription's domain allowance, and refuses an
+  unverified one with `403`. Enrolment is a product flow rather than a dashboard
+  trip: `POST /api/v1/breaches/domain-verification` with `action: "generate"`
+  answers with the TXT record to publish, `action: "verify"` checks whether the
+  source can see it, and the attempt is audited as
+  `breach.domain_verification.requested` whether or not it could be queued. Read
+  the outcome from `GET /api/v1/breaches/provider-readiness`: per domain it says
+  `asked` (the source was put the question), `unscanned` with the source's own
+  reason (`domain_not_verified`, `domain_outside_allowance`,
+  `domain_access_denied`) or `unknown` (the scan stopped before reaching it), and
+  `verifications` carries the newest attempt with `status`
+  (`generated`/`verified`/`not_verified`/`failed`) and the record exactly as the
+  source stated it. An empty Breaches page for a domain is therefore read against
+  that card, not guessed at: a scan that found nothing and a scan the provider
+  refused are both empty on the page, and only the readiness card and the job
+  summary say which one happened.
+
 The connector registry is stored in `drp_connectors`. Administrators can enable or disable a registered connector and update its validated configuration from **Settings → Connectors**. For Shodan, registry settings override environment fallbacks on the next scan.
 
 See [connectors/README.md](connectors/README.md) for the connector protocol and SDK contract.
 
 ### Optional passive intelligence
 
-Netlas is available as an opt-in connector/module combination behind the `netlas` Compose profile in the installation file itself — there is no second overlay to deploy — and migrations seed those rows disabled. The two endpoint-service workers for the exposure module are gated the same way, by `netlas-endpoints` and `shodan-endpoints`. Capabilities differ by module and are not all implemented. See [Passive source intelligence](docs/source-intelligence.md) for supported operations, account-level quotas, explicit approval and unverified provider-plan limits.
+Netlas is available as an opt-in connector/module combination behind the `netlas` Compose profile in the installation file itself — there is no second overlay to deploy — and migrations seed those rows disabled. The two endpoint-service workers for the exposure module are gated the same way, by `netlas-endpoints` and `shodan-endpoints`. Capabilities differ by module and are listed per worker in [Passive source intelligence](docs/source-intelligence.md): the phishing worker searches certificates for a brand, page titles and body text, our own favicon (byte-for-byte and near-duplicate) and the registration and mail facts of confirmed candidates; the DNS worker reads passive A/AAAA/NS records and certificate names; the exposure workers ask what a host serves. The vendor's reputation and tag collections are not read. Account-level quotas, explicit approval and unverified provider-plan limits are on that page too.
+
+### Provider terms, and what the platform keeps of them
+
+A third-party answer is evidence about a name or an address, not a dataset this
+installation is licensed to hold or hand on. Both vendors draw that line, and the
+platform is built to sit inside it:
+
+- **Shodan** permits the API to be integrated into a product **with attribution to
+  Shodan**, and reserves reproduction, resale and redistribution for a separate
+  agreement — redistributing the database itself is the Enterprise Data License
+  ([Terms of Service](https://static.shodan.io/legal/terms.html),
+  [API plans](https://account.shodan.io/billing)). The key is shareable inside your own
+  organization per that FAQ and is not an asset to transfer; the plan tier decides
+  which filters exist at all, which is why a lower-tier key shows up as a partial scan
+  rather than as an empty one.
+- **Netlas** permits commercial client services and "derived findings" on a paid plan,
+  reserves resale and white-label use for an Enterprise add-on, and forbids use that
+  builds or supports a competing product. Credentials are per-account and may not be
+  shared or transferred ([Terms & Conditions](https://netlas.io/legal/terms_and_conditions/)).
+
+What the installation therefore stores is bounded facts about the operator's own
+assets — a name, an address, a port, a certificate, a title, a hash — compared against
+the inventory and scored there. Raw provider response bodies are neither retained nor
+rendered, no provider dataset is mirrored, and `GET /api/v1/exposure/observations`
+serves observations rather than the vendor's records. Neither vendor publishes a
+customer-side retention limit, so how long a fact is kept is this platform's own
+setting (the `*_RETENTION_DAYS` values in [Retention](#retention), and
+`TLS_CERTIFICATE_RETENTION_DAYS` for certificates); check your own agreement before
+assuming a longer one is permitted, and before enabling a capability whose plan
+entitlement you have not confirmed in the vendor's own console.
 
 ## Features
 
 - Asset inventory with `domain`, `ip_address`, `email_account`, `keyword_domain`, and `keyword_title` types.
 - Asset criticality and active/inactive state management, with canonical per-type uniqueness and bounded search/pagination.
 - DNSTwist, Shodan, and HIBP connector scans.
-- DNS Security: source-scoped DNS RRsets, RDAP registration expiry, historical CT/wildcard evidence and VirusTotal passive DNS; observed hosts/IPs can be promoted to assets after review.
+- DNS Security: source-scoped DNS RRsets, RDAP registration expiry, historical CT/wildcard evidence, VirusTotal and Netlas passive DNS, and the certificate an active TLS handshake reads from the service itself; observed hosts/IPs can be promoted to assets after review. Certificates are also reviewed as objects rather than as rows: the daily sweep projects that evidence into fingerprint identities and the addresses each one was served from, and reports a certificate of ours appearing on a foreign address, one key inside two different certificates, and a certificate for our name we did not deploy — with a verdict per sighting and a scope exception per identity, so a CDN or partner appliance is a recorded decision instead of a recurring alert.
 - Manual `Rescan` actions and configurable UTC schedules for `phishing`, `breaches`, `dns`, and optional `exposure`; daily registration and exact-CT certificate expiry reminders at 30/14/7/3/1-day thresholds and once after expiry, subject to fresh successful checks.
 - Matched-asset resolution for breach findings: an exact `email_account` asset wins when the breached address is monitored itself, otherwise the finding resolves through the address's domain, and raw provider values stay intact when nothing in the inventory matches.
 - **Modules are data, not code.** `drp_modules` declares a module's findings kind, consumed inventory, field schema, deduplication keys and storage target, so an operator can register a new source with `POST /api/v1/modules` and its findings land in `drp_findings` without a core change. Declared findings are read through `GET /api/v1/findings` and triaged through `PATCH /api/v1/findings/{finding_id}`.
@@ -229,7 +285,7 @@ reads `<placeholder>` as input redirection.
    make up
    # equivalent without make:
    docker compose -f docker-compose.yml up -d --build
-   ```Startup applies Alembic migrations under a PostgreSQL advisory lock (so two API replicas can start together), ensures the `system_settings` singleton, and starts the core, the workers and the four connectors that need no key — `connector-phishing-dnstwist`, `connector-dns-rdap`, `connector-dns-resolver` and `connector-dns-ctlogs`. Every keyed connector is behind a Compose profile (see [First-party connectors](#first-party-connectors)): step 3 starts two of them by name, and `COMPOSE_PROFILES` in `.env` is what makes a later `make up` bring them up again. It does not create an administrator account. A connector that starts without a credential exits with `Missing required environment variables: CONNECTOR_TOKEN` — expected, and fixed next.
+   ```Startup applies Alembic migrations under a PostgreSQL advisory lock (so two API replicas can start together), ensures the `system_settings` singleton, and starts the core, the workers and the five connectors that need no key — `connector-phishing-dnstwist`, `connector-dns-rdap`, `connector-dns-resolver`, `connector-dns-ctlogs` and `connector-dns-tlsprobe`. Every keyed connector is behind a Compose profile (see [First-party connectors](#first-party-connectors)): step 3 starts two of them by name, and `COMPOSE_PROFILES` in `.env` is what makes a later `make up` bring them up again. It does not create an administrator account. A connector that starts without a credential exits with `Missing required environment variables: CONNECTOR_TOKEN` — expected, and fixed next.
 
    Nothing in the stack terminates TLS: the UI is published as plain HTTP on
    `127.0.0.1:3000`, and the proxy in front of the host is what makes it
@@ -317,7 +373,9 @@ reads `<placeholder>` as input redirection.
      `hibp-integration-tests.com`. Add those as an `email_account` asset and a
      `domain` asset, and a breaches scan completes end to end on a brand-new
      installation. It is a test identity, not a credential: it only ever answers
-     with fixture data, so real results need a real key.
+     with fixture data, so real results need a real key. A domain lookup has one
+     prerequisite an address lookup does not — see
+     [Provider-side limits](#first-party-connectors).
 
 5. Create the first administrator. Replace the quoted temporary password with
    one that meets the CLI's bootstrap minimum (8 characters, one uppercase letter
@@ -375,8 +433,9 @@ Non-production API documentation is available at `/api/docs`, `/api/redoc`, and 
 | `connector-phishing-dnstwist` | — | Phishing connector for DNSTwist. |
 | `connector-phishing-shodan` | `shodan` | Phishing connector for Shodan. |
 | `connector-breaches-hibp` | `hibp` | Breaches connector for HIBP. |
-| `connector-dns-rdap`, `connector-dns-resolver`, `connector-dns-ctlogs` | — | Keyless DNS Security workers, one per source, sharing one image. |
+| `connector-dns-rdap`, `connector-dns-resolver`, `connector-dns-ctlogs`, `connector-dns-tlsprobe` | — | Keyless DNS Security workers, one per source, sharing one image. |
 | `connector-dns-virustotal` | `virustotal` | Keyed DNS Security worker for passive DNS and subdomains. |
+| `connector-dns-shodan` | `shodan` | Keyed DNS Security worker that confirms what our own addresses serve and searches where else a certificate of ours is indexed. |
 | `connector-phishing-netlas`, `connector-dns-netlas`, `connector-exposure-netlas` | `netlas` | Optional Netlas workers, one per module. |
 | `connector-exposure-netlas-endpoints`, `connector-exposure-shodan-endpoints` | `netlas-endpoints`, `shodan-endpoints` | Optional endpoint-service workers for the exposure module. |
 | `backup` | `backup` | One-pass dump, restore and restore-verification runner; it is not part of the running stack. |
@@ -422,10 +481,10 @@ Groups worth knowing about:
   `CONNECTOR_HEALTH_STALE_AFTER_SECONDS` (how long a connector may stay silent
   before `/connectors/health` reports it as unhealthy).
 - Per-connector credentials (`CONNECTOR_TOKEN_DNSTWIST`, `CONNECTOR_TOKEN_SHODAN`, `CONNECTOR_TOKEN_HIBP`). Each connector gets its own token, issued by the core, stored only as a digest and revocable on its own; there is no platform-wide connector secret.
-- `CONNECTOR_TOKEN_DNS_RDAP`, `CONNECTOR_TOKEN_DNS_RESOLVER`, `CONNECTOR_TOKEN_DNS_CTLOGS`, and `CONNECTOR_TOKEN_DNS_VIRUSTOTAL` are independent core-issued DNS worker credentials. They are distinct from provider API keys.
+- `CONNECTOR_TOKEN_DNS_RDAP`, `CONNECTOR_TOKEN_DNS_RESOLVER`, `CONNECTOR_TOKEN_DNS_CTLOGS`, `CONNECTOR_TOKEN_DNS_TLSPROBE`, `CONNECTOR_TOKEN_DNS_VIRUSTOTAL` and `CONNECTOR_TOKEN_DNS_SHODAN` are independent core-issued DNS worker credentials. They are distinct from provider API keys.
 - `COMPOSE_PROFILES` is the switch for every service that does not start by default — the keyed connectors, the optional Netlas and endpoint workers, and the backup runner. It is the only place an installation decides which optional services a bare `make up` brings up, and a service started by name is not remembered by the next one.
-- `SHODAN_API_KEY`, `HIBP_API_KEY`, `DNS_SECURITY_CTLOGS_API_TOKEN`, and `DNS_SECURITY_VT_API_KEY` are supplied only to their matching connector containers, and the Netlas and endpoint workers read `NETLAS_API_TOKEN` and `SHODAN_API_KEY` the same way, beside their own `CONNECTOR_TOKEN_NETLAS_*` and `CONNECTOR_TOKEN_EXPOSURE_*` credentials. A provider key can also live in the core instead of the environment: an administrator stores one per source account (`PUT /api/v1/connectors/accounts/{account_id}/api-key`), it is encrypted with `ENCRYPTION_KEY`, returned only as a masked hint, and handed to the connector bound to that account at `GET /api/v1/connectors/me/credential`. DNS resolver settings and the explicit VT noncommercial acknowledgement are documented in the [DNS environment table](docs/dns-security.md#2-configure-the-provider-environment).
-- `ALERT_HEALTH_CHECK_TIMEOUT_SECONDS` bounds alert-channel health checks. Finding alerts use the durable delivery queue: `ALERT_DELIVERY_TIMEOUT_SECONDS` bounds one SMTP/Telegram attempt, `ALERT_DELIVERY_MAX_ATTEMPTS` and `ALERT_DELIVERY_RETRY_BASE_SECONDS` control transient retries, `ALERT_AGGREGATION_DELAY_SECONDS` groups findings until a connector job is terminal, and `ALERT_RECIPIENT_HOLD_SECONDS` is how long a send whose acceptance is unknown keeps its recipient out of the queue. `ALERT_MAX_FINDINGS_PER_MESSAGE` and `ALERT_MAX_TELEGRAM_MESSAGE_LENGTH` bound notification size.
+- `SHODAN_API_KEY`, `HIBP_API_KEY`, `DNS_SECURITY_CTLOGS_API_TOKEN`, and `DNS_SECURITY_VT_API_KEY` are supplied only to their matching connector containers, and the Netlas and endpoint workers read `NETLAS_API_TOKEN` and `SHODAN_API_KEY` the same way, beside their own `CONNECTOR_TOKEN_NETLAS_*` and `CONNECTOR_TOKEN_EXPOSURE_*` credentials. The DNS Security Shodan worker (`connector-dns-shodan`) reads `SHODAN_API_KEY` as its fallback too, and (like the phishing Shodan worker) prefers the key stored on the approved source account. A provider key can also live in the core instead of the environment: an administrator stores one per source account (`PUT /api/v1/connectors/accounts/{account_id}/api-key`), it is encrypted with `ENCRYPTION_KEY`, returned only as a masked hint, and handed to the connector bound to that account at `GET /api/v1/connectors/me/credential`. DNS resolver settings and the explicit VT noncommercial acknowledgement are documented in the [DNS environment table](docs/dns-security.md#2-configure-the-provider-environment).
+- `ALERT_HEALTH_CHECK_TIMEOUT_SECONDS` bounds alert-channel health checks. Finding alerts use the durable delivery queue: `ALERT_DELIVERY_TIMEOUT_SECONDS` bounds one SMTP/Telegram attempt, `ALERT_DELIVERY_MAX_ATTEMPTS` and `ALERT_DELIVERY_RETRY_BASE_SECONDS` control transient retries, `ALERT_AGGREGATION_DELAY_SECONDS` groups findings until a connector job is terminal, and `ALERT_RECIPIENT_HOLD_SECONDS` is how long a send whose acceptance is unknown keeps its recipient out of the queue. `ALERT_MAX_FINDINGS_PER_MESSAGE` and `ALERT_MAX_TELEGRAM_MESSAGE_LENGTH` bound notification size, and `ALERT_NO_CHANNEL_RETRY_HOURS` is how long a finding that no configured channel can receive is held before the outbox tries it again. The alert budget is those values plus the phishing thresholds — `ALERT_CONFIDENCE_DIRECT`, `ALERT_CONFIDENCE_DIGEST`, `ALERT_PHISHING_DIGEST_ENABLED`, `ALERT_PHISHING_DIGEST_HOUR_UTC`, `ALERT_NO_CHANNEL_RETRY_HOURS` and `ALERT_CANDIDATE_CHANGE_NOTIFICATIONS` — and an installation can restate any of them in Settings → **Alert budget**; a field left blank keeps answering from `.env`, and `GET /api/v1/settings/alert-policy` reports which values are in force, which source answered and which stored fields were refused as contradictory.
 - Shodan capability fallbacks: `SHODAN_SCAN_SSL_TEXT`, `SHODAN_SCAN_HTTP_TITLE`, and `SHODAN_SCAN_FAVICON`. These reach the connector and apply until an administrator changes the capability in its configuration form; the registry value then takes precedence for every later scan. Connector-scoped settings are namespaced after their connector, because `.env` is one namespace shared by every service (`scripts/check_env_template.py` enforces it).
 
 - `METRICS_TOKEN` is what creates the scrape endpoint — with it unset, `GET /api/v1/metrics` answers `404` — and a scraper presents it as `X-Metrics-Token: …` or `Authorization: Bearer …`. `MIGRATION_LOCK_TIMEOUT_MS` bounds how long the startup migration waits behind another session's open transaction; `MIGRATION_STATEMENT_TIMEOUT_MS` stays `0` on purpose, because the baseline's index builds are legitimately the longest statement the platform runs. Thresholds and a scrape configuration are in [docs/observability.md](docs/observability.md).
@@ -472,8 +531,10 @@ declared it, which is what keeps work isolated between connectors and modules.
 | `dns.rdap` | dns | dns-rdap | Active domains: registration and expiry. |
 | `dns.resolver` | dns | dns-resolver | Active domains: current DNS RRsets. |
 | `dns.ctlogs` | dns | dns-ctlogs | Active domains: historical CT evidence. |
+| `dns.tlsprobe` | dns | dns-tlsprobe | Active domains: the certificate each host and port serves now, read from a bounded handshake. |
 | `dns.virustotal` | dns | dns-virustotal | Active domains: historical passive-DNS/subdomain intelligence. |
-| `phishing.netlas` | phishing | phishing-netlas | Profile `netlas`; the provider's brand capabilities are not all implemented. |
+| `dns.shodan` | dns | dns-shodan | Profile `shodan`. Active domains and `ip_address` assets: what each of our own addresses serves, plus a capped per-scan search for where else a certificate of ours is served. |
+| `phishing.netlas` | phishing | phishing-netlas | Profile `netlas`; asks the certificate collection for the *brand*, page titles and page text, our own favicon (exact and near-duplicate) and the registration and mail facts of confirmed candidates. |
 | `dns.netlas` | dns | dns-netlas | Profile `netlas`. |
 | `exposure.netlas` | exposure | exposure-netlas | Profile `netlas`: host and service observations for monitored domains and addresses. |
 | `exposure.netlas-endpoints` | exposure | exposure-netlas-endpoints | Profile `netlas-endpoints`. |
@@ -589,7 +650,10 @@ they have their own administrator-only orphan cleanup.
   `REQUIRE_MFA_FOR_ADMINS=true` makes an enrolled factor a step of the same
   onboarding flow — the account is asked for one at sign-in and can reach nothing
   else until it is enrolled — and turning the setting off is the release valve for an
-  administrator who cannot enrol.
+  administrator who cannot enrol. `REQUIRE_MFA_ROLES=admin,analyst` states the same
+  policy as a list of roles (the two are read together, so the list never disables
+  the flag), and an unknown role name fails at startup rather than quietly
+  requiring nothing.
 - **Sessions are cookies, not browser storage.** The access token lives in memory,
   the session of record is the `HttpOnly` refresh cookie, every page load asks
   `POST /api/v1/auth/refresh` once, and signing out ends the session on both sides.
@@ -743,7 +807,22 @@ delivery event instead of waiting for SMTP or Telegram, and every channel and
 recipient has its own state, so a successful email never marks a failed chat as
 sent. `channel` names a concrete destination; with no channel configured nothing is
 queued and `alert_delivery_no_channel` is logged, because a finding is already
-stored and a row no destination can satisfy would only fail forever.
+stored and a row no destination can satisfy would only fail forever. That event is
+held rather than consumed, for `ALERT_NO_CHANNEL_RETRY_HOURS` (24 hours by default;
+`0` consumes it exactly as the platform did before the window existed): the scan an
+installation ran before it had an SMTP password is still reported afterwards, and
+the save that first makes delivery possible reports everything held as one
+digest instead of replaying it finding by finding.
+- How loudly a *phishing* candidate is reported is the alert budget: at or above
+  `ALERT_CONFIDENCE_DIRECT` (60 by default) it is announced when its signals are
+  known, between that and `ALERT_CONFIDENCE_DIGEST` (30) it is reported once a day
+  in the digest — `ALERT_PHISHING_DIGEST_ENABLED`, running at
+  `ALERT_PHISHING_DIGEST_HOUR_UTC` — and below it is list-only. An analyst's verdict
+  outranks the score: a confirmed candidate is announced however low it scores, a
+  rejected one is silent in every later scan and in the digest. Any of the six
+  values can be restated per installation in Settings → **Alert budget**, where a
+  blank field keeps the deployment's `ALERT_*` value; a save takes effect on the
+  next scan, batch and digest tick rather than on the next container restart.
 - A batch is aggregated per job, finding type and channel, and bounded by
   `ALERT_MAX_FINDINGS_PER_MESSAGE` and `ALERT_MAX_TELEGRAM_MESSAGE_LENGTH`.
   `ALERT_AGGREGATION_DELAY_SECONDS` holds findings until the connector job reaches
@@ -855,11 +934,11 @@ Inactive assets still count as existing assets. Breach cleanup recognizes exact 
 
 Authenticated views are:
 
-1. **Dashboard** — KPIs, timelines, source distribution, asset criticality, and administrator service health.
+1. **Dashboard** — KPIs, a 30-day timeline whose series are built from the module registry (each counted module is one line, labelled by the module; current-state modules such as DNS and Exposure are named as left out, and each series carries its previous 30-day total), source distribution, asset criticality, and connector/alert-channel health visible to every signed-in account (raw error text, the reason a provider's scan is refused, and provider quota are administrator-only).
 2. **Assets** — filters, create/edit, active/inactive toggle, canonical value normalization, and administrator deletion with optional finding cascade.
 3. **DNS Security** — `/dns-security`: source-filtered observations, wildcard-aware evidence, asset promotion, `Rescan`, admin orphan cleanup and per-source jobs.
 4. **Exposure** — `/exposure`: provider-observed hosts and services with a triage status, asset promotion, and the module's own `Rescan`.
-5. **Phishing** — filtered findings, status updates, source badges, `Rescan`, orphan cleanup, and module-specific jobs.
+5. **Phishing** — filtered findings, status updates, source badges, the age of a registration and a row that opens to name the registrar, the abuse contact and the sources that reported the candidate, `Rescan`, orphan cleanup, and module-specific jobs.
 6. **Breaches** — HIBP findings, resolved matched asset and type, `Rescan`, orphan cleanup, and module-specific jobs.
 7. **Modules** — one page per enabled module declared in the registry (`/modules/<module id>`), showing the
    findings of that module with a per-row triage status. The built-in modules keep
@@ -934,7 +1013,7 @@ and the local procedure are in
 [docs/production-readiness.md](docs/production-readiness.md#reproducing-the-measurements)).
 It is the only job that builds images, so it is the slowest.
 
-A `repo-hygiene` job runs the repository gates where the checkout is complete: `scripts/check_tracked_sources.py` fails when an ignore rule keeps source files out of the repository — an over-broad `lib/` pattern once hid `frontend/src/lib` from the published tree while every local command still passed; `scripts/check_portable_commands.py` fails when a documented command needs a shell-specific line continuation, which is how the quick start's administrator step broke on its first Windows install; `scripts/check_compose_healthchecks.py` compares the per-service limits documented in `docs/configuration.md` with the Compose file, row by row; `scripts/check_env_template.py` fails when a documented setting never reaches a container or a variable Compose reads is undocumented; `scripts/check_frontend_spa.py` fails when an SPA route can collide with a static directory; `scripts/check_dependency_sources.py` fails when a dependency declaration drifts from `requirements*.txt`; `scripts/check_version_consistency.py` fails when the platform's version statements disagree with each other; `scripts/check_docs_consistency.py` fails on a relative link that no longer resolves or a page nothing reaches; and `scripts/check_withdrawn_providers.py` fails when a provider this project removed reappears in the source or the documentation.
+A `repo-hygiene` job runs the repository gates where the checkout is complete: `scripts/check_tracked_sources.py` fails when an ignore rule keeps source files out of the repository — an over-broad `lib/` pattern once hid `frontend/src/lib` from the published tree while every local command still passed; `scripts/check_portable_commands.py` fails when a documented command needs a shell-specific line continuation, which is how the quick start's administrator step broke on its first Windows install; `scripts/check_compose_healthchecks.py` compares the per-service limits documented in `docs/configuration.md` with the Compose file, row by row; `scripts/check_env_template.py` fails when a documented setting never reaches a container or a variable Compose reads is undocumented; `scripts/check_frontend_spa.py` fails when an SPA route can collide with a static directory; `scripts/check_dependency_sources.py` fails when a dependency declaration drifts from `requirements*.txt`; `scripts/check_version_consistency.py` fails when the platform's version statements disagree with each other; `scripts/check_docs_consistency.py` fails on a relative link that no longer resolves, a page nothing reaches, or a page a document names and the repository does not have; `python -m compileall -q setup.py` fails when the setup wizard stops parsing under the grammar the prerequisites promise; and `scripts/check_withdrawn_providers.py` fails when a provider this project removed reappears in the source or the documentation.
 
 The rest of the workflow covers the same ground from other angles: the `frontend` job runs the SPA suite with its coverage floors and a production build; `production-integration` runs the PostgreSQL-only suites and the migration round trip against a real database; `compose` validates the two-replica file set without starting it; `release-image-coverage` resolves every Compose profile and fails if an image the stack can ask for is not one the release publishes; `secrets` scans the whole history with gitleaks (`.gitleaks.toml` allowlists test fixtures by path and nothing else); and `codeql` starts analysing the day the repository is public, because it needs GitHub Advanced Security while it is private.
 

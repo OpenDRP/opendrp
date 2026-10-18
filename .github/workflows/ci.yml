@@ -74,6 +74,18 @@ jobs:
           REDIS_URL: redis://127.0.0.1:6379/0
           COVERAGE_CORE: sysmon
         run: python -m pytest -q tests/test_connector_runtime.py tests/test_connector_sdk_contract.py
+      - name: Run connector worker tests
+        # Connector suites live outside `testpaths = tests`, so nothing collected
+        # them: the DNS Security file that pins CT exact lookup, deduplication and
+        # the rule that an uncertain result is never promoted to `verified` ran by
+        # hand or not at all (F-12 in the DNS & TLS audit). The whole tree is named
+        # rather than individual files, so a new connector's tests are collected on
+        # the day they land; `tests/test_connector_tests_collected.py` fails if this
+        # step stops covering them. The SDK is imported from the checkout, the same
+        # way `tests/test_connector_sdk_contract.py` locates it.
+        env:
+          PYTHONPATH: ../connectors/base
+        run: python -m pytest -q ../connectors
       - name: Enforce coverage floor
         env:
           APP_ENV: test
@@ -242,9 +254,10 @@ jobs:
         run: >-
           python -m pytest -q
           tests/test_asset_involvement_postgres.py tests/test_dns_expiry_postgres.py
+          tests/test_users_rbac_postgres.py
           -m integration --junitxml=postgres-only.xml
       - name: Verify the PostgreSQL-only suites actually ran
-        run: python scripts/check_integration_ran.py postgres-only.xml --min-passed 2
+        run: python scripts/check_integration_ran.py postgres-only.xml --min-passed 6
 
       # The dump and the restore both run inside postgres:17-alpine rather than
       # in the runner's own shell: pg_dump refuses to dump a newer server, and
@@ -597,10 +610,12 @@ jobs:
       # packages the production image never contained.
       - name: Fail if dependency declarations drift apart
         run: python3 scripts/check_dependency_sources.py
-      # Three files carry the platform version. A release tagged from a commit
-      # that disagrees with itself produces images reporting a version no
+      # Several files carry the release version: the app, its package metadata,
+      # the changelog, the connector SDK (including the `api_version` a
+      # connector registers with) and the SPA package. A release tagged from a
+      # commit that disagrees with itself produces images reporting a version no
       # release note describes, and the moment to notice that is now.
-      - name: Fail if the platform version disagrees with itself
+      - name: Fail if the release version disagrees with itself
         run: python3 scripts/check_version_consistency.py
       # Documentation is a tree an operator navigates, and two of the three ways
       # it rots are invisible in a rendered page: a relative link that points at

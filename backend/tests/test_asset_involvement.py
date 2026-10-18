@@ -219,6 +219,51 @@ class TestAssetInvolvement:
         excluded = await self._list(client, auth_headers_admin, has_findings=False)
         assert asset["id"] not in [item["id"] for item in excluded["items"]]
 
+    async def test_the_filter_does_not_read_more_statements_as_the_inventory_grows(
+        self, client, db_session, auth_headers_admin
+    ):
+        """AWI-07: the filter is a database question, not an inventory load.
+
+        The old form loaded every asset row into the request and summarised the
+        whole inventory before choosing a page, so its statement count was
+        constant but its *work* grew with the table. This counts statements for
+        the same request against two inventory sizes: a per-asset lookup would
+        show up as a growing count, and the union semi-join keeps it flat. The
+        listener is attached to the ``Engine`` class because the API and the test
+        session may run on different engine instances (PostgreSQL CI).
+        """
+        from sqlalchemy import event
+        from sqlalchemy.engine import Engine
+
+        await self._create(client, auth_headers_admin, f"involved.{MARK}")
+        await self._phishing(db_session, f"involved.{MARK}")
+        await db_session.commit()
+
+        async def statement_count() -> int:
+            counted = {"selects": 0}
+
+            def before_cursor_execute(
+                conn, cursor, statement, parameters, context, executemany
+            ):
+                if statement.lstrip().upper().startswith("SELECT"):
+                    counted["selects"] += 1
+
+            event.listen(Engine, "before_cursor_execute", before_cursor_execute)
+            try:
+                response = await self._list(client, auth_headers_admin, has_findings=True)
+                assert response["items"], response
+            finally:
+                event.remove(Engine, "before_cursor_execute", before_cursor_execute)
+            return counted["selects"]
+
+        small = await statement_count()
+        for index in range(40):
+            await self._create(client, auth_headers_admin, f"extra{index}.{MARK}")
+        large = await statement_count()
+
+        assert small > 0, "the listener saw no statements; the count proves nothing"
+        assert small == large, (small, large)
+
 
 @pytest.mark.anyio
 class TestAssetInvolvementOrdering:

@@ -3,22 +3,47 @@ import html
 import json
 import smtplib
 import ssl
-from collections import Counter
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.message import EmailMessage
 from typing import Literal
-from urllib.parse import quote, urlparse
+from urllib.parse import urlparse
 
 import httpx
 import structlog
 from jinja2 import Environment, FileSystemLoader
 from sqlalchemy.ext.asyncio import AsyncSession
-from tenacity import RetryCallState
 from types import SimpleNamespace
-from concurrent.futures import ThreadPoolExecutor
 
 from app.services.alert_content import fact_text, safe_snapshot, telegram_parts
+from app.services.alert_facts import message_facts, stored_message_facts
+from app.services.alert_transport import (
+    AlertDeliveryAmbiguousError as AlertDeliveryAmbiguousError,
+    AlertDeliveryCancelledError as AlertDeliveryCancelledError,
+    AlertDeliveryPermanentError as AlertDeliveryPermanentError,
+    AlertDeliveryTransientError as AlertDeliveryTransientError,
+    _SMTP_SLOTS as _SMTP_SLOTS,
+    alert_retry_wait,
+    bounded_smtp as bounded_smtp,
+)
+from app.services.alert_message import (
+    BADGE_CLASSES,
+    BREAKDOWN_CHARS,
+    LOOPBACK_HOSTS,
+    Notification,
+    breach_subject_class,
+    clip,
+    counted,
+    declared_column,
+    digest_heading as digest_heading,
+    finding_path,
+    highest_severity,
+    plain_text,
+    plural,
+)
+from app.services.alert_routing import (
+    PhishingRoute as PhishingRoute,
+    phishing_alert_route as phishing_alert_route,
+)
 
 from app.core.safe_errors import sanitize_external_error
 
@@ -35,233 +60,14 @@ from app.services.settings_service import SettingsService
 
 log = structlog.get_logger()
 
-
-class AlertDeliveryTransientError(RuntimeError):
-    """A provider/network failure that is safe to retry."""
-
-    def __init__(self, message: str, *, retry_after: float | None = None):
-        super().__init__(message)
-        self.retry_after = retry_after
-
-
-def _alert_retry_wait(state: RetryCallState) -> float:
-    """Honor provider Retry-After without losing the local exponential backoff."""
-    exception = state.outcome.exception() if state.outcome else None
-    retry_after = getattr(exception, "retry_after", None)
-    if retry_after is not None:
-        return min(max(float(retry_after), 0.0), 300.0)
-    # Keep a bounded fallback for network failures that carry no provider hint.
-    attempt = max(state.attempt_number - 1, 0)
-    return min(max(settings.ALERT_DELIVERY_RETRY_BASE_SECONDS * (2**attempt), 1.0), 30.0)
-
-
-class AlertDeliveryAmbiguousError(RuntimeError):
-    """Provider acceptance is unknown; operator reconciliation is required."""
-
-
-class AlertDeliveryCancelledError(RuntimeError):
-    """The configured destination no longer permits this queued delivery."""
-
-
-_SMTP_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="alert-smtp")
-_SMTP_SLOTS = __import__("threading").BoundedSemaphore(4)
-
-
-async def bounded_smtp(operation):
-    if not _SMTP_SLOTS.acquire(blocking=False):
-        raise AlertDeliveryTransientError("SMTP workers are busy")
-    future = _SMTP_EXECUTOR.submit(operation)
-    future.add_done_callback(lambda done: _SMTP_SLOTS.release())
-    try:
-        await asyncio.wait_for(asyncio.shield(asyncio.wrap_future(future)), settings.ALERT_DELIVERY_TIMEOUT_SECONDS)
-    except asyncio.TimeoutError as exc:
-        # The slot remains occupied until the thread actually exits. Do not start
-        # another attempt: cancellation cannot establish provider non-acceptance.
-        raise AlertDeliveryAmbiguousError("SMTP deadline exceeded; acceptance unknown") from exc
-
-
-class AlertDeliveryPermanentError(RuntimeError):
-    """A configuration or provider rejection that must not be retried."""
-
-
-#: Longest single value a delivered message prints before it is clipped. A
-#: connector controls these strings, and one 4 KB "domain" must not be able to
-#: push every other finding out of its own alert.
-_MAX_FIELD_CHARS = 160
-#: The same bound for values in the breakdown, which prints several per line.
-_BREAKDOWN_CHARS = 80
-#: How many distinct values a breakdown line counts before it counts the rest,
-#: so a job that matched 400 assets does not print 400 of them.
-_MAX_BREAKDOWN_VALUES = 4
-#: Room kept for the "… +N more findings" line. It is what explains a truncated
-#: list, so it is charged to the budget the list was built against.
-_OMISSION_NOTE_RESERVE = 64
-#: Hosts whose "link" would point at the reader's own machine rather than at
-#: this installation.
-# B104 is about binding a listener, not rejecting a URL host supplied as input.
-_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "0.0.0.0"})  # nosec B104
-#: The finding list a delivered message links to, per threat type. A module
-#: declared at runtime has its own page, named by its registry id.
-_FINDING_PATHS = {"phishing": "/phishing", "breach": "/breaches", "dns": "/dns-security", "dns_security": "/dns-security"}
-_BADGE_CLASSES = {"phishing": "badge-phishing", "breach": "badge-breach"}
-
-
-def _clip(value: object, limit: int = _MAX_FIELD_CHARS) -> str:
-    """One printable value: single line, bounded, and never a raw `None`."""
-    text = " ".join(str("N/A" if value is None else value).split())
-    if len(text) <= limit:
-        return text
-    return text[: limit - 1].rstrip() + "…"
-
-
-def _escaped(value: object, limit: int = _MAX_FIELD_CHARS) -> str:
-    """`_clip`, escaped for Telegram's HTML parse mode.
-
-    Clipping happens before escaping on purpose: escaping first would let a slice
-    cut `&amp;` in half, which Telegram reads as an unknown entity and rejects.
-    """
-    return html.escape(_clip(value, limit))
-
-
-def _counted(values: list[str]) -> str:
-    """`a × 3, b × 1`: most frequent first, the tail counted rather than listed."""
-    ordered = sorted(Counter(values).items(), key=lambda item: (-item[1], item[0]))
-    shown = [f"{value} × {count}" for value, count in ordered[:_MAX_BREAKDOWN_VALUES]]
-    if len(ordered) > len(shown):
-        shown.append(f"+{len(ordered) - len(shown)} more")
-    return ", ".join(shown)
-
-
-def _plural(count: int, noun: str) -> str:
-    return f"{count} {noun}" if count == 1 else f"{count} {noun}s"
-
-
-def _finding_path(threat_type: str) -> str:
-    """The page a delivered message links to for this threat type."""
-    if threat_type in _FINDING_PATHS:
-        return _FINDING_PATHS[threat_type]
-    if threat_type.startswith("module:"):
-        module_id = threat_type.removeprefix("module:").strip()
-        if module_id:
-            return f"/modules/{quote(module_id, safe='')}"
-    return "/dashboard"
-
-
-@dataclass(frozen=True)
-class _Notification:
-    """One queued alert batch, in the neutral shape each channel renders.
-
-    The module decides the content — which values identify a finding, and which
-    of them are worth counting — while the channel decides the layout. That split
-    is what lets a source onboarded as data reach an inbox or a chat without a
-    line of per-source rendering code.
-    """
-
-    label: str
-    subject: str
-    job_id: str
-    total: int
-    included: int
-    rows: list[dict[str, str]]
-    groups: list[tuple[str, str]]
-    link: str | None
-
-    @property
-    def columns(self) -> list[str]:
-        """Every fact name the findings use, in the order they named them.
-
-        A module declares its own fields, so two findings of one batch can carry
-        different keys; the table shows the union rather than the first row's.
-        """
-        names: list[str] = []
-        for row in self.rows:
-            for name in row:
-                if name not in names:
-                    names.append(name)
-        return names
-
-    def table(self) -> list[list[str]]:
-        """Rows aligned to `columns`, with a missing field shown as missing."""
-        return [[row.get(name, "—") for name in self.columns] for row in self.rows]
-
-
-def _telegram_finding_line(index: int, row: dict[str, str]) -> str:
-    values = list(row.values())
-    primary = _escaped(values[0]) if values else "N/A"
-    details = [_escaped(value) for value in values[1:4]]
-    tail = " · ".join(details)
-    if len(values) > 4:
-        tail += f" · +{len(values) - 4} more fields"
-    return f"{index}. <code>{primary}</code>" + (f" — {tail}" if tail else "")
-
-
-def _telegram_text(notification: _Notification) -> str:
-    """Render the summary Telegram receives, inside Telegram's own limits.
-
-    Telegram answers a message it cannot parse (unbalanced or sliced markup) or
-    one it considers too long with `400`, which the delivery queue records as a
-    permanent failure — an alert lost to a length check rather than to an outage.
-    So this never slices markup it built: the finding list is dropped line by
-    line against a budget that already reserved the footer and the note saying
-    how many findings were left out.
-    """
-    lines = [f"🚨 <b>OpenDRP {html.escape(notification.label.upper())}</b>"]
-    counted = f"<b>{_plural(notification.total, 'new finding')}</b>"
-    if notification.included < notification.total:
-        counted += f" · showing {notification.included}"
-    lines.append(counted)
-    if notification.groups:
-        lines.append("")
-        lines.extend(
-            f"<b>{html.escape(name)}:</b> {html.escape(summary)}"
-            for name, summary in notification.groups
-        )
-    if notification.rows:
-        lines.append("")
-        lines.append("<b>Findings</b>")
-    footer = [f"Job <code>{html.escape(notification.job_id)}</code>"]
-    if notification.link:
-        footer.append(
-            f'🔗 <a href="{html.escape(notification.link, quote=True)}">Open in OpenDRP</a>'
-        )
-    footer_text = "\n".join(footer)
-    budget = (
-        settings.ALERT_MAX_TELEGRAM_MESSAGE_LENGTH
-        - _OMISSION_NOTE_RESERVE
-        - len(footer_text)
-        - 1
-    )
-    text = "\n".join(lines)
-    kept = 0
-    for index, row in enumerate(notification.rows, start=1):
-        line = _telegram_finding_line(index, row)
-        if len(text) + 1 + len(line) > budget:
-            break
-        text = f"{text}\n{line}"
-        kept += 1
-    if kept < len(notification.rows):
-        missing = len(notification.rows) - kept
-        text += f"\n… +{_plural(missing, 'more finding')} in OpenDRP"
-    return f"{text}\n\n{footer_text}"
-
-
-def _plain_text(notification: _Notification) -> str:
-    """The `text/plain` alternative: the same facts, readable without HTML."""
-    lines = [notification.subject, ""]
-    lines.append(f"Job: {notification.job_id}")
-    counted = f"Findings: {notification.total}"
-    if notification.included < notification.total:
-        counted += f" (showing the first {notification.included})"
-    lines.append(counted)
-    lines.extend(f"{name}: {summary}" for name, summary in notification.groups)
-    if notification.rows:
-        lines.append("")
-        for index, row in enumerate(notification.rows, start=1):
-            facts = "  ".join(f"{name}={fact_text(value)}" for name, value in row.items())
-            lines.append(f"{index:>3}. {facts}")
-    if notification.link:
-        lines.extend(["", f"Open in OpenDRP: {notification.link}"])
-    return "\n".join(lines)
+#: Historical private names: the message layer used to live in this module, and a
+#: caller (or a test) that reached for one of these should not have to learn a
+#: second import path in the same release. Remove with the next major version.
+_Notification = Notification
+_plain_text = plain_text
+_highest_severity = highest_severity
+_breach_subject_class = breach_subject_class
+_alert_retry_wait = alert_retry_wait
 
 
 class AlertService:
@@ -309,6 +115,31 @@ class AlertService:
         except Exception:
             pass
 
+    async def send_email(
+        self,
+        *,
+        to: str,
+        subject: str,
+        html_body: str,
+        plain_body: str | None = None,
+    ) -> bool:
+        """Send one message through the alert transport, as a non-alert.
+
+        Opening this door rather than a second SMTP path keeps TLS rules, the
+        timeout, credential handling and the outbound destination policy in one
+        place (RWI-15). ``audit=False`` is what makes the rows that accompany it
+        honest: the account-change notice records ``user.notification.*``, and a
+        ``alert.dispatch.success`` row for a password-reset mail would describe it
+        as a finding alert.
+        """
+        return await self._send_email_smtp(
+            to=to,
+            subject=subject,
+            html_body=html_body,
+            plain_body=plain_body,
+            audit=False,
+        )
+
     async def _send_email_smtp(
         self,
         *,
@@ -316,6 +147,7 @@ class AlertService:
         subject: str,
         html_body: str,
         plain_body: str | None = None,
+        audit: bool = True,
     ) -> bool:
         s = await self._get_settings()
         if getattr(self, "_settings_snapshot", None) is None:
@@ -396,11 +228,12 @@ class AlertService:
                 f"smtp {type(exc).__name__}"
             ) from exc
         log.info("alert_email_sent", to=to, subject=subject)
-        await self._audit_alert(
-            action="alert.dispatch.success",
-            channel="email",
-            details={"to": to, "subject": subject[:120]},
-        )
+        if audit:
+            await self._audit_alert(
+                action="alert.dispatch.success",
+                channel="email",
+                details={"to": to, "subject": subject[:120]},
+            )
         return True
 
     async def _send_telegram(self, text: str, parse_mode: str = "HTML", chat_id: str | None = None) -> bool:
@@ -693,54 +526,27 @@ class AlertService:
             parsed = urlparse(candidate)
             if parsed.scheme not in {"http", "https"} or not parsed.netloc:
                 continue
-            if (parsed.hostname or "").lower() in _LOOPBACK_HOSTS:
+            if (parsed.hostname or "").lower() in LOOPBACK_HOSTS:
                 continue
-            return f"{candidate}{_finding_path(threat_type)}"
+            return f"{candidate}{finding_path(threat_type)}"
         return None
 
-    def _facts(
-        self, threat_type: str, item: dict
-    ) -> tuple[dict[str, str], dict[str, str]]:
-        """What a message says about one finding, and what the summary counts.
+    async def _stored_message_facts(
+        self, threat_type: str, findings: list[dict]
+    ) -> dict[str, dict]:
+        """The module's own row behind each event of one batch.
 
-        The module decides both, not the alert path: the two built-in modules
-        name their neutral fields, and a module declared at runtime contributes
-        the fields it declared — which is what lets a source onboarded as data
-        arrive in an operator's inbox without a line of rendering code. The
-        second half holds only what a count is useful for; a module that names
-        nothing there is simply not broken down.
+        The SQL and the per-module field mapping live in
+        :mod:`app.services.alert_facts`; this method is the service's entry point
+        so a caller keeps one dependency.
         """
-        if threat_type == "phishing":
-            return (
-                {
-                    "Domain": item.get("phishing_domain") or "N/A",
-                    "Matched asset": item.get("matched_asset") or "N/A",
-                    "Source": item.get("detection_source") or "N/A",
-                },
-                {
-                    "Source": item.get("detection_source") or "N/A",
-                    "Matched asset": item.get("matched_asset") or "N/A",
-                },
-            )
-        if threat_type == "breach":
-            return (
-                {
-                    "Breach": item.get("breach_name") or "N/A",
-                    "Account": item.get("matched_email")
-                    or item.get("matched_domain")
-                    or "N/A",
-                    "Domain": item.get("domain") or "N/A",
-                },
-                {
-                    "Breach": item.get("breach_name") or "N/A",
-                    "Domain": item.get("domain") or "N/A",
-                },
-            )
-        declared = item.get("fields")
-        facts: dict[str, str] = {"Finding": item.get("title") or "N/A"}
-        if isinstance(declared, dict):
-            facts.update({str(key): value for key, value in declared.items()})
-        return facts, {}
+        return await stored_message_facts(self.db, threat_type, findings)
+
+    def _facts(
+        self, threat_type: str, item: dict, stored: dict | None = None
+    ) -> tuple[dict[str, str], dict[str, str]]:
+        """What a message says about one finding, and what the summary counts."""
+        return message_facts(threat_type, item, stored)
 
     def _build_notification(
         self,
@@ -753,32 +559,37 @@ class AlertService:
         job_id,
         link: str | None,
         total_count: int | None = None,
-    ) -> _Notification:
+        stored_facts: dict[str, dict] | None = None,
+    ) -> Notification:
         """Turn one queued batch into the neutral shape every channel renders."""
         rows: list[dict[str, str]] = []
-        counted: dict[str, list[str]] = {}
+        grouped: dict[str, list[str]] = {}
+        known = stored_facts or {}
         for item in bounded:
             safe_item = safe_snapshot(item)
-            row, groups = self._facts(threat_type, safe_item)
+            row, groups = self._facts(
+                threat_type, safe_item, known.get(str(item.get("finding_id") or ""))
+            )
             if item.get("finding_id") and threat_type in {"phishing", "breach"}:
                 origin_link = self._platform_link(threat_type)
                 if origin_link:
                     from uuid import UUID
                     row["Finding link"] = f"{origin_link}?finding_id={UUID(str(item['finding_id']))}"
             for name, value in safe_item.items():
-                if name not in {"phishing_domain", "matched_asset", "detection_source", "breach_name", "matched_email", "matched_domain", "domain", "fields", "title"}:
-                    row[name] = fact_text(value)
+                if not declared_column(threat_type, name):
+                    continue
+                row[name] = fact_text(value)
             rows.append({name: fact_text(value) for name, value in row.items()})
             for group_label, value in groups.items():
-                counted.setdefault(group_label, []).append(_clip(value, _BREAKDOWN_CHARS))
-        return _Notification(
+                grouped.setdefault(group_label, []).append(clip(value, BREAKDOWN_CHARS))
+        return Notification(
             label=label,
             subject=subject,
             job_id=str(job_id) if job_id else "unrecorded",
             total=total_count if total_count is not None else len(findings),
             included=len(bounded),
             rows=rows,
-            groups=[(name, _counted(values)) for name, values in counted.items()],
+            groups=[(name, counted(values)) for name, values in grouped.items()],
             link=link,
         )
 
@@ -833,7 +644,14 @@ class AlertService:
             if threat_type in {"dns", "dns_security"}
             else threat_type.removeprefix("module:")
         )
-        subject = f"[OpenDRP Alert] {label}: {_plural(total, 'new finding')}"
+        subject = f"[OpenDRP Alert] {label}: {plural(total, 'new finding')}"
+        severity = highest_severity(findings)
+        if severity is not None:
+            subject = f"{subject} ({severity})"
+        if threat_type == "breach":
+            change = _breach_subject_class(findings)
+            if change is not None:
+                subject = f"{subject} ({change})"
         notification = self._build_notification(
             threat_type=threat_type,
             label=label,
@@ -842,12 +660,13 @@ class AlertService:
             bounded=bounded,
             job_id=job_id,
             link=self._platform_link(threat_type),
+            stored_facts=await self._stored_message_facts(threat_type, findings),
         )
         email_html = self._render_template(
             "emails/finding_summary.html",
             module_label=notification.label,
             title=notification.subject,
-            badge_class=_BADGE_CLASSES.get(threat_type, ""),
+            badge_class=BADGE_CLASSES.get(threat_type, ""),
             dashboard_url=notification.link,
             job_id=notification.job_id,
             total=notification.total,
@@ -856,7 +675,7 @@ class AlertService:
             columns=notification.columns,
             rows=notification.table(),
         )
-        plain = _plain_text(notification)
+        plain = plain_text(notification)
         sent = 0
         failures: list[Exception] = []
         for recipient in email_recipients:

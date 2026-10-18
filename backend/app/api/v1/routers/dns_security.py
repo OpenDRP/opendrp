@@ -4,6 +4,7 @@ import ipaddress
 import math
 import uuid
 from datetime import datetime, timezone
+from typing import Any
 from app.models.dns_expiry_monitor import DNSExpiryMonitor
 from app.services.dns_expiry_monitor_service import monitor_payload
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -14,9 +15,10 @@ from app.services.dns_security_service import normalize_subject
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import extract_ip, get_db, require_admin, require_analyst_or_admin, require_viewer_plus
+from app.api.deps import extract_ip, get_db, require_admin, require_analyse, require_active_account
 from app.core.audit import AuditLogger
 from app.core.exceptions import ConflictException, NotFoundException
+from app.core.manual_rate_limit import SCOPE_ASSETS, enforce_manual_rate_limit
 from app.models.asset import Asset, AssetType
 from app.models.dns_observation import DNSObservation
 from app.schemas.asset import AssetCreate, validate_and_normalize_asset_value
@@ -37,7 +39,7 @@ async def list_observations(
     page: int = Query(1, ge=1),
     size: int = Query(50, ge=1, le=MAX_PAGE_SIZE),
     db: AsyncSession = Depends(get_db),
-    user=Depends(require_viewer_plus),
+    user=Depends(require_active_account),
 ):
     if subject:
         from app.services.dns_security_service import normalize_subject
@@ -86,13 +88,13 @@ async def list_observations(
         "value_in_assets": in_assets(value_asset_target(row, value)),
         "expires_at": row.expires_at, "status": row.status, "metadata": row.metadata_json,
         "alerted_thresholds": row.alerted_thresholds or [],
-        "expiry_kind": "registration" if row.observation_type == "rdap" else "certificate" if row.observation_type in {"certificate", "certificate_check"} else "dns_cache" if row.source == "resolver" else "unknown",
-        "expiry_monitor": controls.get((row.subject, "registration" if row.observation_type == "rdap" else "certificate")) if row.observation_type in {"rdap", "certificate", "certificate_check"} else None,
+        "expiry_kind": expiry_kind(row),
+        "expiry_monitor": _expiry_monitor(controls, row),
     } for row, value, evidence_count, first_seen in rows], total=total, page=page, size=size, pages=math.ceil(total / size) if size else 0)
 
 
 @router.post("/scan", status_code=202)
-async def scan_dns_security(request: Request, db: AsyncSession = Depends(get_db), user=Depends(require_analyst_or_admin)):
+async def scan_dns_security(request: Request, db: AsyncSession = Depends(get_db), user=Depends(require_analyse)):
     service = ConnectorService(db)
     offline = [conn.name for conn in await service.list_enabled_by_type("dns") if not service.is_online(conn)]
     # The queued Job rows and the event that says the scan was requested are one
@@ -136,11 +138,54 @@ def value_asset_target(row: DNSObservation, value: str | None) -> str | None:
         return None
 
 
+def monitor_kind(observation_type: str) -> str | None:
+    """The expiry control an observation feeds, or None when it feeds none.
+
+    `tls_probe` is a kind of its own rather than part of `certificate`: the active
+    handshake and the passive Certificate Transparency check answer different
+    questions about the same hostname, and a reader has to be able to tell which
+    one a reminder came from.
+    """
+    if observation_type == "rdap":
+        return "registration"
+    if observation_type in {"certificate", "certificate_check"}:
+        return "certificate"
+    if observation_type == "tls_probe":
+        return "tls"
+    return None
+
+
+def _expiry_monitor(controls: dict[tuple[str, str], dict], row: Any) -> dict | None:
+    """The expiry control an inventory row feeds, or None when it feeds none.
+
+    ``monitor_kind`` answers ``None`` for an observation type no control tracks, and
+    ``None`` is not a key any control row has — the guard states that in the one place
+    the question is asked, instead of leaving a reader to notice that the lookup it
+    would build could only ever miss.
+    """
+    kind = monitor_kind(row.observation_type)
+    if not kind:
+        return None
+    return controls.get((row.subject, kind))
+
+
+def expiry_kind(row) -> str:
+    """What the expiry column is about for one inventory row."""
+    kind = monitor_kind(row.observation_type)
+    if kind:
+        return kind
+    if row.observation_type == "tls_certificate":
+        return "tls"
+    if row.source == "resolver":
+        return "dns_cache"
+    return "unknown"
+
+
 @router.delete("/observations/{observation_id}", status_code=204)
 async def delete_observation(
     observation_id: uuid.UUID, request: Request,
     value: str | None = Query(None, max_length=1000),
-    db: AsyncSession = Depends(get_db), user=Depends(require_analyst_or_admin),
+    db: AsyncSession = Depends(get_db), user=Depends(require_analyse),
 ):
     row = (await db.execute(select(DNSObservation).where(DNSObservation.id == observation_id).with_for_update())).scalar_one_or_none()
     if row is None:
@@ -162,10 +207,10 @@ async def delete_observation(
     else:
         await db.delete(row)
         deleted = 1
-    if row.observation_type in {"rdap", "certificate", "certificate_check"}:
+    deleted_kind = monitor_kind(row.observation_type)
+    if deleted_kind:
         from sqlalchemy import update
-        kind = "registration" if row.observation_type == "rdap" else "certificate"
-        await db.execute(update(DNSExpiryMonitor).where(DNSExpiryMonitor.subject == row.subject, DNSExpiryMonitor.kind == kind).values(state="unverified", observation_id=None))
+        await db.execute(update(DNSExpiryMonitor).where(DNSExpiryMonitor.subject == row.subject, DNSExpiryMonitor.kind == deleted_kind).values(state="unverified", observation_id=None))
     details = {"observation_id": str(observation_id), "subject": row.subject, "source": row.source, "deleted": deleted}
     await AuditLogger.emit(db, action="dns_security.observation.delete", ip_address=extract_ip(request), user_id=user.id, details=details, require_persistence=True, commit=False)
     await db.commit()
@@ -178,7 +223,7 @@ async def promote_observation_to_asset(
     request: Request,
     payload: PromoteObservation | None = None,
     db: AsyncSession = Depends(get_db),
-    user=Depends(require_analyst_or_admin),
+    user=Depends(require_analyse),
 ):
     observation = await db.get(DNSObservation, observation_id)
     if observation is None:
@@ -203,6 +248,19 @@ async def promote_observation_to_asset(
         normalized_subject = validate_and_normalize_asset_value(asset_type.value, target)
     except ValueError as exc:
         raise ConflictException("This observation cannot be promoted to an asset") from exc
+    # Promoting is creating: the value joins every scan of its type, exactly as
+    # it would through the direct-create route, so it charges the same per-user
+    # window (AWI-02/AST-43). The check sits after the observation is validated
+    # and before the existing-row lookup, so a repeat click on an already
+    # monitored value counts too - that click still writes an audit row, and a
+    # batch of 300 observations is how an inventory grows in one sitting.
+    await enforce_manual_rate_limit(
+        db=db,
+        user=user,
+        scope=SCOPE_ASSETS,
+        action="asset promotion",
+        ip_address=extract_ip(request),
+    )
     existing = (await db.execute(select(Asset).where(
         Asset.asset_type == asset_type,
         Asset.normalized_value == normalized_subject,
@@ -230,3 +288,113 @@ async def promote_observation_to_asset(
     await AuditLogger.emit(db, action="dns_security.asset.promoted", ip_address=extract_ip(request), user_id=user.id, details={"observation_id": str(observation.id), "asset_id": str(asset.id), "asset_type": asset_type.value, "asset_value": asset.asset_value, "criticality": asset_type_value(asset.criticality), "subject": observation.subject, "source": observation.source, "observation_type": observation.observation_type, "promoted_from": "dns_security", "already_exists": already_exists}, require_persistence=True, commit=False)
     await db.commit()
     return {"already_exists": already_exists, "asset": asset, "source": observation.source}
+
+
+class CertificateVerdict(BaseModel):
+    """The review decision for one sighting, with the note that goes in the trail."""
+
+    verdict: str = Field(pattern="^(expected|shared_infrastructure|confirmed_foreign|rejected|candidate)$")
+    note: str | None = Field(default=None, max_length=2000)
+
+
+class CertificateExceptionCreate(BaseModel):
+    match_kind: str = Field(pattern="^(fingerprint|spki|ip|asn|issuer)$")
+    match_value: str = Field(min_length=1, max_length=255)
+    reason: str | None = Field(default=None, max_length=1000)
+    expires_at: datetime | None = None
+
+
+@router.get("/certificates", response_model=PaginatedResponse[dict])
+async def list_certificates(
+    request: Request,
+    verdict: str | None = Query(None, pattern="^(candidate|expected|shared_infrastructure|confirmed_foreign|rejected)$"),
+    foreign_only: bool = Query(False),
+    page: int = Query(1, ge=1),
+    size: int = Query(25, ge=1, le=MAX_PAGE_SIZE),
+    db: AsyncSession = Depends(get_db),
+    user=Depends(require_active_account),
+):
+    """Certificates and the places each one was observed, with the review state."""
+    from app.services.tls_identity_service import identities_payload
+
+    items, total = await identities_payload(db, verdict=verdict, foreign_only=foreign_only, page=page, size=size)
+    await AuditLogger.emit_background(db, action="dns_security.certificates.list", ip_address=extract_ip(request), user_id=user.id, details={"verdict": verdict, "foreign_only": foreign_only, "count": len(items), "total": total})
+    return PaginatedResponse(items=items, total=total, page=page, size=size, pages=math.ceil(total / size) if size else 0)
+
+
+@router.patch("/certificates/sightings/{sighting_id}")
+async def review_certificate_sighting(
+    sighting_id: uuid.UUID,
+    payload: CertificateVerdict,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    user=Depends(require_analyse),
+):
+    """Record what the operator decided about one sighting.
+
+    A verdict other than ``candidate`` is what keeps the rules quiet about this
+    sighting: the next sweep only queues for candidates, so a judgement survives
+    every later scan.
+    """
+    from app.services.tls_identity_service import record_verdict
+
+    sighting = await record_verdict(db, sighting_id=sighting_id, verdict=payload.verdict, user_id=user.id, note=payload.note)
+    if sighting is None:
+        raise NotFoundException("Certificate sighting not found")
+    await AuditLogger.emit(db, action=f"tls.sighting.{payload.verdict}", ip_address=extract_ip(request), user_id=user.id, details={"sighting_id": str(sighting.id), "identity_id": str(sighting.identity_id), "ip": sighting.ip, "port": sighting.port, "source": sighting.source, "subject": sighting.subject, "note": payload.note}, require_persistence=True, commit=False)
+    await db.commit()
+    return {"id": str(sighting.id), "verdict": sighting.verdict, "reviewed_at": sighting.reviewed_at}
+
+
+@router.get("/certificate-exceptions", response_model=list[dict])
+async def list_certificate_exceptions(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    user=Depends(require_active_account),
+):
+    """Identities, keys, addresses, ASNs and issuers the rules must not alert on."""
+    from app.services.tls_identity_service import exceptions_payload
+
+    items = await exceptions_payload(db)
+    await AuditLogger.emit_background(db, action="dns_security.certificate_exceptions.list", ip_address=extract_ip(request), user_id=user.id, details={"count": len(items)})
+    return items
+
+
+@router.post("/certificate-exceptions", status_code=201)
+async def create_certificate_exception(
+    payload: CertificateExceptionCreate,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    user=Depends(require_admin),
+):
+    """Allow one certificate out of the scope rules, with a reason on the record."""
+    from app.services.tls_identity_service import add_exception
+
+    try:
+        row = await add_exception(db, match_kind=payload.match_kind, match_value=payload.match_value, reason=payload.reason, user_id=user.id, expires_at=payload.expires_at)
+    except ValueError as exc:
+        from app.core.exceptions import BadRequestException
+
+        raise BadRequestException(str(exc)) from exc
+    await AuditLogger.emit(db, action="tls.exception.added", ip_address=extract_ip(request), user_id=user.id, details={"exception_id": str(row.id), "match_kind": row.match_kind, "match_value": row.match_value, "reason": row.reason, "expires_at": row.expires_at.isoformat() if row.expires_at else None}, require_persistence=True, commit=False)
+    await db.commit()
+    return {"id": str(row.id), "match_kind": row.match_kind, "match_value": row.match_value, "reason": row.reason, "expires_at": row.expires_at}
+
+
+@router.delete("/certificate-exceptions/{exception_id}", status_code=204)
+async def delete_certificate_exception(
+    exception_id: uuid.UUID,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    user=Depends(require_admin),
+):
+    from app.models.tls_certificate import CertificateScopeException
+
+    row = (await db.execute(select(CertificateScopeException).where(CertificateScopeException.id == exception_id).with_for_update())).scalar_one_or_none()
+    if row is None:
+        raise NotFoundException("Certificate scope exception not found")
+    details = {"exception_id": str(row.id), "match_kind": row.match_kind, "match_value": row.match_value}
+    await db.delete(row)
+    await AuditLogger.emit(db, action="tls.exception.removed", ip_address=extract_ip(request), user_id=user.id, details=details, require_persistence=True, commit=False)
+    await db.commit()
+    return None

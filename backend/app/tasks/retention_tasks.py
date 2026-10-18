@@ -35,7 +35,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
 import structlog
-from sqlalchemy import delete, func, select, update
+from sqlalchemy import delete, exists, func, select, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
@@ -450,6 +450,67 @@ async def run_retention_sweep(
     results["drp_refresh_families"] = await purge_expired_sessions(db, now=moment)
 
     results.update(await purge_terminal_alert_history(db, now=moment))
+    results.update(await purge_expired_certificate_evidence(db, now=moment))
+    return results
+
+
+async def purge_expired_certificate_evidence(db, *, now) -> dict[str, PurgeResult]:
+    """Bound the certificate identity/sighting evidence the design adds (WI-23).
+
+    Two tables grow with every scan and provider read, and neither had a policy: a
+    sighting that has not been observed for the configured window is history, an
+    identity with no sightings left is only weight, and a scope exception past its
+    own expiry date is a rule that silently stopped applying.
+    """
+    from app.models.tls_certificate import (
+        CertificateScopeException,
+        TLSCertificateIdentity,
+        TLSCertificateSighting,
+    )
+
+    results: dict[str, PurgeResult] = {}
+    if settings.TLS_CERTIFICATE_RETENTION_DAYS <= 0:
+        for model in (TLSCertificateSighting, TLSCertificateIdentity, CertificateScopeException):
+            results[model.__tablename__] = PurgeResult(table=model.__tablename__)
+        return results
+    cutoff = now - timedelta(days=settings.TLS_CERTIFICATE_RETENTION_DAYS)
+    results[TLSCertificateSighting.__tablename__] = await purge_table(
+        db,
+        model=TLSCertificateSighting,
+        timestamp_column=TLSCertificateSighting.last_seen_at,
+        cutoff=cutoff,
+        batch_size=settings.RETENTION_BATCH_SIZE,
+        max_batches=settings.RETENTION_MAX_BATCHES_PER_RUN,
+    )
+    # An identity is kept while any sighting still refers to it: the fingerprint is what
+    # the review workflow and the rules name, so an orphaned one is unreachable.
+    orphan = ~exists().where(TLSCertificateSighting.identity_id == TLSCertificateIdentity.id)
+    result = PurgeResult(table=TLSCertificateIdentity.__tablename__)
+    for _ in range(settings.RETENTION_MAX_BATCHES_PER_RUN):
+        ids = (
+            select(TLSCertificateIdentity.id)
+            .where(TLSCertificateIdentity.last_seen_at < cutoff, orphan)
+            .order_by(TLSCertificateIdentity.last_seen_at)
+            .limit(settings.RETENTION_BATCH_SIZE)
+        )
+        outcome = await db.execute(delete(TLSCertificateIdentity).where(TLSCertificateIdentity.id.in_(ids)))
+        await db.commit()
+        count = outcome.rowcount or 0
+        result.deleted_rows += count
+        result.batches += int(count > 0)
+        if count < settings.RETENTION_BATCH_SIZE:
+            break
+    else:
+        result.truncated = True
+    results[TLSCertificateIdentity.__tablename__] = result
+    results[CertificateScopeException.__tablename__] = await purge_table(
+        db,
+        model=CertificateScopeException,
+        timestamp_column=CertificateScopeException.expires_at,
+        cutoff=now,
+        batch_size=settings.RETENTION_BATCH_SIZE,
+        max_batches=settings.RETENTION_MAX_BATCHES_PER_RUN,
+    )
     return results
 
 
@@ -534,6 +595,10 @@ async def _emit_sweep_audit(results: dict[str, PurgeResult]) -> None:
         "audit_retention_days": settings.AUDIT_RETENTION_DAYS,
         "report_retention_days": settings.REPORT_RETENTION_DAYS,
         "session_retention_days": max(settings.JWT_REFRESH_TOKEN_EXPIRE_DAYS, 1),
+        # Deleting certificate evidence is the only way a certificate the operator
+        # could still triage disappears, so the window that did it is on the record
+        # next to the tables it emptied.
+        "certificate_retention_days": settings.TLS_CERTIFICATE_RETENTION_DAYS,
     }
     if any(r.truncated for r in deletable.values()):
         # Visible in the audit trail as well as in the logs, because a sweep

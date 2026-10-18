@@ -47,7 +47,7 @@ help:
 	@echo "  destroy         ⚠️  Stop + DELETE ALL volumes (postgres_data, redis_data, reports_store)"
 	@echo "  build           Build images only ($(COMPOSE) build)"
 	@echo "  restart         down + up (restart all services)"
-	@echo "  clean           Remove __pycache__, .pytest_cache, and temporary files"
+	@echo "  clean           Remove caches, coverage reports and frontend build output"
 	@echo ""
 	@echo "Data safety:"
 	@echo "  backup          Dump PostgreSQL + report store into ./backups (one pass)"
@@ -225,7 +225,7 @@ test-backend-fast: tools-check
 # points them at the live migrated database, and CI runs them against the one
 # its own migration step left behind.
 test-backend-integration: tools-check
-	$(TOOLS) exec -T backend sh -c 'COVERAGE_CORE=sysmon REQUIRE_INTEGRATION=1 INTEGRATION_DATABASE_URL=$$DATABASE_URL INTEGRATION_MIGRATION_DATABASE_URL=$$DATABASE_URL INTEGRATION_REDIS_URL=$$REDIS_URL python -m pytest -q tests/test_production_integrations.py tests/test_asset_involvement_postgres.py tests/test_dns_expiry_postgres.py'
+	$(TOOLS) exec -T backend sh -c 'COVERAGE_CORE=sysmon REQUIRE_INTEGRATION=1 INTEGRATION_DATABASE_URL=$$DATABASE_URL INTEGRATION_MIGRATION_DATABASE_URL=$$DATABASE_URL INTEGRATION_REDIS_URL=$$REDIS_URL python -m pytest -q tests/test_production_integrations.py tests/test_asset_involvement_postgres.py tests/test_dns_expiry_postgres.py tests/test_users_rbac_postgres.py'
 
 # Both halves of "is the schema what the code expects": the revision *graph*
 # (single head, ancestry, table names that exist by then) and the *models*
@@ -410,6 +410,7 @@ clean:
 	@echo "Cleaning temporary files and cache..."
 	@find . -type d \( -name __pycache__ -o -name .pytest_cache -o -name .mypy_cache -o -name .ruff_cache -o -name htmlcov \) -prune -exec rm -rf {} +
 	@find . -type f \( -name '*.pyc' -o -name '*.pyo' -o -name '.coverage' -o -name 'coverage-critical.json' -o -name '*.tsbuildinfo' \) -delete
+	@rm -rf frontend/dist frontend/coverage
 	@rm -f celerybeat-schedule celerybeat-schedule* backend/celerybeat-schedule backend/celerybeat-schedule*
 	python -c "import pathlib, shutil; [shutil.rmtree(p, ignore_errors=True) for p in pathlib.Path('.').rglob('__pycache__')]; [shutil.rmtree(p, ignore_errors=True) for p in pathlib.Path('.').rglob('.pytest_cache')]; [p.unlink() for p in pathlib.Path('.').rglob('*.pyc')]" 2>/dev/null || true
 	@echo "Clean completed."

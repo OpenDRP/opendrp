@@ -33,6 +33,8 @@ from app.core.metrics import (
 from app.models.alert_delivery import AlertDelivery, AlertDeliveryStatus
 from app.models.audit import AuditLog
 
+pytestmark = pytest.mark.usefixtures("without_testing_switch")
+
 TOKEN = "metrics-scrape-token-for-tests-" + "0" * 12
 HEADERS = {"X-Metrics-Token": TOKEN}
 

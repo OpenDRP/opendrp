@@ -8,6 +8,13 @@ from sqlalchemy.sql.elements import ColumnElement
 from app.models.dns_observation import DNSObservation
 
 
+#: Certificate evidence, however it was obtained: a Certificate Transparency record or
+#: the certificate an active TLS probe read from the service. Both are historical rows
+#: keyed by certificate identity, so both belong in the same one-row-per-group projection
+#: instead of one list row per certificate in a chain.
+_CERTIFICATE_EVIDENCE = ("certificate", "tls_certificate")
+
+
 def inventory_query(db: AsyncSession):
     """Expand RRsets and collapse certificates BEFORE counting and pagination."""
     table = DNSObservation.__table__
@@ -30,7 +37,7 @@ def inventory_query(db: AsyncSession):
     ordinary = select(
         table.c.id.label("observation_id"), table.c.value.label("display_value"),
         literal(1).label("evidence_count"), table.c.first_seen_at.label("inventory_first_seen"),
-    ).where(~is_rrset, table.c.observation_type != "certificate")
+    ).where(~is_rrset, table.c.observation_type.notin_(_CERTIFICATE_EVIDENCE))
     rrsets = select(
         table.c.id.label("observation_id"), member_value.label("display_value"),
         literal(1).label("evidence_count"), table.c.first_seen_at.label("inventory_first_seen"),
@@ -40,7 +47,7 @@ def inventory_query(db: AsyncSession):
         func.count().over(partition_by=partition).label("evidence_count"),
         func.min(table.c.first_seen_at).over(partition_by=partition).label("inventory_first_seen"),
         func.row_number().over(partition_by=partition, order_by=[func.coalesce(table.c.metadata_json["not_before"].as_string(), "").desc(), table.c.id.desc()]).label("rank"),
-    ).where(table.c.observation_type == "certificate").subquery()
+    ).where(table.c.observation_type.in_(_CERTIFICATE_EVIDENCE)).subquery()
     latest = select(certificates.c.observation_id, certificates.c.display_value, certificates.c.evidence_count, certificates.c.inventory_first_seen).where(certificates.c.rank == 1)
     inventory = union_all(ordinary, rrsets, latest).subquery()
     return select(DNSObservation, inventory.c.display_value, inventory.c.evidence_count, inventory.c.inventory_first_seen).join(inventory, DNSObservation.id == inventory.c.observation_id)
@@ -49,7 +56,7 @@ def inventory_query(db: AsyncSession):
 def certificate_group(row: DNSObservation):
     """Group identity matches the inventory window, including wildcard scope."""
     return (
-        (DNSObservation.observation_type == "certificate")
+        (DNSObservation.observation_type.in_(_CERTIFICATE_EVIDENCE))
         & (DNSObservation.source == row.source)
         & (DNSObservation.subject == row.subject)
         & (func.coalesce(DNSObservation.metadata_json["wildcard"].as_boolean(), False) == (row.metadata_json.get("wildcard") is True))

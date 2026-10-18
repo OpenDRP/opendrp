@@ -68,6 +68,46 @@ Disabling a source cancels pending jobs; re-enabling does not resurrect them. A 
 - Responses and domains share the 60/min general account budget; certificate collection has its own 3/min bucket plus the shared account, day and job budgets.
 - The DNS Security worker uses the Domains and Certificates collections. Host summary and certificate SAN names are not ownership assertions.
 - Malformed records are isolated from valid siblings; a scan with malformed records reports `partial`, not a clean result.
+- The phishing worker asks the breadth questions: `/certs/` with `certificate.subject.organization:"…" OR certificate.names:*…*` (a *brand*, not our own domain — a double does not name us), `/responses/` with `http.body` and with `http.favicon.hash_sha256` / `http.favicon.perceptual_hash:…~1`, `/whois_domains/` (`created_date`, `registrar`) and `/domains/` with `domain:"…" AND mx:*`. The last two are asked about *confirmed candidates* — names an analyst judged, handed to the scan in its params — so they are evidence about a finding rather than another way to discover one.
+- The two broad expressions (a brand in a certificate, a brand in page text) are counted with `/responses_count/` before any page of them is fetched, and a result set above `max_broad_results` is skipped by name instead of paged: one request instead of a scan's whole budget.
+- Certificate queries — the brand one included, and its count — are reserved from the certificate bucket the provider's 3/min limit applies to, not from the general one.
+- A scan reports what it could not do beside what it found: `skipped` counts the reasons (`expression_too_broad`, `target_refused`, `favicon_hash_unavailable`, `whois_unavailable`, `provider_quota_exhausted`, `source_disabled`, `provider_access_denied`), and `spent`, `budget_left`, `daily_budget`, `daily_budget_left` and `retry_after_seconds` say what the allowed work cost. A budget or kill-switch refusal ends the scan as a named reason rather than as a provider error, because the credentials and the provider are fine and a readiness row claiming otherwise outlives the condition.
+
+## Confirming the provider contract
+
+`connectors/intelligence/live_check.py` is the operator-run spike for exactly these
+questions. It spends real quota — at most six requests, retries included — and prints
+counters, never the key, a request URL or a response body, so its output can be pasted
+into an issue:
+
+```bash
+NETLAS_API_TOKEN=... python live_check.py --question brand --value "ACME Corp."
+NETLAS_API_TOKEN=... python live_check.py --question body --value "ACME Corp."
+NETLAS_API_TOKEN=... python live_check.py --question own_hashes --value example.com
+NETLAS_API_TOKEN=... python live_check.py --question favicon --value <sha256 from above>
+```
+
+One question per run: `brand`, `count`, `body`, `own_hashes`, `favicon`,
+`favicon_similar`, `whois` and `mx`, each answering with counts (`certificates=`,
+`responses=`, `count=`, `sha256=`/`perceptual=`, `registrar=`/`created=`,
+`mail_capable=`) rather than rows. A field the provider names differently shows up here
+as an empty answer and in a scan summary as a skip reason, because a value that arrives
+under none of the documented names is refused rather than guessed at. A brand, a count
+and a body expression are phrases the query builder quotes; only `own_hashes`, `whois`
+and `mx` are normalised as hosts, so a documented example like `"ACME Corp."` is not
+refused as an invalid endpoint.
+
+**Confirmed against a live account (2026-10-17, SPIKE-04).** `http.body:"OpenDRP"`
+answered `count=8 rows=8` — the count route and the responses route agree, so the body
+expression WI-24 rests on is confirmed, and WI-25's acknowledgement gate is wired in
+front of it. `whois` on a reserved domain answered `rows=1 registrar=no created=yes`, and
+`mx` answered `rows=0 mail_capable=False` — both fields parse. The certificate collection
+is **not** confirmed on this account: `/certs/` with a `certificate.*` expression (the
+brand question, and even the provider's own name) timed out after 30 seconds, while
+`host:` on the same path answered immediately. Until it is re-checked against the plan
+in use, the brand-certificate capability must be treated as unverified: a scan reports it
+as a provider error and does not fall back to another shape. This is the kind of result
+the spike exists for — it is a property of the account, not of the parser.
 
 Readiness uses a small safe error set (`invalid_credentials`, `credits_exhausted`, `rate_limited`, `provider_rejected_request`, `network_or_invalid_response`, or an HTTP status class).
 
@@ -75,7 +115,7 @@ Readiness uses a small safe error set (`invalid_credentials`, `credits_exhausted
 
 - `POST /api/v1/modules/{module}/scan`: per-source admission.
 - `GET /api/v1/exposure/observations`: paginated inventory with optional source filter.
-- `GET /api/v1/phishing/threats/{id}/evidence`: source evidence (up to 200 records).
+- `GET /api/v1/phishing/threats/{id}/evidence`: source evidence (up to 200 records). Each row carries `fields` — the allowlisted payload facts (`capability`, `verdict`, registrar and registration date, mail facts) — beside the raw `payload`, so a row that *found* a name and one that describes a name the platform already had are distinguishable.
 - The Exposure UI at `/exposure` lets analysts triage observations and promote a concrete hostname or IP into Assets after a confirmation that names the asset type and criticality.
 - PDF reports include bounded Exposure and DNS observation sections with truncation metadata.
 

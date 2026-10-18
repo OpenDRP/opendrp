@@ -14,6 +14,8 @@ is recorded once, on its first page.
 from __future__ import annotations
 
 import asyncio
+import csv
+import io
 
 import pytest
 from sqlalchemy import select
@@ -245,3 +247,134 @@ class TestAssetListAuditPolicy:
         assert rows[0].details["page"] == 1
         assert rows[0].details["sort"] == "created_at"
         assert rows[0].details["order"] == "desc"
+
+
+@pytest.mark.anyio
+class TestAssetExportAndDeadline:
+    """AST-49 and AST-50: one file shape, and a read that answers in time."""
+
+    async def _create(self, client, headers, asset_type: str, value: str) -> dict:
+        response = await client.post(
+            "/api/v1/assets",
+            headers=headers,
+            json={"asset_type": asset_type, "asset_value": value},
+        )
+        assert response.status_code == 201, response.text
+        return response.json()
+
+    async def test_export_carries_the_same_involvement_as_the_list(
+        self, client, auth_headers_admin
+    ):
+        """AST-49: the file must answer the question the table answers.
+
+        The counters are read through ``related_finding_summaries`` — the same
+        batched path the list uses — so equality here is not a coincidence of
+        two implementations, it is the one implementation.
+        """
+        for value in ("export-a.example", "export-b.example"):
+            await self._create(client, auth_headers_admin, "domain", value)
+
+        listed = (
+            await client.get("/api/v1/assets?size=200", headers=auth_headers_admin)
+        ).json()
+        exported = (
+            await client.get(
+                "/api/v1/assets/export?format=json", headers=auth_headers_admin
+            )
+        ).json()
+
+        listed_by_value = {
+            item["asset_value"]: item["findings"] for item in listed["items"]
+        }
+        exported_by_value = {
+            item["asset_value"]: item["findings"] for item in exported["items"]
+        }
+        assert exported_by_value == listed_by_value
+        assert exported_by_value["export-a.example"]["total"] == 0
+        assert set(exported_by_value["export-a.example"]) == {
+            "total",
+            "phishing",
+            "breaches",
+            "dns",
+            "exposure",
+            "findings",
+            "last_seen",
+        }
+        assert all("last_seen" in item for item in exported["items"])
+
+    async def test_the_csv_header_names_the_new_columns(
+        self, client, auth_headers_admin
+    ):
+        await self._create(client, auth_headers_admin, "domain", "export-csv.example")
+
+        response = await client.get(
+            "/api/v1/assets/export?format=csv", headers=auth_headers_admin
+        )
+        assert response.status_code == 200, response.text
+        rows = list(csv.reader(io.StringIO(response.text)))
+        header = rows[0]
+        assert header[:5] == [
+            "asset_type",
+            "asset_value",
+            "criticality",
+            "is_active",
+            "created_at",
+        ]
+        assert header[5:] == [
+            "findings_total",
+            "findings_phishing",
+            "findings_breaches",
+            "findings_dns",
+            "findings_exposure",
+            "findings_other",
+            "last_seen",
+        ]
+        row = next(
+            dict(zip(header, values))
+            for values in rows[1:]
+            if values[1] == "export-csv.example"
+        )
+        assert row["findings_total"] == "0"
+        assert row["last_seen"] == ""
+
+    async def test_a_slow_has_findings_read_returns_a_named_deadline(
+        self, client, auth_headers_admin, monkeypatch
+    ):
+        """AST-50: the server answers before the browser gives up."""
+        from app.api.v1.routers import assets as assets_router
+        from app.services.asset_service import AssetService
+
+        async def slow(self, **kwargs):
+            await asyncio.sleep(0.2)
+            return [], 0
+
+        monkeypatch.setattr(AssetService, "list_assets", slow)
+        monkeypatch.setattr(assets_router, "ASSET_QUERY_DEADLINE_SECONDS", 0.01)
+
+        response = await client.get(
+            "/api/v1/assets?has_findings=true", headers=auth_headers_admin
+        )
+        assert response.status_code == 503, response.text
+        body = response.json()
+        assert body["code"] == "query_deadline_exceeded"
+        assert "Narrow the filter" in body["detail"]
+        assert response.headers["Retry-After"] == "5"
+
+    async def test_a_slow_export_returns_a_named_deadline(
+        self, client, auth_headers_admin, monkeypatch
+    ):
+        from app.api.v1.routers import assets as assets_router
+        from app.services.asset_service import AssetService
+
+        async def slow(self, **kwargs):
+            await asyncio.sleep(0.2)
+            return [], 0
+
+        monkeypatch.setattr(AssetService, "list_assets", slow)
+        monkeypatch.setattr(assets_router, "ASSET_QUERY_DEADLINE_SECONDS", 0.01)
+
+        response = await client.get(
+            "/api/v1/assets/export?format=json", headers=auth_headers_admin
+        )
+        assert response.status_code == 503, response.text
+        assert response.json()["code"] == "query_deadline_exceeded"

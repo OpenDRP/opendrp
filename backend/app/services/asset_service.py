@@ -2,9 +2,10 @@ import uuid
 from collections.abc import Sequence
 from typing import Any, Optional
 
-from sqlalchemy import and_, asc, delete, desc, exists, func, literal, or_, select
+from sqlalchemy import and_, asc, delete, desc, exists, func, literal, or_, select, union_all
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.sql.elements import ColumnElement
 from app.core.exceptions import BadRequestException, ConflictException
 from app.models.asset import Asset
 from app.schemas.asset import (
@@ -15,13 +16,14 @@ from app.schemas.asset import (
 )
 from app.schemas.user import AssetType
 from app.services.asset_matching import (
+    DOMAIN_ASSET_TYPE,
     IP_ASSET_TYPE,
     RELATED_FINDING_MODULES,
+    EmailDomain,
     asset_key_variants,
     asset_sql_key,
     cidr_search_values,
     domain_asset_variants,
-    email_domain_join_predicate,
     email_domain_variants,
     email_domain_key,
     email_suffix_predicate,
@@ -29,6 +31,7 @@ from app.services.asset_matching import (
     keys_predicate,
     related_finding_observed_at,
     related_finding_value_columns,
+    sql_email_like,
     sql_key,
 )
 
@@ -124,22 +127,29 @@ class AssetService:
             conditions.append(Asset.criticality == criticality)
         if is_active is not None:
             conditions.append(Asset.is_active.is_(is_active))
+        # "Is this asset involved in anything" is answered under the display
+        # policy: an inactive asset still owns the findings recorded about it, so
+        # deactivating one does not make its evidence disappear from this filter
+        # (WI-20). The predicate is a correlated EXISTS over the five modules,
+        # not a list of ids: a 50k-asset inventory produced an `IN (...)` with one
+        # bind parameter per involved asset, which asyncpg refuses beyond 32767
+        # arguments (AWI-07 measured the refusal on the plan's dataset).
         if has_findings is not None:
-            # "Is this asset involved in anything" is answered under the display
-            # policy: an inactive asset still owns the findings recorded about it,
-            # so deactivating one does not make its evidence disappear from this
-            # filter (WI-20). The set is read the same way the row counters are
-            # (see ``related_finding_summaries`` for why not per row), and it is
-            # one statement of the inventory's own keys, so the filter and the
-            # counters cannot answer the question differently.
-            involved = await self.asset_ids_with_findings()
-            ids = sorted(involved)
-            chunks = [
-                Asset.id.in_(ids[start : start + self.MATCHING_KEY_BATCH_SIZE])
-                for start in range(0, len(ids), self.MATCHING_KEY_BATCH_SIZE)
-            ] or [Asset.id.in_([])]
-            matching = or_(*chunks)
-            conditions.append(matching if has_findings else ~matching)
+            matching = self.involved_predicate()
+            # The IDNA spellings SQL cannot compare are added as ids; the set is
+            # bounded by the punycode assets that actually have findings and is
+            # normally empty.
+            idna_ids = await self._idna_involved_ids()
+            if has_findings:
+                conditions.append(
+                    or_(matching, Asset.id.in_(idna_ids)) if idna_ids else matching
+                )
+            else:
+                conditions.append(
+                    and_(~matching, Asset.id.not_in(idna_ids))
+                    if idna_ids
+                    else ~matching
+                )
         if search:
             raw_search = search.strip()[:100]
             try:
@@ -367,16 +377,70 @@ class AssetService:
             )
         return summaries
 
-    async def asset_ids_with_findings(self) -> set[uuid.UUID]:
-        """The assets the platform holds findings about (WI-20).
+    def involved_predicate(self) -> ColumnElement[bool]:
+        """Whether this asset is one the platform holds findings about (AWI-07).
 
-        The ``has_findings`` filter needs this for the whole inventory before the
-        page is chosen, so it is read through the same counters rather than by a
-        per-row existence test (which is what made filtering the inventory cost
-        one scan of the breaches table per asset).
+        A correlated ``EXISTS`` over the five modules, each branch an equality
+        against the expression index on its key column. The branches travel as
+        ``UNION ALL ... LIMIT 1`` so the executor stops at the first module that
+        answers: on the plan's dataset (50k assets, 1M findings) the alternative
+        shapes either scanned every finding key per request (~1.4 s) or let the
+        planner hash all five modules (~1.5 s), while this one probes one index
+        per asset (457 ms for ``true`` and 407 ms for ``false`` on the same
+        host).
+
+        A mailbox breach names no asset, so its branch is attributed to the
+        monitored domain it is at, and only a ``domain`` asset answers it. One
+        case SQL cannot express stays in :meth:`_idna_involved_ids`: an asset
+        stored in IDNA form and a finding written in Unicode are the same host,
+        and only :func:`key_variants` can convert between the two.
         """
-        assets = (await self.db.execute(select(Asset))).scalars().all()
-        summaries = await self.related_finding_summaries(assets)
+        columns = related_finding_value_columns()
+        probes = [
+            select(literal(1))
+            .where(column.is_not(None), sql_key(column) == asset_sql_key())
+            .correlate(Asset)
+            for module_columns in columns.values()
+            for column in module_columns
+        ]
+        breach_email = columns["breaches"][1]
+        probes.append(
+            select(literal(1))
+            .where(
+                Asset.asset_type == DOMAIN_ASSET_TYPE,
+                sql_email_like(breach_email, "%@%"),
+                EmailDomain(breach_email) == asset_sql_key(),
+            )
+            .correlate(Asset)
+        )
+        any_row = union_all(*probes).subquery("involved_row")
+        return exists(select(literal(1)).select_from(any_row).limit(1))
+
+    async def _idna_involved_ids(self) -> set[uuid.UUID]:
+        """Involved assets whose IDNA spelling SQL cannot compare (AWI-07).
+
+        ``assets.normalized_value`` stores punycode while a finding may carry the
+        Unicode spelling, and the database has no conversion. Only assets stored
+        in punycode need the re-check; the summary path is the same one the
+        counters use, so the filter and the row counters keep agreeing.
+        """
+        punycode_assets = (
+            (
+                await self.db.execute(
+                    select(Asset).where(
+                        or_(
+                            Asset.asset_value.like("xn--%"),
+                            Asset.normalized_value.like("xn--%"),
+                        )
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        if not punycode_assets:
+            return set()
+        summaries = await self.related_finding_summaries(punycode_assets)
         return {
             asset_id for asset_id, summary in summaries.items() if summary.total > 0
         }
@@ -645,16 +709,37 @@ class AssetService:
         )
 
     async def clean_orphan_breach_findings(self) -> int:
-        """Delete breach findings that no longer match any configured asset (WI-10)."""
+        """Delete breach findings that no longer match any configured asset (WI-10).
+
+        The email-to-domain branch is an equality on ``EmailDomain``, which
+        ``ix_drp_breaches_matched_email_domain`` serves, rather than the
+        correlated ``LIKE '%@' || asset_key`` that rebuilt the pattern for every
+        asset row (AST-46).
+        """
         from app.models.breach import Breach
 
         asset_keys, domain_keys = await self._asset_keys()
+        # The email-to-domain branch is an equality against an expression index,
+        # not the correlated `LIKE '%@' || asset_key` it used to be. The old form
+        # evaluated the pattern once per asset row, so the anti-join could not use
+        # `ix_drp_breaches_matched_email_domain` and degraded to
+        # O(candidates × assets) on a large installation. `email_suffix_predicate`
+        # is the same rule the counters and the cascade use, expressed as
+        # `EmailDomain(...).in_(...)`; batching keeps the statement's parameter
+        # count bounded exactly as the involvement lookup does. A domain key that
+        # is not a hostname is dropped by the predicate, and the IDNA spelling
+        # SQL cannot compare is still confirmed by `is_linked` below.
+        domain_links: list[Any] = []
+        for chunk in _batched(sorted(domain_keys), self.MATCHING_KEY_BATCH_SIZE):
+            predicate = email_suffix_predicate(Breach.matched_email, chunk)
+            if predicate is not None:
+                domain_links.append(predicate)
         linked_in_sql = exists(
             select(Asset.id).where(
                 or_(
                     asset_sql_key() == sql_key(Breach.matched_domain),
                     asset_sql_key() == sql_key(Breach.matched_email),
-                    email_domain_join_predicate(Breach.matched_email),
+                    *domain_links,
                 )
             )
         )

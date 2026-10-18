@@ -494,6 +494,16 @@ docker compose -f docker-compose.yml up -d
 
 Read [upgrading.md](upgrading.md) for destructive migrations, key rotation and rollback. Do not downgrade application images across an incompatible migration without a verified backup and a rollback plan.
 
+A restart gives the report worker 60 seconds to finish before Docker sends
+`SIGKILL`, and the alert worker 45 seconds, where Compose's own default is 10. The
+first is sized for a PDF render, which is the heaviest thing the platform does; a
+render still running at the end of it is lost work rather than a lost task, because
+the task acknowledges late and the broker hands it to the next worker. The second
+lets a delivery in flight finish, so a restart does not cut a message part-way or
+make an operator wait for its redelivery. A service that needs longer than these
+values should say so in its own `stop_grace_period` rather than inherit a number
+chosen for a report.
+
 ## Installing without internet access
 
 An installation whose host cannot reach the internet is supported, because the

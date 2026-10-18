@@ -201,6 +201,7 @@ class TestBoundedSmtpProbe:
         try:
             result = await alerts._bounded_smtp_probe(_settings(), timeout=0.02)
             assert result.health == "failed"
+            assert result.probe_state == "timeout"
             assert "timed out" in result.message
             assert entered.wait(timeout=1)
             assert alerts._SMTP_PROBE_SLOTS._value == initial_slots - 1
@@ -230,7 +231,11 @@ class TestBoundedSmtpProbe:
                 workers.append(asyncio.create_task(alerts._bounded_smtp_probe(_settings(), timeout=0.5)))
             assert await asyncio.to_thread(entered.wait, 1)
             rejected = await alerts._bounded_smtp_probe(_settings(), timeout=0.02)
-            assert rejected.health == "degraded"
+            # Busy admission is a fact about the probe pool, not about the
+            # channel: no observation was made, so health is "unknown" and the
+            # separate marker carries the reason (D8).
+            assert rejected.health == "unknown"
+            assert rejected.probe_state == "saturated"
             assert "busy" in rejected.message
             assert alerts._SMTP_PROBE_SLOTS._value == 0
         finally:
@@ -342,6 +347,37 @@ class TestTelegramProbe:
         assert "ConnectError" in result.message
 
 
+class _FakeRedis:
+    """The cache client the endpoint uses in these tests (the real one is None
+    under ``TESTING``, and Redis is not part of the unit-test contract)."""
+
+    def __init__(self) -> None:
+        self.values: dict[str, str] = {}
+        self.expires: dict[str, float] = {}
+        self.now = 0.0
+
+    async def set(self, key, value, nx=False, ex=None):
+        if nx and key in self.values:
+            return None
+        self.values[key] = value
+        if ex is not None:
+            self.expires[key] = self.now + float(ex)
+        return True
+
+    async def get(self, key):
+        deadline = self.expires.get(key)
+        if deadline is not None and deadline <= self.now:
+            self.values.pop(key, None)
+            self.expires.pop(key, None)
+            return None
+        return self.values.get(key)
+
+    async def delete(self, key):
+        self.values.pop(key, None)
+        self.expires.pop(key, None)
+        return 1
+
+
 class TestAlertHealthEndpoint:
     """The endpoint reports per-channel state without ever probing a disabled one."""
 
@@ -385,8 +421,13 @@ class TestAlertHealthEndpoint:
         assert items["telegram"]["health"] == "disabled"
         assert items["email"]["message"] == "Email alerts are disabled"
         assert items["email"]["configured"] is False
-        assert items["email"]["last_checked_at"] is None
-        assert items["telegram"]["last_checked_at"] is None
+        # No probe ran, so there is no probe time to report — and saying "now"
+        # would be the very mistake `checked_at` replaced.
+        assert items["email"]["checked_at"] is None
+        assert items["telegram"]["checked_at"] is None
+        assert items["email"]["probe_state"] == "skipped"
+        assert items["telegram"]["probe_state"] == "skipped"
+        assert items["email"]["from_cache"] is False
         # A switched-off channel is never dialled: probing it could block the
         # endpoint for the full SMTP timeout and still report "disabled".
         assert probed == []
@@ -425,8 +466,139 @@ class TestAlertHealthEndpoint:
         assert items["email"]["latency_ms"] == 30
         assert items["telegram"]["health"] == "degraded"
         assert items["telegram"]["configured"] is True
-        assert items["email"]["last_checked_at"]
-        assert items["telegram"]["last_checked_at"]
+        assert items["email"]["checked_at"]
+        assert items["telegram"]["checked_at"]
+        assert items["email"]["probe_state"] == "ok"
+        assert items["telegram"]["probe_state"] == "ok"
+        assert items["email"]["from_cache"] is False
+
+    @pytest.mark.asyncio
+    async def test_a_second_request_within_the_ttl_reuses_the_probe(
+        self, client, auth_headers_viewer, fake_settings_service, monkeypatch
+    ):
+        """Two loads of the dashboard are one SMTP handshake, and the second
+        answer says when that handshake happened (D6, D7)."""
+        fake_settings_service(
+            _settings(
+                email_alerts_enabled=True,
+                smtp_host="smtp.example",
+                smtp_port=587,
+                smtp_from_email_decrypted="a@b.example",
+            )
+        )
+        fake = _FakeRedis()
+        monkeypatch.setattr(alerts.alert_health_cache, "_client", lambda: fake)
+        # Count real SMTP connections, not probe calls: the acceptance criterion
+        # is one handshake for two page loads, and a counter one level above the
+        # socket would not notice a probe that dialled twice.
+        connections: list[_FakeSmtpServer] = []
+
+        def _factory(host, port, timeout=None, context=None):
+            server = _FakeSmtpServer(host, port, timeout, context)
+            connections.append(server)
+            return server
+
+        monkeypatch.setattr(smtplib, "SMTP", _factory)
+
+        first = await client.get("/api/v1/alerts/health", headers=auth_headers_viewer)
+        second = await client.get("/api/v1/alerts/health", headers=auth_headers_viewer)
+        first_item = {item["channel"]: item for item in first.json()["items"]}["email"]
+        second_item = {item["channel"]: item for item in second.json()["items"]}["email"]
+
+        assert len(connections) == 1
+        assert first_item["from_cache"] is False
+        assert second_item["from_cache"] is True
+        assert second_item["checked_at"] == first_item["checked_at"]
+        assert second_item["health"] == first_item["health"] == "healthy"
+        assert second_item["latency_ms"] == first_item["latency_ms"]
+        assert isinstance(second_item["latency_ms"], int)
+
+    @pytest.mark.asyncio
+    async def test_a_changed_telegram_token_is_a_new_question(
+        self, client, auth_headers_viewer, monkeypatch
+    ):
+        current = {
+            "value": _settings(
+                telegram_alerts_enabled=True,
+                telegram_bot_token_decrypted="tok-a",
+                telegram_chat_ids=["1"],
+            )
+        }
+
+        class _Service:
+            def __init__(self, _db):
+                pass
+
+            async def get_singleton(self):
+                return current["value"]
+
+        monkeypatch.setattr(alerts, "SettingsService", _Service)
+        fake = _FakeRedis()
+        monkeypatch.setattr(alerts.alert_health_cache, "_client", lambda: fake)
+        requested: list[str] = []
+
+        class _Client(_FakeAsyncClient):
+            async def get(self, url: str):
+                requested.append(url)
+                return await super().get(url)
+
+        monkeypatch.setattr(
+            httpx, "AsyncClient", lambda **_kwargs: _Client(response=SimpleNamespace(status_code=200))
+        )
+
+        await client.get("/api/v1/alerts/health", headers=auth_headers_viewer)
+        current["value"] = _settings(
+            telegram_alerts_enabled=True,
+            telegram_bot_token_decrypted="tok-b",
+            telegram_chat_ids=["1"],
+        )
+        response = await client.get("/api/v1/alerts/health", headers=auth_headers_viewer)
+        item = {row["channel"]: row for row in response.json()["items"]}["telegram"]
+
+        assert len(requested) == 2
+        assert "bottok-a/getMe" in requested[0]
+        assert "bottok-b/getMe" in requested[1]
+        assert item["from_cache"] is False
+
+    @pytest.mark.asyncio
+    async def test_a_changed_smtp_host_is_a_new_question(
+        self, client, auth_headers_viewer, fake_settings_service, monkeypatch
+    ):
+        """The cache key carries a fingerprint of the settings that decide the
+        answer, so editing the host cannot be answered by the old probe."""
+        configured = {
+            "email_alerts_enabled": True,
+            "smtp_host": "smtp.example",
+            "smtp_port": 587,
+            "smtp_from_email_decrypted": "a@b.example",
+        }
+        current = {"value": _settings(**configured)}
+
+        class _Service:
+            def __init__(self, _db):
+                pass
+
+            async def get_singleton(self):
+                return current["value"]
+
+        monkeypatch.setattr(alerts, "SettingsService", _Service)
+        fake = _FakeRedis()
+        monkeypatch.setattr(alerts.alert_health_cache, "_client", lambda: fake)
+        probed: list[str] = []
+
+        def _smtp(_s):
+            probed.append("smtp")
+            return alerts.ProbeResult("healthy", "SMTP connection is available", 7)
+
+        monkeypatch.setattr(alerts, "_smtp_probe", _smtp)
+
+        await client.get("/api/v1/alerts/health", headers=auth_headers_viewer)
+        current["value"] = _settings(**{**configured, "smtp_host": "smtp2.example"})
+        response = await client.get("/api/v1/alerts/health", headers=auth_headers_viewer)
+        item = {row["channel"]: row for row in response.json()["items"]}["email"]
+
+        assert probed == ["smtp", "smtp"]
+        assert item["from_cache"] is False
 
     @pytest.mark.asyncio
     async def test_a_refused_destination_is_audited_as_a_security_event(

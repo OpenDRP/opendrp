@@ -14,7 +14,7 @@ import re
 import uuid
 from datetime import date, datetime, timezone
 from decimal import Decimal
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from pydantic import (
     BaseModel,
@@ -28,6 +28,11 @@ from app.schemas.email import EmailAddress
 
 
 _CONTROL_CHARS_RE = re.compile(r"[\x00\r\n]")
+
+#: The active TLS probe stores one control row per port, and the storage identity
+#: is (source, subject, record type): without the port in the record type, 443 and
+#: 8443 would overwrite each other. `TLS` alone is the default port.
+_TLS_RECORD_TYPE = re.compile(r"TLS(?::(?:[1-9]|[1-9][0-9]{1,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5]))?")
 
 #: Attribute keys travel into a JSON payload the UI renders generically, so the
 #: grammar is enforced instead of trusting a connector's naming.
@@ -110,8 +115,19 @@ def sanitize_attributes(raw: Any, *, strict: bool = True) -> dict[str, Any]:
 _HOSTNAME_RE = re.compile(
     r"^(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,63}$"
 )
-_DNS_HOSTNAME_RE = re.compile(
-    r"^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$"
+#: The subject grammar for DNS observations. It is a hostname plus the RFC 8552
+#: underscore service labels that address records which are *not* hostnames: the DMARC
+#: policy (`_dmarc.example.com`), DKIM selectors (`_domainkey`), ACME challenges and
+#: `_sip._tcp` service names. Those records exist only under such a name, so refusing
+#: the underscore would leave the platform unable to represent what a domain actually
+#: publishes - and an observation subject is matched by exact string equality against
+#: assets, never resolved or fetched, so the label cannot reach a URL or a probe.
+_DNS_LABEL = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+_DNS_SERVICE_LABEL = r"_[a-z0-9-]{1,63}"
+#: At least two labels are required, exactly as before: a single label is not a
+#: name the platform can attribute to an asset.
+DNS_NAME_RE = re.compile(
+    rf"^(?:{_DNS_SERVICE_LABEL}\.)*{_DNS_LABEL}(?:\.{_DNS_LABEL})+$"
 )
 
 
@@ -198,7 +214,17 @@ class DNSObservationPayload(ConnectorFindingBase):
     @field_validator("observation_type")
     @classmethod
     def _valid_observation_type(cls, value: str) -> str:
-        allowed = {"dns_record", "rdap", "certificate", "certificate_check", "vt_subdomain", "vt_resolution", "hostname", "passive_dns"}
+        allowed = {"dns_record", "rdap", "certificate", "certificate_check", "vt_subdomain", "vt_resolution", "vt_domain", "hostname", "passive_dns",
+                   # The active probe's two shapes: the mutable control row that says
+                   # what a host serves now, and the certificate evidence it read.
+                   "tls_probe", "tls_certificate",
+                   # Where an index says a certificate we serve is *being served* - the
+                   # reverse of discovery - together with the host facts (organisation,
+                   # ASN, JARM, title) the scoring rules read.
+                   "certificate_response",
+                   # One address as a provider's own index saw it: what it serves now and
+                   # the stack behind it.
+                   "host_lookup"}
         cleaned = value.strip().lower()
         if cleaned not in allowed:
             raise ValueError("unsupported DNS observation type")
@@ -219,8 +245,8 @@ class DNSObservationPayload(ConnectorFindingBase):
             normalized = cleaned.rstrip(".").encode("idna").decode("ascii").lower()
         except UnicodeError as exc:
             raise ValueError("subject has invalid IDNA encoding") from exc
-        if len(normalized) > 253 or not _DNS_HOSTNAME_RE.fullmatch(normalized):
-            raise ValueError("subject must be a valid hostname or IP address")
+        if len(normalized) > 253 or not DNS_NAME_RE.fullmatch(normalized):
+            raise ValueError("subject must be a valid DNS name or IP address")
         return normalized
 
     @field_validator("value")
@@ -241,7 +267,7 @@ class DNSObservationPayload(ConnectorFindingBase):
         if value is None:
             return None
         cleaned = value.strip().upper()
-        if cleaned not in {"A", "AAAA", "CNAME", "NS", "MX", "CAA", "SOA", "RDAP", "TXT"}:
+        if cleaned not in {"A", "AAAA", "CNAME", "NS", "MX", "CAA", "SOA", "RDAP", "TXT"} and not _TLS_RECORD_TYPE.fullmatch(cleaned):
             raise ValueError("unsupported DNS record type")
         return cleaned
 
@@ -312,6 +338,13 @@ class BreachFinding(ConnectorFindingBase):
     )
     matched_email: EmailAddress | None = None
     matched_domain: str | None = Field(default=None, max_length=255)
+    #: Which class of exposure this finding is: an account compromised (the default, and
+    #: what every source reported before the field existed), the account appearing in a
+    #: paste, or a site found in a stealer log. Declared by the source and closed here,
+    #: because a class nothing recognizes would be stored under a heading nobody chose
+    #: (WI-21). The dedup keys do not move for it: a paste or a stealer log also carries
+    #: its own identifier inside ``breach_name``.
+    exposure_kind: Literal["breach", "paste", "stealer_log"] | None = None
     #: Provider-specific payload (scalars or lists of strings).
     attributes: dict[str, Annotated[bool | int | float | str | list[str], Field()]] = Field(
         default_factory=dict
@@ -366,12 +399,90 @@ class BreachFinding(ConnectorFindingBase):
         return cleaned
 
 
+class BreachCatalogueEntry(BaseModel):
+    """One incident from a breach source's own catalogue (F-09, WI-13).
+
+    The same neutral facts a finding carries and no match: an entry describes an
+    incident the source knows about, whether or not any address of ours is in it. That
+    is the whole point of the catalogue — an incident at a domain being watched is
+    worth knowing about *before* somebody has added an address to it.
+
+    ``attributes`` carries what a source knows beyond the neutral fields, with the same
+    validation a finding's attributes get, and deliberately nothing else: a catalogue is
+    a description of incidents, not a second place to store exposed credentials (the
+    exposed-secret sample belongs to the finding of the address it was recovered from).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    breach_name: str = Field(min_length=1, max_length=255)
+    title: str = Field(default="", max_length=512)
+    domain: str = Field(default="", max_length=255)
+    breach_date: date | None = None
+    #: The source's own catalogue timestamps. They are what makes the platform's diff
+    #: meaningful: an incident whose ``added_date`` is old but which this installation
+    #: has never stored is still new *here*, and the column says which is which.
+    added_date: datetime | None = None
+    modified_date: datetime | None = None
+    pwn_count: StrictInt = Field(default=0, ge=0, le=1_000_000_000_000)
+    data_classes: list[Annotated[str, Field(min_length=1, max_length=255)]] = Field(
+        default_factory=list, max_length=100
+    )
+    attributes: dict[str, Annotated[bool | int | float | str | list[str], Field()]] = Field(
+        default_factory=dict
+    )
+
+    @field_validator("breach_name")
+    @classmethod
+    def validate_breach_name(cls, value: str) -> str:
+        cleaned = _clean_text(value, field_name="breach_name")
+        if cleaned is None:
+            raise ValueError("breach_name must not be empty")
+        return cleaned
+
+    @field_validator("title")
+    @classmethod
+    def validate_title(cls, value: str) -> str:
+        return _clean_text(value, field_name="title") or ""
+
+    @field_validator("domain")
+    @classmethod
+    def validate_vendor_domain(cls, value: str) -> str:
+        if not value:
+            return ""
+        return _validate_host_or_ip(value, field_name="domain") or ""
+
+    @field_validator("attributes")
+    @classmethod
+    def validate_attributes(cls, value: dict) -> dict:
+        cleaned = sanitize_attributes(value, strict=True)
+        if len(json.dumps(cleaned, default=str)) > MAX_ATTRIBUTES_JSON_LEN:
+            raise ValueError("attributes payload is too large")
+        return cleaned
+
+    @field_validator("data_classes")
+    @classmethod
+    def validate_data_classes(cls, value: list[str]) -> list[str]:
+        cleaned: list[str] = []
+        for raw_item in value:
+            item = _clean_text(raw_item, field_name="data_classes")
+            if item is not None and item not in cleaned:
+                cleaned.append(item)
+        return cleaned
+
+
 ConnectorFinding = PhishingFinding | BreachFinding
 MAX_FINDINGS_PER_BATCH = 500
+#: One catalogue submission's bound. A source's whole catalogue is a handful of
+#: requests' worth of rows at most, and a batch larger than this is a caller that
+#: assembled its payload wrongly rather than a catalogue that grew.
+MAX_CATALOGUE_ENTRIES_PER_BATCH = 500
 
 __all__ = [
     "MAX_ATTRIBUTES",
+    "MAX_CATALOGUE_ENTRIES_PER_BATCH",
     "MAX_FINDINGS_PER_BATCH",
+    "BreachCatalogueEntry",
     "BreachFinding",
     "ConnectorFinding",
     "PhishingFinding",

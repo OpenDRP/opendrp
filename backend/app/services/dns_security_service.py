@@ -14,23 +14,24 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.asset import Asset, AssetType
 from app.models.dns_observation import DNSObservation
-from app.schemas.connector import DNSObservationPayload
+from app.schemas.connector import DNSObservationPayload, DNS_NAME_RE
 from app.services.asset_matching import asset_sql_key
 
-_DNS_NAME_RE = re.compile(
-    r"^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$"
-)
-
-
 def normalize_subject(value: str) -> str:
-    """Canonicalize a validated DNS name or address for matching and display."""
+    """Canonicalize a validated DNS name or address for matching and display.
+
+    The grammar is the one `app.schemas.connector` applies at the wire boundary, so a
+    payload the schema accepted is never rejected here, and it includes the RFC 8552
+    underscore service labels (`_dmarc.example.com`, `_sip._tcp.example.com`) under
+    which a domain publishes records that are not hostnames.
+    """
     raw = str(value or "").strip().rstrip(".")
     try:
         return str(ipaddress.ip_address(raw))
     except ValueError:
         normalized = raw.encode("idna").decode("ascii").lower()
-        if len(normalized) > 253 or not _DNS_NAME_RE.fullmatch(normalized):
-            raise ValueError("subject must be a valid DNS hostname or IP address")
+        if len(normalized) > 253 or not DNS_NAME_RE.fullmatch(normalized):
+            raise ValueError("subject must be a valid DNS name or IP address")
         return normalized
 
 
@@ -38,7 +39,14 @@ def observation_key(source: str, payload: dict[str, Any]) -> str:
     """Stable source-scoped identity, including cert identifiers when present."""
     metadata = payload.get("metadata") or {}
     observation_type = payload["observation_type"]
-    is_mutable_current_fact = observation_type in {"dns_record", "rdap", "vt_resolution", "certificate_check"}
+    # `tls_probe` belongs here for the same reason `certificate_check` does: it is the
+    # current answer for one host and port, so a re-probe must update that row rather
+    # than leave the previous handshake as if it were still true. The certificate the
+    # probe read is a separate, historical row keyed by fingerprint.
+    # `vt_domain` is the provider's current reputation for the monitored name, so a
+    # re-scan refreshes that row instead of accumulating one per scan the way the
+    # historical discovery and certificate rows deliberately do.
+    is_mutable_current_fact = observation_type in {"dns_record", "rdap", "vt_resolution", "vt_domain", "certificate_check", "tls_probe"}
     identity = {
         "source": source,
         "type": observation_type,
@@ -60,6 +68,17 @@ def observation_key(source: str, payload: dict[str, Any]) -> str:
     # needed only for evidence that can originate from multiple scan targets.
     if observation_type in {"passive_dns", "vt_resolution", "vt_subdomain", "certificate"} and metadata.get("source_domain"):
         identity["source_domain"] = normalize_subject(metadata["source_domain"])
+    if observation_type == "certificate_response" and metadata.get("ip"):
+        # Where an endpoint was seen is part of *which* observation it is. A provider
+        # answers "where else is this certificate served" with one row per endpoint, and
+        # it names the same host at several addresses; without the address in the
+        # identity those rows collapse into one and the copy at the earlier address
+        # disappears from the projection - the deployment rules read sightings, and a
+        # vanished row is a foreign address nobody reviews.
+        try:
+            identity["ip"] = str(ipaddress.ip_address(str(metadata["ip"]).strip()))
+        except ValueError:
+            pass
     if observation_type == "passive_dns":
         # Historical record bounds change only when first/last seen changes;
         # include their window in identity so future windows do not overwrite old facts.
@@ -111,7 +130,7 @@ async def ingest_dns_observations(
     for raw in findings[:500]:
         payload = DNSObservationPayload.model_validate(raw).model_dump()
         subject = normalize_subject(payload["subject"])
-        if payload["observation_type"] == "certificate":
+        if payload["observation_type"] in {"certificate", "tls_certificate"}:
             from app.services.dns_expiry_monitor_service import parse_date
             issued = parse_date(payload["metadata"].get("not_before"))
             if issued:
@@ -187,7 +206,10 @@ async def ingest_dns_observations(
     await db.execute(statement)
     from app.services.dns_expiry_monitor_service import update_monitor
 
-    controls = list((await db.execute(select(DNSObservation).where(DNSObservation.source == source, DNSObservation.observation_key.in_(rows_by_key), DNSObservation.observation_type.in_(["rdap", "certificate_check"])).execution_options(populate_existing=True))).scalars())
+    # Every control kind has to be named here or its monitor is never written: the
+    # active probe was added to this list with its own kind, and a new control type
+    # that forgets it looks like a scan that succeeded and recorded nothing.
+    controls = list((await db.execute(select(DNSObservation).where(DNSObservation.source == source, DNSObservation.observation_key.in_(rows_by_key), DNSObservation.observation_type.in_(["rdap", "certificate_check", "tls_probe"])).execution_options(populate_existing=True))).scalars())
     for control in controls:
         await update_monitor(db, control, now=now)
     if commit:

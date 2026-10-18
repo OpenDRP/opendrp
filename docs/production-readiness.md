@@ -35,11 +35,23 @@ delivery, image pinning — is verified on the host with
 | Every service has a healthcheck, a bounded logging policy, resource limits, the edge/data/connector network split, an authenticated broker, and the settings the application refuses to start without | `scripts/check_compose_healthchecks.py` | `repo-hygiene`, `make check-compose` |
 | Every variable a Compose file interpolates is documented in `.env.example`, every documented application setting reaches a container, and no Compose file shadows an entry with a literal | `scripts/check_env_template.py` | `repo-hygiene`, `make check-env` |
 | Every documented command is pasteable as one line in bash, PowerShell and `cmd.exe` | `scripts/check_portable_commands.py` | `repo-hygiene`, `make check-commands` |
-| The platform version in `backend/app/__init__.py`, `pyproject.toml` and `CHANGELOG.md` agree | `scripts/check_version_consistency.py` | `repo-hygiene`, `release.yml` |
+| The release version agrees across `backend/app/__init__.py`, `backend/pyproject.toml`, `CHANGELOG.md`, the connector SDK (`opendrp_connector/__init__.py`, `base.py`'s `SDK_VERSION`, `connectors/base/pyproject.toml`) and `frontend/package.json` | `scripts/check_version_consistency.py` | `repo-hygiene`, `release.yml` |
 | An ignore rule cannot hide a source file from the repository | `scripts/check_tracked_sources.py` | `repo-hygiene` |
 | The SPA fallback cannot redirect a client route into a real build directory | `scripts/check_frontend_spa.py` | `repo-hygiene` |
 | Dependencies are declared in one place, as exact pins, with no second declaration to drift from | `scripts/check_dependency_sources.py` | `repo-hygiene` |
-| Every relative link in the documentation resolves, and every document under `docs/` is reachable from an index | `scripts/check_docs_consistency.py` | `repo-hygiene` |
+| Every relative link in the documentation resolves, every `#fragment` names a heading the target page has, every code fence is closed, every table row carries its header's cells, and every document under `docs/` is reachable from an index | `scripts/check_docs_consistency.py` | `repo-hygiene` |
+| The readable schema snapshot `docs/db.sql` and the models the platform maps describe the same tables, columns, `NOT NULL` constraints, defaults and primary keys — in both directions | `backend/tests/test_schema_reference_gate.py` | `backend` job |
+| A deployed installation refuses to start with `TESTING` set, so the flag that switches scan admission and login lockout off cannot reach production | `backend/tests/test_config.py` | `backend` job |
+| Every connector worker declares its capabilities, quota buckets and credential state through one SDK shape, at start-up and after each scan, and a refused readiness post never fails a scan that produced findings | `backend/tests/test_connector_readiness_contract.py` | `backend` job |
+| The connector protocol is bounded per source address, so a leaked or invented token cannot search the job queue without limit, and the bound leaves the shipped poll interval untouched | `backend/tests/test_connectors_protocol_api.py`, `backend/tests/test_security_boundaries.py` | `backend` job |
+| A connector's scan summary is cut to the audit shape at the wire boundary, and a completion row carries the address and the batches of the scan it ends | `backend/tests/test_bounded_audit_lifecycle.py`, `backend/tests/test_connectors_protocol_api.py` | `backend` job |
+| Every `/api/v1` route a page names is a route `docs/api.md` documents, and every declared exception still appears in the pages | `backend/tests/test_page_routes_contract.py` | `backend` job |
+| Every published route carries a capability or is one of the six named public routes, the connector exemption stays under its own prefix, and every role appears in the capability table | `backend/tests/test_route_access_gate.py` | `backend` job |
+| The `Access` column in `docs/api.md` states the capability the route actually requires, and no route is missing from the page | `backend/tests/test_api_docs_contract.py`, `backend/tests/route_table.py` | `backend` job |
+| A refused role leaves an `authz.denied` row, at most once per account, method and route per window, and the in-process fallback still records it when Redis is down | `backend/tests/test_authorization_denials.py` | `backend` job |
+| No `manage_admin` command changes a role or an active flag unless it is asked to, and every command that changes an account writes its audit row before applying | `backend/tests/test_manage_admin_cli.py` | `backend` job |
+| Every `python -m scripts.<tool>` command in a fenced block is one that script's parser accepts — script, subcommand and each flag | `backend/tests/test_documented_cli_gate.py` | `backend` job |
+| Every number a page promises (limits, retention, password policy, recovery codes, version) is the number the code holds, and the sentence stating it is still on the page | `backend/tests/test_docs_numbers_gate.py` | `backend` job |
 | The Alembic chain has one head, intact ancestry and no silently empty `downgrade()` | `backend/scripts/check_migrations.py` | `backend` job, `make check-backend-migrations` |
 | Every table and column the ORM maps is created by the revision chain, and everything the chain creates is mapped | `backend/scripts/check_schema_drift.py` | `backend` job |
 | Each security-boundary module stays above its own coverage threshold | `backend/scripts/check_critical_coverage.py` | `backend` job, `make test-backend-critical-coverage` |
@@ -64,6 +76,32 @@ Every row above is mechanical, which is the point: what a red build cannot see i
 the target host. TLS termination, host sizing, backup encryption, SIEM delivery and
 network placement are the operator's, and they are verified as described in the
 linked runbooks rather than inferred from a green CI run.
+
+## What no gate covers
+
+These boundaries are deliberate, and each was measured once by the audits of
+2026-10-15 rather than being left to look covered. A page that reads clean is not
+evidence about any of them.
+
+* **How a browser renders the page.** The gates read the Markdown source: they know
+  a fence is balanced and a table row has its cells, not how GitHub draws the
+  result. A screenshot job was rejected as slow, flaky and a test of somebody
+  else's renderer; the class of defect that actually strands a reader — an unclosed
+  fence swallowing the rest of the page — is what rule 6 of
+  `scripts/check_docs_consistency.py` closes instead.
+* **What an image contains beyond the scanners' view.** Trivy, `pip-audit`, `npm
+  audit` and the SBOM attestation answer for the packages they can see. A binary a
+  base layer carries, a build argument that changes behaviour, and the difference
+  between the image CI built and the one a registry serves are outside them.
+* **What each provider can and may do.** Which endpoints a plan reaches, which
+  fields a response actually carries, and what a vendor's terms permit are facts
+  about an account, not about this tree. They belong to the phishing, breaches and
+  DNS & TLS audits and their live spikes; the documentation remediation audit of
+  2026-10-15 changed pages, not provider capability.
+* **The dated measurements in this page's appendix.** Each snapshot states the tree
+  it was taken on and the command that produced it, so a gate would have to freeze
+  history to hold them. Reading a number here as the state of the checkout in front
+  of you is the mistake the appendix exists to prevent.
 
 ## Gated security boundaries
 
@@ -109,6 +147,12 @@ gated, and the run measures what the gate names because CI and the Makefile prin
 | `app/services/source_accounts.py` | 80% |
 | `app/services/alert_content.py` | 80% |
 | `app/services/module_aliases.py` | 90% |
+| `app/services/phishing_score_service.py` | 90% |
+| `app/services/alert_policy.py` | 95% |
+| `app/services/breach_catalogue.py` | 90% |
+| `app/services/breach_kpi.py` | 95% |
+| `app/services/breach_severity.py` | 85% |
+| `app/services/invitations.py` | 90% |
 
 ## Earlier remediation rounds (historical)
 
@@ -226,7 +270,7 @@ is about what the toolchain was allowed to hide rather than about the bug itself
 | Gap | Closed by |
 |---|---|
 | No contribution, conduct, changelog or issue/PR documentation | `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, `CHANGELOG.md`, `.github/ISSUE_TEMPLATE/*`, `.github/pull_request_template.md`, and a `SECURITY.md` supported-versions section that names releases rather than `main`. |
-| Three copies of the version, no releases, no tags | `backend/app/__init__.py` is the single source; `scripts/check_version_consistency.py` fails the build when `pyproject.toml` or `CHANGELOG.md` disagrees, and it runs in CI **and** in the release workflow, which also refuses a tag that does not match the code. `OPENDRP_VERSION` pins the images Compose resolves, and the SPA's reported version is baked in at build time. |
+| Several copies of the version, no releases, no tags | `backend/app/__init__.py` is the single source; `scripts/check_version_consistency.py` fails the build when `backend/pyproject.toml`, `CHANGELOG.md`, the connector SDK (its `__version__`, the `SDK_VERSION` a connector registers as `api_version`, and its package metadata) or `frontend/package.json` disagrees, and it runs in CI **and** in the release workflow, which also refuses a tag that does not match the code. `OPENDRP_VERSION` pins the images Compose resolves, and the SPA's reported version is baked in at build time from that same release. |
 | Nothing told an operator what upgrading would break | `docs/upgrading.md`: the procedure, the maintenance window the baseline's index families need on a populated database, the rewrite of the recorded revision that adopts a database an earlier build created, rollback in both directions, the secret-rotation procedures, and what changes when two replicas are in play. |
 | Provisioning was `cp .env.example .env` and five secrets written by hand | `setup.py` is the onboarding path: a small set of deployment and security questions, then every secret generated with the operating system's CSPRNG in the exact shape the validators demand, the finished file checked against the startup rules *before* it is written, and no secret value ever printed (a fingerprint confirms the write). `--check` audits an existing `.env` without touching it and is the mechanical form of the upgrade-time template diff, `--repair` fills only the empties and placeholders, `--force` rotates while moving the replaced keys into the matching `*_PREVIOUS_*` lists so live sessions, stored ciphertext and signed audit history stay valid. It refuses to write a file git would commit. |
 | `.env.example` documented settings that did nothing, and omitted settings Compose read | `scripts/check_env_template.py` (rule 1: every variable a Compose file interpolates is documented; rule 2: every entry the template defines is consumed somewhere real; rule 3: every documented application setting reaches a container; rule 4: no Compose file shadows an entry with a literal; rule 5: a setting one connector reads, and nothing else does, is namespaced after that connector, because `.env` is a single namespace shared by every service). It found seven settings that were documentation-only — including the statement timeout the template told an operator to raise for a large inventory — and nine variables Compose read that the template never mentioned; all are now wired or documented. Tests: `tests/test_env_template_gate.py`, `tests/test_setup_env.py`. |
@@ -288,13 +332,17 @@ is about what the toolchain was allowed to hide rather than about the bug itself
    per-finding. Native modules do not have bulk transitions either, so this is
    consistency rather than a gap, but a triage workflow over many findings would
    want them.
-8. **Finding alerts are durable and asynchronous.** Ingestion writes an `alert_deliveries` queue row and never waits for SMTP or Telegram. The alert worker waits for a connector job to reach a terminal state, aggregates rows by job/module/channel/recipient, and retries only transient network/provider failures. The `alert_deliveries` queue stores delivery state independently for each channel and recipient, so an email success cannot suppress a Telegram retry. Delivery rows retain attempts, next retry time, final status, and sanitized error information. Pool exhaustion is returned as retryable `503 database_busy`, distinct from a statement timeout.
+8. **Finding alerts are durable and asynchronous.** Ingestion writes an `alert_deliveries` queue row and never waits for SMTP or Telegram. The alert worker waits for a connector job to reach a terminal state, aggregates rows by job/module/channel/recipient, and retries only transient network/provider failures. The `alert_deliveries` queue stores delivery state independently for each channel and recipient, so an email success cannot suppress a Telegram retry. Delivery rows retain attempts, next retry time, final status, and sanitized error information. Pool exhaustion is returned as retryable `503 database_busy`, distinct from a statement timeout. The channel health response carries the queue's own counters beside the probe (`delivery` and `delivery_queue`), so a reachable provider with a stalled queue reads as `degraded` rather than green; the aggregate publishes numbers only, never a recipient, target or batch id.
 9. **A disabled alert channel is never probed**, deliberately: the health
    endpoint reports `disabled` either way, so dialling it could only add latency.
-   The response distinguishes *off* from *incomplete* via `configured` and leaves
-   `last_checked_at` null because no probe ran. SMTP checks use a fixed-size worker
-   pool and bounded wait; a timed-out socket operation holds its slot until it
-   exits, preventing an unbounded background-thread backlog.
+   The response distinguishes *off* from *incomplete* via `configured`, and leaves
+   `checked_at` null because no probe ran (`probe_state: "skipped"` says the
+   same thing in one vocabulary). SMTP checks use a fixed-size worker pool and
+   bounded wait; a timed-out socket operation holds its slot until it exits,
+   preventing an unbounded background-thread backlog. Results are cached in Redis
+   for `ALERT_HEALTH_CACHE_SECONDS`, so two operators refreshing the dashboard are
+   one handshake, and a busy pool reports `probe_state: "saturated"` rather than a
+   `degraded` channel.
 10. **Test sends ignore the enable toggle** for email and Telegram, so an operator
    can validate credentials before switching a channel on. Real deliveries honour
    the toggle.
@@ -348,6 +396,20 @@ is about what the toolchain was allowed to hide rather than about the bug itself
     failures are gone from the list a later run compares against. [The appendix](#appendix-measurements-at-a-point-in-time)
     lists the run with its evidence, so a later run can be compared against a known
     list instead of rediscovered.
+18. **User search is a substring scan, and the threshold for an index is
+    stated rather than assumed.** `GET /api/v1/users?search=` filters on
+    `email ILIKE '%…%' OR full_name ILIKE '%…%'`, and no trigram index exists:
+    at the account counts an installation starts with, the planner answers that
+    with a sequential scan and an index would only be maintained on every user
+    change for a query it would still answer the same way. **The trigger is a
+    `users` table of a few thousand rows** (RWI-12 in the user/RBAC plan). At that
+    point the decision is made from a measurement, not from this paragraph:
+    `EXPLAIN (ANALYZE, BUFFERS) SELECT id FROM users WHERE email ILIKE '%…%' OR
+    full_name ILIKE '%…%'` on a production copy. If it reports a sequential scan
+    whose buffers dominate the page, the fix is `CREATE EXTENSION pg_trgm` plus
+    GIN indexes with `gin_trgm_ops` on both columns — added to the baseline and
+    with an adoption note in [upgrading.md](upgrading.md), because the history is
+    one revision.
 
 ## Reproducing the measurements
 
@@ -512,7 +574,7 @@ later hardening work.
 | `mypy app` | 0 errors, 81 source files |
 | Migration gate (`backend/scripts/check_migrations.py`) | single head, intact ancestry, no no-op downgrades |
 | Schema-drift gate (`backend/scripts/check_schema_drift.py`) | every mapped table and column is created by the revision chain, and everything the chain creates is mapped |
-| Per-module coverage gate (`backend/scripts/check_critical_coverage.py`) | OK — all 14 modules the gate held at that date above threshold (it holds 31 today: see [Gated security boundaries](#gated-security-boundaries)) |
+| Per-module coverage gate (`backend/scripts/check_critical_coverage.py`) | OK — all 14 modules the gate held at that date above threshold (it holds 37 today: see [Gated security boundaries](#gated-security-boundaries)) |
 | Alembic head | `0001_initial_schema` at that date |
 | Frontend typecheck (`tsc -b`) | clean |
 | PostgreSQL migration + parity tests (`tests/test_alembic_migrations.py`, `REQUIRE_INTEGRATION=1`) | 5 passed — clean upgrade to head, downgrade round trip, `Base.metadata` versus the migrated schema, the startup seeder, and the `alembic_version` width |
@@ -520,7 +582,7 @@ later hardening work.
 | Live stack | a single observation from that date, not a verified deployment |
 
 Per-module coverage as measured at that baseline, for the 14 modules the gate held at
-that date; the thresholds are the rule, and today's 31-row table of them lives in
+that date; the thresholds are the rule, and today's 37-row table of them lives in
 [Gated security boundaries](#gated-security-boundaries):
 
 | Module | Measured |
@@ -598,7 +660,7 @@ does.
 
 | Area | Value |
 |---|---|
-| Backend suite (`-p no:randomly`, `COVERAGE_CORE=sysmon`) | **2074 passed, 4 failed, 14 skipped** — the four are the ones that need a live broker, and this container had none: CI's `backend` job runs a password-less `redis:7-alpine` on `127.0.0.1:6379` for exactly them |
+| Backend suite (`-p no:randomly`, `COVERAGE_CORE=sysmon`) | **2074 passed, 4 failed, 14 skipped** — the four are the ones that need a live broker, and this container had none: CI's `backend` job runs a password-less `redis:7-alpine` on `127.0.0.1:6379` for exactly them. That run is the record of what the environment looked like; the four no longer *fail* without a broker. They take the `live_redis` fixture (`backend/tests/conftest.py`), so a run that has no broker skips them with the reason — the host, never the password — while every environment that supplies one (the tooling stack, CI's `backend` job, the integration job's password-protected broker) still executes them for real, and `REQUIRE_INTEGRATION=1` turns a missing broker back into a failure. `backend/tests/test_broker_suites_gate.py` pins both halves. |
 | Per-module critical coverage gate (`backend/scripts/check_critical_coverage.py`) | OK — all 21 modules above their thresholds |
 | Five newly gated modules, measured before their thresholds were set | `asset_matching.py` 95.6% (floor 90), `scan_admission.py` 97.8% (90), `retention_tasks.py` 86.3% (80), `provider_quota.py` 80.3% (75), `integrity_tasks.py` 75.0% (70) |
 | `app/tasks/alert_tasks.py` | 75.68% before the two uncovered task bodies gained tests, **100%** after — the gate was red on a module whose statements were never executed |

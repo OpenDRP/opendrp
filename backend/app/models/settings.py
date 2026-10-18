@@ -1,6 +1,6 @@
 from typing import Optional
 
-from sqlalchemy import Boolean, CheckConstraint, Integer, String
+from sqlalchemy import Boolean, CheckConstraint, Integer, SmallInteger, String
 
 from sqlalchemy.dialects.postgresql import JSON
 from sqlalchemy.ext.hybrid import hybrid_property
@@ -43,6 +43,30 @@ class SystemSettings(Base, UUIDMixin, TimestampMixin):
     # v0.1.0, so there is no second place a chat ID can come from and no
     # fallback that could deliver to a chat an operator has since deleted.
     telegram_chat_ids: Mapped[list | None] = mapped_column(JSON, nullable=True)
+
+    # --- Alert budget (Part 3) ---
+    # The operator's half of the alert policy (see app/services/alert_policy.py).
+    # Every column is nullable on purpose: NULL means "this installation has not
+    # decided this one", and the environment's value (ALERT_CONFIDENCE_DIRECT and
+    # friends) answers it. That is what lets a save raise one threshold without
+    # resetting the other five, and what keeps an installation that never opens
+    # the Settings page on the deployment's own defaults.
+    # The four numbers are ``smallint`` like the confidence they are compared
+    # with; the largest of them is a retry window in hours (8760 at most), which a
+    # 16-bit integer holds with room to spare.
+    alert_confidence_direct: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
+    alert_confidence_digest: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
+    alert_phishing_digest_enabled: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    alert_phishing_digest_hour_utc: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
+    alert_no_channel_retry_hours: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
+    alert_candidate_change_notifications: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    #: The breach module's half of the budget: what the channel does with an
+    #: incident the source itself labels spam or fabricated, and how many new
+    #: incidents one scan may report before the rest wait for the digest. Nullable
+    #: for the same reason as the six above - NULL is "not decided here", and the
+    #: environment answers.
+    alert_breach_noise_policy: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    alert_breach_digest_threshold: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
 
     # --- Scan schedules (Part 3) ---
     # JSON: {"days": [0-6 (0=Sun)], "hour": 0-23, "minute": 0-59} in UTC.

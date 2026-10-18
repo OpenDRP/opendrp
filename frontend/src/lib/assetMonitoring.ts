@@ -77,9 +77,16 @@ export function coverageDescription(coverage: AssetTypeCoverage): string {
 /**
  * The latest moment any module saw this asset, as the backend published it.
  *
- * The moments are ISO text — a breach reports a disclosure date while a scan
- * reports a timestamp — so they are compared as text: an ISO date and an ISO
- * timestamp agree on every part they share, which is what "latest" means here.
+ * The moments are ISO-8601 text, and the invariant is that the API publishes
+ * them in UTC: a breach reports a disclosure date (`2024-01-01`) while a scan
+ * reports a timestamp (`2026-01-02T00:00:00+00:00`). Comparing the strings — as
+ * this helper used to do — happens to put a bare date before every timestamp in
+ * the same year, and silently misorders a date-only value against a timestamp
+ * from a different one (`2026-10-15` vs `2026-10-15T12:00:00+00:00` is fine,
+ * but `2026-10-15` vs `2026-10-14T23:00:00+00:00` is not what a reader expects
+ * once offsets differ). Parsing to an instant compares what the values mean.
+ * A value the browser cannot parse is ignored rather than allowed to win: a
+ * malformed date must not hide a real observation.
  */
 export function lastSeenAt(
   summary: AssetFindingSummary | null | undefined,
@@ -87,8 +94,17 @@ export function lastSeenAt(
   const moments = Object.values(summary?.last_seen ?? {}).filter(
     (moment): moment is string => Boolean(moment),
   );
-  if (moments.length === 0) return null;
-  return moments.reduce((latest, moment) => (moment > latest ? moment : latest));
+  let latest: string | null = null;
+  let latestAt = Number.NEGATIVE_INFINITY;
+  for (const moment of moments) {
+    const parsed = Date.parse(moment);
+    if (Number.isNaN(parsed)) continue;
+    if (parsed > latestAt) {
+      latestAt = parsed;
+      latest = moment;
+    }
+  }
+  return latest;
 }
 
 /**

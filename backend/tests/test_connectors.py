@@ -560,8 +560,11 @@ class TestIngestion:
         await db_session.commit()
 
         suffix = uuid.uuid4().hex[:6]
+        #: Every finding that is meant to be *accepted* carries a date: a finding with
+        #: no usable date is refused (`missing_breach_date`, WI-02), which is what makes
+        #: the two below it rejected rather than stored with an invented one.
         findings = [
-            {"breach_name": f"TestBreach-{suffix}", "matched_email": f"user-{suffix}@example.com", "pwn_count": 5, "data_classes": ["Emails"]},
+            {"breach_name": f"TestBreach-{suffix}", "matched_email": f"user-{suffix}@example.com", "breach_date": "2020-01-01", "pwn_count": 5, "data_classes": ["Emails"]},
             {"breach_name": f"NoMatch-{suffix}"},  # no matched_email/domain
             {"matched_email": "a@b.c"},  # no breach_name
         ]

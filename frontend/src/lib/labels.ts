@@ -46,7 +46,14 @@ export function humanizeKey(raw: string): string {
  * registry is unreachable, and cover the core-owned report module.
  */
 export const FALLBACK_MODULE_JOB_TYPES = {
-  phishing: ["phishing.dnstwist", "phishing.shodan"],
+  phishing: [
+    "phishing.dnstwist",
+    "phishing.shodan",
+    // Same reason the DNS list names its keyed workers: with the registry
+    // unreachable the Netlas job type is absent from the table an operator is
+    // most likely to be reading (F-14).
+    "phishing.netlas",
+  ],
   breaches: ["breaches.hibp"],
   reports: ["report.generate"],
   dns: [
@@ -54,13 +61,29 @@ export const FALLBACK_MODULE_JOB_TYPES = {
     "dns.resolver",
     "dns.ctlogs",
     "dns.virustotal",
+    // The Netlas job was missing from this list, so with the connector registry
+    // unreachable its jobs vanished from the table entirely (F-14).
+    "dns.netlas",
+    "dns.tlsprobe",
+    "dns.shodan",
   ],
 } as const;
 
 const JOB_TYPE_LABELS: Record<string, string> = {
   "phishing.dnstwist": "Phishing scan",
   "phishing.shodan": "Phishing scan",
+  "phishing.netlas": "Phishing scan",
   "breaches.hibp": "Breach scan (all sources)",
+  "dns.rdap": "DNS registration lookup",
+  "dns.resolver": "DNS record lookup",
+  "dns.ctlogs": "Certificate Transparency lookup",
+  "dns.virustotal": "Passive DNS lookup",
+  "dns.netlas": "Passive DNS lookup",
+  "dns.tlsprobe": "TLS certificate probe",
+  // Named for what the job asks, not for the provider that answers it: this
+  // worker confirms what our own addresses serve and searches where else a
+  // certificate of ours is indexed.
+  "dns.shodan": "Certificate exposure search",
   "report.generate": "Report generation",
   system: "System task",
 };
@@ -193,6 +216,101 @@ const THREAT_STATUS_LABELS: Record<ThreatStatus | string, string> = {
 
 export function threatStatusLabel(status: string): string {
   return THREAT_STATUS_LABELS[status] ?? humanize(status);
+}
+
+/**
+ * The signals a candidate's confidence is made of (WI-08/WI-11).
+ *
+ * These are the labels the API's `?signal=` vocabulary is described with, and the
+ * order is the weight table's — so the picker lists them the way the score adds
+ * them up, and a signal a later wave adds (wave 2-4) is humanized from its own name
+ * rather than disappearing from the list.
+ */
+export const SIGNAL_LABELS: Record<string, string> = {
+  young_domain: "Young registration",
+  mx_without_spf: "Mail-capable, no SPF",
+  title_match: "Page title carries the brand",
+  favicon_perceptual_match: "Favicon matches ours",
+  html_similarity: "Page body resembles ours",
+  brand_in_body: "Brand in the page body",
+  source_corroboration: "Two or more sources",
+  parked_hint: "Looks parked",
+  aged_domain: "Aged registration",
+  tls_issuer_reuse: "Our certificate issuer",
+};
+
+/** The declared signal names, in the order the score weighs them. */
+export const SIGNAL_NAMES: string[] = Object.keys(SIGNAL_LABELS);
+
+export function signalLabel(name: string): string {
+  return SIGNAL_LABELS[name] ?? humanize(name);
+}
+
+/**
+ * What the alert budget does with a scored candidate.
+ *
+ * The thresholds behind these bands belong to the deployment, so the *band* is what
+ * the server sends and this only names it: a page that printed "60+" would be
+ * telling an operator about a threshold their installation may have raised.
+ */
+const ALERT_BAND_LABELS: Record<string, string> = {
+  direct: "Alerts now",
+  digest: "Daily digest",
+  list: "List only",
+};
+
+export function alertBandLabel(band: string): string {
+  return ALERT_BAND_LABELS[band] ?? humanize(band);
+}
+
+/**
+ * What an analyst decided about a candidate (WI-12).
+ *
+ * The words are the decision, not the effect: "Confirmed" and "Rejected" are what the
+ * analyst did, while *what the channel does about it* is a separate fact the page
+ * states where it matters — a badge that read "Alerts now" beside "Confirmed" would
+ * be saying one thing twice.
+ */
+const VERDICT_LABELS: Record<string, string> = {
+  confirmed: "Confirmed",
+  rejected: "Rejected",
+  // The provider's own verdict on a row it produced: the name is a candidate nobody
+  // has verified yet, which is a different claim from an analyst's decision and has to
+  // read as one.
+  candidate_not_verified: "Not verified yet",
+};
+
+export function verdictLabel(verdict: string): string {
+  return VERDICT_LABELS[verdict] ?? humanize(verdict);
+}
+
+/**
+ * Which question produced an evidence row (W2.5).
+ *
+ * An evidence list holds two kinds of row: one that *found* a name (a certificate
+ * claiming the brand, a page title carrying it) and one that describes a name the
+ * platform already had (a registration record, a mail lookup on a confirmed
+ * candidate). Both used to render as a source and a timestamp, which read as the
+ * same statement. Naming the question is what tells an operator which one they are
+ * looking at - and a capability a later connector adds is humanized from its own
+ * name rather than disappearing from the list.
+ */
+const EVIDENCE_CAPABILITY_LABELS: Record<string, string> = {
+  certificate: "Certificate names this domain",
+  certificate_brand: "Certificate claims the brand",
+  title: "Page title carries it",
+  body: "Page body carries it",
+  hostname: "Endpoint serves this name",
+  favicon: "Favicon is ours, byte for byte",
+  favicon_similar: "Favicon resembles ours",
+  whois: "Registration record",
+  mx: "Mail records",
+  passive_dns: "Passive DNS",
+  lookup: "Endpoint lookup",
+};
+
+export function evidenceCapabilityLabel(capability: string): string {
+  return EVIDENCE_CAPABILITY_LABELS[capability] ?? humanize(capability);
 }
 
 // ---------------------------------------------------------------------------

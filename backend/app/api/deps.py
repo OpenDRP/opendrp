@@ -1,6 +1,6 @@
 import ipaddress
 import uuid
-from typing import AsyncGenerator
+from typing import AsyncGenerator, NoReturn
 
 import structlog
 from fastapi import Depends, Request
@@ -9,10 +9,12 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.audit import AuditLogger
+from app.core.authorization_audit import audit_denied_authorization
 from app.core.config import settings
 from app.core.database import AsyncSessionLocal
 from app.core.exceptions import ForbiddenException, RateLimitException, UnauthorizedException
 from app.core.mfa_policy import mfa_required_by_policy
+from app.core.permissions import Capability, capability_error, role_holds
 from app.core.request_rate_limit import RequestRateLimiter
 from app.core.security import decode_token
 from app.models.user import User, role_name
@@ -54,7 +56,8 @@ def pending_credential_steps(user: User) -> list[str]:
 
     Only the per-account facts: a password assigned *for* the holder, and a second
     factor removed *for* them. The deployment-wide policy
-    (``REQUIRE_MFA_FOR_ADMINS``) produces a similar-looking step but is not one of
+    (``REQUIRE_MFA_ROLES`` / ``REQUIRE_MFA_FOR_ADMINS``) produces a similar-looking
+    step but is not one of
     these, and the difference is not cosmetic: this list is what gets *written* into
     audit details when an administrator creates the situation (``onboarding_required``
     on ``user.password_reset`` / ``user.mfa.reset``), and the policy writes nothing
@@ -117,7 +120,7 @@ async def _audit_missing_policy_factor(
             details={
                 "path": str(request.url.path),
                 "role": role_name(user.role),
-                "reason": "require_mfa_for_admins",
+                "reason": "require_mfa",
             },
         )
     except Exception:
@@ -141,7 +144,8 @@ async def _enforce_credential_onboarding(
     * a password assigned *for* the account (``must_change_password``);
     * a second factor cleared *for* it (``must_enrol_mfa``);
     * a second factor the *installation* requires and this account does not have
-      (``REQUIRE_MFA_FOR_ADMINS``, administrators only).
+      (``REQUIRE_MFA_ROLES``, plus ``admin`` when ``REQUIRE_MFA_FOR_ADMINS`` is
+      set — whichever way the deployment stated the policy).
 
     The third is why this gate is no longer only about flags. It used to be refused
     on admin routes by ``require_admin``, which left every other page open — so an
@@ -229,6 +233,52 @@ async def get_current_user(
     await _enforce_request_rate_limit(request, user, db)
     await _enforce_credential_onboarding(request, user, db)
     return user
+
+
+#: Requests per minute one source address may send to the connector protocol.
+#: Sized against normal polling, not against a human: twelve connectors polling
+#: every five seconds is 144 requests a minute, so 600 leaves more than four
+#: times the headroom while still bounding a leaked or invented token, whose
+#: every attempt costs a credential lookup and, for work, an index scan.
+CONNECTOR_PROTOCOL_RATE_LIMIT_PER_MINUTE = 600
+
+
+async def enforce_connector_protocol_rate_limit(request: Request) -> None:
+    """Bound one address's request rate on the connector protocol.
+
+    Keyed by the resolved client address, not by the connector: the check runs
+    before the token is resolved, so a flood of made-up tokens is refused without
+    a database lookup per request. The counter is the same fixed-window one
+    authenticated traffic uses (``RequestRateLimiter``), so the state stays in
+    Redis and the API stays stateless.
+
+    A block is logged but not audited as a row: this is the one path a bad token
+    reaches without an identity, and writing a database row per rejection would
+    reproduce the amplification the bound exists to prevent. Every accepted call
+    still carries its own audit row where it matters (registration, completion).
+    """
+    ip_address = extract_ip(request)
+    verdict = await RequestRateLimiter.check(
+        f"connector-ip:{ip_address}",
+        limit_per_minute=CONNECTOR_PROTOCOL_RATE_LIMIT_PER_MINUTE,
+    )
+    if verdict.allowed:
+        return
+    log.warning(
+        "connector_protocol_rate_limited",
+        ip_address=ip_address,
+        path=str(request.url.path),
+        limit_per_minute=CONNECTOR_PROTOCOL_RATE_LIMIT_PER_MINUTE,
+        retry_after_seconds=verdict.retry_after,
+    )
+    raise RateLimitException(
+        detail=(
+            "Too many connector protocol requests from this address: the limit "
+            f"is {CONNECTOR_PROTOCOL_RATE_LIMIT_PER_MINUTE} per minute. "
+            f"Retry in about {verdict.retry_after} second(s)."
+        ),
+        retry_after=verdict.retry_after,
+    )
 
 
 async def _enforce_request_rate_limit(request: Request, user: User, db: AsyncSession) -> None:
@@ -378,17 +428,112 @@ def extract_ip(request: Request | None) -> str:
     return "unknown"
 
 
+#: Path parameters that name the object a refused request was aimed at. Kept to
+#: a fixed list rather than "whatever the route has": an audit detail is read by a
+#: human and matched by a SIEM rule, and forwarding an arbitrary parameter would
+#: let a future route put something that is not an identifier there.
+_DENIED_TARGET_PARAMS = (
+    "user_id",
+    "asset_id",
+    "threat_id",
+    "breach_id",
+    "report_id",
+    "job_id",
+    "family_id",
+)
+
+
+def _denied_target(request: Request) -> str | None:
+    for name in _DENIED_TARGET_PARAMS:
+        value = request.path_params.get(name)
+        if value:
+            return str(value)
+    return None
+
+
+async def _refuse_role(
+    request: Request,
+    db: AsyncSession,
+    user: User,
+    *,
+    required: str,
+    detail: str,
+) -> NoReturn:
+    """Record the refusal, then refuse.
+
+    The row is written here rather than in the ``ForbiddenException`` handler
+    because only the predicate knows *what* was required and who was refused; the
+    handler sees an exception with no user on it. ``authz.denied`` is deduplicated
+    per account, method and route inside a window by
+    :mod:`app.core.authorization_audit`, so a client ignoring the 403 does not
+    turn the trail into its own load.
+    """
+    await audit_denied_authorization(
+        db,
+        user=user,
+        required=required,
+        path=str(request.url.path),
+        method=request.method,
+        ip_address=extract_ip(request),
+        target_id=_denied_target(request),
+    )
+    raise ForbiddenException(detail)
+
+
+def require_capability(capability: Capability):
+    """Build the dependency that enforces one capability.
+
+    Returned as a factory rather than as three hand-written predicates, because
+    the predicates were where the roles got listed twice: the guard reads the
+    table in :mod:`app.core.permissions`, and the gate in
+    ``tests/test_route_access_gate.py`` reads the marker this sets to prove a
+    route declares *something*.
+    """
+
+    async def _guard(
+        request: Request,
+        current_user: User = Depends(get_current_user),
+        db: AsyncSession = Depends(get_db),
+    ) -> User:
+        if not role_holds(current_user.role, capability):
+            await _refuse_role(
+                request,
+                db,
+                current_user,
+                required=capability.value,
+                detail=capability_error(capability),
+            )
+        return current_user
+
+    _guard.__name__ = f"require_{capability.value}"
+    _guard.__capability__ = capability  # type: ignore[attr-defined]
+    return _guard
+
+
+#: Managing your own account (password, second factor, sessions). Every role
+#: holds it; the endpoints are self-service rather than administration.
+require_self_service = require_capability(Capability.SELF_SERVICE)
+#: Reading the platform: every active account, which is what the old
+#: ``require_viewer_plus`` really meant (its name read like a boundary while it
+#: accepted all three roles). The name now says so, and the roles come from the
+#: table rather than from a literal beside the check.
+require_active_account = require_capability(Capability.VIEW_PLATFORM)
+#: Acting on findings (scans, triage, promotion, deletion).
+require_analyse = require_capability(Capability.ANALYSE)
+
+
 async def require_admin(
     request: Request,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> User:
-    """Admin-only gate, with the second-factor policy on top when enabled.
+    """Admin-only gate (``Capability.ADMINISTER``), with the second factor on top.
 
     The second factor is optional by design — an installation must not be able to
     lock its own administrator out because a phone was lost — so a deployment that
-    wants it enforced sets ``REQUIRE_MFA_FOR_ADMINS=true``. When it is set, an
-    administrator who has not enrolled is refused.
+    wants it enforced names the roles in ``REQUIRE_MFA_ROLES`` (or sets
+    ``REQUIRE_MFA_FOR_ADMINS=true`` for administrators). Whichever an account's
+    role falls under, an account that has not enrolled is refused.
 
     That refusal now normally happens one layer earlier: the credential gate in
     ``get_current_user`` refuses the account on *every* route but the enrolment
@@ -400,8 +545,14 @@ async def require_admin(
     differently, a policy that comes to depend on something the gate cannot see —
     the refusal and its trail must not be the thing that quietly went missing.
     """
-    if current_user.role != "admin":
-        raise ForbiddenException("Admin role required")
+    if not role_holds(current_user.role, Capability.ADMINISTER):
+        await _refuse_role(
+            request,
+            db,
+            current_user,
+            required=Capability.ADMINISTER.value,
+            detail=capability_error(Capability.ADMINISTER),
+        )
 
     if mfa_required_by_policy(current_user.role, current_user.totp_enabled_at):
         await _audit_missing_policy_factor(request, current_user, db)
@@ -409,19 +560,5 @@ async def require_admin(
     return current_user
 
 
-def require_analyst_or_admin(
-    current_user: User = Depends(get_current_user),
-) -> User:
-    if current_user.role not in {"admin", "analyst"}:
-        raise ForbiddenException("Analyst or Admin role required")
-    return current_user
-
-
-def require_viewer_plus(
-    current_user: User = Depends(get_current_user),
-) -> User:
-    if not current_user.is_active:
-        raise UnauthorizedException("User is inactive")
-    if current_user.role not in {"admin", "analyst", "viewer"}:
-        raise ForbiddenException("Insufficient permissions")
-    return current_user
+#: The route gate reads this marker to map a route to the capability it declares.
+require_admin.__capability__ = Capability.ADMINISTER  # type: ignore[attr-defined]

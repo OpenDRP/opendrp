@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING
 from datetime import datetime
 import uuid
 
-from sqlalchemy import JSON, UUID, ForeignKey, String, Boolean, DateTime, Integer, Text, func
+from sqlalchemy import JSON, Uuid, ForeignKey, String, Boolean, DateTime, Integer, Text, func
 from sqlalchemy.ext.mutable import MutableDict
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -18,7 +18,7 @@ class Report(Base, UUIDMixin, TimestampMixin):
 
     report_name: Mapped[str] = mapped_column(String(255), nullable=False)
     created_by: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True),
+        Uuid(as_uuid=True),
         ForeignKey("users.id", ondelete="SET NULL"),
         nullable=True,
     )
@@ -51,7 +51,7 @@ class ReportArtifactCleanup(Base):
     )
     attempts: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
-    report_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True, index=True)
+    report_id: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True), nullable=True, index=True)
 
 
 class ReportAuditOutbox(Base):
@@ -59,11 +59,11 @@ class ReportAuditOutbox(Base):
 
     __tablename__ = "report_audit_outbox"
 
-    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
     event_key: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
     action: Mapped[str] = mapped_column(String(80), nullable=False)
-    report_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False, index=True)
-    job_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    report_id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), nullable=False, index=True)
+    job_id: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True), nullable=True)
     details: Mapped[dict] = mapped_column(MutableDict.as_mutable(JSON()), nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False

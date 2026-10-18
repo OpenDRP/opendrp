@@ -1,6 +1,6 @@
 """The documentation gate has to see a tree that stopped holding together.
 
-Three failures shipped here without anything noticing, and each of them is a
+Four failures shipped here without anything noticing, and each of them is a
 question a reader asks:
 
 * a relative link that points at a page which was renamed — the text still reads
@@ -9,7 +9,15 @@ question a reader asks:
   reader which page was live guidance and which was history;
 * a migration reference that is stale — the readiness page named a revision as
   the end of the chain while the tree had already moved past it, so an operator
-  planning an upgrade had two answers and no way to choose.
+  planning an upgrade had two answers and no way to choose;
+* a page named in prose that the repository no longer has — the alerts runbook was
+  folded into `README.md` and `docs/observability.md` kept sending an operator on
+  call to the page it used to live on, in backticks, where no link rule reaches;
+* a fragment that names no section — the link resolves to the right page and
+  drops the reader at its top, so the instruction it belongs to reads as current
+  while the paragraph behind it has moved;
+* a block that renders as text — an unclosed fence swallows every heading after
+  it, and a table row one cell short loses the column a reader came for.
 
 Each test below builds the smallest checkout that demonstrates one of them. The
 shipped tree is asserted to be clean as well, which is what keeps the gate from
@@ -129,16 +137,243 @@ def test_a_link_inside_a_fenced_block_is_not_a_link(tmp_path: Path) -> None:
     assert gate.check(root) == []
 
 
-def test_an_anchor_and_a_query_are_stripped_before_resolving(tmp_path: Path) -> None:
+def test_a_query_is_stripped_before_resolving(tmp_path: Path) -> None:
+    """A query names a view of a page, not a different page."""
     root = _checkout(
         tmp_path,
         {
-            "README.md": "# OpenDRP\n\n[config](docs/configuration.md#database-pool-budget)\n",
+            "README.md": (
+                "# OpenDRP\n\n"
+                "[config](docs/configuration.md?plain=1#configuration)\n"
+            ),
             "docs/configuration.md": "# Configuration\n",
         },
     )
 
     assert gate.check(root) == []
+
+
+# ==============================================================================
+# Anchors
+# ==============================================================================
+def test_an_anchor_no_heading_answers_to_is_reported(tmp_path: Path) -> None:
+    """The page resolves, the section does not: the reader lands at the top."""
+    root = _checkout(
+        tmp_path,
+        {
+            "README.md": (
+                "# OpenDRP\n\n"
+                "[at the top](docs/deployment.md)\n\n"
+                "See [pooling](docs/configuration.md#database-pool-budget).\n"
+            ),
+            "docs/deployment.md": "# Deployment\n",
+            "docs/configuration.md": "# Configuration\n\n## Pooling\n",
+        },
+    )
+
+    failures = gate.check(root)
+
+    assert len(failures) == 1, failures
+    assert "README.md:5" in failures[0]
+    assert "database-pool-budget" in failures[0]
+
+
+def test_a_heading_anchor_passes(tmp_path: Path) -> None:
+    """`#documentation` is how GitHub slugs the heading `Documentation`."""
+    root = _checkout(
+        tmp_path,
+        {
+            "README.md": (
+                "# OpenDRP\n\n"
+                "See [the docs](#documentation) and [config](docs/configuration.md#configuration).\n"
+                "\n## Documentation\n"
+            ),
+            "docs/configuration.md": "# Configuration\n",
+        },
+    )
+
+    assert gate.check(root) == []
+
+
+def test_a_repeated_heading_is_disambiguated_the_way_github_does(tmp_path: Path) -> None:
+    """The second `Notes` section is `#notes-1`, not `#notes`."""
+    root = _checkout(
+        tmp_path,
+        {
+            "README.md": "# OpenDRP\n\n[second](docs/page.md#notes-1)\n",
+            "docs/page.md": "# Page\n\n## Notes\n\ntext\n\n## Notes\n\nmore\n",
+        },
+    )
+
+    assert gate.check(root) == []
+
+
+def test_an_anchor_a_page_declares_by_hand_passes(tmp_path: Path) -> None:
+    """A page may name a place that has no heading of its own."""
+    root = _checkout(
+        tmp_path,
+        {
+            "README.md": "# OpenDRP\n\n[here](docs/page.md#release-checklist)\n",
+            "docs/page.md": (
+                "# Page\n\n<a name=\"release-checklist\"></a>\n\nFollow it.\n"
+            ),
+        },
+    )
+
+    assert gate.check(root) == []
+
+
+def test_a_broken_anchor_inside_a_fenced_block_is_an_example(tmp_path: Path) -> None:
+    root = _checkout(
+        tmp_path,
+        {
+            "README.md": (
+                "# OpenDRP\n\n"
+                "[page](docs/page.md)\n\n"
+                "```markdown\n[example](docs/page.md#not-a-section)\n```\n"
+            ),
+            "docs/page.md": "# Page\n",
+        },
+    )
+
+    assert gate.check(root) == []
+
+
+def test_an_internal_record_may_anchor_a_heading_that_is_gone(tmp_path: Path) -> None:
+    """A dated record links to the sections of its own time; that is the record."""
+    root = _checkout(
+        tmp_path,
+        {
+            "README.md": (
+                "# OpenDRP\n\n"
+                "[records](docs/internal/README.md) and [config](docs/configuration.md)\n"
+            ),
+            "docs/internal/README.md": (
+                "# Internal records\n\n[audit](audit.md)\n"
+            ),
+            "docs/internal/audit.md": (
+                "# Audit\n\nThe budget lived in "
+                "[the old section](../configuration.md#pool-budget).\n"
+            ),
+            "docs/configuration.md": "# Configuration\n\n## Pool\n",
+        },
+    )
+
+    assert gate.check(root) == []
+
+
+# ==============================================================================
+# Fences and tables
+# ==============================================================================
+def test_an_unclosed_fence_is_reported_where_it_opened(tmp_path: Path) -> None:
+    root = _checkout(
+        tmp_path,
+        {
+            "README.md": (
+                "# OpenDRP\n\n"
+                "```bash\ndocker compose up -d\n"
+                "\n## After it starts\n\nThe page continues.\n"
+            ),
+        },
+    )
+
+    failures = gate.check(root)
+
+    assert len(failures) == 1, failures
+    assert "README.md:3" in failures[0]
+    assert "never" in failures[0]
+
+
+def test_a_fence_is_closed_only_by_its_own_marker(tmp_path: Path) -> None:
+    """A `~~~` inside a ```-block is sample text, not the close."""
+    root = _checkout(
+        tmp_path,
+        {
+            "README.md": (
+                "# OpenDRP\n\n"
+                "```text\n~~~\nstill inside\n"
+                "\n## A heading the reader never sees\n"
+            ),
+        },
+    )
+
+    failures = gate.check(root)
+
+    assert len(failures) == 1, failures
+    assert "README.md:3" in failures[0]
+
+
+def test_a_table_row_with_a_missing_cell_is_reported(tmp_path: Path) -> None:
+    root = _checkout(
+        tmp_path,
+        {
+            "README.md": (
+                "# OpenDRP\n\n"
+                "| Setting | Default | Note |\n"
+                "|---|---|---|\n"
+                "| `MAX_PAGE_SIZE` | 200 |\n"
+            ),
+        },
+    )
+
+    failures = gate.check(root)
+
+    assert len(failures) == 1, failures
+    assert "README.md:5" in failures[0]
+    assert "2 cell(s)" in failures[0]
+
+
+def test_a_table_inside_a_fence_is_an_example(tmp_path: Path) -> None:
+    root = _checkout(
+        tmp_path,
+        {
+            "README.md": (
+                "# OpenDRP\n\n"
+                "```markdown\n| a | b |\n|---|---|\n| only one |\n```\n"
+            ),
+        },
+    )
+
+    assert gate.check(root) == []
+
+
+def test_an_escaped_pipe_is_text_not_a_separator(tmp_path: Path) -> None:
+    """`10 000 rows \\| 1 MiB` is one cell, which is how a page writes it."""
+    root = _checkout(
+        tmp_path,
+        {
+            "README.md": (
+                "# OpenDRP\n\n"
+                "| Limit | Value |\n"
+                "|---|---|\n"
+                "| Import | 1000 rows \\| 1 MiB |\n"
+            ),
+        },
+    )
+
+    assert gate.check(root) == []
+
+
+def test_a_header_and_separator_that_disagree_are_reported(tmp_path: Path) -> None:
+    """GitHub renders the block as a paragraph, not as the matrix intended."""
+    root = _checkout(
+        tmp_path,
+        {
+            "README.md": (
+                "# OpenDRP\n\n"
+                "| Setting | Default |\n"
+                "|---|---|---|\n"
+                "| `MAX_PAGE_SIZE` | 200 |\n"
+            ),
+        },
+    )
+
+    failures = gate.check(root)
+
+    assert len(failures) == 1, failures
+    assert "README.md:3" in failures[0]
+    assert "2 cell(s)" in failures[0]
+    assert "3" in failures[0]
 
 
 # ==============================================================================
@@ -267,6 +502,129 @@ def test_an_internal_record_may_cite_a_revision_the_baseline_absorbed(
                 "# Audit\n\n"
                 "The matching indexes shipped in `0010_report_reliability`.\n"
             ),
+        },
+    )
+
+    assert gate.check(root) == []
+
+
+# ==============================================================================
+# Pages named in prose
+# ==============================================================================
+def test_a_page_a_document_names_but_the_tree_lacks_is_reported(
+    tmp_path: Path,
+) -> None:
+    """The defect this rule was written for, in the words it was written in."""
+    root = _checkout(
+        tmp_path,
+        {
+            "README.md": "# OpenDRP\n\n[alerts](docs/alerts.md)\n",
+            "docs/alerts.md": (
+                "# Alerts\n\nReconcile it, then release the recipient "
+                "(`docs/alerts-settings-operations.md`).\n"
+            ),
+        },
+    )
+
+    failures = gate.check(root)
+
+    assert len(failures) == 1, failures
+    assert "docs/alerts-settings-operations.md" in failures[0]
+    assert "no such file exists" in failures[0]
+
+
+def test_a_page_name_inside_a_fenced_block_is_an_example(tmp_path: Path) -> None:
+    """A command or a sample that happens to end in `.md` names nothing."""
+    root = _checkout(
+        tmp_path,
+        {
+            "README.md": (
+                "# OpenDRP\n\n"
+                "[page](docs/page.md)\n\n"
+                "```text\ngrep -r 'docs/does-not-exist.md' .\n```\n"
+            ),
+            "docs/page.md": "# Page\n",
+        },
+    )
+
+    assert gate.check(root) == []
+
+
+def test_a_page_name_beside_its_own_page_resolves(tmp_path: Path) -> None:
+    """`security.md` written in `docs/` is the sibling page, not a missing root."""
+    root = _checkout(
+        tmp_path,
+        {
+            "README.md": (
+                "# OpenDRP\n\n"
+                "[config](docs/configuration.md) and [security](docs/security.md)\n"
+            ),
+            "docs/configuration.md": "# Configuration\n\nSee `security.md`.\n",
+            "docs/security.md": "# Security\n",
+        },
+    )
+
+    assert gate.check(root) == []
+
+
+def test_a_broken_link_to_a_page_is_reported_once(tmp_path: Path) -> None:
+    """One broken reference is one finding, however the gate reaches it."""
+    root = _checkout(
+        tmp_path,
+        {"README.md": "# OpenDRP\n\n[runbook](docs/missing.md)\n"},
+    )
+
+    failures = gate.check(root)
+
+    assert len(failures) == 1, failures
+    assert "does not resolve" in failures[0]
+
+
+def test_an_internal_record_may_name_a_page_that_was_removed(
+    tmp_path: Path,
+) -> None:
+    """A dated record names the pages of its own time; that is the record."""
+    root = _checkout(
+        tmp_path,
+        {
+            "README.md": "# OpenDRP\n\n[records](docs/internal/README.md)\n",
+            "docs/internal/README.md": "# Internal records\n\n[audit](audit.md)\n",
+            "docs/internal/audit.md": (
+                "# Audit\n\n`docs/operations.md` carried what `README.md` now carries.\n"
+            ),
+        },
+    )
+
+    assert gate.check(root) == []
+
+
+def test_the_changelog_may_name_the_page_it_deleted(tmp_path: Path) -> None:
+    """An entry stating a deletion is the entry doing its job."""
+    root = _checkout(
+        tmp_path,
+        {
+            "README.md": "# OpenDRP\n",
+            "CHANGELOG.md": (
+                "# Changelog\n\n"
+                "## [0.2.0]\n\n"
+                "- **`docs/refactoring-baseline.md` is deleted.**\n"
+            ),
+        },
+    )
+
+    assert gate.check(root) == []
+
+
+def test_an_external_url_ending_in_markdown_is_not_a_page_name(
+    tmp_path: Path,
+) -> None:
+    root = _checkout(
+        tmp_path,
+        {
+            "README.md": (
+                "# OpenDRP\n\n"
+                "[upstream](https://example.invalid/notes/page.md) is theirs.\n"
+            )
         },
     )
 

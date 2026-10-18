@@ -125,6 +125,72 @@ describe("PaginatedDataTable", () => {
     expect(screen.getByRole("combobox", { name: "Items per page" })).toBeInTheDocument();
   });
 
+  it("turns a sortable header into a button that reports the field (AWI-04)", async () => {
+    const user = userEvent.setup();
+    const onSortChange = vi.fn();
+    renderTable({
+      columns: [{ ...columns[0], sortable: true }, columns[1]],
+      sort: { field: "name", direction: "asc" },
+      onSortChange,
+    });
+
+    // A sorted column says so to assistive technology, and the next click on it
+    // reverses the direction rather than starting over.
+    expect(screen.getByRole("columnheader", { name: /Name/ })).toHaveAttribute("aria-sort", "ascending");
+    await user.click(screen.getByRole("button", { name: "Sort by Name" }));
+    expect(onSortChange).toHaveBeenCalledWith({ field: "name", direction: "desc" });
+  });
+
+  it("reports the ticked rows without owning the selection (AWI-11)", async () => {
+    const user = userEvent.setup();
+    const onSelectedChange = vi.fn();
+    renderTable({
+      selectable: true,
+      selectedIds: [],
+      onSelectedChange,
+      getRowId: (row) => row.id,
+      getRowLabel: (row) => row.name,
+    });
+
+    await user.click(screen.getByRole("checkbox", { name: "Select Example" }));
+    expect(onSelectedChange).toHaveBeenCalledWith(["row-1"]);
+  });
+
+  it("selects and clears every row on the page from the header (AWI-11)", async () => {
+    const user = userEvent.setup();
+    const onSelectedChange = vi.fn();
+    const props = {
+      selectable: true,
+      onSelectedChange,
+      getRowId: (row: TestRow) => row.id,
+      getRowLabel: (row: TestRow) => row.name,
+    };
+    const { rerender } = renderTable({ ...props, selectedIds: [] });
+
+    await user.click(screen.getByRole("checkbox", { name: "Select all rows on this page" }));
+    expect(onSelectedChange).toHaveBeenCalledWith(["row-1"]);
+
+    // The header is checked only for a full page, and clearing forwards the ids
+    // that stay selected rather than an empty array that erases another page.
+    rerender(
+      <PaginatedDataTable
+        columns={columns}
+        rows={rows}
+        total={1}
+        page={1}
+        pageSize={10}
+        onPageChange={vi.fn()}
+        onPageSizeChange={vi.fn()}
+        storageKey="test-table"
+        selectedIds={["row-1"]}
+        {...props}
+      />,
+    );
+    expect(screen.getByRole("checkbox", { name: "Select all rows on this page" })).toBeChecked();
+    await user.click(screen.getByRole("checkbox", { name: "Select all rows on this page" }));
+    expect(onSelectedChange).toHaveBeenLastCalledWith([]);
+  });
+
   it("changes page through navigation and resizes a column with the keyboard", async () => {
     const user = userEvent.setup();
     const onPageChange = vi.fn();

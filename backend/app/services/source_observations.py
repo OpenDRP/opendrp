@@ -33,6 +33,49 @@ def source_identity(connector):
     return connector.name
 
 
+async def sources_for_candidates(db, candidate_ids) -> dict[str, list[str]]:
+    """Every source that reported each of these candidates, distinct (WI-30).
+
+    One statement for a page of the list, because the question is asked about a
+    whole page at a time: the candidate list shows the column and the alert message
+    carries the same fact, and a query per row would make both of them N+1. Keyed by
+    the candidate id as a string, which is how a candidate travels in a payload
+    (``finding_id``) as well as in a URL, so the two callers can look a row up
+    without converting anything.
+
+    The names are the connector-declared source identities, which is what an analyst
+    recognises: two rows that agree on a name agree on a provider, and two that do
+    not are the corroboration the ``source_corroboration`` signal scores.
+    """
+    ids = [candidate_id for candidate_id in candidate_ids if candidate_id]
+    if not ids:
+        return {}
+    rows = (
+        await db.execute(
+            select(SourceObservation.candidate_id, SourceObservation.source)
+            .where(
+                SourceObservation.module == "phishing",
+                SourceObservation.candidate_id.in_(ids),
+            )
+            .distinct()
+        )
+    ).all()
+    by_candidate: dict[str, set[str]] = {}
+    for candidate_id, source in rows:
+        if not source:
+            continue
+        by_candidate.setdefault(str(candidate_id), set()).add(str(source))
+    return {
+        candidate_id: sorted(sources)
+        for candidate_id, sources in by_candidate.items()
+    }
+
+
+async def sources_for_candidate(db, candidate_id) -> list[str]:
+    """The same answer for one candidate, as the single-row reads need it."""
+    return (await sources_for_candidates(db, [candidate_id])).get(str(candidate_id), [])
+
+
 async def persist(db, *, module, source, finding, job_id=None, candidate_id=None, connector=None, commit=True):
     now = datetime.now(timezone.utc)
     raw_subject = finding.get("subject") or finding.get("phishing_domain")

@@ -293,6 +293,10 @@ services:
       # set true to make an administrator's second factor a condition of reaching
       # admin routes rather than an optional feature. Only the API enforces it.
       REQUIRE_MFA_FOR_ADMINS: ${REQUIRE_MFA_FOR_ADMINS:-false}
+      # The same policy as a list of roles (`admin,analyst`). Read together with
+      # the flag above: the union is what the API enforces. Only the API resolves
+      # the gate, so only the API needs it.
+      REQUIRE_MFA_ROLES: ${REQUIRE_MFA_ROLES:-}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       # Only the API serves the scrape endpoint; the workers carry the same
       # settings because they run the same application, but a metric is read
@@ -312,6 +316,9 @@ services:
       CONNECTOR_JOB_LEASE_SECONDS: ${CONNECTOR_JOB_LEASE_SECONDS:-180}
       CONNECTOR_JOB_MAX_ATTEMPTS: ${CONNECTOR_JOB_MAX_ATTEMPTS:-3}
       ALERT_HEALTH_CHECK_TIMEOUT_SECONDS: ${ALERT_HEALTH_CHECK_TIMEOUT_SECONDS:-15}
+      # Reuse one channel probe for this many seconds. Two dashboard loads were
+      # two SMTP handshakes before the cache existed.
+      ALERT_HEALTH_CACHE_SECONDS: ${ALERT_HEALTH_CACHE_SECONDS:-60}
       ALERT_DELIVERY_TIMEOUT_SECONDS: ${ALERT_DELIVERY_TIMEOUT_SECONDS:-20}
       ALERT_DELIVERY_MAX_ATTEMPTS: ${ALERT_DELIVERY_MAX_ATTEMPTS:-3}
       # How long a recipient is held after a delivery whose outcome is unknown,
@@ -319,7 +326,25 @@ services:
       ALERT_RECIPIENT_HOLD_SECONDS: ${ALERT_RECIPIENT_HOLD_SECONDS:-900}
       ALERT_DELIVERY_RETRY_BASE_SECONDS: ${ALERT_DELIVERY_RETRY_BASE_SECONDS:-2}
       ALERT_AGGREGATION_DELAY_SECONDS: ${ALERT_AGGREGATION_DELAY_SECONDS:-10}
+      # How loudly the phishing module reports a scored candidate: at or above
+      # ALERT_CONFIDENCE_DIRECT at once, in the daily digest between the two,
+      # list-only below ALERT_CONFIDENCE_DIGEST.
+      ALERT_CONFIDENCE_DIRECT: ${ALERT_CONFIDENCE_DIRECT:-60}
+      ALERT_CONFIDENCE_DIGEST: ${ALERT_CONFIDENCE_DIGEST:-30}
+      # The middle band waits for the daily digest; off makes the budget binary.
+      ALERT_PHISHING_DIGEST_ENABLED: ${ALERT_PHISHING_DIGEST_ENABLED:-true}
+      ALERT_PHISHING_DIGEST_HOUR_UTC: ${ALERT_PHISHING_DIGEST_HOUR_UTC:-6}
       ALERT_MAX_FINDINGS_PER_MESSAGE: ${ALERT_MAX_FINDINGS_PER_MESSAGE:-50}
+      ALERT_NO_CHANNEL_RETRY_HOURS: ${ALERT_NO_CHANNEL_RETRY_HOURS:-24}
+      # On, a candidate that changes address, ports or brand is reported again.
+      ALERT_CANDIDATE_CHANGE_NOTIFICATIONS: ${ALERT_CANDIDATE_CHANGE_NOTIFICATIONS:-true}
+      # What the channel does with a breach incident the source itself labels spam
+      # or fabricated, how many new incidents one scan reports before the rest
+      # wait for the digest, and how much the affected-account count must grow for
+      # an already reported incident to be worth a second message.
+      ALERT_BREACH_NOISE_POLICY: ${ALERT_BREACH_NOISE_POLICY:-store_only_spam}
+      ALERT_BREACH_DIGEST_THRESHOLD: ${ALERT_BREACH_DIGEST_THRESHOLD:-20}
+      ALERT_BREACH_GROWTH_FLOOR: ${ALERT_BREACH_GROWTH_FLOOR:-1}
       ALERT_MAX_TELEGRAM_MESSAGE_LENGTH: ${ALERT_MAX_TELEGRAM_MESSAGE_LENGTH:-3800}
       OUTBOUND_DNS_TIMEOUT_SECONDS: ${OUTBOUND_DNS_TIMEOUT_SECONDS:-3}
       REPORT_MAX_ROWS: ${REPORT_MAX_ROWS:-5000}
@@ -494,7 +519,25 @@ services:
       ALERT_RECIPIENT_HOLD_SECONDS: ${ALERT_RECIPIENT_HOLD_SECONDS:-900}
       ALERT_DELIVERY_RETRY_BASE_SECONDS: ${ALERT_DELIVERY_RETRY_BASE_SECONDS:-2}
       ALERT_AGGREGATION_DELAY_SECONDS: ${ALERT_AGGREGATION_DELAY_SECONDS:-10}
+      # How loudly the phishing module reports a scored candidate: at or above
+      # ALERT_CONFIDENCE_DIRECT at once, in the daily digest between the two,
+      # list-only below ALERT_CONFIDENCE_DIGEST.
+      ALERT_CONFIDENCE_DIRECT: ${ALERT_CONFIDENCE_DIRECT:-60}
+      ALERT_CONFIDENCE_DIGEST: ${ALERT_CONFIDENCE_DIGEST:-30}
+      # The middle band waits for the daily digest; off makes the budget binary.
+      ALERT_PHISHING_DIGEST_ENABLED: ${ALERT_PHISHING_DIGEST_ENABLED:-true}
+      ALERT_PHISHING_DIGEST_HOUR_UTC: ${ALERT_PHISHING_DIGEST_HOUR_UTC:-6}
       ALERT_MAX_FINDINGS_PER_MESSAGE: ${ALERT_MAX_FINDINGS_PER_MESSAGE:-50}
+      ALERT_NO_CHANNEL_RETRY_HOURS: ${ALERT_NO_CHANNEL_RETRY_HOURS:-24}
+      # On, a candidate that changes address, ports or brand is reported again.
+      ALERT_CANDIDATE_CHANGE_NOTIFICATIONS: ${ALERT_CANDIDATE_CHANGE_NOTIFICATIONS:-true}
+      # What the channel does with a breach incident the source itself labels spam
+      # or fabricated, how many new incidents one scan reports before the rest
+      # wait for the digest, and how much the affected-account count must grow for
+      # an already reported incident to be worth a second message.
+      ALERT_BREACH_NOISE_POLICY: ${ALERT_BREACH_NOISE_POLICY:-store_only_spam}
+      ALERT_BREACH_DIGEST_THRESHOLD: ${ALERT_BREACH_DIGEST_THRESHOLD:-20}
+      ALERT_BREACH_GROWTH_FLOOR: ${ALERT_BREACH_GROWTH_FLOOR:-1}
       ALERT_MAX_TELEGRAM_MESSAGE_LENGTH: ${ALERT_MAX_TELEGRAM_MESSAGE_LENGTH:-3800}
       # The retention sweep runs here (beat schedules it, this worker executes
       # it), so these are the only container that needs the values. The API
@@ -502,6 +545,7 @@ services:
       AUDIT_RETENTION_DAYS: ${AUDIT_RETENTION_DAYS:-365}
       REPORT_RETENTION_DAYS: ${REPORT_RETENTION_DAYS:-365}
       DNS_EXPIRY_MAX_AGE_HOURS: ${DNS_EXPIRY_MAX_AGE_HOURS:-48}
+      TLS_CERTIFICATE_RETENTION_DAYS: ${TLS_CERTIFICATE_RETENTION_DAYS:-365}
       RETENTION_BATCH_SIZE: ${RETENTION_BATCH_SIZE:-5000}
       RETENTION_MAX_BATCHES_PER_RUN: ${RETENTION_MAX_BATCHES_PER_RUN:-200}
       ENCRYPTION_PREVIOUS_KEYS: ${ENCRYPTION_PREVIOUS_KEYS:-}
@@ -616,7 +660,25 @@ services:
       ALERT_RECIPIENT_HOLD_SECONDS: ${ALERT_RECIPIENT_HOLD_SECONDS:-900}
       ALERT_DELIVERY_RETRY_BASE_SECONDS: ${ALERT_DELIVERY_RETRY_BASE_SECONDS:-2}
       ALERT_AGGREGATION_DELAY_SECONDS: ${ALERT_AGGREGATION_DELAY_SECONDS:-10}
+      # How loudly the phishing module reports a scored candidate: at or above
+      # ALERT_CONFIDENCE_DIRECT at once, in the daily digest between the two,
+      # list-only below ALERT_CONFIDENCE_DIGEST.
+      ALERT_CONFIDENCE_DIRECT: ${ALERT_CONFIDENCE_DIRECT:-60}
+      ALERT_CONFIDENCE_DIGEST: ${ALERT_CONFIDENCE_DIGEST:-30}
+      # The middle band waits for the daily digest; off makes the budget binary.
+      ALERT_PHISHING_DIGEST_ENABLED: ${ALERT_PHISHING_DIGEST_ENABLED:-true}
+      ALERT_PHISHING_DIGEST_HOUR_UTC: ${ALERT_PHISHING_DIGEST_HOUR_UTC:-6}
       ALERT_MAX_FINDINGS_PER_MESSAGE: ${ALERT_MAX_FINDINGS_PER_MESSAGE:-50}
+      ALERT_NO_CHANNEL_RETRY_HOURS: ${ALERT_NO_CHANNEL_RETRY_HOURS:-24}
+      # On, a candidate that changes address, ports or brand is reported again.
+      ALERT_CANDIDATE_CHANGE_NOTIFICATIONS: ${ALERT_CANDIDATE_CHANGE_NOTIFICATIONS:-true}
+      # What the channel does with a breach incident the source itself labels spam
+      # or fabricated, how many new incidents one scan reports before the rest
+      # wait for the digest, and how much the affected-account count must grow for
+      # an already reported incident to be worth a second message.
+      ALERT_BREACH_NOISE_POLICY: ${ALERT_BREACH_NOISE_POLICY:-store_only_spam}
+      ALERT_BREACH_DIGEST_THRESHOLD: ${ALERT_BREACH_DIGEST_THRESHOLD:-20}
+      ALERT_BREACH_GROWTH_FLOOR: ${ALERT_BREACH_GROWTH_FLOOR:-1}
       ALERT_MAX_TELEGRAM_MESSAGE_LENGTH: ${ALERT_MAX_TELEGRAM_MESSAGE_LENGTH:-3800}
       # The report and retention settings are repeated from the other worker on
       # purpose: `app.core.celery_app` imports `app.tasks.report_tasks`, whose
@@ -629,6 +691,7 @@ services:
       AUDIT_RETENTION_DAYS: ${AUDIT_RETENTION_DAYS:-365}
       REPORT_RETENTION_DAYS: ${REPORT_RETENTION_DAYS:-365}
       DNS_EXPIRY_MAX_AGE_HOURS: ${DNS_EXPIRY_MAX_AGE_HOURS:-48}
+      TLS_CERTIFICATE_RETENTION_DAYS: ${TLS_CERTIFICATE_RETENTION_DAYS:-365}
       RETENTION_BATCH_SIZE: ${RETENTION_BATCH_SIZE:-5000}
       RETENTION_MAX_BATCHES_PER_RUN: ${RETENTION_MAX_BATCHES_PER_RUN:-200}
       ENCRYPTION_PREVIOUS_KEYS: ${ENCRYPTION_PREVIOUS_KEYS:-}
@@ -738,7 +801,25 @@ services:
       ALERT_RECIPIENT_HOLD_SECONDS: ${ALERT_RECIPIENT_HOLD_SECONDS:-900}
       ALERT_DELIVERY_RETRY_BASE_SECONDS: ${ALERT_DELIVERY_RETRY_BASE_SECONDS:-2}
       ALERT_AGGREGATION_DELAY_SECONDS: ${ALERT_AGGREGATION_DELAY_SECONDS:-10}
+      # How loudly the phishing module reports a scored candidate: at or above
+      # ALERT_CONFIDENCE_DIRECT at once, in the daily digest between the two,
+      # list-only below ALERT_CONFIDENCE_DIGEST.
+      ALERT_CONFIDENCE_DIRECT: ${ALERT_CONFIDENCE_DIRECT:-60}
+      ALERT_CONFIDENCE_DIGEST: ${ALERT_CONFIDENCE_DIGEST:-30}
+      # The middle band waits for the daily digest; off makes the budget binary.
+      ALERT_PHISHING_DIGEST_ENABLED: ${ALERT_PHISHING_DIGEST_ENABLED:-true}
+      ALERT_PHISHING_DIGEST_HOUR_UTC: ${ALERT_PHISHING_DIGEST_HOUR_UTC:-6}
       ALERT_MAX_FINDINGS_PER_MESSAGE: ${ALERT_MAX_FINDINGS_PER_MESSAGE:-50}
+      ALERT_NO_CHANNEL_RETRY_HOURS: ${ALERT_NO_CHANNEL_RETRY_HOURS:-24}
+      # On, a candidate that changes address, ports or brand is reported again.
+      ALERT_CANDIDATE_CHANGE_NOTIFICATIONS: ${ALERT_CANDIDATE_CHANGE_NOTIFICATIONS:-true}
+      # What the channel does with a breach incident the source itself labels spam
+      # or fabricated, how many new incidents one scan reports before the rest
+      # wait for the digest, and how much the affected-account count must grow for
+      # an already reported incident to be worth a second message.
+      ALERT_BREACH_NOISE_POLICY: ${ALERT_BREACH_NOISE_POLICY:-store_only_spam}
+      ALERT_BREACH_DIGEST_THRESHOLD: ${ALERT_BREACH_DIGEST_THRESHOLD:-20}
+      ALERT_BREACH_GROWTH_FLOOR: ${ALERT_BREACH_GROWTH_FLOOR:-1}
       ALERT_MAX_TELEGRAM_MESSAGE_LENGTH: ${ALERT_MAX_TELEGRAM_MESSAGE_LENGTH:-3800}
       ENCRYPTION_PREVIOUS_KEYS: ${ENCRYPTION_PREVIOUS_KEYS:-}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
@@ -832,12 +913,26 @@ services:
       # Empty means use the Docker/system resolver. Set this only when the
       # deployment requires explicit resolvers (comma-separated).
       DNS_NAMESERVERS: ${DNS_NAMESERVERS:-}
-      # Optional expensive dimensions are disabled by default. The connector
-      # always uses a bounded fuzzer set unless DNSTWIST_FUZZERS is overridden.
-      DNSTWIST_FUZZERS: ${DNSTWIST_FUZZERS:-addition,omission,repetition,hyphenation,insertion,replacement,transposition,vowel-swap}
-      # Optional TLD dictionary. Enabling the 100-entry common-TLD dictionary
-      # materially increases DNS work and should be an explicit choice.
+      # What the scan asks for, in classes rather than as a raw fuzzer list: a class
+      # brings the technique and the dictionary it needs (the CLI refuses `--tld`/
+      # `--dictionary` unless their fuzzer is in the same command). `typo` is the
+      # documented baseline and needs no companion file; the expensive classes are
+      # opt-in because together they generate thousands of DNS requests per asset.
+      DNSTWIST_FUZZER_CLASSES: ${DNSTWIST_FUZZER_CLASSES:-typo}
+      # Optional TLD dictionary for the `tld` class. Empty means the dictionary the
+      # package ships; a missing file is reported per domain instead of failing it.
       DNSTWIST_TLD_DICTIONARY: ${DNSTWIST_TLD_DICTIONARY:-}
+      # Optional word list for the `dictionary` class.
+      DNSTWIST_DICTIONARY: ${DNSTWIST_DICTIONARY:-}
+      # The candidate bound. The CLI has no such option, so it is applied where it
+      # costs nothing: a permutation that is never resolved is never submitted.
+      DNSTWIST_MAX_CANDIDATES: ${DNSTWIST_MAX_CANDIDATES:-250}
+      # The CLI's MX check plus one free TXT question, so `mx_without_spf` is answered
+      # rather than inferred. Off by default: it connects to the candidate's mail server.
+      DNSTWIST_MX_CHECK: ${DNSTWIST_MX_CHECK:-false}
+      # Page similarity (`--lsh tlsh`). Refused with a named skip when the TLSh module
+      # is absent from the image; `--phash` and screenshots are never used.
+      DNSTWIST_CONTENT_INSPECTION: ${DNSTWIST_CONTENT_INSPECTION:-false}
       # Bound one dnstwist subprocess. A timeout is reported as a partial job,
       # and the SDK terminates the complete process group rather than leaving a
       # child resolver behind.
@@ -899,6 +994,20 @@ services:
       SHODAN_SCAN_SSL_TEXT: ${SHODAN_SCAN_SSL_TEXT:-true}
       SHODAN_SCAN_HTTP_TITLE: ${SHODAN_SCAN_HTTP_TITLE:-true}
       SHODAN_SCAN_FAVICON: ${SHODAN_SCAN_FAVICON:-true}
+      # The five questions this wave adds ship off (see `.env.example`): each spends
+      # query credits, and the two field names they rest on are confirmed against
+      # the paying account by `connectors/shodan/live_check.py` first. An
+      # administrator's choice in the connector's configuration form still wins for
+      # every later scan.
+      SHODAN_SCAN_HTTP_BODY: ${SHODAN_SCAN_HTTP_BODY:-false}
+      SHODAN_SCAN_CERT_SUBJECT: ${SHODAN_SCAN_CERT_SUBJECT:-false}
+      SHODAN_SCAN_HTML_HASH: ${SHODAN_SCAN_HTML_HASH:-false}
+      SHODAN_SCAN_PIVOTS: ${SHODAN_SCAN_PIVOTS:-false}
+      SHODAN_SCAN_HOST_LOOKUP: ${SHODAN_SCAN_HOST_LOOKUP:-false}
+      # The five capabilities above also wait for this statement: an operator
+      # confirms in their account that the plan permits the queries (F-12).
+      # Without it the worker refuses them by name instead of spending silently.
+      SHODAN_TERMS_ACKNOWLEDGED: ${SHODAN_TERMS_ACKNOWLEDGED:-false}
       SHODAN_MIN_REQUEST_INTERVAL_SECONDS: ${SHODAN_MIN_REQUEST_INTERVAL_SECONDS:-1}
       SHODAN_REQUEST_TIMEOUT_SECONDS: ${SHODAN_REQUEST_TIMEOUT_SECONDS:-30}
     depends_on:
@@ -972,11 +1081,16 @@ services:
       CONNECTOR_NAME: phishing-netlas
       CONNECTOR_TYPE: phishing
       CONNECTOR_JOB_TYPE: phishing.netlas
-      CONNECTOR_ASSET_TYPES: domain,keyword_title
+      # Brand assets are what the certificate and page-text questions are asked *from*:
+      # a worker that never receives them can only look for our own domain's name.
+      CONNECTOR_ASSET_TYPES: domain,keyword_domain,keyword_title
       CONNECTOR_TOKEN: ${CONNECTOR_TOKEN_NETLAS_PHISHING:-}
       POLL_INTERVAL_SEC: "5"
       INTELLIGENCE_PROVIDER: netlas
       NETLAS_API_TOKEN: ${NETLAS_API_TOKEN:-}
+      # An ``http.body`` search is the broadest question this worker asks, and the
+      # plan entitlement is the operator's statement (F-12). Unset means refused.
+      INTELLIGENCE_HTTP_BODY_ACKNOWLEDGED: ${INTELLIGENCE_HTTP_BODY_ACKNOWLEDGED:-false}
     depends_on:
       backend:
         condition: service_healthy
@@ -1228,6 +1342,48 @@ services:
       CONNECTOR_TOKEN: ${CONNECTOR_TOKEN_DNS_CTLOGS:-}
       DNS_SECURITY_CTLOGS_API_BASE: ${DNS_SECURITY_CTLOGS_API_BASE:-https://api.ctlogs.dev}
       DNS_SECURITY_CTLOGS_API_TOKEN: ${DNS_SECURITY_CTLOGS_API_TOKEN:-}
+      DNS_SECURITY_CTLOGS_PUBLIC_NONCOMMERCIAL: ${DNS_SECURITY_CTLOGS_PUBLIC_NONCOMMERCIAL:-false}
+      DNS_SECURITY_CTLOGS_MAX_REQUESTS_PER_SCAN: ${DNS_SECURITY_CTLOGS_MAX_REQUESTS_PER_SCAN:-100}
+      DNS_SECURITY_CTLOGS_MIN_REQUEST_INTERVAL_SECONDS: ${DNS_SECURITY_CTLOGS_MIN_REQUEST_INTERVAL_SECONDS:-36}
+      POLL_INTERVAL_SEC: "5"
+    depends_on:
+      backend:
+        condition: service_healthy
+    logging: *default-logging
+    networks:
+      - opendrp-connectors
+
+  connector-dns-tlsprobe:
+    # Keyless like the other DNS workers and keyed on nothing: the only traffic it
+    # generates is a bounded handshake against our own asset, so it starts with the
+    # installation instead of behind a profile.
+    build:
+      context: .
+      dockerfile: ./connectors/dns_security/Dockerfile
+    image: ${OPENDRP_IMAGE_PREFIX:-ghcr.io/opendrp/opendrp}/connector-dns-security:${OPENDRP_VERSION:-latest}
+    container_name: opendrp-connector-dns-tlsprobe
+    restart: on-failure:10
+    mem_limit: 512m
+    cpus: "0.75"
+    pids_limit: 128
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    environment:
+      CORE_URL: http://backend:8000
+      CONNECTOR_NAME: dns-tlsprobe
+      CONNECTOR_TYPE: dns
+      CONNECTOR_JOB_TYPE: dns.tlsprobe
+      CONNECTOR_FINDING_KIND: dns_observation
+      CONNECTOR_ASSET_TYPES: domain
+      CONNECTOR_TOKEN: ${CONNECTOR_TOKEN_DNS_TLSPROBE:-}
+      DNS_SECURITY_TLS_PORTS: ${DNS_SECURITY_TLS_PORTS:-443}
+      DNS_SECURITY_TLS_PATH: ${DNS_SECURITY_TLS_PATH:-/}
+      DNS_SECURITY_TLS_MAX_PROBES: ${DNS_SECURITY_TLS_MAX_PROBES:-200}
       POLL_INTERVAL_SEC: "5"
     depends_on:
       backend:
@@ -1265,6 +1421,50 @@ services:
       CONNECTOR_TOKEN: ${CONNECTOR_TOKEN_DNS_VIRUSTOTAL:-}
       DNS_SECURITY_VT_API_KEY: ${DNS_SECURITY_VT_API_KEY:-}
       DNS_SECURITY_VT_PUBLIC_NONCOMMERCIAL: ${DNS_SECURITY_VT_PUBLIC_NONCOMMERCIAL:-false}
+      POLL_INTERVAL_SEC: "5"
+    depends_on:
+      backend:
+        condition: service_healthy
+    logging: *default-logging
+    networks:
+      - opendrp-connectors
+
+  connector-dns-shodan:
+    # Keyed: enable with COMPOSE_PROFILES=shodan once the Shodan account is approved
+    # and its key is stored. The host lookup it makes about our own addresses is free;
+    # the per-scan search that answers "where else is this certificate served" spends
+    # a query credit, so its budget is a connector setting (`max_searches`, default 1)
+    # reserved against the approved source account.
+    profiles: ["shodan"]
+    build:
+      context: .
+      dockerfile: ./connectors/dns_security/Dockerfile
+    image: ${OPENDRP_IMAGE_PREFIX:-ghcr.io/opendrp/opendrp}/connector-dns-security:${OPENDRP_VERSION:-latest}
+    container_name: opendrp-connector-dns-shodan
+    restart: on-failure:10
+    mem_limit: 512m
+    cpus: "0.75"
+    pids_limit: 128
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    environment:
+      CORE_URL: http://backend:8000
+      CONNECTOR_NAME: dns-shodan
+      CONNECTOR_TYPE: dns
+      CONNECTOR_JOB_TYPE: dns.shodan
+      CONNECTOR_FINDING_KIND: dns_observation
+      CONNECTOR_ASSET_TYPES: domain,ip_address
+      CONNECTOR_TOKEN: ${CONNECTOR_TOKEN_DNS_SHODAN:-}
+      # Fallback only: the key an operator stored on the approved source account is
+      # the one the quota is drawn from and the one that wins.
+      SHODAN_API_KEY: ${SHODAN_API_KEY:-}
+      SHODAN_MIN_REQUEST_INTERVAL_SECONDS: ${SHODAN_MIN_REQUEST_INTERVAL_SECONDS:-1}
+      SHODAN_REQUEST_TIMEOUT_SECONDS: ${SHODAN_REQUEST_TIMEOUT_SECONDS:-30}
       POLL_INTERVAL_SEC: "5"
     depends_on:
       backend:

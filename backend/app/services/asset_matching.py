@@ -44,7 +44,7 @@ from collections.abc import Iterable
 
 from typing import Any
 
-from sqlalchemy import ColumnElement, and_, func, literal, or_
+from sqlalchemy import ColumnElement, and_, func, or_
 from sqlalchemy.exc import CompileError
 from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.orm import InstrumentedAttribute
@@ -349,18 +349,6 @@ def sql_email_like(column: ColumnLike, pattern: str) -> ColumnElement:
     return func.lower(column).like(pattern, escape="\\")
 
 
-def email_domain_join_predicate(email_column: ColumnLike) -> ColumnElement:
-    """Correlated form of the email-to-domain rule, driven by an asset row.
-
-    ``email_column`` is an address at the domain of the *asset row in scope*, so
-    the anti-join can decide it without loading either table into memory.
-    """
-    return and_(
-        Asset.asset_type == DOMAIN_ASSET_TYPE,
-        func.lower(email_column).like(literal("%@").concat(asset_sql_key())),
-    )
-
-
 def related_finding_models() -> dict[str, Any]:
     """The finding table behind each entry of :data:`RELATED_FINDING_MODULES`.
 
@@ -439,8 +427,6 @@ def related_finding_predicates(asset_type: object, value: object) -> dict[str, C
     if by_email_domain is not None:
         predicates["breaches"] = or_(predicates["breaches"], by_email_domain)
     return predicates
-
-
 
 
 #: The largest subnet ``GET /assets?search=`` enumerates (WI-16). A subnet search
