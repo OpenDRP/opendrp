@@ -96,7 +96,12 @@ gate that turns out to be wrong does not drag the SDK with it.
   five different ways (`hibp` never retries, `exposure` and `intelligence` cap at
   5 s, `dns_security` abandons above 60 s, `shodan` waits to its ceiling). Each is
   defensible; converging them is a product decision about a scan's deadline, not a
-  deduplication, and it deserves its own plan.
+  deduplication, and it deserves its own plan. What did happen here is that the
+  numbers stopped being implicit:
+  `backend/tests/test_connector_provider_limits.py` pins all five workers' limits
+  in one table, with the reason for each row beside it, so the policy change will
+  arrive as a visible diff instead of a surprise — and so the divergence itself is
+  documented somewhere a reader can find it.
 - **The release.** `dev` is 30+ commits ahead of `main`; shipping is a separate
   decision from this refactoring.
 - **`dns_security`'s four clients and three timeouts.** Same reason: changing them
