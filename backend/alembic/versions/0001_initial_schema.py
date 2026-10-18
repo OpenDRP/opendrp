@@ -204,6 +204,11 @@ _CONNECTOR_SEED = (
         # the requests from one budget and name a refusal instead of returning a
         # short list that reads like "no breaches".
         "source": "hibp",
+        # Enabled, unlike the other provider-backed workers: the approval step for
+        # this one is the account policy (readiness plus an approved account), not
+        # the row's status, and a disabled row would make a scan wait for a switch
+        # the operator was never told to flip.
+        "status": "enabled",
     },
     {
         "name": "dns-rdap",
@@ -1318,7 +1323,6 @@ def downgrade() -> None:
     op.drop_table("tls_certificate_sightings")
     op.drop_table("certificate_scope_exceptions")
     op.drop_table("tls_certificate_identities")
-    op.drop_table("users")
     op.drop_table("system_settings")
     op.drop_table("source_accounts")
     op.drop_table("report_queue_control")
@@ -1327,6 +1331,12 @@ def downgrade() -> None:
     op.drop_table("drp_refresh_families")
     op.drop_table("phishing_candidate_signals")
     op.drop_table("drp_phishing_domains")
+    # `users` goes after the last table that references it: a phishing row's
+    # verdict (`drp_phishing_domains.verdict_by`) and a refresh family's owner
+    # (`drp_refresh_families.user_id`). Dropped in creation order it is dropped
+    # while those constraints still exist, and PostgreSQL refuses the statement —
+    # which is what made the round trip to base fail rather than empty the schema.
+    op.drop_table("users")
     op.drop_table("drp_modules")
     op.drop_table("breach_catalogue")
     op.drop_table("drp_breaches")
