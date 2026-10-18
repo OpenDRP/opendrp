@@ -17,7 +17,7 @@ They are working records, not operator guidance. The maintained pages are under
 
 ## Writing the next one
 
-A plan that does not name its acceptance criteria is a wish. Follow the sections
-in [AGENTS.md](../../AGENTS.md): Goal, Plan of Work, Concrete Steps, Validation and
-Acceptance — plus a Progress and Milestones section that is updated as the work
-lands, never at the end.
+A plan that does not name its acceptance criteria is a wish. Every plan here uses
+the same sections: Goal, Plan of Work, Concrete Steps, Validation and Acceptance —
+plus a Progress and Milestones section that is updated as the work lands, never at
+the end.

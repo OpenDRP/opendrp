@@ -10,10 +10,10 @@ This plan puts those four mechanisms in **one** place in the SDK, leaves every
 provider's endpoint/parameter/error vocabulary in its own connector, and fixes one
 security gap that the duplication hid.
 
-The architectural rule behind it is the one in `AGENTS.md`: the platform must not
-depend on particular connectors, and connectors must not each reinvent the
-contract. A new provider should cost an endpoint map and a field mapping, not a
-third copy of a retry loop.
+The architectural rule behind it is the one the project states for the platform:
+the core must not depend on particular connectors, and connectors must not each
+reinvent the contract. A new provider should cost an endpoint map and a field
+mapping, not a third copy of a retry loop.
 
 **This plan changes no code.** It exists so the migration can be sliced and
 verified provider by provider.
