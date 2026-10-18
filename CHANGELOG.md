@@ -109,6 +109,15 @@ a pending or expired link.
 
 ### Changed
 
+- A new CI gate reads the connector tree for the defect class the last four
+  fixes belonged to: five separate times a worker took a third party's body in
+  full and considered its size afterwards, or had no bound at all. The rule is
+  now checked by machine — a body from anywhere but this platform's own API is
+  read through a bounded reader, never through `.content`, `.text` or `.json()` —
+  and its one exception (an answer from `self._request`) is syntactic, so there is
+  no allowlist by file. The Shodan diagnostic CLI was the gate's first finding and
+  now reads its provider answer through the shared client, one attempt per
+  question.
 - The Shodan worker's favicon fetch reads the icon under its size bound instead of
   after the fact: the request is the only one a connector makes to a *target*
   rather than to its provider, and it buffered whatever that host sent before

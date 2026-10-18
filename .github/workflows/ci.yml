@@ -635,6 +635,14 @@ jobs:
       # reference that names a revision the chain no longer ends at.
       - name: Fail if the documentation tree stops holding together
         run: python3 scripts/check_docs_consistency.py
+      # Six times a connector read a third party's body in full and considered its
+      # size afterwards, or had no bound at all: what a provider sent, what a
+      # target's host sent, and one `len(response.content) > 2 MB` that compared a
+      # length to a number only after the body was in memory. Each was found by
+      # reading code. This is the reading, done by a machine: a body from anywhere
+      # but the platform's own API is read through a bounded reader.
+      - name: Fail if a connector reads a response body without a bound
+        run: python3 scripts/check_connector_body_bounds.py
       # Half of a provider removal is invisible: source lists in the frontend
       # kept offering providers no connector could produce, and a module page
       # kept advertising one as optional. Neither is a syntax error, so only a

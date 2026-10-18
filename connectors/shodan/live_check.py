@@ -43,6 +43,8 @@ import time
 
 import httpx
 
+from opendrp_connector.provider import ProviderClient, ProviderLimits
+
 API = "https://api.shodan.io"
 HARD_CEILING = 4
 #: Shodan's documented general API rate is one request per second; the spike is
@@ -84,26 +86,55 @@ class Spike:
         self.requests = 0
         self._last = 0.0
 
-    async def get(self, path: str, **params) -> dict:
-        if self.requests >= self.max_requests:
-            raise RuntimeError("request ceiling reached")
+    async def _pace(self) -> None:
+        """Shodan's documented one request per second, kept from the spike's side."""
         elapsed = time.monotonic() - self._last
         if elapsed < MIN_INTERVAL:
             await asyncio.sleep(MIN_INTERVAL - elapsed)
         self._last = time.monotonic()
+
+    async def _charge(self) -> None:
+        if self.requests >= self.max_requests:
+            raise RuntimeError("request ceiling reached")
         self.requests += 1
+
+    async def get(self, path: str, **params) -> dict:
+        """One question, one request, through the shared client.
+
+        The body is read by the client that bounds it rather than by this script:
+        a diagnostic tool is exactly where an unbounded read would go unnoticed,
+        because nobody reads its source while it works. One attempt is stated
+        rather than inherited — the ceiling counts physical requests, and a retry
+        here would spend a second one for a question already answered.
+        """
         timeout = httpx.Timeout(30.0, connect=10.0)
         async with httpx.AsyncClient(timeout=timeout) as client:
-            response = await client.get(
+            provider = ProviderClient(
+                http=client,
+                limits=ProviderLimits(
+                    max_attempts=1,
+                    timeout=30.0,
+                    max_response_bytes=2_000_000,
+                ),
+                reserve=self._charge,
+                pace=self._pace,
+            )
+            result = await provider.get_json(
                 f"{API}{path}",
                 params={"key": self.key, **params},
                 headers={"User-Agent": "OpenDRP-Connector-live-check/1.0"},
+                timeout=timeout,
             )
-        if response.status_code != 200:
+        if result.outcome is not None:
             # The status is the answer for a refused query; the body may quote
             # the query, and this script prints neither.
-            raise RuntimeError(f"http_{response.status_code}")
-        return response.json()
+            raise RuntimeError(
+                f"http_{result.status}" if result.status is not None else result.outcome
+            )
+        payload = result.payload
+        if not isinstance(payload, dict):
+            raise RuntimeError("invalid_response")
+        return payload
 
 
 async def ask(spike: Spike, question: str, value: str) -> str:

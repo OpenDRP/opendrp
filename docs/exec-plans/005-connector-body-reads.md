@@ -18,9 +18,11 @@ Closing it is one commit. Making sure a fifth instance cannot appear is the rest
 this plan: a **source-level gate** over the connector tree, so a new worker that
 reaches for `response.json()` fails on CI instead of passing review.
 
-**The defect is fixed in the first commit of this plan; the gate is not written
-yet.** This document exists so the gate is specified before it is built, and so the
-next session does not re-derive which body reads remain and why each is allowed.
+Both halves are written: the defect is fixed in this plan's first commit and the
+gate is in the second, wired into CI. What remains open is the one decision the
+gate's evidence was meant to settle — whether the SDK should also read the
+*platform's* own answers under a bound — and that is recorded in Progress rather
+than left to a reader.
 
 ## Inventory — every remaining body read in the connector tree
 
@@ -143,7 +145,23 @@ Acceptance criteria:
 
 - [x] `_fetch_favicon` bounded read + test (`_read_favicon`): eight chunks sent,
       four read, the same truncated slice returned.
-- [ ] `scripts/check_connector_body_bounds.py` + its test.
-- [ ] CI wiring, and the tree clean under the rule (or step 3 taken instead).
-- [ ] `connectors/shodan/live_check.py` reads its provider body through the same
-      bounded reader.
+- [x] `scripts/check_connector_body_bounds.py`, with its own test
+      (`backend/tests/test_connector_body_bounds_gate.py`, 9 cases) that builds a
+      tree demonstrating each violation the rule names, and asserts the shipped
+      tree is clean — which is what keeps the gate from being a rule nobody
+      satisfies.
+- [x] CI wiring: the step sits in `repo-hygiene` next to the documentation gate,
+      because it parses source and needs no environment.
+- [x] `connectors/shodan/live_check.py` reads its provider body through the shared
+      client, which was the gate's first and only finding. One attempt is stated
+      explicitly: the tool's ceiling counts physical requests, and a retry would
+      spend a second one on a question already answered.
+- [x] **Step 3 was not taken, on the gate's evidence.** The rule as written
+      expressed the core exception structurally — a name bound from
+      `self._request(...)` — and every core read in the tree is exactly that shape,
+      five of them, so the SDK-wide bounded reader would have added a dependency
+      for no behavioural gain. Recording it here so the next session does not
+      re-open it as a missing step. If the core ever answers with something the
+      platform cannot bound, the SDK is where that bound goes — it owns the only
+      reader that is allowed to touch a body unboundedly, because it *is* the
+      reader.
