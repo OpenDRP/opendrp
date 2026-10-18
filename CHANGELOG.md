@@ -109,6 +109,19 @@ a pending or expired link.
 
 ### Changed
 
+- The intelligence worker makes its Netlas calls through the connector SDK's
+  shared client, which is the last of the five copies of a pace, a quota
+  reservation, a retry loop and a `Retry-After` parser. Its own numbers are stated
+  rather than inherited — three attempts, a five second cap on one wait, a body
+  bound of 2 MB, and a long hint waited out at that cap instead of abandoning the
+  call. Its failure vocabulary is unchanged, because the codes are the module's
+  decisions: the statuses stay `classify_http_error`'s (wired to the client as its
+  classifier), a body that would not parse, one refused for its size and a failed
+  transport come back through one explicit table, and the provider's own
+  `Retry-After` is still reported to the core on the error it produced. A Netlas
+  400 whose text says the key is unknown is still `invalid_credentials`. The
+  provider's refusal text is still bounded, now at the 4 KB the shared client
+  reads for classification instead of 8 KB.
 - The exposure-endpoint worker makes its Netlas and Shodan lookups through the
   connector SDK's shared client, and the bound on what a provider may return is
   now enforced while the answer is being read instead of after: `client.get(...)`

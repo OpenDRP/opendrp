@@ -1,13 +1,21 @@
 import importlib.util
+import json
+import sys
 from pathlib import Path
 from unittest.mock import AsyncMock
 
 import httpx
 import pytest
 
-_PATH = Path("/connectors/intelligence/providers.py")
-if not _PATH.exists():
-    _PATH = Path(__file__).resolve().parents[2] / "connectors/intelligence/providers.py"
+_ROOT = (
+    Path("/connectors")
+    if Path("/connectors").exists()
+    else Path(__file__).resolve().parents[2] / "connectors"
+)
+# The provider module now makes its calls through the shared SDK client, so the
+# SDK has to be importable the way the connector image makes it importable.
+sys.path.insert(0, str(_ROOT / "base"))
+_PATH = _ROOT / "intelligence/providers.py"
 _spec = importlib.util.spec_from_file_location("intelligence_providers", _PATH)
 providers = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(providers)
@@ -44,9 +52,11 @@ async def test_netlas_page_budget_truncates_without_extra_requests():
 @pytest.mark.asyncio
 async def test_rate_limit_retries_are_bounded_and_charged_to_quota(monkeypatch):
     sleeps = []
+    # The waiting happens inside the shared client now, and it waits through this
+    # same `asyncio.sleep`: patching the module keeps the test about the accounting
+    # it asserts rather than about the wall clock.
     monkeypatch.setattr(
-        providers.asyncio,
-        "sleep",
+        "asyncio.sleep",
         AsyncMock(side_effect=lambda delay: sleeps.append(delay)),
     )
     calls = 0
@@ -67,7 +77,7 @@ async def test_rate_limit_retries_are_bounded_and_charged_to_quota(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_transient_server_error_retries_then_succeeds(monkeypatch):
-    monkeypatch.setattr(providers.asyncio, "sleep", AsyncMock())
+    monkeypatch.setattr("asyncio.sleep", AsyncMock())
     calls = 0
 
     def handler(request):
@@ -83,6 +93,54 @@ async def test_transient_server_error_retries_then_succeeds(monkeypatch):
     assert await source.search("title", "Example") == []
     assert calls == source.requests == 2
     assert source.reserve.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_a_long_pause_hint_is_capped_and_never_abandons_the_call(monkeypatch):
+    """A hint is waited out for at most five seconds, then the call is tried again.
+
+    The shared client abandons a call whose hint exceeds its sixty-second ceiling;
+    this worker's answer to a long hint is the five-second cap, so the ceiling is
+    switched off explicitly rather than inherited.
+    """
+    waits = []
+
+    async def fake_sleep(delay):
+        waits.append(delay)
+
+    monkeypatch.setattr("asyncio.sleep", fake_sleep)
+    calls = []
+
+    def handler(request):
+        calls.append(request.url.path)
+        if len(calls) == 1:
+            return httpx.Response(429, headers={"Retry-After": "3600"}, text="slow down")
+        return httpx.Response(200, json={"items": []})
+
+    source = adapter("netlas", handler)
+    assert await source.search("title", "Example") == []
+    assert waits == [5.0]
+    assert len(calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_a_credential_refusal_is_named_at_the_end_of_a_full_body():
+    """The classifier sees a bounded snippet, and the phrase has to be inside it.
+
+    This worker used to read 8 KB of a refusal body and the shared client stops at
+    4 KB, so the known phrases are asserted where it matters: at the end of a body
+    that nearly fills the snippet.
+    """
+    body = json.dumps({"detail": "x" * 3900 + " API key not found"}).encode()
+    assert len(body) <= 4096
+
+    source = adapter(
+        "netlas",
+        lambda request: httpx.Response(400, content=body),
+    )
+    with pytest.raises(providers.ProviderError) as error:
+        await source.lookup_host("example.com")
+    assert str(error.value) == "invalid_credentials"
 
 
 def test_retry_after_parses_http_dates_and_caps_delays():

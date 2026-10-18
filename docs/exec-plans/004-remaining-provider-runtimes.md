@@ -161,5 +161,29 @@ Acceptance criteria, stated so the migration cannot drift:
       mid-read (ten chunks sent, five read). A long `Retry-After` is still capped
       at five seconds rather than abandoning the call, which is why
       `abort_when_retry_after_exceeds=None` is stated rather than inherited.
-- [ ] `intelligence` migrated; `retry_delay` gone, `classify_http_error` wired.
-- [ ] Contract suites, lint, types and docs gate green.
+- [x] `intelligence` migrated: `Adapter.request` is an adapter over
+      `ProviderClient`, with `self.requests`/`self.max_requests` and the core
+      reservation kept as one `charge` hook in their original order. The statuses
+      are `classify_http_error`'s, handed to the client as its classifier; the
+      outcomes a status cannot express are the `OUTCOME_CODES` table; and the
+      provider's own `Retry-After` is still attached to `ProviderError`, read from
+      the response that carried it, because this worker reports the pause to the
+      core rather than only waiting on it. `retry_delay` stayed as the wrapper
+      that caps what is reported to one day — the shared parser reads both forms,
+      and the cap is this worker's decision. The signature did not change: the
+      client is still built by this worker and passed in, so the transport seam is
+      intact.
+      Two harness changes, neither an assertion: the test module puts
+      `connectors/base` on `sys.path` so the SDK is importable the way the image
+      makes it importable, and the two `asyncio.sleep` patches now patch the
+      module instead of a local import, because the wait happens inside the shared
+      client. A new test pins the 4 KB snippet against a refusal body that nearly
+      fills it, and another pins the long-hint policy: a `Retry-After: 3600` is
+      waited out for five seconds and the call is retried, not abandoned.
+- [x] Contract suites, lint, types and docs gate green locally: 247 passed over
+      `test_connector_runtime.py`, `test_connector_provider_client.py`,
+      `test_connector_readiness_contract.py`, `test_connector_sdk_contract.py`,
+      `test_connectors_protocol_api.py`, `test_intelligence_worker.py`,
+      `test_exposure_endpoints_connector.py`, `test_no_legacy_surface.py`, plus
+      `test_intelligence_providers.py` (41) and `test_intelligence_credential.py`;
+      `ruff check app ../connectors` clean, `mypy app` clean, docs gate OK.

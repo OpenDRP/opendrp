@@ -1,20 +1,61 @@
 """Passive provider contracts (Netlas only); never submit targets or request live scans."""
 
-import asyncio
 import ipaddress
 import json
 import re
 from datetime import datetime, timezone
-from email.utils import parsedate_to_datetime
 from urllib.parse import quote, urlsplit
 
 import httpx
+
+from opendrp_connector.provider import (
+    ProviderClient,
+    ProviderLimits,
+    parse_retry_after,
+)
 
 BASES = {
     "netlas": "https://app.netlas.io/api",
 }
 KEYS = {
     "netlas": "NETLAS_API_TOKEN",
+}
+#: The ceiling this worker runs its client under. It is named once because the
+#: shared client takes one number and replacing it with a single flat value would
+#: drop the separate connect bound.
+CLIENT_TIMEOUT = httpx.Timeout(30, connect=5)
+
+#: This worker's numbers for one provider call, stated rather than inherited:
+#: three attempts, a local backoff of `0.25 * 2 ** attempt`, a `Retry-After`
+#: capped at five seconds, and a two megabyte body.
+#:
+#: `abort_when_retry_after_exceeds=None` is the one that would change behaviour if
+#: left to the shared default: this worker's answer to a long hint is the five
+#: second cap, so there is nothing to abandon, and the shared ceiling of sixty
+#: would turn a provider asking for a longer pause into a `http_<status>_retry_later`
+#: failure none of the codes below describe.
+LIMITS = ProviderLimits(
+    max_attempts=3,
+    max_retry_delay=5.0,
+    max_response_bytes=2_000_000,
+    backoff_factor=0.25,
+    abort_when_retry_after_exceeds=None,
+)
+
+#: The shared client's names, said in this worker's own vocabulary.
+#:
+#: The statuses already have a home - `classify_http_error`, which the client
+#: calls - so this table is only what a status cannot express: a body that could
+#: not be read as JSON, one that was refused for its size, and a transport that
+#: failed. `unconfigured`, `missing` and `credits_exhausted` are not in it because
+#: the client never names them: they come from this worker's own checks.
+OUTCOME_CODES = {
+    "network_error": "network_or_invalid_response",
+    "network_timeout": "network_or_invalid_response",
+    "retry_exhausted": "network_or_invalid_response",
+    "invalid_json": "network_or_invalid_response",
+    "response_too_large": "response_too_large",
+    "invalid_response": "invalid_response",
 }
 
 
@@ -397,18 +438,16 @@ def classify_http_error(provider, status_code, body):
 
 
 def retry_delay(value):
-    """Parse Retry-After delta-seconds or HTTP-date, capped to one day."""
-    try:
-        if value.strip().isdigit():
-            seconds = int(value.strip())
-        else:
-            deadline = parsedate_to_datetime(value)
-            if deadline.tzinfo is None:
-                deadline = deadline.replace(tzinfo=timezone.utc)
-            seconds = int((deadline - datetime.now(timezone.utc)).total_seconds())
-        return min(86400, max(0, seconds))
-    except (AttributeError, TypeError, ValueError, OverflowError):
+    """The provider's pause, in the seconds this worker is willing to report.
+
+    Both documented forms are read by the shared parser; the cap is this worker's
+    own decision, and it stays because a pause is passed on to the core rather than
+    only waited on: a provider may ask for a pause, not for a week.
+    """
+    seconds = parse_retry_after(value)
+    if seconds is None:
         return None
+    return min(86400, max(0, int(seconds)))
 
 
 def observed(value):
@@ -923,85 +962,79 @@ class Adapter:
     async def request(
         self, client, method, path, *, params=None, body=None, bucket="search"
     ):
+        """One provider call, made through the shared client.
+
+        The pace, the retries, the ``Retry-After`` ceiling and the body bound are
+        :class:`ProviderClient`'s mechanisms; what stays here is what only this
+        worker knows. ``charge`` is the client's reservation: this scan's own
+        request budget first, then the core's shared quota, because retries are
+        never free — and a refusal from either reaches the caller as the code it
+        always was, with nothing sent.
+
+        The signature is unchanged because every lookup in this file, and the
+        worker that drives them, already takes the client as an argument: the
+        shared client wraps the client it is given and never builds one, so the
+        transport seam the tests use is still this worker's.
+
+        A failure is reported in this worker's vocabulary. The statuses are
+        :func:`classify_http_error`'s, handed to the shared client as its
+        classifier; the rest — a body that would not parse, one that was refused
+        for its size, a transport that failed — come back through
+        :data:`OUTCOME_CODES`. The provider's own ``Retry-After`` is read from the
+        response that carried it, because the pause is reported to the core and
+        not only waited on here.
+        """
         key = self.env.get(KEYS[self.provider], "").strip()
         if not key or len(key) > 512 or any(ord(c) < 33 for c in key):
             raise ProviderError("credentials_unconfigured")
         headers = {"Accept": "application/json", "Authorization": "Bearer " + key}
         params = dict(params or {})
 
-        for attempt in range(3):
+        async def charge():
             if self.requests >= self.max_requests:
                 raise ProviderError("scan_request_budget_exhausted")
             # Charge each physical attempt against both the shared provider
             # quota and per-job request budget; retries are never free.
             await self.reserve(bucket)
             self.requests += 1
-            try:
-                retry_wait = None
-                async with client.stream(
-                    method,
-                    BASES[self.provider] + path,
-                    params=params,
-                    json=body,
-                    headers=headers,
-                ) as response:
-                    if response.status_code != 200:
-                        chunks = bytearray()
-                        async for chunk in response.aiter_bytes():
-                            chunks.extend(chunk[: 8192 - len(chunks)])
-                            if len(chunks) >= 8192:
-                                break
-                        code = classify_http_error(
-                            self.provider, response.status_code, bytes(chunks)
-                        )
-                        retry_after = retry_delay(
-                            response.headers.get("Retry-After", "")
-                        )
-                        error = ProviderError(code, retry_after)
-                        if (
-                            response.status_code != 429
-                            and not 500 <= response.status_code <= 599
-                        ):
-                            raise error
-                        if attempt == 2 or self.requests >= self.max_requests:
-                            raise error
-                        retry_wait = min(
-                            5,
-                            retry_after
-                            if retry_after is not None
-                            else 0.25 * (2**attempt),
-                        )
-                    else:
-                        data = bytearray()
-                        async for chunk in response.aiter_bytes():
-                            if len(data) + len(chunk) > 2_000_000:
-                                raise ProviderError("response_too_large")
-                            data.extend(chunk)
-                        result = json.loads(data)
-                if retry_wait is not None:
-                    await asyncio.sleep(retry_wait)
-                    continue
-                break
-            except ProviderError:
-                raise
-            except httpx.HTTPError as exc:
-                if attempt == 2 or self.requests >= self.max_requests:
-                    raise ProviderError("network_or_invalid_response") from exc
-                await asyncio.sleep(0.25 * (2**attempt))
-            except (ValueError, UnicodeError) as exc:
-                raise ProviderError("network_or_invalid_response") from exc
-        else:
-            raise ProviderError("network_or_invalid_response")
 
-        if not isinstance(result, dict):
+        provider = ProviderClient(
+            http=client,
+            limits=LIMITS,
+            reserve=charge,
+            classify_error=lambda status, snippet: classify_http_error(
+                self.provider, status, snippet.encode("utf-8", errors="ignore")
+            ),
+        )
+        url = BASES[self.provider] + path
+        if method == "POST":
+            result = await provider.post_json(
+                url, params=params, json=body, headers=headers, timeout=CLIENT_TIMEOUT
+            )
+        else:
+            result = await provider.get_json(
+                url, params=params, headers=headers, timeout=CLIENT_TIMEOUT
+            )
+        if result.outcome is not None:
+            raise ProviderError(
+                OUTCOME_CODES.get(result.outcome, result.outcome),
+                retry_delay(
+                    result.response.headers.get("Retry-After", "")
+                    if result.response is not None
+                    else ""
+                ),
+            )
+
+        payload = result.payload
+        if not isinstance(payload, dict):
             raise ProviderError("invalid_response")
-        if result.get("error"):
+        if payload.get("error"):
             raise ProviderError("provider_application_error")
-        return result
+        return payload
 
     def client(self):
         return httpx.AsyncClient(
-            timeout=httpx.Timeout(30, connect=5),
+            timeout=CLIENT_TIMEOUT,
             follow_redirects=False,
             transport=self.transport,
         )
