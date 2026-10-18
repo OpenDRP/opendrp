@@ -92,7 +92,11 @@ API = os.environ.get("E2E_BASE_URL", "http://127.0.0.1:8000").rstrip("/")
 FRONTEND = os.environ.get("E2E_FRONTEND_URL", "").rstrip("/")
 ADMIN_EMAIL = os.environ.get("E2E_ADMIN_EMAIL", "")
 ADMIN_PASSWORD = os.environ.get("E2E_ADMIN_PASSWORD", "")
-METRICS_TOKEN = os.environ.get("E2E_METRICS_TOKEN", "")
+#: `.strip()` is not cosmetic: the token is sent as an HTTP header, and a value
+#: with a trailing newline is refused by the client (and would be a header
+#: injection in one that accepted it). A token never carries meaningful
+#: whitespace.
+METRICS_TOKEN = os.environ.get("E2E_METRICS_TOKEN", "").strip()
 TOTP_SECRET = os.environ.get("E2E_ADMIN_TOTP_SECRET", "")
 MODULE = os.environ.get("E2E_MODULE", "phishing")
 TIMEOUT = float(os.environ.get("E2E_TIMEOUT_SECONDS", "30"))

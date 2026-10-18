@@ -535,7 +535,12 @@ jobs:
           # The token the stack was raised with, read from the file the run wrote.
           # Exported rather than written to `$GITHUB_ENV`, because this step is the
           # only consumer and `$GITHUB_ENV` applies to the *next* step.
-          E2E_METRICS_TOKEN="$(grep -E '^METRICS_TOKEN=' .env | cut -d= -f2-)"
+          # `setup.py` already writes an empty `METRICS_TOKEN=` line, and this job
+          # appends the real one. Reading the first match therefore handed the
+          # smoke a leading newline, which urllib refuses in a header; take the
+          # line this job wrote, and drop a CR if the file was checked out on
+          # Windows.
+          E2E_METRICS_TOKEN="$(grep -E '^METRICS_TOKEN=' .env | tail -n 1 | cut -d= -f2- | tr -d '\r')"
           export E2E_METRICS_TOKEN
           python3 scripts/e2e_smoke.py
       - name: Install the browser the second half of the journey drives
