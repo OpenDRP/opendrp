@@ -6,12 +6,13 @@ Every physical HTTP attempt is charged to the per-scan budget and to the core's
 shared provider quota before it is sent, so retries are never free.
 """
 
-import asyncio
 import ipaddress
 import re
 from urllib.parse import quote
 
 import httpx
+
+from opendrp_connector.provider import ProviderClient, ProviderLimits
 
 BASES = {
     "netlas": "https://app.netlas.io/api",
@@ -23,6 +24,47 @@ KEY_ENV = {
 }
 MAX_BODY_BYTES = 2_000_000
 MAX_ATTEMPTS = 3
+#: The ceiling this worker runs its client under, named once because the shared
+#: client is given it explicitly: its own limit is a single number, and passing
+#: that instead would drop the separate connect bound.
+CLIENT_TIMEOUT = httpx.Timeout(30, connect=5)
+
+#: This worker's numbers for one provider call, stated rather than inherited.
+#: Every one of them is what `_get` did before the shared client existed: three
+#: attempts, a local backoff of `0.25 * 2 ** attempt`, a `Retry-After` capped at
+#: five seconds, and a two megabyte body.
+#:
+#: Two of them would change behaviour if left to the shared defaults.
+#: `backoff_factor` is a quarter of the shared exponent, and
+#: `abort_when_retry_after_exceeds=None` is this worker's answer to a long hint:
+#: the hint is already capped at five seconds by `max_retry_delay`, so there is
+#: nothing to abandon - and the shared default of sixty would turn a provider
+#: asking for a longer pause into a `http_<status>_retry_later` failure this
+#: worker's vocabulary has no name for.
+LIMITS = ProviderLimits(
+    max_attempts=MAX_ATTEMPTS,
+    max_retry_delay=5.0,
+    max_response_bytes=MAX_BODY_BYTES,
+    backoff_factor=0.25,
+    abort_when_retry_after_exceeds=None,
+)
+
+#: The shared client's names, said in this worker's own vocabulary.
+#:
+#: `RECOVERABLE_ERRORS` in `main.py` is a set of *these* strings and it decides
+#: whether the next target is worth asking about, so a shared name cannot simply
+#: pass through: `network_timeout` would turn "try the next target" into "stop the
+#: scan" without a single test changing. The statuses already have a home - the
+#: classifier below, which the shared client calls - so this table is only what a
+#: status cannot express: a body it refused to read, and a transport that failed.
+OUTCOME_CODES = {
+    "network_error": "network_or_invalid_response",
+    "network_timeout": "network_or_invalid_response",
+    "retry_exhausted": "network_or_invalid_response",
+    "invalid_json": "network_or_invalid_response",
+    "response_too_large": "response_too_large",
+    "invalid_response": "invalid_response",
+}
 
 
 class ProviderError(RuntimeError):
@@ -72,14 +114,6 @@ def _token(value, default="unknown"):
     return text[:32] or default
 
 
-def _retry_wait(value):
-    try:
-        seconds = float(value)
-    except (TypeError, ValueError):
-        return None
-    return min(5.0, max(0.0, seconds))
-
-
 class EndpointClient:
     """One provider, one scan. ``reserve(bucket)`` is awaited before every attempt."""
 
@@ -93,8 +127,43 @@ class EndpointClient:
         self.requests = 0
         self._transport = transport
 
+    def _error_code(self, status, _body):
+        """What this worker calls each refusal, from the status alone.
+
+        The shared client hands every plain ``http_<status>`` to this table, which
+        is why the numbers live here rather than in the SDK: which of them mean
+        "the account cannot scan" and which mean "this target failed" is this
+        worker's decision, and ``RECOVERABLE_ERRORS`` is written in its words.
+
+        A Shodan 404 is the one answer that is not a failure at all - the address
+        simply is not in the index - so it is left under the client's own name,
+        which :meth:`_get` reads as "nothing to report".
+        """
+        if status == 404 and self.provider == "shodan":
+            return None
+        if status == 401:
+            return "invalid_credentials"
+        if status == 403:
+            return "access_denied"
+        if status == 429:
+            return "rate_limited"
+        if 500 <= status <= 599:
+            return "network_or_invalid_response"
+        return "provider_rejected_request"
+
     async def _get(self, path, params=None, *, bucket="lookup"):
-        """Return the decoded JSON object, or ``None`` for a Shodan 404 (not indexed)."""
+        """Return the decoded JSON object, or ``None`` for a Shodan 404 (not indexed).
+
+        One provider call, made through the shared client: the pace, the retries,
+        the ``Retry-After`` ceiling and the body bound are its mechanisms, and each
+        physical attempt is charged to this scan's budget and to the core's shared
+        quota by the hook below, so a retry is never free.
+
+        The body bound is also the fix this migration carries: the attempt used to
+        read the whole answer into memory and compare its length afterwards, which
+        is the buffering the bound exists to prevent. It is now refused while it is
+        being read.
+        """
         if not self.api_key or len(self.api_key) > 512 or any(ord(c) < 33 for c in self.api_key):
             raise ProviderError("credentials_unconfigured")
         headers = {"Accept": "application/json"}
@@ -105,50 +174,40 @@ class EndpointClient:
             # Shodan authenticates with a query parameter only; the URL is never logged.
             query["key"] = self.api_key
 
+        async def charge():
+            if self.requests >= self.max_requests:
+                raise ProviderError("scan_request_budget_exhausted")
+            await self.reserve(bucket)
+            self.requests += 1
+
         async with httpx.AsyncClient(
-            timeout=httpx.Timeout(30, connect=5),
+            timeout=CLIENT_TIMEOUT,
             follow_redirects=False,
             transport=self._transport,
         ) as client:
-            for attempt in range(MAX_ATTEMPTS):
-                if self.requests >= self.max_requests:
-                    raise ProviderError("scan_request_budget_exhausted")
-                await self.reserve(bucket)
-                self.requests += 1
-                last = attempt == MAX_ATTEMPTS - 1
-                try:
-                    response = await client.get(BASES[self.provider] + path, params=query, headers=headers)
-                except httpx.HTTPError as exc:
-                    if last or self.requests >= self.max_requests:
-                        raise ProviderError("network_or_invalid_response") from exc
-                    await asyncio.sleep(0.25 * (2**attempt))
-                    continue
+            provider = ProviderClient(
+                http=client,
+                limits=LIMITS,
+                reserve=charge,
+                classify_error=self._error_code,
+            )
+            result = await provider.get_json(
+                BASES[self.provider] + path,
+                params=query,
+                headers=headers,
+                timeout=CLIENT_TIMEOUT,
+            )
 
-                status = response.status_code
-                if status == 404 and self.provider == "shodan":
-                    return None
-                if status == 401:
-                    raise ProviderError("invalid_credentials")
-                if status == 403:
-                    raise ProviderError("access_denied")
-                if status == 429 or 500 <= status <= 599:
-                    if last or self.requests >= self.max_requests:
-                        raise ProviderError("rate_limited" if status == 429 else "network_or_invalid_response")
-                    wait = _retry_wait(response.headers.get("Retry-After"))
-                    await asyncio.sleep(wait if wait is not None else 0.25 * (2**attempt))
-                    continue
-                if status != 200:
-                    raise ProviderError("provider_rejected_request")
-                if len(response.content) > MAX_BODY_BYTES:
-                    raise ProviderError("response_too_large")
-                try:
-                    data = response.json()
-                except ValueError as exc:
-                    raise ProviderError("network_or_invalid_response") from exc
-                if not isinstance(data, dict):
-                    raise ProviderError("invalid_response")
-                return data
-        raise ProviderError("network_or_invalid_response")
+        if result.outcome is None:
+            payload = result.payload
+            if not isinstance(payload, dict):
+                # A JSON array or scalar is a valid body and the wrong answer.
+                raise ProviderError("invalid_response")
+            return payload
+        if result.outcome == "http_404" and self.provider == "shodan":
+            # The provider's documented way of saying "not indexed", not a failure.
+            return None
+        raise ProviderError(OUTCOME_CODES.get(result.outcome, result.outcome))
 
     async def host_ports(self, target):
         """Services exposed by one IP or domain, as normalized endpoint records."""

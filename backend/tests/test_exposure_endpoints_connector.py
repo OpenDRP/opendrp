@@ -151,7 +151,10 @@ async def test_request_budget_is_charged_per_attempt_and_stops_before_sending():
 
 @pytest.mark.asyncio
 async def test_rate_limit_retries_are_quota_accounted_then_reported_safely(monkeypatch):
-    monkeypatch.setattr(endpoint_providers.asyncio, "sleep", AsyncMock())
+    # The waiting is the shared client's now, and it waits through this same
+    # `asyncio.sleep`: patching the module rather than a local import keeps the
+    # test about the accounting it asserts instead of about the wall clock.
+    monkeypatch.setattr("asyncio.sleep", AsyncMock())
     reserve = AsyncMock()
     client = _client(
         "netlas",
@@ -162,6 +165,63 @@ async def test_rate_limit_retries_are_quota_accounted_then_reported_safely(monke
         await client.host_ports("a.example.com")
     assert str(error.value) == "rate_limited"
     assert client.requests == 3 and reserve.await_count == 3
+
+
+@pytest.mark.asyncio
+async def test_an_oversized_body_is_refused_while_it_is_being_read():
+    """The bound used to be consulted after the whole answer was already in memory.
+
+    Ten chunks of half a megabyte are five megabytes of provider-controlled bytes;
+    the read must stop at the bound rather than buffering all of it and comparing
+    lengths afterwards, which is what this worker did before.
+    """
+    pulled = []
+    chunk = b"x" * (endpoint_providers.MAX_BODY_BYTES // 4)
+
+    class Stream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            for _ in range(10):
+                pulled.append(len(chunk))
+                yield chunk
+
+    client = _client(
+        "netlas",
+        lambda request: httpx.Response(200, stream=Stream()),
+        max_requests=5,
+    )
+    with pytest.raises(endpoint_providers.ProviderError, match="response_too_large"):
+        await client.host_ports("a.example.com")
+    # Four chunks fit, the fifth crosses the bound: ten were sent, five were read.
+    assert len(pulled) == 5
+    assert client.requests == 1, "an oversized answer is not worth retrying"
+
+
+@pytest.mark.asyncio
+async def test_a_long_pause_hint_is_capped_and_never_abandons_the_call(monkeypatch):
+    """This worker waits a hint out for at most five seconds, then tries again.
+
+    The shared client would abandon the call when a hint exceeds its sixty-second
+    ceiling; this worker's answer to a long hint is the five-second cap instead,
+    so the ceiling is switched off explicitly rather than inherited.
+    """
+    waits = []
+
+    async def fake_sleep(delay):
+        waits.append(delay)
+
+    monkeypatch.setattr("asyncio.sleep", fake_sleep)
+    calls = []
+
+    def handler(request):
+        calls.append(request.url.path)
+        if len(calls) == 1:
+            return httpx.Response(429, text="slow down", headers={"Retry-After": "3600"})
+        return httpx.Response(200, json={"ports": []})
+
+    client = _client("netlas", handler)
+    assert await client.host_ports("a.example.com") == []
+    assert waits == [5.0]
+    assert len(calls) == 2
 
 
 @pytest.mark.asyncio
@@ -274,7 +334,8 @@ async def test_one_target_failing_does_not_throw_away_the_rest(netlas, monkeypat
     second target left every target after it unasked — and the summary could not
     say how many were never reached, which read like "nothing is exposed".
     """
-    monkeypatch.setattr(endpoint_providers.asyncio, "sleep", AsyncMock())
+    # The retry waits happen inside the shared client, on `asyncio.sleep`.
+    monkeypatch.setattr("asyncio.sleep", AsyncMock())
 
     def handler(request):
         path = request.url.path

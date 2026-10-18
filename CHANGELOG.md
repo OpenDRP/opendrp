@@ -109,6 +109,18 @@ a pending or expired link.
 
 ### Changed
 
+- The exposure-endpoint worker makes its Netlas and Shodan lookups through the
+  connector SDK's shared client, and the bound on what a provider may return is
+  now enforced while the answer is being read instead of after: `client.get(...)`
+  buffered the whole body and compared its length to 2 MB afterwards, so a
+  provider-controlled 500 MB response was already in memory when the check ran.
+  The numbers that were this worker's decision are stated rather than inherited —
+  three attempts, a five second cap on one wait, and a `Retry-After` that is
+  waited out at that cap instead of abandoning the call. The failure vocabulary
+  is deliberately unchanged, because it is control flow here:
+  `RECOVERABLE_ERRORS` decides whether the next target is attempted, so the
+  shared client's names are mapped back onto the codes this worker already had.
+  A Shodan 404 keeps meaning "not indexed".
 - DNS Security makes every provider call through the connector SDK's shared
   client, which closes the third and last copy of a pace, a quota reservation, a
   retry loop and a `Retry-After` parser. Four of its own numbers are stated

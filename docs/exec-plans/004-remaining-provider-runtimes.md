@@ -143,8 +143,23 @@ Acceptance criteria, stated so the migration cannot drift:
 
 ## Progress and Milestones
 
-- [ ] Inventory (this document).
-- [ ] `backoff_factor` in `ProviderLimits` + SDK test.
-- [ ] `exposure_endpoints` migrated; the buffered read closed with a test.
+- [x] Inventory (this document).
+- [x] `backoff_factor` in `ProviderLimits` + SDK test (`47282d7`).
+- [x] `exposure_endpoints` migrated; the buffered read closed with a test.
+      `EndpointClient._get` is an adapter over `ProviderClient.get_json`, and the
+      per-scan budget plus the core reservation became the client's `reserve`
+      hook, so a refused attempt is still sent nowhere. The statuses moved into
+      `EndpointClient._error_code`, which the shared client calls; the outcomes a
+      status cannot express are one explicit table,
+      because `RECOVERABLE_ERRORS` is written in this worker's words and a shared
+      name arriving unrenamed would stop a scan that should have continued. One
+      case is deliberately left unnamed: a Shodan 404 returns `None` from the
+      classifier so the `http_404` stays the client's, and `_get` reads it as
+      "not indexed" rather than as a failure.
+      The defect is closed by the read the shared client performs: the bound was
+      consulted after the whole answer had been buffered, and is now enforced
+      mid-read (ten chunks sent, five read). A long `Retry-After` is still capped
+      at five seconds rather than abandoning the call, which is why
+      `abort_when_retry_after_exceeds=None` is stated rather than inherited.
 - [ ] `intelligence` migrated; `retry_delay` gone, `classify_http_error` wired.
 - [ ] Contract suites, lint, types and docs gate green.
