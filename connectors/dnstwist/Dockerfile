@@ -1,4 +1,4 @@
-FROM python:3.12-slim
+FROM python:3.14-slim
 
 # dnstwist binary + its dictionary. The Debian package only Recommends
 # python3-dnspython (skipped by --no-install-recommends), yet the CLI's
