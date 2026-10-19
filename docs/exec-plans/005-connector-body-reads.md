@@ -101,7 +101,17 @@ gate that turns out to be wrong does not drag the SDK with it.
   `backend/tests/test_connector_provider_limits.py` pins all five workers' limits
   in one table, with the reason for each row beside it, so the policy change will
   arrive as a visible diff instead of a surprise — and so the divergence itself is
-  documented somewhere a reader can find it.
+  documented somewhere a reader can find it. **Decided: the divergence is the
+  rule, not a defect.** The connector documentation now states it to an operator
+  ("What one provider call costs" in `connectors/README.md`): the four questions,
+  each worker's answer, and why they differ — HIBP bills every request, Shodan
+  bills a credit per page, DNS Security's CT phase has a hundred-request scan
+  budget to protect, and the two per-target workers cap a single wait so one slow
+  answer cannot eat their twenty-request budget. The page's table is checked
+  against the code table by `test_connector_provider_limits.py`, so a number that
+  changes without the page changing fails CI. Behaviour is deliberately unchanged:
+  every alternative would have been a product decision about scan latency taken
+  without evidence.
 - **The release.** `dev` is 30+ commits ahead of `main`; shipping is a separate
   decision from this refactoring.
 - **`dns_security`'s four clients and three timeouts.** Same reason: changing them

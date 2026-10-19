@@ -109,6 +109,15 @@ a pending or expired link.
 
 ### Changed
 
+- The connector documentation states how long a provider call may take: the four
+  questions every worker answers (attempts, the longest single wait, the body
+  bound, and whether a longer `Retry-After` abandons the call), the answer each
+  worker gives, and why they differ — HIBP bills every request, Shodan bills a
+  credit per page, DNS Security's CT phase has a hundred-request scan budget to
+  protect, and the per-target workers cap one wait so a slow answer cannot eat a
+  twenty-request budget. The numbers are unchanged; the table on the page is
+  checked against the code table, so a value that changes without the page
+  changing fails CI.
 - The connector SDK owns the one bounded reader: `read_bounded` refuses the chunk
   that crosses a limit and `read_head` keeps at most the limit and stops reading.
   Every provider body goes through them, and so does the one body a worker reads

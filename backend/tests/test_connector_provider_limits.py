@@ -161,6 +161,81 @@ def test_every_worker_states_its_body_bound_explicitly(worker, connector_env):
     assert _limits(worker, connector_env).max_response_bytes == 2_000_000
 
 
+#: How the operator page spells the last column. A row either abandons a call whose
+#: hint is longer than its ceiling, does not retry at all, or waits the hint out.
+_DOC_BEHAVIOURS = {
+    "waited out at the ceiling, then retried": "wait",
+    "abandoned as `http_<status>_retry_later`": "abandon",
+    "not retried — the call has one attempt": "single",
+}
+
+
+def _documented_table() -> dict[str, dict]:
+    """The table `connectors/README.md` shows an operator, parsed.
+
+    The page states the policy because an operator reading about a source needs to
+    know how long a scan may sit on one answer. `TABLE` is where the numbers live;
+    this parsing is what keeps the two from drifting apart, which is the failure a
+    documented number always has.
+    """
+    text = (_ROOT / "connectors" / "README.md").read_text(encoding="utf-8")
+    section = text.split("## What one provider call costs", 1)
+    assert len(section) == 2, "the connector page no longer states the policy"
+
+    rows: dict[str, dict] = {}
+    lines = section[1].splitlines()
+    header = next(
+        (index for index, line in enumerate(lines) if line.startswith("| Worker |")),
+        None,
+    )
+    assert header is not None, "the policy table lost its header row"
+    for line in lines[header + 2 :]:  # skip the header and its separator
+        if not line.startswith("|"):
+            break
+        cells = [cell.strip() for cell in line.strip("|").split("|")]
+        worker = cells[0].strip("`")
+        attempts = int(cells[1])
+        wait, unit = cells[2].split()
+        assert unit == "s", f"{worker}: the wait column must be seconds"
+        bound, bound_unit = cells[3].split()
+        assert bound_unit == "MB", f"{worker}: the bound column must be megabytes"
+        rows[worker] = dict(
+            attempts=attempts,
+            ceiling=float(wait),
+            body=int(float(bound) * 1_000_000),
+            behaviour=_DOC_BEHAVIOURS[cells[4]],
+        )
+    return rows
+
+
+def test_the_documented_table_is_the_code_table():
+    documented = _documented_table()
+
+    assert sorted(documented) == sorted(TABLE), (
+        "the operator page lists a different set of workers than the code table"
+    )
+    for worker, row in documented.items():
+        expected = TABLE[worker]
+        assert row["attempts"] == expected["attempts"], worker
+        assert row["ceiling"] == expected["ceiling"], worker
+        assert row["body"] == expected["body"], worker
+        if row["behaviour"] == "abandon":
+            assert expected["hint_above"] == expected["ceiling"], (
+                f"{worker}: the page says a long hint abandons the call at the "
+                f"ceiling, but the code does not"
+            )
+        elif row["behaviour"] == "wait":
+            assert expected["hint_above"] is None, (
+                f"{worker}: the page says a long hint is waited out, but the code "
+                f"abandons the call"
+            )
+        else:  # "single"
+            assert expected["attempts"] == 1 and expected["hint_above"] is None, (
+                f"{worker}: the page says the call has one attempt, but the code "
+                f"retries it"
+            )
+
+
 def test_the_loader_really_loads_five_distinct_workers():
     """A table of five identical objects would pass every row above."""
     modules = {id(_shodan), id(_hibp), id(_dns), id(_intelligence), id(_exposure)}

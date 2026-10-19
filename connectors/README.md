@@ -897,6 +897,60 @@ batches are idempotent in the core, so a response lost after a successful commit
 cannot create duplicate findings; authentication and validation errors are never
 retried.
 
+## What one provider call costs
+
+Every worker makes its provider requests through one client in the connector SDK
+(`connectors/base/opendrp_connector/provider.py`), so the *mechanisms* are the same
+everywhere: a pace before each attempt, a reservation against the account's quota
+before each spend, a streamed read that stops at a body bound, and a
+`Retry-After` read in either documented form (seconds or an HTTP date). The
+*numbers* are not shared, and that is deliberate — a request costs a different
+amount at each vendor, so how many attempts are worth spending and how long a scan
+may wait for one answer differ too. Each worker states its own; none of them
+inherits a shared default by accident.
+
+Four questions, and the answer each worker gives:
+
+| Worker | Attempts | Longest single wait | Body bound | A `Retry-After` longer than that |
+|---|---|---|---|---|
+| `shodan` | 3 | 30 s | 2 MB | waited out at the ceiling, then retried |
+| `hibp` | 1 | 30 s | 2 MB | not retried — the call has one attempt |
+| `dns_security` | 4 | 60 s | 2 MB | abandoned as `http_<status>_retry_later` |
+| `intelligence` | 3 | 5 s | 2 MB | waited out at the ceiling, then retried |
+| `exposure_endpoints` | 3 | 5 s | 2 MB | waited out at the ceiling, then retried |
+
+Why the answers differ, in the order the table lists them:
+
+- **Shodan bills a query credit per search page and about one request per second**
+  on a free plan, so three attempts with a 30 second ceiling is a worker willing
+  to spend the *next* credit on a transient failure but not to string one job out.
+  A refusal that names credits is classified (`quota_exhausted`) rather than
+  retried, which is what keeps a retry from being a second charge for a definite
+  answer.
+- **HIBP bills a request whether or not it succeeds.** A retry there is a second
+  charge for one answer, so the worker makes exactly one attempt and reports what
+  came back; the ceiling is a shared default it never reaches.
+- **DNS Security's providers are cheap per call but its scan is not**: the CT-log
+  phase may make at most a hundred requests per scan (a keyless plan's hourly
+  allowance), so a single slow answer is worth waiting out for up to a minute — and
+  beyond a minute the call is abandoned with a name, because a provider asking for
+  an hour must not silently become an hour-long job.
+- **Intelligence and the endpoint worker ask many small questions per target**, and
+  their per-scan budgets are small (twenty requests by default). A five second cap
+  keeps one slow answer from eating the target list, which is a worse outcome than
+  a refused request.
+
+Two rules apply to every row. A body is never decoded past its bound — the read
+stops at the limit and the failure is reported as `response_too_large`, not as an
+empty result. And a body is never read through `.content`, `.text`, `.json()` or
+`.aread()` outside the SDK: `scripts/check_connector_body_bounds.py` fails the
+build on that, because six separate defects in this repository were exactly that
+shape.
+
+The numbers above are pinned by `backend/tests/test_connector_provider_limits.py`,
+which also checks this table against the code — changing a worker's attempts, wait
+or bound without changing this page fails CI.
+
 ## Writing a new connector
 
 1. Create `connectors/<name>/main.py`:
