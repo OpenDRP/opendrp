@@ -324,9 +324,7 @@ a pending or expired link.
   exceeds its 40-second budget, and the export carries the same involvement
   counters and last-seen value as a list row.
 
-## [0.2.0] - 2026-10-15
-
-Local source version; no GitHub release or registry publication has been performed.
+## [0.2.0] - 2026-10-19
 
 ### Added
 
