@@ -30,6 +30,7 @@ import pytest
 
 from app.models.breach import Breach
 from app.services.alert_service import AlertService
+from tests.text_matching import mentions
 
 
 class _Rendered(HTMLParser):
@@ -391,7 +392,9 @@ class TestBreachMessageContent:
 
         text = captured.telegram_text
         assert "Exposure: Stealer log" in text
-        assert "netflix.com" in text
+        # The vendor's own domain, named as a whole host rather than as a fragment
+        # of one — see tests/text_matching.py for what a substring check misses.
+        assert mentions(text, "netflix.com")
 
     @pytest.mark.asyncio
     async def test_a_breach_of_an_account_keeps_the_shape_it_always_had(

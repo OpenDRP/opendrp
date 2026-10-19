@@ -136,7 +136,8 @@ async def test_a_refusal_pauses_its_registry_and_not_a_registry_still_answering(
     # the one the batch happened to pick.
     asked_com = [name for name in asked if name.endswith(".com")]
     assert asked_com in (["evil-one.example.com"], ["evil-two.example.com"])
-    assert "evil-three.example.net" in asked
+    asked_net = [name for name in asked if name.endswith(".net")]
+    assert asked_net == ["evil-three.example.net"]
     assert len(asked) == 2
     assert summary["rate_limited"] == 1
 

@@ -18,6 +18,7 @@ Pins the CURRENT behavior of previously untested endpoints and branches:
 
 from __future__ import annotations
 
+import json
 import uuid
 from datetime import date
 from typing import AsyncGenerator
@@ -83,6 +84,17 @@ async def _audit_actions(db, action: str) -> list[dict]:
         )
     ).mappings().all()
     return [dict(r) for r in rows]
+
+
+def _details(raw) -> dict:
+    """An audit row's details as a mapping, whichever driver returned the row.
+
+    The column is JSON, and the two drivers disagree about how to hand it back:
+    SQLite returns the text, PostgreSQL a mapping. Asserting on the parsed value
+    is also what makes an assertion about a domain a statement about that field
+    rather than about a substring of the serialized row.
+    """
+    return json.loads(raw) if isinstance(raw, str) else raw
 
 
 class TestAssetMatching:
@@ -239,8 +251,9 @@ class TestPatchBreach:
         await db_session.commit()
         rows = await _audit_actions(db_session, "breach.update")
         assert len(rows) == 1
-        assert str(breach.id) in rows[0]["details"]
-        assert "status" in rows[0]["details"]
+        details = _details(rows[0]["details"])
+        assert details["breach_id"] == str(breach.id)
+        assert details["changed_fields"] == ["status"]
 
     @pytest.mark.asyncio
     async def test_patch_missing_breach_404(self, client, auth_headers_analyst):
@@ -288,7 +301,7 @@ class TestScanEndpoints:
         await db_session.commit()
         rows = await _audit_actions(db_session, "breach.scan.start")
         assert len(rows) == 1
-        assert '"no_connector"' in rows[0]["details"]
+        assert _details(rows[0]["details"])["status"] == "no_connector"
 
     @pytest.mark.asyncio
     async def test_scan_email_202_audits_and_enqueues(
@@ -359,7 +372,7 @@ class TestScanEndpoints:
         await db_session.commit()
         rows = await _audit_actions(db_session, "breach.scan.domain")
         assert len(rows) == 1
-        assert "watched.example.com" in rows[0]["details"]
+        assert _details(rows[0]["details"])["domain"] == "watched.example.com"
 
     @pytest.mark.asyncio
     async def test_scan_domain_too_short_422(self, client, auth_headers_analyst):

@@ -294,6 +294,12 @@ a pending or expired link.
 
 ### Fixed
 
+- The audit trail's last-resort stdout line publishes exactly the five documented
+  fields. `_publish_audit_event` falls back to `print()` when the structured
+  renderer refuses a record, and it used to serialize the event as it stood: the
+  five fields a SIEM index maps, plus anything a caller had put beside them. It
+  now takes the five by name, the same way the renderer it falls back from does,
+  so a safety net cannot become a second stream with a shape nobody documented.
 - The `has_findings` filter answers in the database instead of loading the
   inventory: on the plan's dataset (50 002 assets, 1 000 001 findings) it used to
   fail outright with `asyncpg`'s 32767-parameter limit, because one bind

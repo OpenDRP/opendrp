@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session
 from app.core.database import AsyncSessionLocal
 from app.core.logging_config import (
     AUDIT_EVENT_NAME,
+    AUDIT_FIELDS,
     configure_logging,
     get_audit_logger,
 )
@@ -59,7 +60,14 @@ def _publish_audit_event(event: dict[str, Any]) -> None:
         # Last-resort path only. A record dropped for being below the level
         # raises ``structlog.DropEvent``, which derives from BaseException and is
         # why the audit logger's level is pinned in logging_config.
-        print(json.dumps(event, default=str, ensure_ascii=False), flush=True)
+        #
+        # The line is built from the five documented fields rather than from the
+        # event as it stands: this path exists so a rendering failure cannot lose
+        # the trail, and the one thing it must not do is put a sixth key on the
+        # stream because an event happened to grow one — the renderer the log call
+        # above goes through drops unknown keys for the same reason.
+        published = {field: event.get(field) for field in AUDIT_FIELDS}
+        print(json.dumps(published, default=str, ensure_ascii=False), flush=True)
 
 
 def _publish_deferred_audit_events(session: Session) -> None:

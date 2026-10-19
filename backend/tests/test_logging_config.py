@@ -231,6 +231,39 @@ class TestOutput:
         assert len(payload["details"]["audit_prev_hash"]) == 64
         assert isinstance(payload["details"]["audit_key_id"], int)
 
+    def test_the_fallback_line_carries_the_five_fields_and_no_others(
+        self, capsys, monkeypatch
+    ):
+        """The last-resort print is part of the contract as well.
+
+        It exists so a rendering failure cannot lose an audit event, and it exists
+        in the module that publishes the shape: it takes the five fields by name,
+        so an event that grew a sixth key — a future field nobody documented —
+        cannot reach a SIEM index through the path that is supposed to be a
+        safety net rather than a second, quieter stream.
+        """
+        import app.core.audit as audit_module
+
+        monkeypatch.setattr(audit_module, "log", _FailingLogger())
+        audit_module._publish_audit_event(
+            {
+                "timestamp": "2026-10-19T00:00:00+00:00",
+                "user_id": None,
+                "action": "asset.delete",
+                "ip_address": "198.51.100.4",
+                "details": {"asset_id": "asset-1"},
+                "undocumented": "must not be exported",
+            }
+        )
+
+        line = capsys.readouterr().out.strip()
+        payload = json.loads(line)
+        assert tuple(sorted(payload)) == tuple(sorted(AUDIT_FIELDS))
+        assert payload["action"] == "asset.delete"
+        assert payload["ip_address"] == "198.51.100.4"
+        assert payload["details"] == {"asset_id": "asset-1"}
+        assert "undocumented" not in line
+
     def test_non_audit_events_keep_their_extra_fields(self, capsys):
         """Only audit events are trimmed; diagnostics keep their context."""
         configure_logging(force=True)
@@ -239,6 +272,13 @@ class TestOutput:
         assert len(matches) == 1
         assert matches[0]["component"] == "retention"
         assert matches[0]["logger"] == PLATFORM_LOGGER_NAME
+
+
+class _FailingLogger:
+    """A logger that refuses the record, which is the only way in to the fallback."""
+
+    def info(self, *args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("renderer refused the record")
 
 
 def _connector_sdk() -> Any | None:

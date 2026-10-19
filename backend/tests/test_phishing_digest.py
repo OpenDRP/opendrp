@@ -42,6 +42,7 @@ from app.services.ingestion_events import (
     queue_phishing_digest,
     record_event,
 )
+from tests.text_matching import mentions
 
 
 class _Mailbox:
@@ -244,9 +245,11 @@ async def test_ten_candidates_become_one_message_and_one_digest(db_session, mail
     assert [result["count"] for result in delivered] == [3]
     assert len(mailbox.messages) == 1
     assert mailbox.subjects == ["[OpenDRP Alert] 3 new findings"]
-    assert "high-1.example.com" in mailbox.plain
-    assert "mid-1.example.com" not in mailbox.plain
-    assert "low-1.example.com" not in mailbox.plain
+    # The middle band's summary names the announced candidate as a whole host:
+    # a substring check would also be satisfied by "high-1.example.com.evil.net".
+    assert mentions(mailbox.plain, "high-1.example.com")
+    assert not mentions(mailbox.plain, "mid-1.example.com")
+    assert not mentions(mailbox.plain, "low-1.example.com")
 
     # The digest band waited for the pass, and the pass is one message.
     digest = await queue_phishing_digest(db_session)
