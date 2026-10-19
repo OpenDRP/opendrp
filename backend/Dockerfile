@@ -46,9 +46,12 @@ RUN python -m venv /opt/venv && \
     . /opt/venv/bin/activate && \
     pip install --upgrade pip && \
     pip install --no-cache-dir setuptools==84.0.0 && \
-    pip install --no-cache-dir -r requirements.txt && \
+    pip install --no-cache-dir --require-hashes -r requirements.txt && \
     if [ "$INSTALL_DEV_REQUIREMENTS" = "true" ]; then \
         echo "[builder] installing dev requirements (test/lint tooling)"; \
+        # No `--require-hashes` here: requirements-dev.txt never ships, and its
+        # toolchain (pytest, ruff, mypy) has no bearing on what a release
+        # contains. The runtime file above is the one pinned by hash.
         pip install --no-cache-dir -r requirements-dev.txt; \
     else \
         echo "[builder] dev requirements skipped (production image)"; \
@@ -74,9 +77,12 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# System runtime deps: dnstwist, whois CLI, curl (for healthcheck), ca-certs
+# System runtime deps: dnstwist, whois CLI, curl (for healthcheck), ca-certs.
+# dnstwist is pinned to the same Debian version as the connector image: the core
+# image carries the CLI for operator debugging, and an unpinned copy here would
+# let the two images disagree about what `dnstwist` means.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    dnstwist \
+    dnstwist=0~20250130-1 \
     python3-dnspython \
     whois \
     curl \
@@ -108,7 +114,7 @@ RUN groupadd --gid "${USER_GID}" opendrp \
        --create-home --shell /usr/sbin/nologin opendrp \
   && mkdir -p /workspace/reports_store \
   && chown -R "${USER_UID}:${USER_GID}" /app /workspace \
-  && chmod 0700 /home/opendrp
+  && chmod 0700 /workspace/reports_store /home/opendrp
 
 # Nothing in this image needs root: uvicorn and the Celery worker only read the
 # source, write generated PDFs into the reports store, and connect out. Running

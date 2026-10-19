@@ -66,3 +66,7 @@ logs/
 backups/
 *.dump
 reports-*.tgz
+
+# Windows copy/corrupt artefacts (same as .gitignore)
+*;C
+**/*;C

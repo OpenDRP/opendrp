@@ -1,5 +1,7 @@
+import importlib.util
 import uuid
-from datetime import date
+from datetime import date, datetime, timezone
+from pathlib import Path
 from typing import AsyncGenerator
 
 import pytest
@@ -205,3 +207,82 @@ class TestListBreaches:
     ):
         r = await client.post("/api/v1/breaches/scan", headers=auth_headers_viewer)
         assert r.status_code == 403
+
+
+class TestHibpProviderAccount:
+    """The breach worker is provider-backed, so its account is part of the refusal (WI-02)."""
+
+    @staticmethod
+    def _baseline_connector(name: str) -> dict:
+        """The baseline revision's own declaration for a seeded connector."""
+        path = (
+            Path(__file__).resolve().parents[1]
+            / "alembic"
+            / "versions"
+            / "0001_initial_schema.py"
+        )
+        spec = importlib.util.spec_from_file_location(
+            "opendrp_initial_schema_under_test", path
+        )
+        assert spec and spec.loader
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return {row["name"]: row for row in module._CONNECTOR_SEED}[name]
+
+    @staticmethod
+    def _hibp_connector():
+        from app.models import Connector
+
+        return Connector(
+            name="breaches-hibp",
+            connector_type="breaches",
+            default_job_type="breaches.hibp",
+            provider="hibp",
+            quota_group="default",
+            status="enabled",
+            readiness={
+                "credentials_configured": True,
+                "credential_state": "valid",
+                "capabilities": ["email_account", "domain", "catalogue"],
+                "operations": ["lookup"],
+            },
+            last_seen_at=datetime.now(timezone.utc),
+        )
+
+    def test_the_baseline_seed_declares_hibp_as_the_breach_source(self):
+        """A fresh installation seeds the binding, not just the connector row."""
+        row = self._baseline_connector("breaches-hibp")
+        assert row["source"] == "hibp"
+
+    @pytest.mark.asyncio
+    async def test_a_scan_without_an_account_names_the_missing_account(
+        self, client, db_session, auth_headers_analyst
+    ):
+        """A refused scan says why, instead of queuing work that cannot spend."""
+        db_session.add(self._hibp_connector())
+        await db_session.commit()
+
+        response = await client.post(
+            "/api/v1/breaches/scan", headers=auth_headers_analyst
+        )
+
+        assert response.status_code == 400, response.text
+        assert "provider_account_missing" in response.json()["detail"]
+
+    @pytest.mark.asyncio
+    async def test_the_source_list_names_a_missing_account(self, db_session):
+        """The per-source result distinguishes this from an unapproved account."""
+        from app.services.connector_service import ConnectorService
+
+        db_session.add(self._hibp_connector())
+        await db_session.commit()
+
+        result = await ConnectorService(db_session).enqueue_ready_sources(
+            connector_type="breaches", created_by=None, title="Breach scan"
+        )
+
+        assert result["status"] == "blocked"
+        assert result["job_ids"] == []
+        assert result["sources"] == [
+            {"connector": "breaches-hibp", "status": "provider_account_missing"}
+        ]

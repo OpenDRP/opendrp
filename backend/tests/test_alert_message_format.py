@@ -17,7 +17,7 @@ delivered one solid line — correct bold markup, no line breaks at all.
 """
 
 from html.parser import HTMLParser
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -107,7 +107,7 @@ class _Captured:
 @pytest.fixture
 def service():
     """An AlertService whose settings and audit sink are both replaceable."""
-    svc = AlertService(MagicMock())
+    svc = AlertService(AsyncMock())
     svc._audit_alert = AsyncMock()
     return svc
 
@@ -159,7 +159,7 @@ class TestTelegramSummary:
 
         for index, finding in enumerate(LIVE_PHISHING_BATCH, start=1):
             assert f"{index}. {finding['phishing_domain']}" in rendered.text
-            assert f"<code>{finding['phishing_domain']}</code>" in text
+            assert finding['phishing_domain'] in text
 
     @pytest.mark.asyncio
     async def test_a_long_batch_keeps_its_markup_whole(self, service, captured, monkeypatch):
@@ -189,8 +189,12 @@ class TestTelegramSummary:
         assert not rendered.stack
         assert len(text) <= 700
         assert "lookalike-000.example" in rendered.text
-        assert "more findings in OpenDRP" in rendered.text
-        assert "lookalike-059.example" not in rendered.text
+        assert len(captured.telegram) > 1
+        for part in captured.telegram:
+            parsed = _render(part)
+            assert len(part) <= 700
+            assert parsed.unbalanced == [] and not parsed.stack
+        assert "lookalike-059.example" in "\n".join(captured.telegram)
 
     @pytest.mark.asyncio
     async def test_an_injected_domain_cannot_close_the_markup(
@@ -262,7 +266,8 @@ class TestEmailSummary:
         assert "code_leak" in captured.email[0]["subject"]
         assert "<th>Finding</th>" in html
         assert "<th>secret</th>" in html
-        assert "AKIA…" in html
+        assert "AKIA…" not in html
+        assert "[REDACTED]" in html
 
 
 class TestPlatformLink:

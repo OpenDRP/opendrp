@@ -7,15 +7,19 @@ from email.message import EmailMessage
 from typing import Any, Optional
 
 from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.orm.exc import StaleDataError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings as core_settings
 from app.core.crypto import mask_value
-from app.core.exceptions import BadRequestException
+from app.core.exceptions import BadRequestException, ConflictException
 from app.core.outbound import OutboundBlocked, ensure_allowed
 from app.core.safe_errors import sanitize_external_error
 from app.models.settings import SystemSettings
 from app.schemas.settings import SystemSettingsUpdate
+from app.services.alert_policy import ROW_FIELDS, policy_from_row
 
 
 # Only alert-channel secrets are owned by the core. Provider credentials belong
@@ -65,6 +69,31 @@ def looks_like_a_mask(value: str) -> bool:
     return bool(_MASK_RUN_RE.search(value))
 
 
+def delivery_is_configured(row: SystemSettings) -> bool:
+    """Whether an installation can deliver a notification at all right now.
+
+    Asked of the row's own fields rather than of the destinations the delivery
+    service resolves, because the settings service needs the answer *before* and
+    *after* a save to recognise the save that first makes delivery possible — the
+    recipients a destination resolves to would mean reading the database in the
+    middle of the update that is deciding whether to report a backlog. The two
+    questions agree except where email is enabled with only recipients that
+    resolve to nothing (an inactive user, say): there this answers yes while the
+    delivery service still queues nothing, and the deferral window covers it — the
+    held rows keep being retried until the configuration actually works.
+    """
+    email_ready = bool(
+        row.email_alerts_enabled
+        and row.smtp_host
+        and row.smtp_port
+        and (row.alert_recipient_email_decrypted or row.alert_email_user_ids)
+    )
+    telegram_ready = bool(
+        row.telegram_alerts_enabled and row.telegram_bot_token and row.telegram_chat_ids
+    )
+    return email_ready or telegram_ready
+
+
 class SettingsService:
     async def _audit_blocked(self, blocked, *, operation: str) -> None:
         """Record a destination the policy refused.
@@ -90,19 +119,44 @@ class SettingsService:
         self.db = db
 
     async def get_singleton(self) -> SystemSettings:
-        result = await self.db.execute(select(SystemSettings).limit(1))
-        settings = result.scalar_one_or_none()
-        if settings is None:
-            settings = SystemSettings()
-            self.db.add(settings)
+        row = (await self.db.execute(select(SystemSettings).where(SystemSettings.singleton_key == 1))).scalar_one_or_none()
+        if row is None:
+            if self.db.get_bind().dialect.name == "sqlite":
+                statement = sqlite_insert(SystemSettings).values(singleton_key=1).on_conflict_do_nothing(index_elements=[SystemSettings.singleton_key])
+                await self.db.execute(statement)
+            else:
+                pg_statement = pg_insert(SystemSettings).values(singleton_key=1).on_conflict_do_nothing(index_elements=[SystemSettings.singleton_key])
+                await self.db.execute(pg_statement)
             await self.db.commit()
-            await self.db.refresh(settings)
-        return settings
+            row = (await self.db.execute(select(SystemSettings).where(SystemSettings.singleton_key == 1))).scalar_one()
+        return row
 
     async def update_settings(
-        self, settings: SystemSettings, data: SystemSettingsUpdate
+        self, settings: SystemSettings, data: SystemSettingsUpdate,
+        *, commit: bool = True,
     ) -> SystemSettings:
         update_data = data.model_dump(exclude_unset=True)
+        expected = update_data.pop("expected_version", None)
+        if expected is not None and expected != settings.version:
+            raise ConflictException("Settings changed concurrently; reload before saving")
+        user_ids = update_data.get("alert_email_user_ids")
+        if user_ids:
+            from uuid import UUID
+            from app.models.user import User
+            active = set((await self.db.execute(select(User.id).where(User.id.in_([UUID(value) for value in user_ids]), User.is_active.is_(True)))).scalars())
+            if active != {UUID(value) for value in user_ids}:
+                raise BadRequestException("Recipients must reference existing active users")
+        if "schedules" in update_data and update_data["schedules"] is not None:
+            from app.models import Module
+            module_ids = set((await self.db.execute(select(Module.id))).scalars().all())
+            unknown = sorted(set(update_data["schedules"]) - module_ids)
+            if unknown:
+                raise BadRequestException(f"Schedules reference unknown modules: {unknown}")
+        # Read before the update is applied: a save that makes this installation
+        # able to deliver for the first time is the moment the findings held while
+        # it could not become reportable, and they leave as one digest rather than
+        # as the stream the deferral window exists to prevent (WI-04).
+        delivering = delivery_is_configured(settings)
         for field, value in update_data.items():
             if field in _ENCRYPTED_FIELDS:
                 current_plain = getattr(settings, _ENCRYPTED_FIELDS[field], None)
@@ -119,8 +173,46 @@ class SettingsService:
                 continue
             else:
                 setattr(settings, field, value)
-        await self.db.commit()
-        await self.db.refresh(settings)
+        if settings.smtp_security_mode == "plain" and settings.smtp_user and settings.smtp_password:
+            raise BadRequestException("SMTP credentials require STARTTLS or implicit TLS")
+        # The columns, not the policy field names: ``update_data`` is keyed by the
+        # names the API uses (``alert_confidence_direct`` and friends), and a guard
+        # written against the resolver's own field names would never match — the
+        # contradiction would be saved and then ignored by every reader.
+        if update_data.keys() & {column for column, _ in ROW_FIELDS}:
+            # The budget as it will be saved, checked as a whole. The one
+            # relationship that matters is *between* two fields (the digest
+            # threshold stays below the direct one), and a save may state only one
+            # of them, so a per-field check cannot see it: the pair is evaluated
+            # against the row the update is about to produce. A row that still
+            # contradicts itself is refused rather than half-applied — the resolver
+            # would ignore it and the operator would be left with a save that
+            # silently did nothing.
+            policy = policy_from_row(settings)
+            if policy.invalid:
+                stated = ", ".join(
+                    f"{column}={getattr(settings, column)}"
+                    for column, field in ROW_FIELDS
+                    if field in policy.invalid
+                )
+                raise BadRequestException(
+                    "The alert budget does not hold together: the digest threshold must "
+                    f"stay below the direct one, and every value within its own range ({stated})"
+                )
+        try:
+            await self.db.flush()
+            if not delivering and delivery_is_configured(settings):
+                # Same transaction as the save: a settings update that fails must
+                # not leave a digest claiming a channel that does not exist.
+                from app.services.ingestion_events import queue_backlog_digest
+
+                await queue_backlog_digest(self.db)
+            if commit:
+                await self.db.commit()
+                await self.db.refresh(settings)
+        except StaleDataError as exc:
+            await self.db.rollback()
+            raise ConflictException("Settings changed concurrently; reload before saving") from exc
         return settings
 
     async def send_test_email(
@@ -149,6 +241,10 @@ class SettingsService:
         smtp_user = settings.smtp_user
         smtp_password = settings.smtp_password_decrypted or None
         host, port = settings.smtp_host, settings.smtp_port
+        mode = settings.smtp_security_mode or "starttls"
+        if mode == "plain" and smtp_user and smtp_password:
+            raise BadRequestException("SMTP credentials require TLS")
+        await self.db.commit()  # Snapshot above; no DB transaction during I/O.
 
         # A test send is a real connection to an operator-supplied host, so it
         # goes through the destination policy like every other one. The refusal is
@@ -156,7 +252,7 @@ class SettingsService:
         # and the message names the reason so the operator can act on it (fix the
         # host, or add it to OUTBOUND_ALLOWED_HOSTS).
         try:
-            ensure_allowed(host, port=int(port or 0))
+            addresses = await asyncio.to_thread(ensure_allowed, host, port=int(port or 0))
         except OutboundBlocked as blocked:
             await self._audit_blocked(blocked, operation="settings_test_email")
             raise BadRequestException(
@@ -172,12 +268,13 @@ class SettingsService:
             message["Subject"] = subject
             message.set_content("Test successful.")
             message.add_alternative(body_html, subtype="html")
-            mode = (settings.smtp_security_mode or "starttls").lower()
-            if mode not in {"starttls", "ssl", "plain"}:
+            from app.core.outbound import pinned_smtp_class
+            transport_mode = mode.lower()
+            if transport_mode not in {"starttls", "ssl", "plain"}:
                 raise ValueError("unsupported SMTP security mode")
-            if mode == "ssl":
+            if transport_mode == "ssl":
                 context = ssl.create_default_context()
-                with smtplib.SMTP_SSL(
+                with pinned_smtp_class(smtplib.SMTP_SSL, addresses, implicit_tls=True)(
                     host,
                     port,
                     context=context,
@@ -188,12 +285,12 @@ class SettingsService:
                     server.send_message(message)
                 return
 
-            with smtplib.SMTP(
+            with pinned_smtp_class(smtplib.SMTP, addresses)(
                 host,
                 port,
                 timeout=core_settings.ALERT_DELIVERY_TIMEOUT_SECONDS,
             ) as server:
-                if mode == "starttls":
+                if transport_mode == "starttls":
                     server.ehlo()
                     server.starttls(context=ssl.create_default_context())
                     server.ehlo()
@@ -206,11 +303,8 @@ class SettingsService:
             # executor socket timeout bounds individual operations, while this
             # wall-clock timeout bounds the complete test, including DNS and
             # authentication handshakes.
-            loop = asyncio.get_running_loop()
-            await asyncio.wait_for(
-                loop.run_in_executor(None, _deliver),
-                timeout=core_settings.ALERT_DELIVERY_TIMEOUT_SECONDS,
-            )
+            from app.services.alert_service import bounded_smtp
+            await bounded_smtp(_deliver)
         except asyncio.TimeoutError as exc:
             raise BadRequestException("Failed to send email: SMTP delivery timed out") from exc
         except Exception as exc:

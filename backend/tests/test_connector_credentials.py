@@ -25,6 +25,7 @@ from app.services.connector_credentials import (
     ConnectorCredentials,
     connector_name_from_token,
     generate_token,
+    generate_token_and_prefix,
     hash_token,
 )
 from app.services.connector_service import ConnectorService
@@ -54,6 +55,34 @@ class TestTokenMaterial:
 
     def test_each_issuance_produces_a_distinct_token(self):
         assert generate_token("hibp") != generate_token("hibp")
+
+    def test_the_public_prefix_changes_with_each_issuance(self):
+        """A rotation has to be visible in the field that exists to show it.
+
+        `token[:16]` was eight constant characters and eight of the name, so it
+        was identical before and after a rotation; an operator checking "did the
+        new credential take" had nothing to look at.
+        """
+        first_token, first = generate_token_and_prefix("connector-hibp")
+        second_token, second = generate_token_and_prefix("connector-hibp")
+
+        assert first != second
+        assert first.startswith("connec_")
+        assert len(first) <= TOKEN_PREFIX_LEN
+        # The random head is a real part of *that* token, not a second draw.
+        assert first.split("_", 1)[1] in first_token
+        assert second.split("_", 1)[1] in second_token
+
+    def test_connectors_sharing_a_name_prefix_get_distinct_labels(self):
+        """`exposure-netlas...` and `exposure-shodan...` used to read the same."""
+        _, netlas = generate_token_and_prefix("exposure-netlas-endpoints")
+        _, shodan = generate_token_and_prefix("exposure-shodan-endpoints")
+
+        assert netlas.startswith("exposu_") and shodan.startswith("exposu_")
+        assert netlas != shodan
+        assert len(netlas) <= TOKEN_PREFIX_LEN and len(shodan) <= TOKEN_PREFIX_LEN
+        # Still a label, not a credential: eight random characters of forty-three.
+        assert len(netlas.split("_", 1)[1]) == 8
 
     def test_unusual_names_still_produce_a_valid_token(self):
         # A name is cosmetic here; authority comes from the stored digest.
@@ -116,7 +145,11 @@ class TestCredentialService:
         token, rotated = await ConnectorCredentials(db_session).issue(conn)
         assert rotated is False
         assert conn.has_token is True
-        assert conn.token_prefix == token[:TOKEN_PREFIX_LEN]
+        assert conn.token_prefix is not None
+        # The label names the connector and the issuance, and fits the column.
+        assert conn.token_prefix.startswith("hibp_")
+        assert len(conn.token_prefix) <= TOKEN_PREFIX_LEN
+        assert conn.token_prefix.split("_", 1)[1] in token
         assert conn.token_created_at is not None
         # The prefix must stay far too short to be usable as a credential.
         assert conn.token_prefix != token
@@ -210,7 +243,8 @@ class TestCredentialAdminApi:
         assert body["rotated"] is False
         assert body["connector"]["name"] == "connector-hibp"
         assert body["connector"]["has_token"] is True
-        assert body["connector"]["token_prefix"] == token[:TOKEN_PREFIX_LEN]
+        assert body["connector"]["token_prefix"].startswith("connec_")
+        assert len(body["connector"]["token_prefix"]) <= TOKEN_PREFIX_LEN
         # The freshly issued token authenticates the connector straight away.
         poll = await client.get(
             "/api/v1/connectors/me/work", headers=_headers(token, "connector-hibp")

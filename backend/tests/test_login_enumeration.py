@@ -49,35 +49,52 @@ async def test_unknown_disabled_and_wrong_password_answers_are_identical(
 
 @pytest.mark.asyncio
 async def test_unknown_account_still_pays_for_a_password_hash(client):
-    """The dummy comparison is what keeps the timing channel closed."""
-    from app.api.v1.routers import auth as auth_module
+    """The dummy comparison is what keeps the timing channel closed.
+
+    The comparison now runs on a worker thread (``verify_password_async``), so the
+    spy goes on ``app.core.security.verify_password`` — the function the thread
+    actually calls — rather than on the router's imported name.
+    """
+    from app.core import security as security_module
 
     seen: list[str] = []
-    original = auth_module.verify_password
+    original = security_module.verify_password
 
     def spy(plain: str, hashed: str) -> bool:
         seen.append(hashed)
         return original(plain, hashed)
 
-    with patch.object(auth_module, "verify_password", side_effect=spy):
+    with patch.object(security_module, "verify_password", side_effect=spy):
         response = await client.post(
             LOGIN, json={"email": UNKNOWN_EMAIL, "password": WRONG_PASSWORD}
         )
 
     assert response.status_code == 401
     assert seen, "an unknown address must still run a bcrypt verification"
-    assert seen[0] == auth_module._dummy_password_hash()
+    assert seen[0] == security_module.DUMMY_PASSWORD_HASH
 
 
 @pytest.mark.asyncio
-async def test_dummy_hash_is_a_real_bcrypt_hash_and_is_reused(client):
-    from app.api.v1.routers import auth as auth_module
+async def test_the_dummy_hash_is_built_once_at_import(client):
+    """A real bcrypt hash, built before any request rather than during one.
 
-    dummy = auth_module._dummy_password_hash()
+    It used to be memoised on first use inside the handler: a ~230 ms bcrypt call
+    on the event loop, in the one place the code was trying not to be observable.
+    Building it during module import is what the constant proves; the patch below
+    fails the login if anything tries to build one again.
+    """
+    from app.core import security as security_module
+
+    dummy = security_module.DUMMY_PASSWORD_HASH
     assert dummy.startswith("$2b$")
-    # Memoised: building a hash on every unknown-account login would turn the
-    # mitigation into a denial-of-service amplifier.
-    assert auth_module._dummy_password_hash() == dummy
+
+    with patch.object(
+        security_module, "hash_password", side_effect=AssertionError("built during a request")
+    ):
+        response = await client.post(
+            LOGIN, json={"email": UNKNOWN_EMAIL, "password": WRONG_PASSWORD}
+        )
+    assert response.status_code == 401
 
 
 @pytest.mark.asyncio

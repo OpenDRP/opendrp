@@ -112,7 +112,9 @@ class TestAuditLogsFilters:
         # the API deliberately does not expose the link as top-level fields — the
         # documented audit shape is unchanged.
         assert row["details"]["asset"] == "alpha.example.com"
-        assert set(row["details"]) == {"asset", "audit_hash", "audit_prev_hash", "audit_key_id"}
+        assert set(row["details"]) == {"asset", "actor_email", "audit_hash", "audit_prev_hash", "audit_key_id"}
+        assert row["actor_identity_source"] == "snapshot"
+        assert row["seq"] > 0
 
     @pytest.mark.asyncio
     async def test_action_filter_case_insensitive_and_literal_fallback(

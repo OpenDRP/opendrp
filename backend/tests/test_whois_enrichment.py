@@ -9,6 +9,14 @@ Also pinned: which value wins when the registrar returns several addresses (an
 abuse contact beats a generic one, because that is the address an analyst has to
 write to), and that an existing value is never overwritten — re-running
 enrichment must not churn a finding.
+
+And the answers that are not facts (WI-25). The service names each of them,
+because the caller's next step differs for each: a registry that has had enough
+of us is a pause for a whole server, a name nobody registered is an answer worth
+re-asking for tomorrow, a budget that expired is a retry, and a row that already
+carries the facts is not asked about at all. Telling them apart is what keeps a
+refused registry from being retried once per candidate and a completed candidate
+from being queried again.
 """
 
 from __future__ import annotations
@@ -18,9 +26,23 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from whois.parser import PywhoisError
 
 from app.services.phishing import whois_service as whois_module
 from app.services.phishing.whois_service import WhoisService
+
+
+class _Response(dict):
+    """A response as python-whois builds it: a mapping with the raw text beside it.
+
+    The text is the only place a refusal is visible — the parser drops the fields
+    a record would have, so a refusal and a thin registration look identical by
+    the mapping alone.
+    """
+
+    def __init__(self, text: str, **fields) -> None:
+        super().__init__(**fields)
+        self.text = text
 
 
 class _Threat:
@@ -87,6 +109,59 @@ async def test_registrar_abuse_contact_and_creation_date_are_recorded(monkeypatc
     assert threat.domain_created_at == dt.datetime(2019, 4, 3, 12, 0, tzinfo=dt.timezone.utc)
     db.commit.assert_awaited_once()
     db.refresh.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_a_registry_that_has_had_enough_of_us_is_reported_not_stored(monkeypatch):
+    """A refusal can be shaped like a record; it must not be stored as one."""
+    _patch_whois(
+        monkeypatch,
+        _Response("WHOIS LIMIT EXCEEDED", registrar="Example Registrar Inc."),
+    )
+    threat = _Threat()
+    db = _db()
+
+    assert await WhoisService(db).enrich(threat) == whois_module.RATE_LIMITED
+
+    # Nothing from a refusal is written: the caller holds the event instead, and a
+    # registrar lifted off a rate-limit page would be a fact nobody observed.
+    assert threat.whois_registrar is None
+    db.commit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_name_nobody_registered_is_an_answer_rather_than_a_failure(monkeypatch):
+    """python-whois raises for "No match for ..."; that is the registry answering."""
+
+    def _no_match(_domain):
+        raise PywhoisError('No match for "evil.example".')
+
+    monkeypatch.setattr(whois_module.whois, "whois", _no_match)
+    db = _db()
+
+    assert await WhoisService(db).enrich(_Threat()) == whois_module.NO_RECORD
+    db.commit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_row_that_already_carries_the_facts_is_not_asked_about(monkeypatch):
+    """The candidate row is the cache (WI-25): a complete row costs no query."""
+    asked: list[str] = []
+    monkeypatch.setattr(
+        whois_module.whois, "whois", lambda domain: asked.append(domain) or {}
+    )
+    threat = _Threat(
+        registrar="Original Registrar",
+        abuse_email="abuse@original.example",
+        created_at=dt.datetime(2001, 1, 1),
+    )
+    db = _db()
+
+    assert await WhoisService(db).enrich(threat) == whois_module.NOTHING_TO_ASK
+
+    assert asked == []
+    db.commit.assert_not_awaited()
+
 
 
 @pytest.mark.asyncio
@@ -157,6 +232,7 @@ async def test_an_unparseable_creation_date_is_ignored_without_failing(monkeypat
 
 @pytest.mark.asyncio
 async def test_existing_values_are_never_overwritten(monkeypatch):
+    """A partial row is still asked about, and the provider fills only the blanks."""
     _patch_whois(
         monkeypatch,
         {
@@ -165,18 +241,20 @@ async def test_existing_values_are_never_overwritten(monkeypatch):
             "creation_date": dt.datetime(2030, 1, 1),
         },
     )
-    original = dt.datetime(2001, 1, 1)
     threat = _Threat(
         registrar="Original Registrar",
         abuse_email="abuse@original.example",
-        created_at=original,
     )
+    db = _db()
 
-    await WhoisService(_db()).enrich(threat)
+    assert await WhoisService(db).enrich(threat) == whois_module.ANSWERED
 
+    # The registration date is the fact the row was missing, so the lookup ran for
+    # it; the facts the row already had are not churned by what came back.
     assert threat.whois_registrar == "Original Registrar"
     assert threat.whois_abuse_email == "abuse@original.example"
-    assert threat.domain_created_at == original
+    assert threat.domain_created_at == dt.datetime(2030, 1, 1)
+    db.commit.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -213,8 +291,9 @@ async def test_an_empty_response_is_a_no_op(monkeypatch):
     _patch_whois(monkeypatch, None)
     db = _db()
 
-    await WhoisService(db).enrich(_Threat())
-
+    # No answer arrived, which is not the same as an answer of "nothing": the
+    # caller may ask again, with a bound.
+    assert await WhoisService(db).enrich(_Threat()) == whois_module.UNAVAILABLE
     db.commit.assert_not_awaited()
 
 
@@ -236,7 +315,26 @@ async def test_a_slow_registrar_is_abandoned_instead_of_delaying_ingestion(monke
     threat = _Threat()
     db = _db()
 
-    await WhoisService(db).enrich(threat)
+    assert await WhoisService(db).enrich(threat) == whois_module.UNAVAILABLE
 
     assert threat.whois_registrar is None
     db.commit.assert_not_awaited()
+
+
+def test_a_lookup_is_paced_by_the_server_that_answers_for_the_name():
+    """The unit the drain batches and pauses on: one registry, one budget (WI-25)."""
+    assert whois_module.lookup_group_key("Evil.Example.COM") == "com"
+    assert whois_module.lookup_group_key("evil.example.co.uk") == "uk"
+    # A name with no suffix is its own key rather than sharing one with the rest.
+    assert whois_module.lookup_group_key("localhost") == "localhost"
+    assert whois_module.lookup_group_key(None) == ""
+
+
+def test_only_a_plain_label_may_scope_a_pause():
+    """The key becomes a LIKE pattern, so its shape is checked before it gets there."""
+    assert whois_module.is_server_label("com")
+    assert whois_module.is_server_label("xn--p1ai")
+    assert not whois_module.is_server_label("")
+    assert not whois_module.is_server_label("co*m")
+    assert not whois_module.is_server_label("%")
+    assert not whois_module.is_server_label("com.")

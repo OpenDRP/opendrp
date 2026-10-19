@@ -586,7 +586,15 @@ class TestRegistryDrivenAdminSurface:
             db_session,
             connector=conn,
             job_id=None,
-            findings=[{"breach_name": "Leak", "matched_email": "user@corp.example"}],
+            #: A breach finding carries the incident's own date: one without a usable
+            #: date is refused rather than stored with an invented one (WI-02).
+            findings=[
+                {
+                    "breach_name": "Leak",
+                    "matched_email": "user@corp.example",
+                    "breach_date": "2020-01-01",
+                }
+            ],
             connector_name=conn.name,
             finding_kind="breach",
         )

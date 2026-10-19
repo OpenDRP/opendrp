@@ -1,7 +1,7 @@
 import { useState, useRef, useEffect, useCallback } from "react";
 import { NavLink, Outlet, useLocation, useNavigate } from "react-router";
 import {
-  LayoutDashboard, ListTree, ShieldAlert, AlertTriangle,
+  LayoutDashboard, ListTree, ShieldAlert, AlertTriangle, Globe2,
   FileBarChart, Settings2, LogOut, ShieldCheck, Users, Menu, X, Boxes, KeyRound
 } from "lucide-react";
 import { cn } from "@/lib/utils";
@@ -24,8 +24,10 @@ import { Separator } from "@/components/ui/separator";
 const navItems = [
   { to: "/dashboard", label: "Dashboard", icon: LayoutDashboard, adminOnly: false },
   { to: "/assets", label: "Assets", icon: ListTree, adminOnly: false },
+  { to: "/dns-security", label: "DNS Security", icon: Globe2, adminOnly: false },
   { to: "/phishing", label: "Phishing", icon: ShieldAlert, adminOnly: false },
   { to: "/breaches", label: "Breaches", icon: AlertTriangle, adminOnly: false },
+  { to: "/exposure", label: "Exposure", icon: Boxes, adminOnly: false },
   { to: "/reports", label: "Reports", icon: FileBarChart, adminOnly: false },
   // Available to every role: this is the account's own second factor, not a
   // platform setting.

@@ -35,7 +35,9 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
 import structlog
-from sqlalchemy import delete, select
+from sqlalchemy import delete, exists, func, select, update
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.core.celery_app import async_task, celery_app
 from app.core.config import settings
@@ -197,6 +199,78 @@ def purge_stale_report_temporary_files(*, now: datetime) -> int:
     return removed
 
 
+async def retry_report_audit_outbox(db, *, now: datetime, batch_size: int) -> int:
+    from app.tasks.report_tasks import deliver_report_audit_outbox
+
+    return await deliver_report_audit_outbox(db, now=now, batch_size=batch_size)
+
+
+async def retry_report_artifact_cleanup(db, *, now: datetime, batch_size: int) -> int:
+    """Retry durable cleanup intents without deleting anything outside the store."""
+    from app.core.artifact_path import classify_artifact, REASON_MISSING, REASON_NO_NAME
+    from app.models import ReportArtifactCleanup, Report
+
+    cleaned = 0
+    intents = list(
+        (
+            await db.execute(
+                select(ReportArtifactCleanup)
+                .where(
+                    ReportArtifactCleanup.available_at <= now,
+                    # A retained soft-deleted report is the normal owner of a
+                    # delete cleanup intent. Only defer while a matching report
+                    # is still pending/generating; excluding `deleted` here
+                    # would strand every retry after an unlink failure.
+                    ~select(Report.id)
+                    .where(
+                        Report.id == ReportArtifactCleanup.report_id,
+                        Report.status.in_(("pending", "generating")),
+                    )
+                    .exists(),
+                    ~select(Report.id)
+                    .where(
+                        Report.file_path == ReportArtifactCleanup.artifact_name,
+                        Report.status.notin_(("deleted", "failed")),
+                    )
+                    .exists(),
+                )
+                .order_by(
+                    ReportArtifactCleanup.available_at,
+                    ReportArtifactCleanup.artifact_name,
+                )
+                .limit(batch_size)
+                .with_for_update(skip_locked=True)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for intent in intents:
+        intent_id = intent.artifact_name
+        resolved, reason = classify_artifact(intent_id)
+        if resolved is None and reason not in {REASON_MISSING, REASON_NO_NAME}:
+            intent.attempts += 1
+            intent.last_error = f"artifact rejected: {reason}"[:500]
+            intent.available_at = now + timedelta(minutes=min(60, 2 ** min(intent.attempts, 6)))
+            continue
+        if resolved is not None:
+            try:
+                await __import__("asyncio").to_thread(os.remove, resolved)
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                intent.attempts += 1
+                intent.last_error = str(exc)[:500]
+                intent.available_at = now + timedelta(minutes=min(60, 2 ** min(intent.attempts, 6)))
+                log.warning("report_artifact_cleanup_retry_scheduled", artifact=intent_id, attempts=intent.attempts)
+                continue
+        await db.delete(intent)
+        cleaned += 1
+    await db.commit()
+    await retry_report_audit_outbox(db, now=now, batch_size=batch_size)
+    return cleaned
+
+
 async def purge_expired_reports(
     db, *, cutoff: datetime, batch_size: int, max_batches: int, now: datetime | None = None
 ) -> PurgeResult:
@@ -206,17 +280,31 @@ async def purge_expired_reports(
     that referenced it is gone. The reverse order could delete a PDF and then
     fail to delete its row, leaving a report that can never be downloaded.
     """
-    from app.models import Report
+    from app.models import Report, ReportArtifactCleanup, ReportAuditOutbox, ReportQueueControl
 
     result = PurgeResult(table=Report.__tablename__)
-    paths: list[str] = []
     drained = False
     while result.batches < max_batches:
+        # Admission and retention share this singleton lock. Acquire it before
+        # reading queue rows so the capacity decision and deletion cannot race.
+        if db.get_bind().dialect.name == "sqlite":
+            await db.execute(sqlite_insert(ReportQueueControl).values(id=1).on_conflict_do_nothing(index_elements=[ReportQueueControl.id]))
+        else:
+            await db.execute(pg_insert(ReportQueueControl).values(id=1).on_conflict_do_nothing(index_elements=[ReportQueueControl.id]))
+        await db.execute(
+            update(ReportQueueControl)
+            .where(ReportQueueControl.id == 1)
+            .values(touched_at=datetime.now(timezone.utc))
+        )
         subquery = (
             select(Report.id)
-            .where(Report.created_at < cutoff)
+            .where(
+                Report.created_at < cutoff,
+                Report.status.notin_(("pending", "generating", "deleted")),
+            )
             .order_by(Report.created_at)
             .limit(batch_size)
+            .with_for_update(skip_locked=True)
         )
         rows = (
             await db.execute(
@@ -227,8 +315,45 @@ async def purge_expired_reports(
             drained = True
             break
         ids = [row[0] for row in rows]
-        paths.extend(str(row[1]) for row in rows if row[1])
-        await db.execute(delete(Report).where(Report.id.in_(ids)))
+        from app.core.artifact_path import classify_artifact, REASON_NOT_A_NAME, REASON_OUTSIDE_STORE
+        for _report_id, stored in rows:
+            if not stored:
+                continue
+            resolved, reason = classify_artifact(stored)
+            if resolved is not None:
+                if await db.get(ReportArtifactCleanup, str(stored)) is None:
+                    db.add(ReportArtifactCleanup(artifact_name=str(stored), report_id=_report_id))
+            elif reason in {REASON_NOT_A_NAME, REASON_OUTSIDE_STORE}:
+                result.outside_store_paths.append(str(stored))
+        await db.execute(
+            delete(Report).where(
+                Report.id.in_(ids),
+                Report.status.notin_(("pending", "generating", "deleted")),
+            )
+        )
+        for report_id in ids:
+            event_key = f"{report_id}:report.retention.expired"
+            exists = await db.scalar(
+                select(ReportAuditOutbox.id).where(ReportAuditOutbox.event_key == event_key)
+            )
+            if exists is None:
+                db.add(
+                    ReportAuditOutbox(
+                        event_key=event_key,
+                        action="report.retention.expired",
+                        report_id=report_id,
+                        job_id=None,
+                        details={
+                            "report_id": str(report_id),
+                            "status": "expired",
+                        "artifact_cleanup_pending": any(
+                            row[0] == report_id
+                            and classify_artifact(row[1])[0] is not None
+                            for row in rows
+                        ),
+                        },
+                    )
+                )
         await db.commit()
         result.batches += 1
         result.deleted_rows += len(ids)
@@ -244,35 +369,30 @@ async def purge_expired_reports(
         now=now or datetime.now(timezone.utc)
     )
 
-    from app.core.artifact_path import (
-        REASON_MISSING,
-        REASON_NO_NAME,
-        classify_artifact,
+    from app.core.artifact_path import classify_artifact, REASON_MISSING, REASON_NO_NAME
+    cleanup_intents = (await db.execute(
+        select(ReportArtifactCleanup).limit(batch_size)
+    )).scalars().all()
+    for intent in cleanup_intents:
+        _resolved, reason = classify_artifact(intent.artifact_name)
+        if reason not in {REASON_MISSING, REASON_NO_NAME, "ok"}:
+            result.outside_store_paths.append(intent.artifact_name)
+    cleanup_now = now or datetime.now(timezone.utc)
+    result.removed_artifacts += await retry_report_artifact_cleanup(
+        db, now=cleanup_now, batch_size=batch_size
     )
-
-    for stored in paths:
-        resolved, reason = classify_artifact(stored)
-        if resolved is None:
-            # Two refusals that mean different things. An artifact that is
-            # already gone is not news — the row was expired, the sweep deleted
-            # it, and the file had been removed earlier (a failed generation, a
-            # restore that did not carry the volume). A value that is not an
-            # artifact name at all *is* news: it is a row pointing somewhere
-            # this platform never writes, and it is reported so that someone can
-            # look at it instead of it being silently corrected or deleted.
-            if reason not in {REASON_MISSING, REASON_NO_NAME}:
-                result.outside_store_paths.append(stored)
-            continue
-        try:
-            os.remove(resolved)
-            result.removed_artifacts += 1
-        except OSError as exc:
-            # A PDF that cannot be unlinked is a disk-space problem, not a
-            # reason to fail the sweep: the row is already gone, and the next
-            # run will not see it again.
-            log.warning(
-                "retention_artifact_not_removed", path=str(resolved), err=str(exc)[:200]
-            )
+    await retry_report_audit_outbox(db, now=cleanup_now, batch_size=batch_size)
+    pending_cleanup = int((await db.execute(
+        select(func.count(ReportArtifactCleanup.artifact_name)).where(
+            ReportArtifactCleanup.available_at <= cleanup_now,
+            ~select(Report.id).where(
+                Report.file_path == ReportArtifactCleanup.artifact_name,
+                Report.status.notin_(("deleted", "failed")),
+            ).exists(),
+        )
+    )).scalar_one())
+    if pending_cleanup:
+        log.error("report_artifact_cleanup_pending", pending=pending_cleanup)
     return result
 
 
@@ -288,33 +408,35 @@ async def run_retention_sweep(
             table="drp_audit_logs", truncated=False
         )
     else:
-        from app.models.audit import AuditLog
-
-        from app.core.audit_chain import retire
+        from app.services.audit_archive import archive_prefix
 
         cutoff = moment - timedelta(days=settings.AUDIT_RETENTION_DAYS)
-
-        async def _record_retirement(session, result: PurgeResult) -> None:
-            await retire(
-                session,
-                through_seq=result.retired_through_seq,
-                tip_hash=result.retired_tip_hash,
-            )
-
-        results["drp_audit_logs"] = await purge_table(
-            db,
-            model=AuditLog,
-            timestamp_column=AuditLog.timestamp,
-            cutoff=cutoff,
-            batch_size=settings.RETENTION_BATCH_SIZE,
-            max_batches=settings.RETENTION_MAX_BATCHES_PER_RUN,
-            seq_column=AuditLog.seq,
-            hash_column=AuditLog.entry_hash,
-            on_batch=_record_retirement,
-        )
+        audit_result = PurgeResult(table="drp_audit_logs")
+        results["drp_audit_logs"] = audit_result
+        try:
+            for _ in range(settings.RETENTION_MAX_BATCHES_PER_RUN):
+                archived = await archive_prefix(db, cutoff=cutoff, limit=settings.RETENTION_BATCH_SIZE)
+                count = archived["deleted"]
+                if not count:
+                    break
+                audit_result.deleted_rows += count
+                audit_result.batches += 1
+                audit_result.retired_through_seq = archived["through_seq"]
+                audit_result.retired_tip_hash = archived["tip_hash"]
+            else:
+                audit_result.truncated = True
+        except (ValueError, OSError) as exc:
+            await db.rollback()
+            log.error("audit_archive_retention_blocked", error=type(exc).__name__)
 
     if settings.REPORT_RETENTION_DAYS <= 0:
         results["reports"] = PurgeResult(table="reports")
+        results["reports"].removed_artifacts += await retry_report_artifact_cleanup(
+            db, now=moment, batch_size=settings.RETENTION_BATCH_SIZE
+        )
+        await retry_report_audit_outbox(
+            db, now=moment, batch_size=settings.RETENTION_BATCH_SIZE
+        )
     else:
         cutoff = moment - timedelta(days=settings.REPORT_RETENTION_DAYS)
         results["reports"] = await purge_expired_reports(
@@ -327,6 +449,93 @@ async def run_retention_sweep(
 
     results["drp_refresh_families"] = await purge_expired_sessions(db, now=moment)
 
+    results.update(await purge_terminal_alert_history(db, now=moment))
+    results.update(await purge_expired_certificate_evidence(db, now=moment))
+    return results
+
+
+async def purge_expired_certificate_evidence(db, *, now) -> dict[str, PurgeResult]:
+    """Bound the certificate identity/sighting evidence the design adds (WI-23).
+
+    Two tables grow with every scan and provider read, and neither had a policy: a
+    sighting that has not been observed for the configured window is history, an
+    identity with no sightings left is only weight, and a scope exception past its
+    own expiry date is a rule that silently stopped applying.
+    """
+    from app.models.tls_certificate import (
+        CertificateScopeException,
+        TLSCertificateIdentity,
+        TLSCertificateSighting,
+    )
+
+    results: dict[str, PurgeResult] = {}
+    if settings.TLS_CERTIFICATE_RETENTION_DAYS <= 0:
+        for model in (TLSCertificateSighting, TLSCertificateIdentity, CertificateScopeException):
+            results[model.__tablename__] = PurgeResult(table=model.__tablename__)
+        return results
+    cutoff = now - timedelta(days=settings.TLS_CERTIFICATE_RETENTION_DAYS)
+    results[TLSCertificateSighting.__tablename__] = await purge_table(
+        db,
+        model=TLSCertificateSighting,
+        timestamp_column=TLSCertificateSighting.last_seen_at,
+        cutoff=cutoff,
+        batch_size=settings.RETENTION_BATCH_SIZE,
+        max_batches=settings.RETENTION_MAX_BATCHES_PER_RUN,
+    )
+    # An identity is kept while any sighting still refers to it: the fingerprint is what
+    # the review workflow and the rules name, so an orphaned one is unreachable.
+    orphan = ~exists().where(TLSCertificateSighting.identity_id == TLSCertificateIdentity.id)
+    result = PurgeResult(table=TLSCertificateIdentity.__tablename__)
+    for _ in range(settings.RETENTION_MAX_BATCHES_PER_RUN):
+        ids = (
+            select(TLSCertificateIdentity.id)
+            .where(TLSCertificateIdentity.last_seen_at < cutoff, orphan)
+            .order_by(TLSCertificateIdentity.last_seen_at)
+            .limit(settings.RETENTION_BATCH_SIZE)
+        )
+        outcome = await db.execute(delete(TLSCertificateIdentity).where(TLSCertificateIdentity.id.in_(ids)))
+        await db.commit()
+        count = outcome.rowcount or 0
+        result.deleted_rows += count
+        result.batches += int(count > 0)
+        if count < settings.RETENTION_BATCH_SIZE:
+            break
+    else:
+        result.truncated = True
+    results[TLSCertificateIdentity.__tablename__] = result
+    results[CertificateScopeException.__tablename__] = await purge_table(
+        db,
+        model=CertificateScopeException,
+        timestamp_column=CertificateScopeException.expires_at,
+        cutoff=now,
+        batch_size=settings.RETENTION_BATCH_SIZE,
+        max_batches=settings.RETENTION_MAX_BATCHES_PER_RUN,
+    )
+    return results
+
+
+async def purge_terminal_alert_history(db, *, now):
+    from app.models.alert_delivery import AlertDelivery, AlertDeliveryStatus
+    from app.models.ingestion_event import IngestionEvent
+    results = {}
+    if settings.ALERT_HISTORY_RETENTION_DAYS <= 0:
+        return results
+    cutoff = now - timedelta(days=settings.ALERT_HISTORY_RETENTION_DAYS)
+    specs = [(AlertDelivery, AlertDelivery.updated_at < cutoff, AlertDelivery.status.in_([AlertDeliveryStatus.sent, AlertDeliveryStatus.failed, AlertDeliveryStatus.cancelled])), (IngestionEvent, IngestionEvent.processed_at < cutoff, IngestionEvent.processed_at.is_not(None))]
+    for model, expired, terminal in specs:
+        result = PurgeResult(table=model.__tablename__)
+        for _ in range(settings.RETENTION_MAX_BATCHES_PER_RUN):
+            ids = select(model.id).where(expired, terminal).order_by(model.created_at, model.id).limit(settings.RETENTION_BATCH_SIZE)
+            outcome = await db.execute(delete(model).where(model.id.in_(ids)))
+            await db.commit()
+            count = outcome.rowcount or 0
+            result.deleted_rows += count
+            result.batches += int(count > 0)
+            if count < settings.RETENTION_BATCH_SIZE:
+                break
+        else:
+            result.truncated = True
+        results[model.__tablename__] = result
     return results
 
 
@@ -386,6 +595,10 @@ async def _emit_sweep_audit(results: dict[str, PurgeResult]) -> None:
         "audit_retention_days": settings.AUDIT_RETENTION_DAYS,
         "report_retention_days": settings.REPORT_RETENTION_DAYS,
         "session_retention_days": max(settings.JWT_REFRESH_TOKEN_EXPIRE_DAYS, 1),
+        # Deleting certificate evidence is the only way a certificate the operator
+        # could still triage disappears, so the window that did it is on the record
+        # next to the tables it emptied.
+        "certificate_retention_days": settings.TLS_CERTIFICATE_RETENTION_DAYS,
     }
     if any(r.truncated for r in deletable.values()):
         # Visible in the audit trail as well as in the logs, because a sweep

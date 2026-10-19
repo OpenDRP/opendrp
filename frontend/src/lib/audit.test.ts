@@ -95,6 +95,84 @@ describe("describeAuditEntry", () => {
     ).toBe("Finding marked as resolved (was active)");
   });
 
+  it("describes an asset change by what changed, not by what was asked for", () => {
+    // The trail records the row's own before/after values, so the sentence can
+    // name the value that moved — including a canonicalization the request never
+    // mentioned. It used to render "Updated asset <uuid>".
+    expect(
+      describeAuditEntry({
+        action: "asset.update",
+        details: {
+          asset_value: "example.com",
+          changed_fields: ["criticality"],
+          changes: { criticality: { from: "medium", to: "high" } },
+        },
+      }),
+    ).toBe("Updated asset example.com — criticality: medium → high");
+    expect(
+      describeAuditEntry({ action: "asset.update", details: { asset_value: "example.com" } }),
+    ).toBe("Updated asset example.com");
+  });
+
+  it("describes the inventory events an operator otherwise reads as codes", () => {
+    expect(
+      describeAuditEntry({ action: "asset.list", details: { results: 12, search_used: true } }),
+    ).toBe("Viewed the asset inventory (12 assets), filtered");
+    expect(describeAuditEntry({ action: "asset.list", details: { results: 1 } })).toBe(
+      "Viewed the asset inventory (1 asset)",
+    );
+    expect(
+      describeAuditEntry({ action: "asset.view", details: { asset_value: "example.com" } }),
+    ).toBe("Viewed asset example.com");
+    expect(
+      describeAuditEntry({
+        action: "dns_security.asset.promoted",
+        details: { asset_type: "domain", asset_id: "a-1" },
+      }),
+    ).toBe("Added the domain asset observed by DNS Security");
+    expect(
+      describeAuditEntry({
+        action: "exposure.asset.already_exists",
+        details: { asset_type: "ip_address" },
+      }),
+    ).toBe("No change — the ip_address asset from Exposure was already monitored");
+    expect(
+      describeAuditEntry({
+        action: "asset.findings.list",
+        details: { asset_value: "example.com", module: "dns_security", counts: { total: 3 } },
+      }),
+    ).toBe("Viewed the findings of asset example.com — dns security tab, involved in 3 findings");
+    // The counters are optional detail: the action still reads as a sentence.
+    expect(
+      describeAuditEntry({ action: "asset.findings.list", details: { asset_value: "example.com" } }),
+    ).toBe("Viewed the findings of asset example.com");
+  });
+
+  it("reads a certificate verdict as the decision and the address it was about", () => {
+    expect(
+      describeAuditEntry({
+        action: "tls.sighting.confirmed_foreign",
+        details: { ip: "198.51.100.7", port: 443, subject: "mail.example.com" },
+      }),
+    ).toBe("Confirmed that this certificate of ours is served by 198.51.100.7:443");
+    // A sighting a provider indexed without an address still names what it was about.
+    expect(
+      describeAuditEntry({
+        action: "tls.sighting.expected",
+        details: { ip: null, subject: "mail.example.com" },
+      }),
+    ).toBe("Marked as expected the certificate served at mail.example.com");
+    expect(describeAuditEntry({ action: "tls.sighting.rejected", details: null })).toBe(
+      "Rejected the evidence that we serve a certificate at an address a provider did not record",
+    );
+    expect(
+      describeAuditEntry({
+        action: "tls.exception.removed",
+        details: { match_value: "ab".repeat(32), match_kind: "fingerprint" },
+      }),
+    ).toBe(`Removed a certificate scope exception: ${"ab".repeat(32)}`);
+  });
+
   it("keeps the values of an action it does not know", () => {
     // The graceful path: a module or connector added later still produces a
     // readable line, never a bare code and never nothing at all.
@@ -120,6 +198,24 @@ describe("describeAuditEntry", () => {
       expect(action).toMatch(/^[a-z][a-z0-9._]*$/);
     }
     expect(describedActions().length).toBeGreaterThanOrEqual(ACCOUNT_SECURITY_ACTIONS.length);
+  });
+});
+
+describe("user.unlocked", () => {
+  it("says whether the account was activated or a lockout was lifted", () => {
+    // Both operations write one action name; the method is what happened.
+    expect(
+      describeAuditEntry({
+        action: "user.unlocked",
+        details: { target_email: "a@example.com", method: "brute_force_unlock" },
+      }),
+    ).toContain("Unlocked user");
+    expect(
+      describeAuditEntry({
+        action: "user.unlocked",
+        details: { target_email: "a@example.com", method: "api_update" },
+      }),
+    ).toContain("Activated user");
   });
 });
 

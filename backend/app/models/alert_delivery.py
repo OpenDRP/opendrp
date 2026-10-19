@@ -3,7 +3,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, ForeignKey, JSON, String, Text
+from sqlalchemy import DateTime, ForeignKey, Index, JSON, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import Base, TimestampMixin, UUIDMixin
@@ -14,6 +14,8 @@ class AlertDeliveryStatus:
     delivering = "delivering"
     sent = "sent"
     failed = "failed"
+    cancelled = "cancelled"
+    ambiguous = "ambiguous"
 
 
 class AlertDelivery(Base, UUIDMixin, TimestampMixin):
@@ -27,6 +29,12 @@ class AlertDelivery(Base, UUIDMixin, TimestampMixin):
     """
 
     __tablename__ = "alert_deliveries"
+    __table_args__ = (Index("ix_alert_delivery_due", "status", "next_attempt_at", "created_at"),)
+
+    lease_token: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    batch_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    parts: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    acknowledged_parts: Mapped[int] = mapped_column(default=0, server_default="0", nullable=False)
 
     job_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("jobs.id", ondelete="SET NULL"), nullable=True, index=True
@@ -49,3 +57,11 @@ class AlertDelivery(Base, UUIDMixin, TimestampMixin):
     locked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class AlertRecipientState(Base):
+    __tablename__ = "alert_recipient_state"
+    key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    next_send_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    lease_token: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

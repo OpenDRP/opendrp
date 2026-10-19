@@ -7,10 +7,14 @@ import { endpoints } from "@/lib/api";
 import { toast } from "@/components/ui/use-toast";
 
 import LoginPage from "@/pages/LoginPage";
+import AcceptInvitationPage from "@/pages/AcceptInvitationPage";
 import DashboardPage from "@/pages/DashboardPage";
 import AssetsPage from "@/pages/AssetsPage";
+import AssetDetailPage from "@/pages/AssetDetailPage";
 import PhishingPage from "@/pages/PhishingPage";
 import BreachesPage from "@/pages/BreachesPage";
+import DNSSecurityPage from "@/pages/DNSSecurityPage";
+import ExposurePage from "@/pages/ExposurePage";
 import ReportsPage from "@/pages/ReportsPage";
 import SecurityPage from "@/pages/SecurityPage";
 import OnboardingPage from "@/pages/OnboardingPage";
@@ -128,6 +132,9 @@ export default function App() {
 
       <Routes>
         <Route path="/login" element={<LoginPage />} />
+        {/* Public by design: the account cannot sign in until this page has run,
+            and the invitation token is the only credential it needs (U-7). */}
+        <Route path="/accept-invitation" element={<AcceptInvitationPage />} />
         <Route path="/logout" element={<LogoutHandler />} />
 
         {/* Outside the application shell on purpose: an account that owes a
@@ -154,7 +161,10 @@ export default function App() {
           <Route index element={<Navigate to="/dashboard" replace />} />
           <Route path="dashboard" element={<DashboardPage />} />
           <Route path="assets" element={<AssetsPage />} />
+          <Route path="assets/:id" element={<AssetDetailPage />} />
           <Route path="phishing" element={<PhishingPage />} />
+          <Route path="dns-security" element={<DNSSecurityPage />} />
+          <Route path="exposure" element={<ExposurePage />} />
           <Route path="breaches" element={<BreachesPage />} />
           <Route path="reports" element={<ReportsPage />} />
           {/* Every role, not only administrators: an analyst's account is worth

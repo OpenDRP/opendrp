@@ -94,9 +94,30 @@ class TestReportsGenerate:
             )
         good.assert_called_once()
         assert r.status_code == 202
-        assert r.json()["estimated_seconds"] == 15
+        assert r.json()["queue_state"] == "queued"
+        assert r.json()["report_id"]
+        assert r.json()["job_id"]
         new_name = r.json()
         assert "scheduled" == new_name["status"]
+
+    @pytest.mark.asyncio
+    async def test_generate_report_rejects_when_global_queue_is_full(
+        self, client, db_session, auth_headers_admin, monkeypatch
+    ):
+        from app.core.config import settings
+        from app.models import Report
+
+        monkeypatch.setattr(settings, "REPORT_QUEUE_MAX_PENDING", 1)
+        db_session.add(Report(
+            report_name="queued already", file_path="", status="pending"
+        ))
+        await db_session.commit()
+        with patch("app.tasks.report_tasks.generate_report_task.apply_async") as schedule:
+            response = await client.post(
+                "/api/v1/reports/generate", json={}, headers=auth_headers_admin
+            )
+        assert response.status_code == 429
+        schedule.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_generate_report_allows_viewer(
@@ -132,8 +153,9 @@ class TestReportsGenerate:
 class TestReportsListAndDownload:
     @pytest.mark.asyncio
     async def test_list_reports_pagination_200_new_item_in_page(
-        self, client, db_session, auth_headers_viewer, test_analyst
+        self, client, db_session, auth_headers_viewer, test_analyst, test_viewer
     ):
+        """The shared single-tenant report list includes another user's reports."""
         from sqlalchemy import text
 
         await db_session.execute(text("DELETE FROM reports"))
@@ -163,11 +185,15 @@ class TestReportsListAndDownload:
         assert len(body["items"]) == 2
         first_email = body["items"][0].get("created_by_email")
         assert first_email == test_analyst.email
+        assert test_analyst.id != test_viewer.id
+        assert all(item["created_by_email"] == test_analyst.email for item in body["items"])
 
     @pytest.mark.asyncio
     async def test_download_report_completed_pdf_returns_file_response(
-        self, client, db_session, auth_headers_viewer, test_analyst, report_store
+        self, client, db_session, auth_headers_viewer, test_analyst, test_viewer, report_store
     ):
+        """Viewer+ can download another account's report in this single-tenant app."""
+        assert test_analyst.id != test_viewer.id
         r_id = uuid.uuid4()
         stored = _write_artifact(
             report_store, r_id, b"%PDF-1.4 fake body bytes here sample"
@@ -189,6 +215,35 @@ class TestReportsListAndDownload:
         assert b"%PDF-1.4" in r.content
         cd = r.headers.get("content-disposition", "")
         assert "Sample_Download" in cd or "Sample Download" in cd or ".pdf" in cd
+
+    @pytest.mark.asyncio
+    async def test_analyst_can_list_and_download_another_users_report(
+        self, client, db_session, auth_headers_analyst, test_analyst, test_viewer, report_store
+    ):
+        """The viewer+ role contract is shared across accounts, not owner-scoped."""
+        r_id = uuid.uuid4()
+        stored = _write_artifact(report_store, r_id, b"%PDF-1.4 shared report")
+        rep = Report(
+            id=r_id,
+            report_name="Viewer-owned report",
+            created_by=test_viewer.id,
+            file_path=stored,
+            status="completed",
+        )
+        db_session.add(rep)
+        await db_session.commit()
+
+        listing = await client.get("/api/v1/reports", headers=auth_headers_analyst)
+        assert listing.status_code == 200, listing.text
+        listed = next(item for item in listing.json()["items"] if item["id"] == str(r_id))
+        assert listed["created_by_email"] == test_viewer.email
+        assert test_analyst.id != test_viewer.id
+
+        download = await client.get(
+            f"/api/v1/reports/{r_id}/download", headers=auth_headers_analyst
+        )
+        assert download.status_code == 200, download.text
+        assert b"shared report" in download.content
 
     @pytest.mark.asyncio
     async def test_download_report_not_found_404_for_pending(
@@ -375,8 +430,119 @@ class TestReportsDelete:
         )
         assert r.status_code == 204
         gone = await db_session.get(Report, r_id)
-        assert gone is None
+        assert gone is not None and gone.status == "deleted"
+        from sqlalchemy import select
+        from app.models.report import ReportArtifactCleanup
+        assert (await db_session.execute(select(ReportArtifactCleanup))).scalars().all() == []
         assert not path.exists()
+
+    @pytest.mark.asyncio
+    async def test_delete_retains_failed_artifact_cleanup_for_retry(
+        self, client, db_session, auth_headers_admin, test_analyst, report_store, monkeypatch
+    ):
+        from app.models import Report
+        from app.tasks.retention_tasks import purge_expired_reports
+        from datetime import timedelta
+        import os
+
+        report_id = uuid.uuid4()
+        stored = _write_artifact(report_store, report_id, b"retry cleanup")
+        path = report_store / stored
+        db_session.add(Report(
+            id=report_id,
+            report_name="retry cleanup",
+            created_by=test_analyst.id,
+            file_path=stored,
+            status="completed",
+        ))
+        await db_session.commit()
+        import app.api.v1.routers.reports as reports_module
+        import app.tasks.retention_tasks as retention_module
+        real_remove = os.remove
+        attempts = 0
+
+        def fail_once(target):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1 and str(target) == str(path):
+                raise PermissionError("temporarily unavailable")
+            return real_remove(target)
+
+        monkeypatch.setattr(reports_module.os, "remove", fail_once)
+        response = await client.delete(f"/api/v1/reports/{report_id}", headers=auth_headers_admin)
+        assert response.status_code == 204
+        # The durable tombstone owns the artifact name after the report row is gone.
+        from sqlalchemy import select
+        from app.models.report import ReportArtifactCleanup
+        intent = (await db_session.execute(select(ReportArtifactCleanup))).scalar_one()
+        assert intent.artifact_name == stored
+        assert intent.attempts == 1
+        assert intent.report_id == report_id
+        assert path.exists()
+
+        monkeypatch.setattr(retention_module.os, "remove", fail_once)
+        result = await purge_expired_reports(
+            db_session,
+            # This is an explicit delete intent, not an expired report row.
+            # The soft-deleted report remains as the audit/lifecycle tombstone.
+            cutoff=datetime.now(timezone.utc) - timedelta(days=1),
+            batch_size=100,
+            max_batches=1,
+            now=datetime.now(timezone.utc) + timedelta(minutes=5),
+        )
+        assert result.removed_artifacts == 1
+        assert not path.exists()
+        assert (await db_session.execute(select(ReportArtifactCleanup))).scalars().all() == []
+        # Idempotent subsequent sweep leaves the soft-delete tombstone untouched.
+        second_result = await purge_expired_reports(
+            db_session,
+            cutoff=datetime.now(timezone.utc) - timedelta(days=1),
+            batch_size=100,
+            max_batches=1,
+            now=datetime.now(timezone.utc) + timedelta(minutes=6),
+        )
+        assert second_result.removed_artifacts == 0
+        assert (await db_session.get(Report, report_id)).status == "deleted"
+
+    @pytest.mark.asyncio
+    async def test_generation_delete_cleanup_remains_retryable_after_unlink_failure(
+        self, db_session, report_store, monkeypatch
+    ):
+        import os
+        from datetime import timedelta
+        from app.tasks.report_tasks import _discard_artifact_with_intent
+        from app.models import ReportArtifactCleanup
+        from sqlalchemy import select
+
+        report_id = uuid.uuid4()
+        stored = _write_artifact(report_store, report_id, b"late render")
+        path = report_store / stored
+        real_remove = os.remove
+
+        def fail_remove(target):
+            if str(target) == str(path):
+                raise PermissionError("temporary filesystem denial")
+            return real_remove(target)
+
+        monkeypatch.setattr("app.tasks.report_tasks.os.remove", fail_remove)
+        await _discard_artifact_with_intent(db_session, stored)
+        intent = (await db_session.execute(select(ReportArtifactCleanup))).scalar_one()
+        assert intent.artifact_name == stored
+        assert intent.report_id == report_id
+        assert intent.attempts == 1
+        assert path.exists()
+
+        monkeypatch.setattr("app.tasks.retention_tasks.os.remove", real_remove)
+        from app.tasks.retention_tasks import retry_report_artifact_cleanup
+
+        cleaned = await retry_report_artifact_cleanup(
+            db_session,
+            now=datetime.now(timezone.utc) + timedelta(minutes=3),
+            batch_size=10,
+        )
+        assert cleaned == 1
+        assert not path.exists()
+        assert (await db_session.execute(select(ReportArtifactCleanup))).scalars().all() == []
 
     @pytest.mark.asyncio
     async def test_delete_removes_the_row_but_never_a_file_outside_the_store(
@@ -391,6 +557,7 @@ class TestReportsDelete:
         from sqlalchemy import select as _select
 
         from app.models.audit import AuditLog
+        from app.models.report import ReportArtifactCleanup
 
         outsider = report_store.parent / "not-ours.pdf"
         outsider.write_bytes(b"must survive")
@@ -409,7 +576,8 @@ class TestReportsDelete:
         r = await client.delete(f"/api/v1/reports/{r_id}", headers=auth_headers_admin)
         assert r.status_code == 204
         assert outsider.exists()
-        assert await db_session.get(Report, r_id) is None
+        gone = await db_session.get(Report, r_id)
+        assert gone is not None and gone.status == "deleted"
 
         await db_session.commit()
         rows = list(
@@ -422,6 +590,9 @@ class TestReportsDelete:
         assert len(rows) == 1
         assert rows[0].details["artifact_removed"] is False
         assert rows[0].details["reason"] == "not_a_name"
+        assert (await db_session.execute(
+            _select(ReportArtifactCleanup)
+        )).scalars().all() == []
 
     @pytest.mark.asyncio
     async def test_delete_report_viewer_403_not_owner_anyway(

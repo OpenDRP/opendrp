@@ -16,6 +16,12 @@ interface ConfirmDialogProps {
   onCancel?: () => void;
   variant?: "default" | "destructive";
   confirmLoading?: boolean;
+  /**
+   * Keeps the confirm action unavailable until its condition is met (WI-23): a
+   * destructive cascade asks the operator to type the asset's value, and a
+   * disabled button is what says so before the click rather than after it.
+   */
+  confirmDisabled?: boolean;
 }
 
 export function ConfirmDialog({
@@ -30,6 +36,7 @@ export function ConfirmDialog({
   onCancel,
   variant = "default",
   confirmLoading = false,
+  confirmDisabled = false,
 }: ConfirmDialogProps) {
   const handleCancel = React.useCallback(() => {
     onOpenChange(false);
@@ -61,7 +68,7 @@ export function ConfirmDialog({
             type="button"
             variant={variant === "destructive" ? "destructive" : "default"}
             onClick={handleConfirm}
-            disabled={confirmLoading}
+            disabled={confirmLoading || confirmDisabled}
           >
             {confirmLoading ? (
               <>

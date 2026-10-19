@@ -1,0 +1,31 @@
+{% extends "emails/base.html" %}
+{#- One account telling its owner what an administrator did. There is no token,
+    password or recovery code in this template on purpose: the message names the
+    event and the operator, and the platform asks for the new credential itself
+    at the next sign-in. -#}
+{% block content %}
+  <h2 style="margin: 0 0 8px;">{{ subject }}</h2>
+  <p style="margin: 0 0 16px;">{{ happened }}</p>
+
+  <table class="alert-table">
+    <tr>
+      <th style="width: 34%;">When</th>
+      <td class="mono">{{ occurred_at }}</td>
+    </tr>
+    <tr>
+      <th>Performed by</th>
+      <td>{{ actor_email }}</td>
+    </tr>
+    <tr>
+      <th>From address</th>
+      <td class="mono">{{ source_ip }}</td>
+    </tr>
+  </table>
+
+  <p style="margin: 16px 0 0;">{{ next_step }}</p>
+
+  <p style="margin: 20px 0 0; color: #6b7280; font-size: 13px;">
+    This message never contains your password, a second-factor secret or a
+    recovery code. Anyone who asks you for one is not the platform.
+  </p>
+{% endblock %}

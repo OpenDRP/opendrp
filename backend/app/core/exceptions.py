@@ -168,6 +168,43 @@ def register_exception_handlers(app) -> None:
         )
 
 
+    #: Imported here rather than at module scope: the audit stack pulls in the
+    #: engine and the models, and the exception module is imported far earlier
+    #: than either is needed. Deferring it to handler registration keeps that
+    #: chain out of every import of this module while still registering by type.
+    from app.core.audit import AuditPersistenceError
+
+    @app.exception_handler(AuditPersistenceError)
+    async def audit_persistence_handler(
+        request: Request, exc: AuditPersistenceError
+    ) -> JSONResponse:
+        """A change the platform refuses to make without recording it.
+
+        The route has already rolled the transaction back by the time this runs
+        (`AuditLogger.emit` rolls back before raising), so nothing was applied and
+        the honest answer is "retry", not a 500 that reads like a defect. The
+        shape matches the database-busy paths on purpose: same 503, same
+        ``Retry-After``, the same kind of transient condition.
+        """
+        log.error(
+            "audit_required_write_failed",
+            path=request.url.path,
+            method=request.method,
+            err=str(exc)[:300],
+        )
+        return JSONResponse(
+            status_code=503,
+            content={
+                "detail": (
+                    "The audit trail could not record this change, so it was not "
+                    "applied. Retry shortly."
+                ),
+                "code": "audit_unavailable",
+            },
+            headers={"Retry-After": "5"},
+        )
+
+
     @app.exception_handler(HTTPException)
     async def http_exception_handler(
         request: Request, exc: HTTPException

@@ -16,13 +16,32 @@ POSTGRES_URL = "postgresql+asyncpg://opendrp:secret@postgres:5432/opendrp"
 SQLITE_URL = "sqlite+aiosqlite:///./test.sqlite3"
 
 
+class _RecordingResult:
+    """The part of SQLAlchemy's `Result` this code path reads.
+
+    A real connection answers `execute` with a result, and the adoption step asks
+    that result which revision the database recorded. This double answers as a
+    database with no `alembic_version` table — the fresh-database case, where
+    there is nothing to adopt and the upgrade creates the table itself.
+    """
+
+    def scalar(self):  # noqa: ANN201 - SQLAlchemy API
+        return None
+
+    def scalars(self) -> "_RecordingResult":
+        return self
+
+    def all(self) -> list[str]:
+        return []
+
+
 class _RecordingConnection:
     def __init__(self, events: list[tuple[str, str]]) -> None:
         self._events = events
 
     def execute(self, statement, parameters=None):  # noqa: ANN001 - SQLAlchemy API
         self._events.append(("execute", str(statement).strip()))
-        return None
+        return _RecordingResult()
 
     def __enter__(self) -> "_RecordingConnection":
         return self
@@ -57,10 +76,20 @@ def test_postgres_takes_the_lock_around_the_upgrade(monkeypatch, events):
 
     assert migrate.main() == 0
 
-    call_order = [name for name, _ in events]
-    assert call_order == ["execute", "upgrade", "execute", "dispose"]
-    assert events[0][1] == "SELECT pg_advisory_lock(:key)"
-    assert events[2][1] == "SELECT pg_advisory_unlock(:key)"
+    # The assertion is about *where* the upgrade runs, not about the exact number
+    # of statements: adoption reads the recorded revision first (that read is
+    # inside the lock, or two replicas could adopt concurrently), so the upgrade is
+    # not the second event. What has to hold is that nothing happens before the
+    # lock is taken and nothing after it is released.
+    names = [name for name, _ in events]
+    statements = [value for name, value in events if name == "execute"]
+    assert names.count("upgrade") == 1
+    assert statements[0] == "SELECT pg_advisory_lock(:key)"
+    assert statements[-1] == "SELECT pg_advisory_unlock(:key)"
+    upgrade_at = names.index("upgrade")
+    assert names[:upgrade_at] == ["execute"] * upgrade_at
+    assert set(names[upgrade_at + 1 : -1]) <= {"execute"}
+    assert names[-1] == "dispose"
     assert engine.disposed is True
 
 
@@ -80,11 +109,14 @@ def test_postgres_releases_the_lock_when_the_upgrade_fails(monkeypatch, events):
     with pytest.raises(RuntimeError):
         migrate.main()
 
+    names = [name for name, _ in events]
     statements = [value for name, value in events if name == "execute"]
-    assert statements == [
-        "SELECT pg_advisory_lock(:key)",
-        "SELECT pg_advisory_unlock(:key)",
-    ]
+    # The release is in a `finally`, so a failed upgrade still leaves the next
+    # replica able to migrate. Adoption's read sits between these two statements.
+    assert names.count("upgrade") == 1
+    assert statements[0] == "SELECT pg_advisory_lock(:key)"
+    assert statements[-1] == "SELECT pg_advisory_unlock(:key)"
+    assert names[-1] == "dispose"
     assert engine.disposed is True
 
 

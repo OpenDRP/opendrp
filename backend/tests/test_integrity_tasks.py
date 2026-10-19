@@ -13,7 +13,7 @@ from __future__ import annotations
 import asyncio
 import functools
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -30,7 +30,7 @@ class _Session:
 
     async def __aenter__(self):
         self.entered += 1
-        return MagicMock()
+        return AsyncMock()
 
     async def __aexit__(self, *_exc_info) -> bool:
         return False
@@ -57,6 +57,9 @@ def env(monkeypatch):
             return session
 
         monkeypatch.setattr(it, "verify", verify)
+        async def full_chunk(db):
+            return await verify(db, full=True)
+        monkeypatch.setattr("app.services.audit_verification.verify_full_chunk", full_chunk)
         monkeypatch.setattr(it, "_notify_break", notify)
         monkeypatch.setattr(AuditLogger, "emit", emit)
         monkeypatch.setattr("app.core.database.AsyncSessionLocal", _factory)
@@ -86,7 +89,7 @@ class TestVerifiedChain:
         summary = await _run_task()
 
         environment.notify.assert_not_awaited()
-        assert environment.verify.await_args.kwargs["full"] is False
+        assert not environment.verify.await_args.kwargs.get("full", False)
         assert environment.emit.await_args.kwargs["action"] == it.ACTION_CHAIN_VERIFIED
         assert environment.emit.await_args.kwargs["ip_address"] == "internal:celery-beat"
         # No user: this is the platform checking itself, and a user_id here would

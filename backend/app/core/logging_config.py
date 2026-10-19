@@ -140,6 +140,53 @@ def _platform_logger_factory() -> Callable[..., Any]:
     return factory
 
 
+def _processors() -> list[Any]:
+    """The processor chain, built fresh per use.
+
+    Shared by :func:`configure_logging` (the process configuration) and
+    :func:`get_audit_logger` (the audit stream's own logger), so the two cannot
+    come to describe two different output contracts.
+    """
+    return [
+        # Delegates the level decision to the stdlib logger, which is why the
+        # handler and the logger level in ``configure_logging`` are what make
+        # events appear.
+        structlog.stdlib.filter_by_level,
+        structlog.stdlib.add_logger_name,
+        structlog.stdlib.add_log_level,
+        structlog.processors.TimeStamper(fmt="iso", utc=True),
+        _add_request_id,
+        _render_audit_event,
+        structlog.processors.JSONRenderer(ensure_ascii=False),
+    ]
+
+
+def get_audit_logger() -> Any:
+    """The audit stream's own logger, independent of the process configuration.
+
+    ``app.core.audit`` writes through this rather than through a lazy
+    ``structlog.get_logger`` proxy, because a proxy resolves its processor chain
+    from whatever the process configuration is at the moment it is first used.
+    The connector SDK configures structlog globally from ``ConnectorBase.main``,
+    so a connector running inside the core process — the connector test suite,
+    and any future in-process use — would have decided the shape of the audit
+    line: an event rendered by the connector's chain carries ``event`` and
+    ``level`` beside the five published fields, and a connector configured at
+    WARNING leaves a filtering wrapper that drops an INFO audit event before any
+    processor sees it. Both are the audit trail changing shape because something
+    else configured logging, and neither is observable from the API response.
+
+    Pinning the chain makes the promise structural rather than sequential: an
+    audit line has the published shape whatever else configures structlog in this
+    process, and ``docs/description.md`` stays true.
+    """
+    return structlog.wrap_logger(
+        logging.getLogger(AUDIT_LOGGER_NAME),
+        processors=_processors(),
+        wrapper_class=structlog.make_filtering_bound_logger(logging.NOTSET),
+    )
+
+
 def configure_logging(*, force: bool = False) -> None:
     """Point platform logs at stdout as one JSON object per line.
 
@@ -178,18 +225,19 @@ def configure_logging(*, force: bool = False) -> None:
     logging.getLogger(AUDIT_LOGGER_NAME).setLevel(logging.INFO)
 
     structlog.configure(
-        processors=[
-            # Delegates the level decision to the stdlib logger, which is why the
-            # handler and the logger level above are what make events appear.
-            structlog.stdlib.filter_by_level,
-            structlog.stdlib.add_logger_name,
-            structlog.stdlib.add_log_level,
-            structlog.processors.TimeStamper(fmt="iso", utc=True),
-            _add_request_id,
-            _render_audit_event,
-            structlog.processors.JSONRenderer(ensure_ascii=False),
-        ],
+        processors=_processors(),
         logger_factory=_platform_logger_factory(),
+        # Pinned rather than inherited. ``structlog.configure`` leaves any
+        # argument it is not given unchanged, so a *foreign* configuration — the
+        # connector SDK configures this same process from ``ConnectorBase.main``,
+        # which is how a connector and this repository's own test suite share a
+        # process — would otherwise decide this process's wrapper class. A
+        # wrapper built by ``make_filtering_bound_logger(WARNING)`` drops an
+        # INFO event before any processor sees it, so an audit event could be
+        # silenced by a connector's log level. This is structlog's own default
+        # (no in-process filtering; the level decision belongs to the stdlib
+        # logger, which is why the handler and level above are what matter).
+        wrapper_class=structlog.make_filtering_bound_logger(logging.NOTSET),
         # Not cached: this is what lets a logger bound before configuration pick
         # up the configuration when it is first used.
         cache_logger_on_first_use=False,

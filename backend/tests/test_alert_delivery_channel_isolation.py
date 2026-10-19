@@ -50,7 +50,7 @@ async def test_channel_delivery_does_not_report_success_for_an_unavailable_chann
     email.assert_awaited_once()
     telegram.assert_not_awaited()
 
-    with pytest.raises(RuntimeError, match="Telegram provider"):
+    with pytest.raises(RuntimeError, match="Destination disabled or removed"):
         await service.send_aggregated_alert_notification(
             threat_type="phishing",
             findings=[{"phishing_domain": "evil.example"}],
@@ -58,4 +58,4 @@ async def test_channel_delivery_does_not_report_success_for_an_unavailable_chann
             channel="telegram",
             target="-100",
         )
-    telegram.assert_awaited_once()
+    telegram.assert_not_awaited()

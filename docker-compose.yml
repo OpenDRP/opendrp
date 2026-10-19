@@ -35,9 +35,48 @@ services:
     image: postgres:17-alpine
     container_name: opendrp-postgres
     restart: unless-stopped
-    mem_limit: 1g
+    mem_limit: 1.5g
     cpus: "1.0"
     pids_limit: 256
+    # The server is configured here instead of inheriting the image defaults.
+    # `postgres:17-alpine` allows 100 connections while the API, the worker and
+    # the scheduler together can open 120 (see docs/configuration.md, "Database
+    # pool budget"), and the refusal surfaces as a `503 database_busy` the
+    # operator would look for in the application rather than in the datastore.
+    # `shared_buffers` and `effective_cache_size` are sized for this container's
+    # 1.5 GiB, and `work_mem` is deliberately small: one complex report query
+    # multiplied by 200 connections is how a database takes a host down.
+    command:
+      - "postgres"
+      - "-c"
+      - "max_connections=200"
+      - "-c"
+      - "shared_buffers=384MB"
+      - "-c"
+      - "effective_cache_size=1024MB"
+      - "-c"
+      - "work_mem=8MB"
+      - "-c"
+      - "maintenance_work_mem=64MB"
+    # Parallel workers and the WAL use POSIX shared memory, and Docker's 64 MiB
+    # default is what produces "could not resize shared memory segment".
+    shm_size: 256mb
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    # The entrypoint starts as root only to create and re-own the data directory
+    # and then drops to the `postgres` user. These five capabilities are exactly
+    # the ones that step uses; every other capability the image's default set
+    # would grant is dropped. `read_only` is deliberately not set here - see
+    # docs/security.md - because the entrypoint and the WAL write outside the
+    # mounted data directory.
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETGID
+      - SETUID
     environment:
       POSTGRES_USER: ${POSTGRES_USER:?Set POSTGRES_USER in .env}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set a strong POSTGRES_PASSWORD in .env}
@@ -82,10 +121,38 @@ services:
       # host process list already has the deployment's `.env`, so this is the
       # same trust level rather than a new exposure.
       REDIS_PASSWORD: '${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env - generate one with python -c "import secrets; print(secrets.token_urlsafe(32))"}'
+    # Bounded memory, and an explicit persistence choice. Without `--maxmemory`
+    # Redis grows until the container's `mem_limit` kills it, taking the Celery
+    # broker, the rate-limit counters and the scan leases down in one event.
+    # `noeviction` turns the bound into an error a caller can see instead of a
+    # silently evicted task. Snapshots are off on purpose: a save forks, and the
+    # fork can double the resident set under the very bound that is meant to
+    # contain it - and the delayed work is re-created by the scheduler, so the
+    # honest statement is that a Redis restart loses what was in flight (see
+    # docs/security.md and README.md).
     command:
       - "redis-server"
       - "--requirepass"
       - "${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env}"
+      - "--maxmemory"
+      - "384mb"
+      - "--maxmemory-policy"
+      - "noeviction"
+      - "--save"
+      - ""
+    security_opt:
+      - no-new-privileges:true
+    # Redis needs no capability at all: it binds no privileged port, owns nothing
+    # outside its volume and runs as its own unprivileged user.
+    #
+    # NOTE: `cap_drop: ALL` breaks Redis 7.x on Alpine because the entrypoint
+    # calls setpriv/setresuid to drop from root to the redis user, which requires
+    # CAP_SETUID/CAP_SETGID. Restore only what the entrypoint needs.
+    cap_drop:
+      - ALL
+    cap_add:
+      - SETUID
+      - SETGID
     ports:
       # Same: loopback only unless user opts-in via REDIS_PORT override in .env.
       - "${REDIS_PORT:-127.0.0.1:6379}:6379"
@@ -226,9 +293,19 @@ services:
       # set true to make an administrator's second factor a condition of reaching
       # admin routes rather than an optional feature. Only the API enforces it.
       REQUIRE_MFA_FOR_ADMINS: ${REQUIRE_MFA_FOR_ADMINS:-false}
+      # The same policy as a list of roles (`admin,analyst`). Read together with
+      # the flag above: the union is what the API enforces. Only the API resolves
+      # the gate, so only the API needs it.
+      REQUIRE_MFA_ROLES: ${REQUIRE_MFA_ROLES:-}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      # Only the API serves the scrape endpoint; the workers carry the same
+      # settings because they run the same application, but a metric is read
+      # where the process that answers it lives. Empty means the endpoint does
+      # not exist (404). See METRICS_TOKEN in .env.example.
+      METRICS_TOKEN: ${METRICS_TOKEN:-}
       AUDIT_RETENTION_DAYS: ${AUDIT_RETENTION_DAYS:-365}
       REPORT_RETENTION_DAYS: ${REPORT_RETENTION_DAYS:-365}
+      DNS_EXPIRY_MAX_AGE_HOURS: ${DNS_EXPIRY_MAX_AGE_HOURS:-48}
       AUTH_COOKIE_SECURE: ${AUTH_COOKIE_SECURE:-true}
       # Bound on authenticated requests per account per minute. Every read writes
       # an audit row, so this is the setting that stops one credential from
@@ -239,21 +316,55 @@ services:
       CONNECTOR_JOB_LEASE_SECONDS: ${CONNECTOR_JOB_LEASE_SECONDS:-180}
       CONNECTOR_JOB_MAX_ATTEMPTS: ${CONNECTOR_JOB_MAX_ATTEMPTS:-3}
       ALERT_HEALTH_CHECK_TIMEOUT_SECONDS: ${ALERT_HEALTH_CHECK_TIMEOUT_SECONDS:-15}
+      # Reuse one channel probe for this many seconds. Two dashboard loads were
+      # two SMTP handshakes before the cache existed.
+      ALERT_HEALTH_CACHE_SECONDS: ${ALERT_HEALTH_CACHE_SECONDS:-60}
       ALERT_DELIVERY_TIMEOUT_SECONDS: ${ALERT_DELIVERY_TIMEOUT_SECONDS:-20}
       ALERT_DELIVERY_MAX_ATTEMPTS: ${ALERT_DELIVERY_MAX_ATTEMPTS:-3}
+      # How long a recipient is held after a delivery whose outcome is unknown,
+      # before the queue retries it. An operator can end the hold early.
+      ALERT_RECIPIENT_HOLD_SECONDS: ${ALERT_RECIPIENT_HOLD_SECONDS:-900}
       ALERT_DELIVERY_RETRY_BASE_SECONDS: ${ALERT_DELIVERY_RETRY_BASE_SECONDS:-2}
       ALERT_AGGREGATION_DELAY_SECONDS: ${ALERT_AGGREGATION_DELAY_SECONDS:-10}
+      # How loudly the phishing module reports a scored candidate: at or above
+      # ALERT_CONFIDENCE_DIRECT at once, in the daily digest between the two,
+      # list-only below ALERT_CONFIDENCE_DIGEST.
+      ALERT_CONFIDENCE_DIRECT: ${ALERT_CONFIDENCE_DIRECT:-60}
+      ALERT_CONFIDENCE_DIGEST: ${ALERT_CONFIDENCE_DIGEST:-30}
+      # The middle band waits for the daily digest; off makes the budget binary.
+      ALERT_PHISHING_DIGEST_ENABLED: ${ALERT_PHISHING_DIGEST_ENABLED:-true}
+      ALERT_PHISHING_DIGEST_HOUR_UTC: ${ALERT_PHISHING_DIGEST_HOUR_UTC:-6}
       ALERT_MAX_FINDINGS_PER_MESSAGE: ${ALERT_MAX_FINDINGS_PER_MESSAGE:-50}
+      ALERT_NO_CHANNEL_RETRY_HOURS: ${ALERT_NO_CHANNEL_RETRY_HOURS:-24}
+      # On, a candidate that changes address, ports or brand is reported again.
+      ALERT_CANDIDATE_CHANGE_NOTIFICATIONS: ${ALERT_CANDIDATE_CHANGE_NOTIFICATIONS:-true}
+      # What the channel does with a breach incident the source itself labels spam
+      # or fabricated, how many new incidents one scan reports before the rest
+      # wait for the digest, and how much the affected-account count must grow for
+      # an already reported incident to be worth a second message.
+      ALERT_BREACH_NOISE_POLICY: ${ALERT_BREACH_NOISE_POLICY:-store_only_spam}
+      ALERT_BREACH_DIGEST_THRESHOLD: ${ALERT_BREACH_DIGEST_THRESHOLD:-20}
+      ALERT_BREACH_GROWTH_FLOOR: ${ALERT_BREACH_GROWTH_FLOOR:-1}
       ALERT_MAX_TELEGRAM_MESSAGE_LENGTH: ${ALERT_MAX_TELEGRAM_MESSAGE_LENGTH:-3800}
       OUTBOUND_DNS_TIMEOUT_SECONDS: ${OUTBOUND_DNS_TIMEOUT_SECONDS:-3}
       REPORT_MAX_ROWS: ${REPORT_MAX_ROWS:-5000}
       REPORT_GENERATION_TIMEOUT_SECONDS: ${REPORT_GENERATION_TIMEOUT_SECONDS:-120}
-      # The Compose subnet is appended rather than only defaulted: nginx reaches
+      REPORT_QUEUE_MAX_PENDING: ${REPORT_QUEUE_MAX_PENDING:-100}
+      REPORT_ENQUEUE_MAX_RETRIES: ${REPORT_ENQUEUE_MAX_RETRIES:-2}
+      REPORT_WORKER_CONCURRENCY: ${REPORT_WORKER_CONCURRENCY:-2}
+      # The edge subnet is appended rather than only defaulted: nginx reaches
       # the backend from inside that network, never from loopback, so without it
       # every audit row records the proxy container address instead of the real
       # client. Appending keeps that guarantee even when TRUSTED_PROXY_IPS is set
       # explicitly in .env (duplicate ranges are harmless).
-      TRUSTED_PROXY_IPS: ${TRUSTED_PROXY_IPS:-127.0.0.1,::1},${OPENDRP_NETWORK_SUBNET:-172.18.0.0/16}
+      #
+      # The *edge* subnet and not the parent range. A trusted network is a
+      # network whose `X-Forwarded-For` entries are believed, so naming
+      # `${OPENDRP_NETWORK_SUBNET}` trusted every container in the deployment —
+      # including the connector network, which holds code this platform did not
+      # write, and the data network, which holds the API's own siblings. Either
+      # one could then write any address it chose into the audit chain.
+      TRUSTED_PROXY_IPS: ${TRUSTED_PROXY_IPS:-127.0.0.1,::1},${OPENDRP_EDGE_SUBNET:-172.18.10.0/24}
       DB_POOL_SIZE: ${DB_POOL_SIZE:-20}
       DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-10}
       DB_POOL_RECYCLE_SECONDS: ${DB_POOL_RECYCLE_SECONDS:-1800}
@@ -274,6 +385,12 @@ services:
       # because that arrives as an error the API can report as a busy database,
       # while a client timeout is an abrupt disconnect that looks like a fault.
       DB_COMMAND_TIMEOUT_SECONDS: ${DB_COMMAND_TIMEOUT_SECONDS:-45}
+      # The bounds the *startup migration* runs under, passed only to the service
+      # that runs it. Its lock bound is not DB_LOCK_TIMEOUT_MS (5s is right for a
+      # request, wrong for an upgrade) and its statement bound is off by default,
+      # because the baseline's index builds are legitimately long.
+      MIGRATION_LOCK_TIMEOUT_MS: ${MIGRATION_LOCK_TIMEOUT_MS:-30000}
+      MIGRATION_STATEMENT_TIMEOUT_MS: ${MIGRATION_STATEMENT_TIMEOUT_MS:-0}
       # The deployment's own address space, so the outbound guard can refuse to
       # dial back into the platform's containers from an operator-supplied
       # destination (a "SMTP host" that is really the API, or the Docker
@@ -331,8 +448,13 @@ services:
       - opendrp-connectors
 
   # ---------------------------------------------------------------------------
-  # Celery Worker — Background task executor
+  # Celery Worker — scans, reports, retention
   # ---------------------------------------------------------------------------
+  # Consumes `default` and `reports`, and deliberately not `alerts`: report
+  # rendering is the heaviest work the platform does and holds this worker for up
+  # to REPORT_GENERATION_TIMEOUT_SECONDS in a single task, so the delivery queue
+  # has its own process (see celery-worker-alerts) rather than waiting behind a
+  # PDF render.
   celery-worker:
     build:
       context: ./backend
@@ -340,9 +462,18 @@ services:
     image: ${OPENDRP_IMAGE_PREFIX:-ghcr.io/opendrp/opendrp}/backend:${OPENDRP_VERSION:-latest}
     container_name: opendrp-celery-worker
     restart: unless-stopped
-    mem_limit: 1g
+    # PDF report generation happens inside this container, and a large inventory
+    # is the heaviest thing the platform does, so the memory bound covers the
+    # render itself. The CPU bound stays at one core: the worker is started with
+    # `-P solo` and therefore executes one task at a time.
+    mem_limit: 1.5g
     cpus: "1.0"
     pids_limit: 256
+    # Long enough for a short task to finish rather than be killed for nothing.
+    # A render that is still running when this expires is *lost work, not a lost
+    # task*: the report task acknowledges late, so the broker hands it to the next
+    # worker instead of dropping it.
+    stop_grace_period: 60s
     security_opt:
       - no-new-privileges:true
     cap_drop:
@@ -350,7 +481,7 @@ services:
     command: >
       celery -A app.core.celery_app worker
         --loglevel=info
-        --queues=default,reports,alerts
+        --queues=default,reports
         -P solo
     environment:
       APP_ENV: ${APP_ENV:?Set APP_ENV in .env}
@@ -360,7 +491,7 @@ services:
       REPORTS_STORE_DIR: /workspace/reports_store
       JWT_SECRET_KEY: ${JWT_SECRET_KEY:?Set JWT_SECRET_KEY in .env}
       ENCRYPTION_KEY: ${ENCRYPTION_KEY:?Set ENCRYPTION_KEY in .env}
-      TRUSTED_PROXY_IPS: ${TRUSTED_PROXY_IPS:-127.0.0.1,::1},${OPENDRP_NETWORK_SUBNET:-172.18.0.0/16}
+      TRUSTED_PROXY_IPS: ${TRUSTED_PROXY_IPS:-127.0.0.1,::1},${OPENDRP_EDGE_SUBNET:-172.18.10.0/24}
       DB_POOL_SIZE: ${DB_POOL_SIZE:-10}
       DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-5}
       DB_POOL_RECYCLE_SECONDS: ${DB_POOL_RECYCLE_SECONDS:-1800}
@@ -378,17 +509,43 @@ services:
       OUTBOUND_DNS_TIMEOUT_SECONDS: ${OUTBOUND_DNS_TIMEOUT_SECONDS:-3}
       REPORT_MAX_ROWS: ${REPORT_MAX_ROWS:-5000}
       REPORT_GENERATION_TIMEOUT_SECONDS: ${REPORT_GENERATION_TIMEOUT_SECONDS:-120}
+      REPORT_QUEUE_MAX_PENDING: ${REPORT_QUEUE_MAX_PENDING:-100}
+      REPORT_ENQUEUE_MAX_RETRIES: ${REPORT_ENQUEUE_MAX_RETRIES:-2}
+      REPORT_WORKER_CONCURRENCY: ${REPORT_WORKER_CONCURRENCY:-2}
       ALERT_DELIVERY_TIMEOUT_SECONDS: ${ALERT_DELIVERY_TIMEOUT_SECONDS:-20}
       ALERT_DELIVERY_MAX_ATTEMPTS: ${ALERT_DELIVERY_MAX_ATTEMPTS:-3}
+      # How long a recipient is held after a delivery whose outcome is unknown,
+      # before the queue retries it. An operator can end the hold early.
+      ALERT_RECIPIENT_HOLD_SECONDS: ${ALERT_RECIPIENT_HOLD_SECONDS:-900}
       ALERT_DELIVERY_RETRY_BASE_SECONDS: ${ALERT_DELIVERY_RETRY_BASE_SECONDS:-2}
       ALERT_AGGREGATION_DELAY_SECONDS: ${ALERT_AGGREGATION_DELAY_SECONDS:-10}
+      # How loudly the phishing module reports a scored candidate: at or above
+      # ALERT_CONFIDENCE_DIRECT at once, in the daily digest between the two,
+      # list-only below ALERT_CONFIDENCE_DIGEST.
+      ALERT_CONFIDENCE_DIRECT: ${ALERT_CONFIDENCE_DIRECT:-60}
+      ALERT_CONFIDENCE_DIGEST: ${ALERT_CONFIDENCE_DIGEST:-30}
+      # The middle band waits for the daily digest; off makes the budget binary.
+      ALERT_PHISHING_DIGEST_ENABLED: ${ALERT_PHISHING_DIGEST_ENABLED:-true}
+      ALERT_PHISHING_DIGEST_HOUR_UTC: ${ALERT_PHISHING_DIGEST_HOUR_UTC:-6}
       ALERT_MAX_FINDINGS_PER_MESSAGE: ${ALERT_MAX_FINDINGS_PER_MESSAGE:-50}
+      ALERT_NO_CHANNEL_RETRY_HOURS: ${ALERT_NO_CHANNEL_RETRY_HOURS:-24}
+      # On, a candidate that changes address, ports or brand is reported again.
+      ALERT_CANDIDATE_CHANGE_NOTIFICATIONS: ${ALERT_CANDIDATE_CHANGE_NOTIFICATIONS:-true}
+      # What the channel does with a breach incident the source itself labels spam
+      # or fabricated, how many new incidents one scan reports before the rest
+      # wait for the digest, and how much the affected-account count must grow for
+      # an already reported incident to be worth a second message.
+      ALERT_BREACH_NOISE_POLICY: ${ALERT_BREACH_NOISE_POLICY:-store_only_spam}
+      ALERT_BREACH_DIGEST_THRESHOLD: ${ALERT_BREACH_DIGEST_THRESHOLD:-20}
+      ALERT_BREACH_GROWTH_FLOOR: ${ALERT_BREACH_GROWTH_FLOOR:-1}
       ALERT_MAX_TELEGRAM_MESSAGE_LENGTH: ${ALERT_MAX_TELEGRAM_MESSAGE_LENGTH:-3800}
       # The retention sweep runs here (beat schedules it, this worker executes
       # it), so these are the only container that needs the values. The API
       # replica does not delete history.
       AUDIT_RETENTION_DAYS: ${AUDIT_RETENTION_DAYS:-365}
       REPORT_RETENTION_DAYS: ${REPORT_RETENTION_DAYS:-365}
+      DNS_EXPIRY_MAX_AGE_HOURS: ${DNS_EXPIRY_MAX_AGE_HOURS:-48}
+      TLS_CERTIFICATE_RETENTION_DAYS: ${TLS_CERTIFICATE_RETENTION_DAYS:-365}
       RETENTION_BATCH_SIZE: ${RETENTION_BATCH_SIZE:-5000}
       RETENTION_MAX_BATCHES_PER_RUN: ${RETENTION_MAX_BATCHES_PER_RUN:-200}
       ENCRYPTION_PREVIOUS_KEYS: ${ENCRYPTION_PREVIOUS_KEYS:-}
@@ -418,6 +575,150 @@ services:
       retries: 3
       # Generous: the worker waits for PostgreSQL and Redis to be healthy before
       # it starts, and the first ping has to wait for a full polling cycle.
+      start_period: 90s
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,size=64m
+    volumes:
+      - reports_store:/workspace/reports_store
+    dns:
+      - "${OPENDRP_DNS_PRIMARY:-8.8.8.8}"
+      - "${OPENDRP_DNS_SECONDARY:-1.1.1.1}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      backend:
+        condition: service_healthy
+    logging: *default-logging
+    networks:
+      - opendrp-net
+
+  # ---------------------------------------------------------------------------
+  # Celery Worker — alert delivery
+  # ---------------------------------------------------------------------------
+  # The queue this worker does *not* consume is the point of it: with one worker
+  # on all three queues, a report render of up to REPORT_GENERATION_TIMEOUT_SECONDS
+  # put every notification behind it, and a scan result that should have been
+  # mailed within seconds arrived minutes later — or, when the render was killed,
+  # not at all until the next beat tick. Delivery now has a process of its own.
+  celery-worker-alerts:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    image: ${OPENDRP_IMAGE_PREFIX:-ghcr.io/opendrp/opendrp}/backend:${OPENDRP_VERSION:-latest}
+    container_name: opendrp-celery-worker-alerts
+    restart: unless-stopped
+    # The delivery path is network-bound (SMTP, Telegram) and processes one group
+    # at a time, so its bounds are small next to the report worker's.
+    mem_limit: 512m
+    cpus: "0.5"
+    pids_limit: 128
+    # A delivery in flight is allowed to finish. Docker's ten-second default
+    # would SIGKILL a message part-way through; the delivery lease makes a repeat
+    # safe, but a restart is not a reason to send an alert twice or to make the
+    # operator wait for the redelivery.
+    stop_grace_period: 45s
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    command: >
+      celery -A app.core.celery_app worker
+        --loglevel=info
+        --queues=alerts
+        -P solo
+    environment:
+      APP_ENV: ${APP_ENV:?Set APP_ENV in .env}
+      OPENDRP_VERSION: ${OPENDRP_VERSION:-dev}
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:?Set POSTGRES_USER in .env}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:?Set POSTGRES_DB in .env}
+      REDIS_URL: redis://:${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env}@redis:6379/0
+      REPORTS_STORE_DIR: /workspace/reports_store
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:?Set JWT_SECRET_KEY in .env}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:?Set ENCRYPTION_KEY in .env}
+      TRUSTED_PROXY_IPS: ${TRUSTED_PROXY_IPS:-127.0.0.1,::1},${OPENDRP_EDGE_SUBNET:-172.18.10.0/24}
+      DB_POOL_SIZE: ${DB_POOL_SIZE:-10}
+      DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-5}
+      DB_POOL_RECYCLE_SECONDS: ${DB_POOL_RECYCLE_SECONDS:-1800}
+      DB_POOL_TIMEOUT_SECONDS: ${DB_POOL_TIMEOUT_SECONDS:-30}
+      DB_POOL_USE_LIFO: ${DB_POOL_USE_LIFO:-True}
+      # Delivery reads and writes delivery rows, so the statement limits are the
+      # same numbers as the other worker's: the same query must not have a
+      # different budget depending on which process runs it.
+      DB_STATEMENT_TIMEOUT_MS: ${DB_STATEMENT_TIMEOUT_MS:-30000}
+      DB_LOCK_TIMEOUT_MS: ${DB_LOCK_TIMEOUT_MS:-5000}
+      DB_IDLE_IN_TRANSACTION_TIMEOUT_MS: ${DB_IDLE_IN_TRANSACTION_TIMEOUT_MS:-60000}
+      DB_COMMAND_TIMEOUT_SECONDS: ${DB_COMMAND_TIMEOUT_SECONDS:-45}
+      OUTBOUND_DNS_TIMEOUT_SECONDS: ${OUTBOUND_DNS_TIMEOUT_SECONDS:-3}
+      # The whole delivery budget goes with this worker, not with a queue: this
+      # container is the one that sends, and `app.tasks.alert_tasks` reads these.
+      ALERT_DELIVERY_TIMEOUT_SECONDS: ${ALERT_DELIVERY_TIMEOUT_SECONDS:-20}
+      ALERT_DELIVERY_MAX_ATTEMPTS: ${ALERT_DELIVERY_MAX_ATTEMPTS:-3}
+      # How long a recipient is held after a delivery whose outcome is unknown,
+      # before the queue retries it. An operator can end the hold early.
+      ALERT_RECIPIENT_HOLD_SECONDS: ${ALERT_RECIPIENT_HOLD_SECONDS:-900}
+      ALERT_DELIVERY_RETRY_BASE_SECONDS: ${ALERT_DELIVERY_RETRY_BASE_SECONDS:-2}
+      ALERT_AGGREGATION_DELAY_SECONDS: ${ALERT_AGGREGATION_DELAY_SECONDS:-10}
+      # How loudly the phishing module reports a scored candidate: at or above
+      # ALERT_CONFIDENCE_DIRECT at once, in the daily digest between the two,
+      # list-only below ALERT_CONFIDENCE_DIGEST.
+      ALERT_CONFIDENCE_DIRECT: ${ALERT_CONFIDENCE_DIRECT:-60}
+      ALERT_CONFIDENCE_DIGEST: ${ALERT_CONFIDENCE_DIGEST:-30}
+      # The middle band waits for the daily digest; off makes the budget binary.
+      ALERT_PHISHING_DIGEST_ENABLED: ${ALERT_PHISHING_DIGEST_ENABLED:-true}
+      ALERT_PHISHING_DIGEST_HOUR_UTC: ${ALERT_PHISHING_DIGEST_HOUR_UTC:-6}
+      ALERT_MAX_FINDINGS_PER_MESSAGE: ${ALERT_MAX_FINDINGS_PER_MESSAGE:-50}
+      ALERT_NO_CHANNEL_RETRY_HOURS: ${ALERT_NO_CHANNEL_RETRY_HOURS:-24}
+      # On, a candidate that changes address, ports or brand is reported again.
+      ALERT_CANDIDATE_CHANGE_NOTIFICATIONS: ${ALERT_CANDIDATE_CHANGE_NOTIFICATIONS:-true}
+      # What the channel does with a breach incident the source itself labels spam
+      # or fabricated, how many new incidents one scan reports before the rest
+      # wait for the digest, and how much the affected-account count must grow for
+      # an already reported incident to be worth a second message.
+      ALERT_BREACH_NOISE_POLICY: ${ALERT_BREACH_NOISE_POLICY:-store_only_spam}
+      ALERT_BREACH_DIGEST_THRESHOLD: ${ALERT_BREACH_DIGEST_THRESHOLD:-20}
+      ALERT_BREACH_GROWTH_FLOOR: ${ALERT_BREACH_GROWTH_FLOOR:-1}
+      ALERT_MAX_TELEGRAM_MESSAGE_LENGTH: ${ALERT_MAX_TELEGRAM_MESSAGE_LENGTH:-3800}
+      # The report and retention settings are repeated from the other worker on
+      # purpose: `app.core.celery_app` imports `app.tasks.report_tasks`, whose
+      # decorator reads REPORT_GENERATION_TIMEOUT_SECONDS, and two containers that
+      # disagree about a task's limits is exactly the drift this file avoids.
+      REPORT_MAX_ROWS: ${REPORT_MAX_ROWS:-5000}
+      REPORT_GENERATION_TIMEOUT_SECONDS: ${REPORT_GENERATION_TIMEOUT_SECONDS:-120}
+      REPORT_ENQUEUE_MAX_RETRIES: ${REPORT_ENQUEUE_MAX_RETRIES:-2}
+      REPORT_WORKER_CONCURRENCY: ${REPORT_WORKER_CONCURRENCY:-2}
+      AUDIT_RETENTION_DAYS: ${AUDIT_RETENTION_DAYS:-365}
+      REPORT_RETENTION_DAYS: ${REPORT_RETENTION_DAYS:-365}
+      DNS_EXPIRY_MAX_AGE_HOURS: ${DNS_EXPIRY_MAX_AGE_HOURS:-48}
+      TLS_CERTIFICATE_RETENTION_DAYS: ${TLS_CERTIFICATE_RETENTION_DAYS:-365}
+      RETENTION_BATCH_SIZE: ${RETENTION_BATCH_SIZE:-5000}
+      RETENTION_MAX_BATCHES_PER_RUN: ${RETENTION_MAX_BATCHES_PER_RUN:-200}
+      ENCRYPTION_PREVIOUS_KEYS: ${ENCRYPTION_PREVIOUS_KEYS:-}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      # Delivery writes audit rows for every sent, refused and ambiguous alert,
+      # and every audit row is signed: without the key here those rows would be
+      # signed with a derivation the API does not share and the chain would not
+      # verify.
+      AUDIT_CHAIN_KEYS: ${AUDIT_CHAIN_KEYS:-}
+      AUDIT_CHAIN_PREVIOUS_KEYS: ${AUDIT_CHAIN_PREVIOUS_KEYS:-}
+      # Delivery resolves the platform's own addresses through the outbound
+      # guard too, so a mis-set SMTP or Telegram host cannot be pointed back at
+      # the deployment's containers.
+      OPENDRP_NETWORK_SUBNET: ${OPENDRP_NETWORK_SUBNET:-172.18.0.0/16}
+      OPENDRP_EDGE_SUBNET: ${OPENDRP_EDGE_SUBNET:-172.18.10.0/24}
+      OPENDRP_DATA_SUBNET: ${OPENDRP_DATA_SUBNET:-172.18.20.0/24}
+      OPENDRP_CONNECTOR_SUBNET: ${OPENDRP_CONNECTOR_SUBNET:-172.18.30.0/24}
+      OUTBOUND_ALLOWED_HOSTS: ${OUTBOUND_ALLOWED_HOSTS:-}
+      OUTBOUND_BLOCKED_CIDRS: ${OUTBOUND_BLOCKED_CIDRS:-}
+    healthcheck:
+      # The same broker round trip as the other worker: it passes only when this
+      # process answers, so a delivery worker that is alive but wedged is reported
+      # unhealthy instead of "running".
+      test: ["CMD-SHELL", "celery -A app.core.celery_app inspect ping -t 10 >/dev/null 2>&1 || exit 1"]
+      interval: 60s
+      timeout: 20s
+      retries: 3
       start_period: 90s
     read_only: true
     tmpfs:
@@ -475,7 +776,7 @@ services:
       # stored and no notification is ever sent.
       AUDIT_CHAIN_KEYS: ${AUDIT_CHAIN_KEYS:-}
       AUDIT_CHAIN_PREVIOUS_KEYS: ${AUDIT_CHAIN_PREVIOUS_KEYS:-}
-      TRUSTED_PROXY_IPS: ${TRUSTED_PROXY_IPS:-127.0.0.1,::1},${OPENDRP_NETWORK_SUBNET:-172.18.0.0/16}
+      TRUSTED_PROXY_IPS: ${TRUSTED_PROXY_IPS:-127.0.0.1,::1},${OPENDRP_EDGE_SUBNET:-172.18.10.0/24}
       DB_POOL_SIZE: ${DB_POOL_SIZE:-5}
       DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-2}
       DB_POOL_RECYCLE_SECONDS: ${DB_POOL_RECYCLE_SECONDS:-1800}
@@ -490,11 +791,35 @@ services:
       OUTBOUND_DNS_TIMEOUT_SECONDS: ${OUTBOUND_DNS_TIMEOUT_SECONDS:-3}
       REPORT_MAX_ROWS: ${REPORT_MAX_ROWS:-5000}
       REPORT_GENERATION_TIMEOUT_SECONDS: ${REPORT_GENERATION_TIMEOUT_SECONDS:-120}
+      REPORT_QUEUE_MAX_PENDING: ${REPORT_QUEUE_MAX_PENDING:-100}
+      REPORT_ENQUEUE_MAX_RETRIES: ${REPORT_ENQUEUE_MAX_RETRIES:-2}
+      REPORT_WORKER_CONCURRENCY: ${REPORT_WORKER_CONCURRENCY:-2}
       ALERT_DELIVERY_TIMEOUT_SECONDS: ${ALERT_DELIVERY_TIMEOUT_SECONDS:-20}
       ALERT_DELIVERY_MAX_ATTEMPTS: ${ALERT_DELIVERY_MAX_ATTEMPTS:-3}
+      # How long a recipient is held after a delivery whose outcome is unknown,
+      # before the queue retries it. An operator can end the hold early.
+      ALERT_RECIPIENT_HOLD_SECONDS: ${ALERT_RECIPIENT_HOLD_SECONDS:-900}
       ALERT_DELIVERY_RETRY_BASE_SECONDS: ${ALERT_DELIVERY_RETRY_BASE_SECONDS:-2}
       ALERT_AGGREGATION_DELAY_SECONDS: ${ALERT_AGGREGATION_DELAY_SECONDS:-10}
+      # How loudly the phishing module reports a scored candidate: at or above
+      # ALERT_CONFIDENCE_DIRECT at once, in the daily digest between the two,
+      # list-only below ALERT_CONFIDENCE_DIGEST.
+      ALERT_CONFIDENCE_DIRECT: ${ALERT_CONFIDENCE_DIRECT:-60}
+      ALERT_CONFIDENCE_DIGEST: ${ALERT_CONFIDENCE_DIGEST:-30}
+      # The middle band waits for the daily digest; off makes the budget binary.
+      ALERT_PHISHING_DIGEST_ENABLED: ${ALERT_PHISHING_DIGEST_ENABLED:-true}
+      ALERT_PHISHING_DIGEST_HOUR_UTC: ${ALERT_PHISHING_DIGEST_HOUR_UTC:-6}
       ALERT_MAX_FINDINGS_PER_MESSAGE: ${ALERT_MAX_FINDINGS_PER_MESSAGE:-50}
+      ALERT_NO_CHANNEL_RETRY_HOURS: ${ALERT_NO_CHANNEL_RETRY_HOURS:-24}
+      # On, a candidate that changes address, ports or brand is reported again.
+      ALERT_CANDIDATE_CHANGE_NOTIFICATIONS: ${ALERT_CANDIDATE_CHANGE_NOTIFICATIONS:-true}
+      # What the channel does with a breach incident the source itself labels spam
+      # or fabricated, how many new incidents one scan reports before the rest
+      # wait for the digest, and how much the affected-account count must grow for
+      # an already reported incident to be worth a second message.
+      ALERT_BREACH_NOISE_POLICY: ${ALERT_BREACH_NOISE_POLICY:-store_only_spam}
+      ALERT_BREACH_DIGEST_THRESHOLD: ${ALERT_BREACH_DIGEST_THRESHOLD:-20}
+      ALERT_BREACH_GROWTH_FLOOR: ${ALERT_BREACH_GROWTH_FLOOR:-1}
       ALERT_MAX_TELEGRAM_MESSAGE_LENGTH: ${ALERT_MAX_TELEGRAM_MESSAGE_LENGTH:-3800}
       ENCRYPTION_PREVIOUS_KEYS: ${ENCRYPTION_PREVIOUS_KEYS:-}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
@@ -527,6 +852,11 @@ services:
         # Beat only enqueues to the broker, but starting it against a worker
         # that cannot run tasks only stores schedules nobody will execute.
         condition: service_healthy
+      celery-worker-alerts:
+        # Beat schedules the alert delivery tick, so a beat that starts while no
+        # delivery worker can run is a scheduler quietly queueing messages into a
+        # queue nothing is draining.
+        condition: service_healthy
       backend:
         condition: service_healthy
     logging: *default-logging
@@ -538,19 +868,19 @@ services:
   # Comment a block out to disconnect that source; the core will simply stop
   # receiving its findings. Toggle a running connector from Settings → Connectors.
   # ---------------------------------------------------------------------------
-  connector-dnstwist:
+  connector-phishing-dnstwist:
     build:
       context: .
       dockerfile: ./connectors/dnstwist/Dockerfile
     image: ${OPENDRP_IMAGE_PREFIX:-ghcr.io/opendrp/opendrp}/connector-dnstwist:${OPENDRP_VERSION:-latest}
-    container_name: opendrp-connector-dnstwist
+    container_name: opendrp-connector-phishing-dnstwist
     mem_limit: 768m
     cpus: "1.0"
     pids_limit: 256
     # Bounded restart: an unprovisioned connector (no CONNECTOR_TOKEN) exits with
     # a clear message, and `unless-stopped` would restart it forever, filling the
     # log and hiding the one real signal. After ten attempts it stays down until
-    # an operator provisions it and runs `docker compose up -d connector-dnstwist`.
+    # an operator provisions it and runs `docker compose up -d connector-phishing-dnstwist`.
     restart: on-failure:10
     security_opt:
       - no-new-privileges:true
@@ -561,11 +891,11 @@ services:
       - /tmp:rw,noexec,nosuid,size=64m
     environment:
       CORE_URL: http://backend:8000
-      CONNECTOR_NAME: dnstwist
+      CONNECTOR_NAME: phishing-dnstwist
       CONNECTOR_TYPE: phishing
       # This connector's own credential — there is no shared connector secret.
       # One command issues it and records it in .env:
-      #     make connector-token NAME=dnstwist TYPE=phishing
+      #     make connector-token NAME=phishing-dnstwist TYPE=phishing
       #
       # The default is empty on purpose. A "required" interpolation
       # (${VAR:?...}) makes *every* compose command fail on an unprovisioned
@@ -583,12 +913,26 @@ services:
       # Empty means use the Docker/system resolver. Set this only when the
       # deployment requires explicit resolvers (comma-separated).
       DNS_NAMESERVERS: ${DNS_NAMESERVERS:-}
-      # Optional expensive dimensions are disabled by default. The connector
-      # always uses a bounded fuzzer set unless DNSTWIST_FUZZERS is overridden.
-      DNSTWIST_FUZZERS: ${DNSTWIST_FUZZERS:-addition,omission,repetition,hyphenation,insertion,replacement,transposition,vowel-swap}
-      # Optional TLD dictionary. Enabling the 100-entry common-TLD dictionary
-      # materially increases DNS work and should be an explicit choice.
+      # What the scan asks for, in classes rather than as a raw fuzzer list: a class
+      # brings the technique and the dictionary it needs (the CLI refuses `--tld`/
+      # `--dictionary` unless their fuzzer is in the same command). `typo` is the
+      # documented baseline and needs no companion file; the expensive classes are
+      # opt-in because together they generate thousands of DNS requests per asset.
+      DNSTWIST_FUZZER_CLASSES: ${DNSTWIST_FUZZER_CLASSES:-typo}
+      # Optional TLD dictionary for the `tld` class. Empty means the dictionary the
+      # package ships; a missing file is reported per domain instead of failing it.
       DNSTWIST_TLD_DICTIONARY: ${DNSTWIST_TLD_DICTIONARY:-}
+      # Optional word list for the `dictionary` class.
+      DNSTWIST_DICTIONARY: ${DNSTWIST_DICTIONARY:-}
+      # The candidate bound. The CLI has no such option, so it is applied where it
+      # costs nothing: a permutation that is never resolved is never submitted.
+      DNSTWIST_MAX_CANDIDATES: ${DNSTWIST_MAX_CANDIDATES:-250}
+      # The CLI's MX check plus one free TXT question, so `mx_without_spf` is answered
+      # rather than inferred. Off by default: it connects to the candidate's mail server.
+      DNSTWIST_MX_CHECK: ${DNSTWIST_MX_CHECK:-false}
+      # Page similarity (`--lsh tlsh`). Refused with a named skip when the TLSh module
+      # is absent from the image; `--phash` and screenshots are never used.
+      DNSTWIST_CONTENT_INSPECTION: ${DNSTWIST_CONTENT_INSPECTION:-false}
       # Bound one dnstwist subprocess. A timeout is reported as a partial job,
       # and the SDK terminates the complete process group rather than leaving a
       # child resolver behind.
@@ -605,12 +949,15 @@ services:
     networks:
       - opendrp-connectors
 
-  connector-shodan:
+  connector-phishing-shodan:
+    # Keyed: starts only when its profile is enabled (COMPOSE_PROFILES=shodan),
+    # so a missing SHODAN_API_KEY never reaches the connector or fails compose.
+    profiles: ["shodan"]
     build:
       context: .
       dockerfile: ./connectors/shodan/Dockerfile
     image: ${OPENDRP_IMAGE_PREFIX:-ghcr.io/opendrp/opendrp}/connector-shodan:${OPENDRP_VERSION:-latest}
-    container_name: opendrp-connector-shodan
+    container_name: opendrp-connector-phishing-shodan
     restart: on-failure:10
     mem_limit: 512m
     cpus: "0.75"
@@ -624,10 +971,10 @@ services:
       - /tmp:rw,noexec,nosuid,size=64m
     environment:
       CORE_URL: http://backend:8000
-      CONNECTOR_NAME: shodan
+      CONNECTOR_NAME: phishing-shodan
       CONNECTOR_TYPE: phishing
       # Own credential — see CONNECTOR_TOKEN_DNSTWIST above.
-      #   make connector-token NAME=shodan TYPE=phishing
+      #   make connector-token NAME=phishing-shodan TYPE=phishing
       CONNECTOR_JOB_TYPE: phishing.shodan
       CONNECTOR_FINDING_KIND: phishing
       CONNECTOR_ASSET_TYPES: domain,keyword_domain,keyword_title,ip_address
@@ -638,7 +985,7 @@ services:
          "scan_http_title": {"type": "bool", "label": "Page title search", "default": true},
          "scan_favicon": {"type": "bool", "label": "Favicon hash search", "default": true}}
       CONNECTOR_TOKEN: ${CONNECTOR_TOKEN_SHODAN:-}
-      SHODAN_API_KEY: ${SHODAN_API_KEY:?Set SHODAN_API_KEY in .env}
+      SHODAN_API_KEY: ${SHODAN_API_KEY:-}
       # Capability fallbacks: passed through from .env rather than hardcoded,
       # because the connector reads them as its defaults and a value it cannot
       # receive is not a setting. An administrator's choice in the connector's
@@ -647,6 +994,20 @@ services:
       SHODAN_SCAN_SSL_TEXT: ${SHODAN_SCAN_SSL_TEXT:-true}
       SHODAN_SCAN_HTTP_TITLE: ${SHODAN_SCAN_HTTP_TITLE:-true}
       SHODAN_SCAN_FAVICON: ${SHODAN_SCAN_FAVICON:-true}
+      # The five questions this wave adds ship off (see `.env.example`): each spends
+      # query credits, and the two field names they rest on are confirmed against
+      # the paying account by `connectors/shodan/live_check.py` first. An
+      # administrator's choice in the connector's configuration form still wins for
+      # every later scan.
+      SHODAN_SCAN_HTTP_BODY: ${SHODAN_SCAN_HTTP_BODY:-false}
+      SHODAN_SCAN_CERT_SUBJECT: ${SHODAN_SCAN_CERT_SUBJECT:-false}
+      SHODAN_SCAN_HTML_HASH: ${SHODAN_SCAN_HTML_HASH:-false}
+      SHODAN_SCAN_PIVOTS: ${SHODAN_SCAN_PIVOTS:-false}
+      SHODAN_SCAN_HOST_LOOKUP: ${SHODAN_SCAN_HOST_LOOKUP:-false}
+      # The five capabilities above also wait for this statement: an operator
+      # confirms in their account that the plan permits the queries (F-12).
+      # Without it the worker refuses them by name instead of spending silently.
+      SHODAN_TERMS_ACKNOWLEDGED: ${SHODAN_TERMS_ACKNOWLEDGED:-false}
       SHODAN_MIN_REQUEST_INTERVAL_SECONDS: ${SHODAN_MIN_REQUEST_INTERVAL_SECONDS:-1}
       SHODAN_REQUEST_TIMEOUT_SECONDS: ${SHODAN_REQUEST_TIMEOUT_SECONDS:-30}
     depends_on:
@@ -656,12 +1017,14 @@ services:
     networks:
       - opendrp-connectors
 
-  connector-hibp:
+  connector-breaches-hibp:
+    # Keyed: enable with COMPOSE_PROFILES=hibp once HIBP_API_KEY is set.
+    profiles: ["hibp"]
     build:
       context: .
       dockerfile: ./connectors/hibp/Dockerfile
     image: ${OPENDRP_IMAGE_PREFIX:-ghcr.io/opendrp/opendrp}/connector-hibp:${OPENDRP_VERSION:-latest}
-    container_name: opendrp-connector-hibp
+    container_name: opendrp-connector-breaches-hibp
     restart: on-failure:10
     mem_limit: 512m
     cpus: "0.75"
@@ -675,15 +1038,15 @@ services:
       - /tmp:rw,noexec,nosuid,size=64m
     environment:
       CORE_URL: http://backend:8000
-      CONNECTOR_NAME: hibp
+      CONNECTOR_NAME: breaches-hibp
       CONNECTOR_TYPE: breaches
       # Own credential — see CONNECTOR_TOKEN_DNSTWIST above.
-      #   make connector-token NAME=hibp TYPE=breaches
+      #   make connector-token NAME=breaches-hibp TYPE=breaches
       CONNECTOR_JOB_TYPE: breaches.hibp
       CONNECTOR_FINDING_KIND: breach
       CONNECTOR_ASSET_TYPES: email_account,domain
       CONNECTOR_TOKEN: ${CONNECTOR_TOKEN_HIBP:-}
-      HIBP_API_KEY: ${HIBP_API_KEY:?Set HIBP_API_KEY in .env}
+      HIBP_API_KEY: ${HIBP_API_KEY:-}
       POLL_INTERVAL_SEC: "5"
     depends_on:
       backend:
@@ -693,6 +1056,423 @@ services:
       - opendrp-connectors
 
   # ---------------------------------------------------------------------------
+  # Netlas passive intelligence (keyed). One profile enables the three modules;
+  # the provider key is NETLAS_API_TOKEN. Enable with COMPOSE_PROFILES=netlas.
+  connector-phishing-netlas:
+    profiles: ["netlas"]
+    build:
+      context: .
+      dockerfile: ./connectors/intelligence/Dockerfile
+    image: ${OPENDRP_IMAGE_PREFIX:-ghcr.io/opendrp/opendrp}/connector-intelligence:${OPENDRP_VERSION:-latest}
+    container_name: opendrp-connector-phishing-netlas
+    restart: on-failure:10
+    mem_limit: 512m
+    cpus: "0.75"
+    pids_limit: 128
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    environment:
+      CORE_URL: http://backend:8000
+      CONNECTOR_NAME: phishing-netlas
+      CONNECTOR_TYPE: phishing
+      CONNECTOR_JOB_TYPE: phishing.netlas
+      # Brand assets are what the certificate and page-text questions are asked *from*:
+      # a worker that never receives them can only look for our own domain's name.
+      CONNECTOR_ASSET_TYPES: domain,keyword_domain,keyword_title
+      CONNECTOR_TOKEN: ${CONNECTOR_TOKEN_NETLAS_PHISHING:-}
+      POLL_INTERVAL_SEC: "5"
+      INTELLIGENCE_PROVIDER: netlas
+      NETLAS_API_TOKEN: ${NETLAS_API_TOKEN:-}
+      # An ``http.body`` search is the broadest question this worker asks, and the
+      # plan entitlement is the operator's statement (F-12). Unset means refused.
+      INTELLIGENCE_HTTP_BODY_ACKNOWLEDGED: ${INTELLIGENCE_HTTP_BODY_ACKNOWLEDGED:-false}
+    depends_on:
+      backend:
+        condition: service_healthy
+    logging: *default-logging
+    networks:
+      - opendrp-connectors
+
+  connector-dns-netlas:
+    profiles: ["netlas"]
+    build:
+      context: .
+      dockerfile: ./connectors/intelligence/Dockerfile
+    image: ${OPENDRP_IMAGE_PREFIX:-ghcr.io/opendrp/opendrp}/connector-intelligence:${OPENDRP_VERSION:-latest}
+    container_name: opendrp-connector-dns-netlas
+    restart: on-failure:10
+    mem_limit: 512m
+    cpus: "0.75"
+    pids_limit: 128
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    environment:
+      CORE_URL: http://backend:8000
+      CONNECTOR_NAME: dns-netlas
+      CONNECTOR_TYPE: dns
+      CONNECTOR_JOB_TYPE: dns.netlas
+      CONNECTOR_ASSET_TYPES: domain
+      CONNECTOR_TOKEN: ${CONNECTOR_TOKEN_NETLAS_DNS_SECURITY:-}
+      POLL_INTERVAL_SEC: "5"
+      INTELLIGENCE_PROVIDER: netlas
+      NETLAS_API_TOKEN: ${NETLAS_API_TOKEN:-}
+    depends_on:
+      backend:
+        condition: service_healthy
+    logging: *default-logging
+    networks:
+      - opendrp-connectors
+
+  connector-exposure-netlas:
+    profiles: ["netlas"]
+    build:
+      context: .
+      dockerfile: ./connectors/intelligence/Dockerfile
+    image: ${OPENDRP_IMAGE_PREFIX:-ghcr.io/opendrp/opendrp}/connector-intelligence:${OPENDRP_VERSION:-latest}
+    container_name: opendrp-connector-exposure-netlas
+    restart: on-failure:10
+    mem_limit: 512m
+    cpus: "0.75"
+    pids_limit: 128
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    environment:
+      CORE_URL: http://backend:8000
+      CONNECTOR_NAME: exposure-netlas
+      CONNECTOR_TYPE: exposure
+      CONNECTOR_JOB_TYPE: exposure.netlas
+      CONNECTOR_ASSET_TYPES: domain,ip_address
+      CONNECTOR_TOKEN: ${CONNECTOR_TOKEN_NETLAS_EXPOSURE:-}
+      POLL_INTERVAL_SEC: "5"
+      INTELLIGENCE_PROVIDER: netlas
+      NETLAS_API_TOKEN: ${NETLAS_API_TOKEN:-}
+    depends_on:
+      backend:
+        condition: service_healthy
+    logging: *default-logging
+    networks:
+      - opendrp-connectors
+
+  # ---------------------------------------------------------------------------
+  # Exposure endpoint connectors: which services a domain or IP exposes. Each
+  # provider has its own profile and its own core-issued connector token.
+  connector-exposure-netlas-endpoints:
+    profiles: ["netlas-endpoints"]
+    build:
+      context: .
+      dockerfile: ./connectors/exposure_endpoints/Dockerfile
+    image: ${OPENDRP_IMAGE_PREFIX:-ghcr.io/opendrp/opendrp}/connector-exposure-endpoints:${OPENDRP_VERSION:-latest}
+    container_name: opendrp-connector-exposure-netlas-endpoints
+    restart: on-failure:10
+    mem_limit: 512m
+    cpus: "0.75"
+    pids_limit: 128
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    environment:
+      CORE_URL: http://backend:8000
+      CONNECTOR_NAME: exposure-netlas-endpoints
+      CONNECTOR_TYPE: exposure
+      CONNECTOR_JOB_TYPE: exposure.netlas-endpoints
+      CONNECTOR_FINDING_KIND: exposure
+      CONNECTOR_ASSET_TYPES: domain,ip_address
+      CONNECTOR_TOKEN: ${CONNECTOR_TOKEN_EXPOSURE_NETLAS_ENDPOINTS:-}
+      EXPOSURE_PROVIDER: netlas
+      NETLAS_API_TOKEN: ${NETLAS_API_TOKEN:-}
+      POLL_INTERVAL_SEC: "5"
+    depends_on:
+      backend:
+        condition: service_healthy
+    logging: *default-logging
+    networks:
+      - opendrp-connectors
+
+  connector-exposure-shodan-endpoints:
+    profiles: ["shodan-endpoints"]
+    build:
+      context: .
+      dockerfile: ./connectors/exposure_endpoints/Dockerfile
+    image: ${OPENDRP_IMAGE_PREFIX:-ghcr.io/opendrp/opendrp}/connector-exposure-endpoints:${OPENDRP_VERSION:-latest}
+    container_name: opendrp-connector-exposure-shodan-endpoints
+    restart: on-failure:10
+    mem_limit: 512m
+    cpus: "0.75"
+    pids_limit: 128
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    environment:
+      CORE_URL: http://backend:8000
+      CONNECTOR_NAME: exposure-shodan-endpoints
+      CONNECTOR_TYPE: exposure
+      CONNECTOR_JOB_TYPE: exposure.shodan-endpoints
+      CONNECTOR_FINDING_KIND: exposure
+      CONNECTOR_ASSET_TYPES: domain,ip_address
+      CONNECTOR_TOKEN: ${CONNECTOR_TOKEN_EXPOSURE_SHODAN_ENDPOINTS:-}
+      EXPOSURE_PROVIDER: shodan
+      SHODAN_API_KEY: ${SHODAN_API_KEY:-}
+      POLL_INTERVAL_SEC: "5"
+    depends_on:
+      backend:
+        condition: service_healthy
+    logging: *default-logging
+    networks:
+      - opendrp-connectors
+
+  # ---------------------------------------------------------------------------
+  # DNS Security: independent source workers share one normalized module/table.
+  # Keyless workers (RDAP, resolver, CT logs) start with the installation.
+  connector-dns-rdap:
+    build:
+      context: .
+      dockerfile: ./connectors/dns_security/Dockerfile
+    image: ${OPENDRP_IMAGE_PREFIX:-ghcr.io/opendrp/opendrp}/connector-dns-security:${OPENDRP_VERSION:-latest}
+    container_name: opendrp-connector-dns-rdap
+    restart: on-failure:10
+    mem_limit: 512m
+    cpus: "0.75"
+    pids_limit: 128
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    environment:
+      CORE_URL: http://backend:8000
+      CONNECTOR_NAME: dns-rdap
+      CONNECTOR_TYPE: dns
+      CONNECTOR_JOB_TYPE: dns.rdap
+      CONNECTOR_FINDING_KIND: dns_observation
+      CONNECTOR_ASSET_TYPES: domain
+      CONNECTOR_TOKEN: ${CONNECTOR_TOKEN_DNS_RDAP:-}
+      POLL_INTERVAL_SEC: "5"
+    depends_on:
+      backend:
+        condition: service_healthy
+    logging: *default-logging
+    networks:
+      - opendrp-connectors
+
+  connector-dns-resolver:
+    build:
+      context: .
+      dockerfile: ./connectors/dns_security/Dockerfile
+    image: ${OPENDRP_IMAGE_PREFIX:-ghcr.io/opendrp/opendrp}/connector-dns-security:${OPENDRP_VERSION:-latest}
+    container_name: opendrp-connector-dns-resolver
+    restart: on-failure:10
+    mem_limit: 512m
+    cpus: "0.75"
+    pids_limit: 128
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    environment:
+      CORE_URL: http://backend:8000
+      CONNECTOR_NAME: dns-resolver
+      CONNECTOR_TYPE: dns
+      CONNECTOR_JOB_TYPE: dns.resolver
+      CONNECTOR_FINDING_KIND: dns_observation
+      CONNECTOR_ASSET_TYPES: domain
+      CONNECTOR_TOKEN: ${CONNECTOR_TOKEN_DNS_RESOLVER:-}
+      DNS_SECURITY_RESOLVER_TIMEOUT_SECONDS: ${DNS_SECURITY_RESOLVER_TIMEOUT_SECONDS:-3}
+      DNS_SECURITY_RESOLVER_EXTENDED: ${DNS_SECURITY_RESOLVER_EXTENDED:-false}
+      DNS_NAMESERVERS: ${DNS_NAMESERVERS:-}
+      POLL_INTERVAL_SEC: "5"
+    depends_on:
+      backend:
+        condition: service_healthy
+    logging: *default-logging
+    networks:
+      - opendrp-connectors
+
+  connector-dns-ctlogs:
+    build:
+      context: .
+      dockerfile: ./connectors/dns_security/Dockerfile
+    image: ${OPENDRP_IMAGE_PREFIX:-ghcr.io/opendrp/opendrp}/connector-dns-security:${OPENDRP_VERSION:-latest}
+    container_name: opendrp-connector-dns-ctlogs
+    restart: on-failure:10
+    mem_limit: 512m
+    cpus: "0.75"
+    pids_limit: 128
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    environment:
+      CORE_URL: http://backend:8000
+      CONNECTOR_NAME: dns-ctlogs
+      CONNECTOR_TYPE: dns
+      CONNECTOR_JOB_TYPE: dns.ctlogs
+      CONNECTOR_FINDING_KIND: dns_observation
+      CONNECTOR_ASSET_TYPES: domain
+      CONNECTOR_TOKEN: ${CONNECTOR_TOKEN_DNS_CTLOGS:-}
+      DNS_SECURITY_CTLOGS_API_BASE: ${DNS_SECURITY_CTLOGS_API_BASE:-https://api.ctlogs.dev}
+      DNS_SECURITY_CTLOGS_API_TOKEN: ${DNS_SECURITY_CTLOGS_API_TOKEN:-}
+      DNS_SECURITY_CTLOGS_PUBLIC_NONCOMMERCIAL: ${DNS_SECURITY_CTLOGS_PUBLIC_NONCOMMERCIAL:-false}
+      DNS_SECURITY_CTLOGS_MAX_REQUESTS_PER_SCAN: ${DNS_SECURITY_CTLOGS_MAX_REQUESTS_PER_SCAN:-100}
+      DNS_SECURITY_CTLOGS_MIN_REQUEST_INTERVAL_SECONDS: ${DNS_SECURITY_CTLOGS_MIN_REQUEST_INTERVAL_SECONDS:-36}
+      POLL_INTERVAL_SEC: "5"
+    depends_on:
+      backend:
+        condition: service_healthy
+    logging: *default-logging
+    networks:
+      - opendrp-connectors
+
+  connector-dns-tlsprobe:
+    # Keyless like the other DNS workers and keyed on nothing: the only traffic it
+    # generates is a bounded handshake against our own asset, so it starts with the
+    # installation instead of behind a profile.
+    build:
+      context: .
+      dockerfile: ./connectors/dns_security/Dockerfile
+    image: ${OPENDRP_IMAGE_PREFIX:-ghcr.io/opendrp/opendrp}/connector-dns-security:${OPENDRP_VERSION:-latest}
+    container_name: opendrp-connector-dns-tlsprobe
+    restart: on-failure:10
+    mem_limit: 512m
+    cpus: "0.75"
+    pids_limit: 128
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    environment:
+      CORE_URL: http://backend:8000
+      CONNECTOR_NAME: dns-tlsprobe
+      CONNECTOR_TYPE: dns
+      CONNECTOR_JOB_TYPE: dns.tlsprobe
+      CONNECTOR_FINDING_KIND: dns_observation
+      CONNECTOR_ASSET_TYPES: domain
+      CONNECTOR_TOKEN: ${CONNECTOR_TOKEN_DNS_TLSPROBE:-}
+      DNS_SECURITY_TLS_PORTS: ${DNS_SECURITY_TLS_PORTS:-443}
+      DNS_SECURITY_TLS_PATH: ${DNS_SECURITY_TLS_PATH:-/}
+      DNS_SECURITY_TLS_MAX_PROBES: ${DNS_SECURITY_TLS_MAX_PROBES:-200}
+      POLL_INTERVAL_SEC: "5"
+    depends_on:
+      backend:
+        condition: service_healthy
+    logging: *default-logging
+    networks:
+      - opendrp-connectors
+
+  connector-dns-virustotal:
+    # Keyed: enable with COMPOSE_PROFILES=virustotal once the VirusTotal key is set.
+    profiles: ["virustotal"]
+    build:
+      context: .
+      dockerfile: ./connectors/dns_security/Dockerfile
+    image: ${OPENDRP_IMAGE_PREFIX:-ghcr.io/opendrp/opendrp}/connector-dns-security:${OPENDRP_VERSION:-latest}
+    container_name: opendrp-connector-dns-virustotal
+    restart: on-failure:10
+    mem_limit: 512m
+    cpus: "0.75"
+    pids_limit: 128
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    environment:
+      CORE_URL: http://backend:8000
+      CONNECTOR_NAME: dns-virustotal
+      CONNECTOR_TYPE: dns
+      CONNECTOR_JOB_TYPE: dns.virustotal
+      CONNECTOR_FINDING_KIND: dns_observation
+      CONNECTOR_ASSET_TYPES: domain
+      CONNECTOR_TOKEN: ${CONNECTOR_TOKEN_DNS_VIRUSTOTAL:-}
+      DNS_SECURITY_VT_API_KEY: ${DNS_SECURITY_VT_API_KEY:-}
+      DNS_SECURITY_VT_PUBLIC_NONCOMMERCIAL: ${DNS_SECURITY_VT_PUBLIC_NONCOMMERCIAL:-false}
+      POLL_INTERVAL_SEC: "5"
+    depends_on:
+      backend:
+        condition: service_healthy
+    logging: *default-logging
+    networks:
+      - opendrp-connectors
+
+  connector-dns-shodan:
+    # Keyed: enable with COMPOSE_PROFILES=shodan once the Shodan account is approved
+    # and its key is stored. The host lookup it makes about our own addresses is free;
+    # the per-scan search that answers "where else is this certificate served" spends
+    # a query credit, so its budget is a connector setting (`max_searches`, default 1)
+    # reserved against the approved source account.
+    profiles: ["shodan"]
+    build:
+      context: .
+      dockerfile: ./connectors/dns_security/Dockerfile
+    image: ${OPENDRP_IMAGE_PREFIX:-ghcr.io/opendrp/opendrp}/connector-dns-security:${OPENDRP_VERSION:-latest}
+    container_name: opendrp-connector-dns-shodan
+    restart: on-failure:10
+    mem_limit: 512m
+    cpus: "0.75"
+    pids_limit: 128
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    environment:
+      CORE_URL: http://backend:8000
+      CONNECTOR_NAME: dns-shodan
+      CONNECTOR_TYPE: dns
+      CONNECTOR_JOB_TYPE: dns.shodan
+      CONNECTOR_FINDING_KIND: dns_observation
+      CONNECTOR_ASSET_TYPES: domain,ip_address
+      CONNECTOR_TOKEN: ${CONNECTOR_TOKEN_DNS_SHODAN:-}
+      # Fallback only: the key an operator stored on the approved source account is
+      # the one the quota is drawn from and the one that wins.
+      SHODAN_API_KEY: ${SHODAN_API_KEY:-}
+      SHODAN_MIN_REQUEST_INTERVAL_SECONDS: ${SHODAN_MIN_REQUEST_INTERVAL_SECONDS:-1}
+      SHODAN_REQUEST_TIMEOUT_SECONDS: ${SHODAN_REQUEST_TIMEOUT_SECONDS:-30}
+      POLL_INTERVAL_SEC: "5"
+    depends_on:
+      backend:
+        condition: service_healthy
+    logging: *default-logging
+    networks:
+      - opendrp-connectors
+
   # Frontend — React 18 SPA (Vite build → Nginx)
   # ---------------------------------------------------------------------------
   frontend:
@@ -705,12 +1485,35 @@ services:
         VITE_CANONICAL_ORIGIN: ${CANONICAL_ORIGIN:-}
         # The release the bundle announces. Pinned alongside the image tag in
         # release.yml, so an instance built from a tag reports that tag.
-        VITE_APP_VERSION: ${OPENDRP_VERSION:-0.1.1}
+        VITE_APP_VERSION: ${OPENDRP_VERSION:-0.2.0}
     container_name: opendrp-frontend
     restart: unless-stopped
     mem_limit: 256m
     cpus: "0.5"
     pids_limit: 128
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    # The server block listens on port 80, which is privileged: binding it is the
+    # one capability nginx cannot work without.
+    #
+    # NOTE: `cap_drop: ALL` breaks nginx on startup because the entrypoint calls
+    # chown() on cache directories. Restore only what nginx needs.
+    cap_add:
+      - NET_BIND_SERVICE
+      - CHOWN
+      - FSETID
+      - SETUID
+      - SETGID
+    # nginx writes into exactly three places - its temporary directories, its pid
+    # file, and the rendered includes the entrypoints write under /tmp/opendrp -
+    # so everything else in the image can be read-only.
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=32m
+      - /var/cache/nginx:rw,noexec,nosuid,size=64m
+      - /var/run:rw,noexec,nosuid,size=8m
     # The same HSTS settings the API reads, from the same variables: the
     # entrypoint renders them into an include (docker/nginx/hsts.sh) and
     # validates the result with `nginx -t` before the server starts, so a value
@@ -720,6 +1523,10 @@ services:
       HSTS_ENABLED: ${HSTS_ENABLED:-false}
       HSTS_MAX_AGE: ${HSTS_MAX_AGE:-31536000}
       HSTS_INCLUDE_SUBDOMAINS: ${HSTS_INCLUDE_SUBDOMAINS:-false}
+      # The same trust list the API uses. The edge rate limits are keyed on the
+      # client address, so nginx has to be told which hops it may believe: an
+      # address outside this list cannot make its own X-Forwarded-For entry win.
+      TRUSTED_PROXY_IPS: ${TRUSTED_PROXY_IPS:-127.0.0.1,::1}
     ports:
       - "${FRONTEND_PORT:-127.0.0.1:3000}:80"
     depends_on:
@@ -804,8 +1611,8 @@ services:
 # Networks & Volumes
 # ==============================================================================
 # Three networks instead of one, carved out of the address space the operator
-# already sets (OPENDRP_NETWORK_SUBNET, which stays the parent range named by
-# TRUSTED_PROXY_IPS):
+# already sets (OPENDRP_NETWORK_SUBNET is the parent range; the API trusts the
+# edge subnet, which is the only hop in front of it):
 #
 #   opendrp-edge        frontend ↔ backend            (the internet-facing hop)
 #   opendrp-net         backend, workers, PostgreSQL, Redis

@@ -26,7 +26,9 @@ def _redact_url(value: str) -> str:
             if re.search(r"(?i)(key|token|secret|password|auth|signature)", key):
                 item = "[REDACTED]"
             query.append((key, item))
-        return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, urlencode(query), ""))
+        netloc = parsed.netloc.rsplit("@", 1)[-1]
+        path = re.sub(r"/bot[^/]+", "/bot[REDACTED]", parsed.path)
+        return urlunsplit((parsed.scheme, netloc, path, urlencode(query), ""))
 
     return re.sub(r"https?://[^\s]+", replace, value)
 

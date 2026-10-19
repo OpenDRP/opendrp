@@ -30,6 +30,49 @@ from app.core.manual_rate_limit import (
 from app.core.rate_limit import RateLimiter
 
 
+class _FakePipeline:
+    """The pipeline surface ``request_rate_limit`` uses for its per-minute counter.
+
+    The authenticated request limiter owns its own window, but it shares the same
+    Redis client cache, so a double that only implements ``set`` makes the
+    request limiter drop the cached client and hand the *manual* throttle a real
+    connection — which then fails open and silently disables the limits this file
+    exists to pin.
+    """
+
+    def __init__(self, owner: "_FakeRedis") -> None:
+        self._owner = owner
+        self._ops: list[tuple[str, tuple]] = []
+
+    def incr(self, key) -> "_FakePipeline":
+        self._ops.append(("incr", (key,)))
+        return self
+
+    def expire(self, key, ttl) -> "_FakePipeline":
+        self._ops.append(("expire", (key, ttl)))
+        return self
+
+    async def execute(self) -> list:
+        if self._owner.fail_set:
+            raise RuntimeError("redis down")
+        out: list = []
+        for op, args in self._ops:
+            if op == "incr":
+                current = int(self._owner.store.get(args[0], 0) or 0) + 1
+                self._owner.store[args[0]] = current
+                out.append(current)
+            else:
+                self._owner.ttls[args[0]] = args[1]
+                out.append(True)
+        return out
+
+    async def __aenter__(self) -> "_FakePipeline":
+        return self
+
+    async def __aexit__(self, *_exc) -> bool:
+        return False
+
+
 class _FakeRedis:
     """Minimal async-redis stand-in for the SET NX EX contract."""
 
@@ -49,6 +92,9 @@ class _FakeRedis:
         self.store[key] = value
         self.ttls[key] = window
         return True
+
+    def pipeline(self, transaction: bool = True) -> _FakePipeline:  # noqa: ARG002 - redis signature
+        return _FakePipeline(self)
 
     async def ttl(self, key):
         return self.ttls.get(key, -1)
@@ -173,6 +219,47 @@ class TestEnforceManualRateLimit:
         assert rows[0].details["limit_minutes"] == 2
 
     @pytest.mark.asyncio
+    async def test_asset_scope_blocks_the_second_creation_and_audits(
+        self, monkeypatch: pytest.MonkeyPatch, db_session, test_analyst
+    ):
+        """An inventory is external cost: every asset multiplies every scan (WI-22)."""
+        from app.core.manual_rate_limit import SCOPE_ASSETS, enforce_manual_rate_limit
+
+        _activate_fake(monkeypatch, _FakeRedis())
+        test_analyst.rate_limit_minutes = 2
+        await db_session.commit()
+
+        await enforce_manual_rate_limit(
+            db=db_session,
+            user=test_analyst,
+            scope=SCOPE_ASSETS,
+            action="asset creation",
+            ip_address="127.0.0.1",
+        )
+        with pytest.raises(RateLimitException) as blocked:
+            await enforce_manual_rate_limit(
+                db=db_session,
+                user=test_analyst,
+                scope=SCOPE_ASSETS,
+                action="asset creation",
+                ip_address="127.0.0.1",
+            )
+        assert "once every 2 minute(s)" in str(blocked.value.detail)
+
+        rows = list(
+            (
+                await db_session.execute(
+                    select(AuditLog).where(
+                        AuditLog.action == "rate_limit.manual_action_blocked"
+                    )
+                )
+            ).scalars()
+        )
+        assert len(rows) == 1
+        assert rows[0].details["scope"] == "assets"
+        assert rows[0].details["action"] == "asset creation"
+
+    @pytest.mark.asyncio
     async def test_zero_limit_never_blocks(
         self, monkeypatch: pytest.MonkeyPatch, db_session, test_viewer
     ):
@@ -222,6 +309,135 @@ class TestThrottledEndpoints:
             ).scalars()
         )
         assert rows and rows[-1].details["scope"] == "breaches"
+
+    @pytest.mark.asyncio
+    async def test_dns_promotion_charges_the_assets_scope(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        client,
+        db_session,
+        auth_headers_analyst,
+        test_analyst,
+    ):
+        """Promoting an observation creates an asset, so it pays the same price."""
+        from datetime import datetime, timezone
+
+        from app.models.dns_observation import DNSObservation
+
+        _activate_fake(monkeypatch, _FakeRedis())
+        test_analyst.rate_limit_minutes = 1
+        now = datetime.now(timezone.utc)
+        observation = DNSObservation(
+            observation_key="promotion-rate-limit",
+            observation_type="dns_record",
+            subject="promotion-rate-limit.example.com",
+            source="resolver",
+            first_seen_at=now,
+            last_seen_at=now,
+            metadata_json={},
+        )
+        db_session.add(observation)
+        await db_session.commit()
+        url = f"/api/v1/dns/observations/{observation.id}/asset"
+
+        first = await client.post(url, headers=auth_headers_analyst)
+        assert first.status_code == 201, first.text
+        # The second request is a repeat on an already-monitored value; the
+        # decision is that it counts, because it still writes an audit row.
+        second = await client.post(url, headers=auth_headers_analyst)
+        assert second.status_code == 429, second.text
+        assert second.headers.get("retry-after") == "60"
+
+        rows = list(
+            (
+                await db_session.execute(
+                    select(AuditLog).where(
+                        AuditLog.action == "rate_limit.manual_action_blocked"
+                    )
+                )
+            ).scalars()
+        )
+        assert rows and rows[-1].details["scope"] == "assets"
+        assert rows[-1].details["action"] == "asset promotion"
+
+    @pytest.mark.asyncio
+    async def test_exposure_promotion_charges_the_assets_scope(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        client,
+        db_session,
+        auth_headers_analyst,
+        test_analyst,
+    ):
+        from datetime import datetime, timezone
+
+        from app.models.source_observation import SourceObservation
+
+        _activate_fake(monkeypatch, _FakeRedis())
+        test_analyst.rate_limit_minutes = 1
+        now = datetime.now(timezone.utc)
+        observation = SourceObservation(
+            module="exposure",
+            source="netlas",
+            observation_key="promotion-rate-limit",
+            subject="promotion-rate-limit.example.com",
+            matched_asset="promotion-rate-limit.example.com",
+            first_seen_at=now,
+            last_seen_at=now,
+            provenance={},
+            payload={},
+        )
+        db_session.add(observation)
+        await db_session.commit()
+        url = f"/api/v1/exposure/observations/{observation.id}/asset"
+
+        first = await client.post(url, headers=auth_headers_analyst)
+        assert first.status_code == 201, first.text
+        second = await client.post(url, headers=auth_headers_analyst)
+        assert second.status_code == 429, second.text
+
+        rows = list(
+            (
+                await db_session.execute(
+                    select(AuditLog).where(
+                        AuditLog.action == "rate_limit.manual_action_blocked"
+                    )
+                )
+            ).scalars()
+        )
+        assert rows and rows[-1].details["scope"] == "assets"
+
+    @pytest.mark.asyncio
+    async def test_asset_creation_asks_the_assets_scope_throttle(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        client,
+        auth_headers_analyst,
+    ):
+        """The route is wired to the throttle, in a scope of its own (WI-22).
+
+        Asserted by interception rather than by a second 429: inside a request
+        the shared limiter is the only Redis caller, and the throttle's blocking
+        behaviour is pinned in ``TestManualRateLimiter`` below. What this test
+        adds is the wiring — that creating an asset goes through the limiter at
+        all, and under the scope that keeps inventory changes from consuming the
+        window an operator needs for the scan that monitors them.
+        """
+        calls: list[tuple[str, str]] = []
+
+        async def _spy(**kwargs):
+            calls.append((kwargs["scope"], kwargs["action"]))
+
+        monkeypatch.setattr(
+            "app.api.v1.routers.assets.enforce_manual_rate_limit", _spy
+        )
+        created = await client.post(
+            "/api/v1/assets",
+            headers=auth_headers_analyst,
+            json={"asset_type": "domain", "asset_value": "scope-wired.example"},
+        )
+        assert created.status_code == 201, created.text
+        assert calls == [("assets", "asset creation")]
 
     @pytest.mark.asyncio
     async def test_report_generation_is_throttled_in_its_own_scope(

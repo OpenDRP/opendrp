@@ -12,18 +12,27 @@ Step-7 refactor:
 * eager ``apply()`` fires the task_prerun/postrun signals -> ``task.started``
   and ``task.completed`` audit rows;
 * ``schedule_matches`` cron semantics (0=Sunday) incl. invalid specs;
-* ``_redis_dedup_key`` format and real-Redis ``SET NX`` dedup behavior;
+* ``_redis_dedup_key`` format and real-Redis ``SET NX`` dedup behavior — the
+  tests of the latter take the ``live_redis`` fixture, so a run without a broker
+  skips them with a reason instead of failing (see tests/conftest.py);
 * ``_load_schedules`` DB read with the 60s in-process cache;
 * ``refresh_scan_schedules_task`` fires only on a matching minute and the
-  dedup guard prevents double dispatch.
+  dedup guard prevents double dispatch;
+* the reliability policy around all of it: which tasks acknowledge late (a
+  killed worker's task is executed again) and which keep early acknowledgement,
+  a time limit for every task, and a Compose stack whose delivery worker does
+  not share a process with report rendering.
 """
 
 from __future__ import annotations
 
 import asyncio
 import functools
+import json
+import re
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pytest
 from sqlalchemy import select
@@ -159,6 +168,7 @@ def _read_status_on_task_engine(report_id: str) -> str | None:
 
 class TestReportTaskPolicy:
     def test_report_task_has_bounded_retry_policy(self):
+        from app.core.config import settings
         from app.tasks.report_tasks import generate_report_task
 
         assert generate_report_task.max_retries == 1
@@ -167,6 +177,96 @@ class TestReportTaskPolicy:
         assert OSError in generate_report_task.autoretry_for
         assert generate_report_task.retry_backoff is True
         assert generate_report_task.retry_jitter is True
+        assert generate_report_task.acks_late is True
+        assert generate_report_task.reject_on_worker_lost is True
+        assert generate_report_task.soft_time_limit > settings.REPORT_GENERATION_TIMEOUT_SECONDS
+        assert generate_report_task.time_limit > generate_report_task.soft_time_limit
+
+    @pytest.mark.asyncio
+    async def test_retryable_failure_returns_report_and_job_to_pending_then_retry_succeeds(
+        self, db_session, monkeypatch
+    ):
+        from celery.exceptions import Retry
+
+        from app.tasks.report_tasks import generate_report_task
+
+        report_id = await _run_sync(
+            _make_report_row_on_task_engine, f"Step7-{uuid.uuid4().hex[:6]}"
+        )
+        task_id = f"report-task-{uuid.uuid4().hex}"
+        job_id = await _run_sync(_make_job_on_task_engine, task_id)
+
+        generation_calls = 0
+        retry_requests = []
+        original_retry = generate_report_task.retry
+
+        async def _transient_failure_once(self, *, report_id, user_email):
+            nonlocal generation_calls
+            generation_calls += 1
+            if generation_calls == 1:
+                raise OSError("temporary volume error")
+            return f"{report_id}.pdf"
+
+        def _capture_retry(*args, **kwargs):
+            retry_requests.append(kwargs)
+            raise Retry(exc=kwargs.get("exc"), when=0)
+
+        monkeypatch.setattr(
+            "app.services.report_service.ReportService.generate_and_save",
+            _transient_failure_once,
+        )
+        monkeypatch.setattr(generate_report_task, "retry", _capture_retry)
+
+        def _run_retry_attempt(retries: int):
+            generate_report_task.push_request(id=task_id, retries=retries, is_eager=True)
+            try:
+                return generate_report_task.run(
+                    report_id,
+                    str(uuid.uuid4()),
+                    "someone@example.com",
+                    job_id,
+                )
+            finally:
+                generate_report_task.pop_request()
+
+        with pytest.raises(Retry):
+            await _run_sync(_run_retry_attempt, 0)
+        assert len(retry_requests) == 1
+        assert isinstance(retry_requests[0]["exc"], OSError)
+        assert await _run_sync(_read_status_on_task_engine, report_id) == "pending"
+        monkeypatch.setattr(generate_report_task, "retry", original_retry)
+        job = await _run_sync(_read_job_on_task_engine, job_id)
+        assert job["status"] == "pending"
+        assert job["error_message"] is None
+        assert job["finished"] is False
+
+        retried = await _run_sync(_run_retry_attempt, 1)
+        assert retried["status"] == "completed"
+        assert generation_calls == 2
+        assert await _run_sync(_read_status_on_task_engine, report_id) == "completed"
+        job = await _run_sync(_read_job_on_task_engine, job_id)
+        assert job["status"] == "success"
+        assert job["error_message"] is None
+        assert job["finished"] is True
+
+        outcomes = await _run_sync(
+            _audit_action_rows_on_task_engine,
+            "action = 'report.generate.retry'",
+        )
+        matching = []
+        for row in outcomes:
+            details = row["details"]
+            if isinstance(details, str):
+                import json
+
+                details = json.loads(details)
+            if details.get("report_id") == report_id:
+                matching.append(details)
+        assert len(matching) == 1
+        assert matching[0]["status"] == "pending"
+        assert matching[0]["attempt"] == 1
+        assert matching[0]["error_type"] == "OSError"
+        assert "someone@example.com" not in str(matching[0])
 
     def test_completed_report_is_idempotent_only_when_artifact_exists(
         self, tmp_path, monkeypatch
@@ -328,6 +428,102 @@ class TestGenerateReportTask:
 
         assert await _run_sync(_read_status_on_task_engine, report_id) == "failed"
 
+        outcome_rows = await _run_sync(
+            _audit_action_rows_on_task_engine,
+            "action = 'report.generate.failed'",
+        )
+        matching_rows = []
+        for row in outcome_rows:
+            details = row["details"]
+            if isinstance(details, str):
+                import json
+
+                details = json.loads(details)
+            if details.get("report_id") == report_id:
+                matching_rows.append(details)
+        assert len(matching_rows) == 1
+        outcome_details = matching_rows[0]
+        assert outcome_details["report_id"] == report_id
+        assert outcome_details["job_id"] is None
+        assert outcome_details["status"] == "failed"
+        assert outcome_details["error_type"] == "RuntimeError"
+        assert "someone@example.com" not in str(outcome_details)
+
+    @pytest.mark.asyncio
+    async def test_failed_audit_delivery_remains_retryable_and_delivers_once(
+        self, db_session, monkeypatch
+    ):
+        from datetime import datetime, timedelta, timezone
+
+        from app.core.audit import AuditLogger
+        from app.tasks.report_tasks import generate_report_task
+
+        original_emit = AuditLogger.emit
+
+        report_id = await _run_sync(
+            _make_report_row_on_task_engine, f"Step7-{uuid.uuid4().hex[:6]}"
+        )
+
+        async def _explode(self, *, report_id, user_email):
+            raise RuntimeError("pdf engine broken")
+
+        async def _audit_unavailable(*args, **kwargs):
+            raise RuntimeError("audit database unavailable")
+
+        monkeypatch.setattr(
+            "app.services.report_service.ReportService.generate_and_save",
+            _explode,
+        )
+        monkeypatch.setattr(AuditLogger, "emit", _audit_unavailable)
+
+        with pytest.raises(RuntimeError, match="pdf engine broken"):
+            await _run_sync(
+                generate_report_task.run,
+                report_id,
+                str(uuid.uuid4()),
+                "someone@example.com",
+                None,
+            )
+
+        pending = await _run_sync(_report_audit_outbox_on_task_engine, report_id)
+        assert len(pending) == 1
+        assert pending[0]["action"] == "report.generate.failed"
+        assert pending[0]["attempts"] == 1
+        assert pending[0]["last_error"] == "RuntimeError"
+        assert pending[0]["details"]["report_id"] == report_id
+        assert await _run_sync(
+            _audit_action_rows_on_task_engine,
+            "action = 'report.generate.failed'",
+        ) == []
+
+        monkeypatch.setattr(AuditLogger, "emit", original_emit)
+        # The persisted retry timestamp is intentionally in the future; pass a
+        # later worker-sweep time to exercise the durable recovery path.
+        recovered = await _run_sync(
+            _deliver_report_audit_outbox_on_task_engine,
+            report_id,
+            datetime.now(timezone.utc) + timedelta(hours=2),
+        )
+        assert recovered == 1
+        assert await _run_sync(_report_audit_outbox_on_task_engine, report_id) == []
+
+        delivered = await _run_sync(
+            _audit_action_rows_on_task_engine,
+            "action = 'report.generate.failed'",
+        )
+        matching = []
+        for row in delivered:
+            details = row["details"]
+            if isinstance(details, str):
+                import json
+
+                details = json.loads(details)
+            if details.get("report_id") == report_id:
+                matching.append(details)
+        assert len(matching) == 1
+        assert matching[0]["status"] == "failed"
+        assert "someone@example.com" not in str(matching[0])
+
     @pytest.mark.asyncio
     async def test_report_deleted_during_generation_drops_the_orphan_artifact(
         self, db_session, monkeypatch, tmp_path
@@ -353,7 +549,7 @@ class TestGenerateReportTask:
         # The task resolves the artifact inside the store before unlinking it, so
         # the store has to be this temporary directory.
         monkeypatch.setattr(core_settings, "REPORTS_STORE_DIR", str(tmp_path))
-        artifact = tmp_path / "generated.pdf"
+        artifact = tmp_path / f"{report_id}.pdf"
 
         async def _generate_then_delete_row(self, *, report_id, user_email):
             # The report disappears while the PDF is being produced (a user
@@ -540,6 +736,8 @@ class TestScheduleMatches:
         assert MODULE_TASKS == {
             "schedule_phishing": [("connector_type", "phishing")],
             "schedule_breaches": [("connector_type", "breaches")],
+            "schedule_dns_security": [("connector_type", "dns")],
+            "schedule_exposure": [("connector_type", "exposure")],
         }
 
 
@@ -549,7 +747,7 @@ class TestRedisDedup:
         assert _redis_dedup_key("phishing", now) == "sched:phishing:203001020304"
 
     @pytest.mark.asyncio
-    async def test_set_nx_allows_once_per_minute(self):
+    async def test_set_nx_allows_once_per_minute(self, live_redis):
         module = f"test-{uuid.uuid4().hex[:8]}"
         now = datetime(2030, 5, 6, 7, 8, tzinfo=timezone.utc)
         try:
@@ -562,11 +760,7 @@ class TestRedisDedup:
         finally:
             import redis as redis_lib
 
-            from app.core.config import settings as core_settings
-
-            client = redis_lib.Redis.from_url(
-                core_settings.REDIS_URL, decode_responses=True
-            )
+            client = redis_lib.Redis.from_url(live_redis, decode_responses=True)
             for minute in (8, 9):
                 client.delete(_redis_dedup_key(module, now.replace(minute=minute)))
             client.close()
@@ -671,12 +865,17 @@ class TestLoadSchedulesAndTick:
         row = await self._get_or_create_settings(db_session)
         row.schedule_phishing = {"days": [1], "hour": 2, "minute": 30}
         row.schedule_breaches = {"days": [6], "hour": 4, "minute": 0}
+        row.schedules = {"code_leak": {"days": [2], "hour": 9, "minute": 15}}
+        from app.models import Module
+        db_session.add(Module(id="code_leak", label="Code leaks", finding_kind="code_leak", asset_types=["domain"], fields={"repository": {"type": "str"}}, dedup_fields=["repository"], title_field="repository", storage={"kind": "generic", "adapter": "generic"}, enabled=True, builtin=False))
         await db_session.commit()
 
         st._schedule_cache["data"] = None  # reset cache for determinism
         data = await st._load_schedules()
         assert data["schedule_phishing"] == {"days": [1], "hour": 2, "minute": 30}
         assert data["schedule_breaches"] == {"days": [6], "hour": 4, "minute": 0}
+        assert data["schedules"]["code_leak"] == {"days": [2], "hour": 9, "minute": 15}
+        assert data["schedule_module:code_leak"] == data["schedules"]["code_leak"]
 
         # Cached: mutating the DB does not change the cached view.
         row.schedule_phishing = {"days": [2], "hour": 5, "minute": 0}
@@ -698,7 +897,7 @@ class TestLoadSchedulesAndTick:
 
     @pytest.mark.asyncio
     async def test_tick_fires_on_match_and_dedup_blocks_second_dispatch(
-        self, db_session
+        self, db_session, live_redis
     ):
         from app.tasks import scheduler_tasks as st
 
@@ -718,9 +917,7 @@ class TestLoadSchedulesAndTick:
         key = _redis_dedup_key("schedule_phishing", now)
         import redis as redis_lib
 
-        from app.core.config import settings as core_settings
-
-        client = redis_lib.Redis.from_url(core_settings.REDIS_URL, decode_responses=True)
+        client = redis_lib.Redis.from_url(live_redis, decode_responses=True)
         try:
             assert client.get(key) is None
         finally:
@@ -788,14 +985,98 @@ def _audit_action_rows_on_task_engine(where: str) -> list[dict]:
 
         async with AsyncSessionLocal() as s:
             rows = (
-                await s.execute(_text(f"SELECT action, details FROM drp_audit_logs WHERE {where}"))
+                await s.execute(
+                    _text(
+                        f"SELECT action, ip_address, details FROM drp_audit_logs WHERE {where}"
+                    )
+                )
             ).mappings().all()
             return [dict(r) for r in rows]
 
     return _asyncio.run(_q())
 
 
+def _clear_dispatch_guard(module: str, now: datetime) -> int:
+    """Delete the per-minute dispatch guard for one occurrence.
+
+    The task under test deliberately keeps the guard it acquired — the second tick
+    in that test has to be blocked by it — and the test pins the occurrence to a
+    fixed date, so a run inside the key's TTL would leave the next run looking
+    already fired. Clearing it in setup keeps the test re-runnable against a shared
+    broker; the assertions still prove the guard blocks the second tick.
+    """
+    import redis as _redis
+
+    from app.core.config import settings as _settings
+
+    client = _redis.Redis.from_url(_settings.REDIS_URL, decode_responses=True)
+    try:
+        return int(client.delete(_redis_dedup_key(module, now)))
+    finally:
+        client.close()
+
+
+def _report_audit_outbox_on_task_engine(report_id: str) -> list[dict]:
+    import asyncio as _asyncio
+    from uuid import UUID as _UUID
+
+    async def _read():
+        from sqlalchemy import select as _select
+
+        from app.core.database import AsyncSessionLocal
+        from app.models import ReportAuditOutbox
+
+        async with AsyncSessionLocal() as session:
+            rows = (
+                await session.execute(
+                    _select(ReportAuditOutbox)
+                    .where(ReportAuditOutbox.report_id == _UUID(report_id))
+                    .order_by(ReportAuditOutbox.created_at)
+                )
+            ).scalars().all()
+            return [
+                {
+                    "event_key": row.event_key,
+                    "action": row.action,
+                    "attempts": row.attempts,
+                    "last_error": row.last_error,
+                    "available_at": row.available_at,
+                    "details": row.details,
+                }
+                for row in rows
+            ]
+
+    return _asyncio.run(_read())
+
+
+def _deliver_report_audit_outbox_on_task_engine(report_id: str, now):
+    import asyncio as _asyncio
+    from uuid import UUID as _UUID
+
+    async def _deliver():
+        from sqlalchemy import select as _select
+
+        from app.core.database import AsyncSessionLocal
+        from app.models import ReportAuditOutbox
+        from app.tasks.report_tasks import deliver_report_audit_outbox
+
+        async with AsyncSessionLocal() as session:
+            event = (
+                await session.execute(
+                    _select(ReportAuditOutbox)
+                    .where(ReportAuditOutbox.report_id == _UUID(report_id))
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            if event is None:
+                return 0
+            return await deliver_report_audit_outbox(session, now=now)
+
+    return _asyncio.run(_deliver())
+
+
 class TestSignalJobSync:
+
     @pytest.mark.asyncio
     async def test_prerun_moves_pending_job_to_running(self, db_session):
         from celery import signals as celery_signals
@@ -1152,6 +1433,7 @@ def _seed_connector_on_task_engine(name: str, connector_type: str, job_type: str
                     connector_type=connector_type,
                     status="enabled",
                     default_job_type=job_type,
+                    last_seen_at=datetime.now(timezone.utc),
                 )
             )
             await s.commit()
@@ -1181,7 +1463,7 @@ def _count_jobs_on_task_engine(title_like: str) -> int:
 class TestSchedulerEnqueue:
     @pytest.mark.asyncio
     async def test_tick_enqueues_jobs_audits_and_dedup_blocks_second(
-        self, db_session
+        self, db_session, live_redis
     ):
         from app.tasks import scheduler_tasks as st
 
@@ -1194,6 +1476,7 @@ class TestSchedulerEnqueue:
         st._schedule_cache["data"] = None
 
         now = datetime(2030, 1, 2, 9, 17, tzinfo=timezone.utc)  # Wednesday, cron 3
+        await _run_sync(_clear_dispatch_guard, "schedule_phishing", now)
 
         first = await _run_sync(st.refresh_scan_schedules_task.run, _now=now)
         assert len(first["fired"]) == 1
@@ -1202,9 +1485,21 @@ class TestSchedulerEnqueue:
 
         audit = await _run_sync(
             _audit_action_rows_on_task_engine,
-            f"action = 'phishing.scan.scheduled' AND details LIKE '%{now.isoformat()}%'",
+            f"action = 'source.scan.queued' AND details LIKE '%{now.isoformat()}%'",
         )
-        assert len(audit) == 1
+        # One tick leaves two records of the same action, because they answer
+        # different questions: the queue writer records the job it created
+        # (`internal:scheduler`, details.job_id — the row the audit chain is
+        # required to persist), and the beat task records the occurrence as a whole
+        # (`internal:celery-beat`, details.job_ids/sources). Both are asserted, so a
+        # job queued without its own record, or a second dispatch, still fails.
+        assert sorted(row["ip_address"] for row in audit) == [
+            "internal:celery-beat",
+            "internal:scheduler",
+        ]
+        per_job = next(row for row in audit if row["ip_address"] == "internal:scheduler")
+        # Read through a raw query, so ``details`` arrives as the stored JSON text.
+        assert json.loads(per_job["details"])["connector"] == name
 
         # Dedup key NOT deleted -> the second tick in the same minute must
         # be blocked before any enqueue happens.
@@ -1214,9 +1509,7 @@ class TestSchedulerEnqueue:
 
         import redis as redis_lib
 
-        from app.core.config import settings as core_settings
-
-        client = redis_lib.Redis.from_url(core_settings.REDIS_URL, decode_responses=True)
+        client = redis_lib.Redis.from_url(live_redis, decode_responses=True)
         client.delete(_redis_dedup_key("schedule_phishing", now))
         client.close()
         st._schedule_cache["data"] = None
@@ -1245,7 +1538,7 @@ class TestSchedulerEnqueue:
         monkeypatch.setattr(st, "_try_acquire_dedup", _acquire)
         monkeypatch.setattr(st, "_release_dedup", _release)
         monkeypatch.setattr(
-            "app.services.connector_service.ConnectorService.enqueue_module_scan",
+            "app.services.connector_service.ConnectorService.enqueue_ready_sources",
             _boom,
         )
 
@@ -1267,7 +1560,7 @@ class TestSchedulerEnqueue:
             raise RuntimeError("enqueue exploded")
 
         monkeypatch.setattr(
-            "app.services.connector_service.ConnectorService.enqueue_module_scan",
+            "app.services.connector_service.ConnectorService.enqueue_ready_sources",
             _boom,
         )
 
@@ -1275,3 +1568,168 @@ class TestSchedulerEnqueue:
         result = await _run_sync(st.refresh_scan_schedules_task.run, _now=now)
         assert result["fired"] == []  # error logged, never propagated
         st._schedule_cache["data"] = None
+
+
+# ---------------------------------------------------------------------------
+# Queue separation and the acknowledgement policy
+# ---------------------------------------------------------------------------
+#
+# Both properties are invisible in a healthy stack and surface only as work that
+# never happened. A message acknowledged *before* its task runs is gone as soon
+# as the worker is killed (a deploy, an OOM kill), and when one process consumes
+# every queue, an alert waits behind whatever long task is ahead of it — for this
+# platform, a PDF render of up to REPORT_GENERATION_TIMEOUT_SECONDS.
+
+_COMPOSE_PATH = Path(__file__).resolve().parents[2] / "docker-compose.yml"
+
+
+def _compose_services() -> dict[str, str]:
+    """Every service block in ``docker-compose.yml``, keyed by service name."""
+    blocks: dict[str, list[str]] = {}
+    current: str | None = None
+    for raw in _COMPOSE_PATH.read_text(encoding="utf-8").splitlines():
+        if raw.strip().startswith("#"):
+            continue
+        if raw and not raw.startswith(" "):
+            current = None
+            continue
+        if raw.startswith("  ") and not raw.startswith("    ") and raw.rstrip().endswith(":"):
+            current = raw.strip()[:-1]
+            blocks[current] = []
+        elif current is not None:
+            blocks[current].append(raw)
+    return {name: "\n".join(lines) for name, lines in blocks.items()}
+
+
+def _consumed_queues(block: str) -> set[str]:
+    """The queues a service's Celery command consumes."""
+    match = re.search(r"--queues=([^\s]+)", block)
+    if match is None:
+        return set()
+    return {item for item in match.group(1).split(",") if item}
+
+
+def _celery_workers() -> dict[str, set[str]]:
+    return {
+        name: queues
+        for name, block in _compose_services().items()
+        if (queues := _consumed_queues(block))
+    }
+
+
+class TestQueueSeparation:
+    def test_the_delivery_queue_has_a_worker_of_its_own(self):
+        workers = _celery_workers()
+        assert len(workers) == 2, f"expected one worker per queue group: {sorted(workers)}"
+        first, second = workers.values()
+        assert not (first & second), "two workers consume the same queue"
+
+    def test_every_routed_queue_is_consumed_by_exactly_one_worker(self):
+        """A queue nothing consumes is work that is queued and never executed."""
+        from app.core.celery_app import celery_app
+
+        routed = {route["queue"] for route in celery_app.conf.task_routes.values()}
+        routed |= {
+            entry.get("options", {}).get("queue")
+            for entry in celery_app.conf.beat_schedule.values()
+        }
+        routed.discard(None)
+
+        consumed: list[str] = []
+        for queues in _celery_workers().values():
+            consumed.extend(queues)
+        assert routed <= set(consumed), f"queues nobody consumes: {sorted(routed - set(consumed))}"
+        assert len(consumed) == len(set(consumed)), "a queue is consumed twice"
+
+    def test_report_work_does_not_share_a_process_with_delivery(self):
+        workers = _celery_workers()
+        delivery = {name for name, queues in workers.items() if "alerts" in queues}
+        renders = {name for name, queues in workers.items() if "reports" in queues}
+        assert len(delivery) == 1 and len(renders) == 1
+        assert not (delivery & renders), "a report render would hold the delivery queue"
+
+    def test_the_delivery_worker_may_finish_a_send_before_it_is_stopped(self):
+        """Docker's ten-second default would kill a message part-way through."""
+        from app.core.config import settings
+
+        block = _compose_services()["celery-worker-alerts"]
+        match = re.search(r"stop_grace_period:\s*(\d+)s", block)
+        assert match is not None, "the delivery worker declares no stop_grace_period"
+        assert int(match.group(1)) > settings.ALERT_DELIVERY_TIMEOUT_SECONDS
+
+
+class TestAcknowledgementPolicy:
+    def test_a_task_that_may_run_twice_acknowledges_after_it_finishes(self):
+        """A repeat has to be safe, so the policy names the tasks one by one."""
+        from app.core.celery_app import _LATE_ACKNOWLEDGED_TASKS, celery_app
+
+        annotations = celery_app.conf.task_annotations
+        for name in _LATE_ACKNOWLEDGED_TASKS:
+            assert annotations[name]["acks_late"] is True, name
+            assert annotations[name]["reject_on_worker_lost"] is True, name
+
+    def test_the_report_task_declares_its_own_late_acknowledgement(self):
+        from app.tasks.report_tasks import generate_report_task
+
+        assert generate_report_task.acks_late is True
+        assert generate_report_task.reject_on_worker_lost is True
+
+    def test_a_task_whose_repeat_writes_a_second_row_acknowledges_early(self):
+        """An enrichment or a queued expiry alert duplicated is a second row.
+
+        Both are scheduled far more often than any outage lasts, so the next tick
+        covers a killed run: the delay is cheaper than the duplicate.
+        """
+        from app.core.celery_app import celery_app
+
+        annotations = celery_app.conf.task_annotations
+        for name in ("process_enrichment_events", "check_dns_expiry_alerts"):
+            assert not annotations.get(name, {}).get("acks_late"), name
+
+    def test_no_task_is_left_without_a_bound(self):
+        from app.core.celery_app import celery_app
+
+        assert celery_app.conf.task_soft_time_limit > 0
+        assert celery_app.conf.task_soft_time_limit < celery_app.conf.task_time_limit
+        for name, annotation in celery_app.conf.task_annotations.items():
+            if "time_limit" in annotation:
+                assert 0 < annotation["soft_time_limit"] < annotation["time_limit"], name
+
+    def test_the_limits_are_per_class(self):
+        """A render, a delivery and everything else do not share one bound."""
+        from app.core.celery_app import (
+            _ALERT_TASK_TIME_LIMIT,
+            _REPORT_TASK_TIME_LIMIT,
+            _TASK_TIME_LIMIT,
+            celery_app,
+        )
+        from app.core.config import settings
+        from app.tasks.report_tasks import generate_report_task
+
+        annotations = celery_app.conf.task_annotations
+        assert annotations["deliver_pending_alerts"]["time_limit"] == _ALERT_TASK_TIME_LIMIT
+        assert annotations["check_dns_expiry_alerts"]["time_limit"] == _ALERT_TASK_TIME_LIMIT
+        assert 0 < annotations["deliver_pending_alerts"]["soft_time_limit"] < _ALERT_TASK_TIME_LIMIT
+        # Delivery is bounded by its class, the render by the setting that
+        # expresses how long a render may take, and the rest by the default: no
+        # two of the three are the same number.
+        assert _ALERT_TASK_TIME_LIMIT != _TASK_TIME_LIMIT
+        assert _REPORT_TASK_TIME_LIMIT == settings.REPORT_GENERATION_TIMEOUT_SECONDS + 30
+        assert generate_report_task.time_limit == settings.REPORT_GENERATION_TIMEOUT_SECONDS + 30
+        assert generate_report_task.soft_time_limit == settings.REPORT_GENERATION_TIMEOUT_SECONDS + 10
+
+    def test_the_broker_does_not_redeliver_work_that_is_still_running(self):
+        """The visibility timeout must outlast the longest task limit."""
+        from app.core.celery_app import (
+            _ALERT_TASK_TIME_LIMIT,
+            _REPORT_TASK_TIME_LIMIT,
+            _TASK_TIME_LIMIT,
+            celery_app,
+        )
+
+        longest = max(_TASK_TIME_LIMIT, _ALERT_TASK_TIME_LIMIT, _REPORT_TASK_TIME_LIMIT)
+        visibility = celery_app.conf.broker_transport_options["visibility_timeout"]
+        assert visibility > longest, (
+            "a message offered to a second worker while its task still runs is "
+            "the same work executing twice at once"
+        )

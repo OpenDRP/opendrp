@@ -18,6 +18,7 @@ Pins the CURRENT behavior of previously untested endpoints and branches:
 
 from __future__ import annotations
 
+import json
 import uuid
 from datetime import date
 from typing import AsyncGenerator
@@ -83,6 +84,17 @@ async def _audit_actions(db, action: str) -> list[dict]:
         )
     ).mappings().all()
     return [dict(r) for r in rows]
+
+
+def _details(raw) -> dict:
+    """An audit row's details as a mapping, whichever driver returned the row.
+
+    The column is JSON, and the two drivers disagree about how to hand it back:
+    SQLite returns the text, PostgreSQL a mapping. Asserting on the parsed value
+    is also what makes an assertion about a domain a statement about that field
+    rather than about a substring of the serialized row.
+    """
+    return json.loads(raw) if isinstance(raw, str) else raw
 
 
 class TestAssetMatching:
@@ -239,8 +251,9 @@ class TestPatchBreach:
         await db_session.commit()
         rows = await _audit_actions(db_session, "breach.update")
         assert len(rows) == 1
-        assert str(breach.id) in rows[0]["details"]
-        assert "status" in rows[0]["details"]
+        details = _details(rows[0]["details"])
+        assert details["breach_id"] == str(breach.id)
+        assert details["changed_fields"] == ["status"]
 
     @pytest.mark.asyncio
     async def test_patch_missing_breach_404(self, client, auth_headers_analyst):
@@ -288,7 +301,7 @@ class TestScanEndpoints:
         await db_session.commit()
         rows = await _audit_actions(db_session, "breach.scan.start")
         assert len(rows) == 1
-        assert '"no_connector"' in rows[0]["details"]
+        assert _details(rows[0]["details"])["status"] == "no_connector"
 
     @pytest.mark.asyncio
     async def test_scan_email_202_audits_and_enqueues(
@@ -359,7 +372,7 @@ class TestScanEndpoints:
         await db_session.commit()
         rows = await _audit_actions(db_session, "breach.scan.domain")
         assert len(rows) == 1
-        assert "watched.example.com" in rows[0]["details"]
+        assert _details(rows[0]["details"])["domain"] == "watched.example.com"
 
     @pytest.mark.asyncio
     async def test_scan_domain_too_short_422(self, client, auth_headers_analyst):
@@ -427,3 +440,181 @@ class TestDeleteBreach:
             f"/api/v1/breaches/{breach.id}", headers=auth_headers_viewer
         )
         assert r.status_code == 403
+
+
+class TestProviderReadiness:
+    """What the last scan was allowed to ask, beside the findings it produced (WI-14).
+
+    A list with nothing in it has two meanings, and this endpoint is where the platform
+    says which: the provider was asked and had nothing, or it refused to be asked. The
+    scan's own summary is the source — same wording for the page and Jobs — and the
+    source's own vocabulary of data classes travels with it (F-04).
+    """
+
+    async def _finished_scan(self, db, *, domains, summary, status="partial"):
+        from datetime import datetime, timezone
+
+        from app.models.job import Job
+
+        job = Job(
+            job_type="breaches.hibp",
+            status=status,
+            title="Breach scan",
+            params={"domains": domains, "emails": ["user@example.com"]},
+            result_summary=summary,
+            finished_at=datetime.now(timezone.utc),
+        )
+        db.add(job)
+        await db.commit()
+        return job
+
+    async def _connector(self, db, *, readiness, status="enabled", name=None):
+        from app.models.connector import Connector
+
+        conn = Connector(
+            name=name or f"breaches-{uuid.uuid4().hex[:8]}",
+            connector_type="breaches",
+            status=status,
+            default_job_type=f"breaches.{uuid.uuid4().hex[:8]}",
+            readiness=readiness,
+        )
+        db.add(conn)
+        await db.commit()
+        return conn
+
+    @pytest.mark.asyncio
+    async def test_no_finished_scan_is_not_a_clean_scan(self, client, auth_headers_viewer):
+        r = await client.get(
+            "/api/v1/breaches/provider-readiness", headers=auth_headers_viewer
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["scan_job_id"] is None
+        assert body["partial"] is False
+        assert body["domains"] == []
+        assert body["entitlements"] is None
+
+    @pytest.mark.asyncio
+    async def test_a_refused_domain_names_the_reason_the_scan_reported(
+        self, client, db_session, auth_headers_viewer
+    ):
+        await self._finished_scan(
+            db_session,
+            domains=["example.com", "other.example"],
+            summary={
+                "provider_readiness": {
+                    "subscription": "Pro",
+                    "reported_requests_per_minute": 600,
+                    "includes_stealer_logs": False,
+                    "includes_kanon": True,
+                    "subscribed_domains": 2,
+                },
+                "domains_unscanned": [
+                    {"domain": "example.com", "reason": "domain_not_verified"}
+                ],
+                "skipped_reasons": {"domain_not_verified": 1},
+                "pacing": {"configured_requests_per_minute": 10, "applied_requests_per_minute": 4},
+            },
+        )
+        r = await client.get(
+            "/api/v1/breaches/provider-readiness", headers=auth_headers_viewer
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["status"] == "partial"
+        assert body["partial"] is True
+        assert body["reasons"] == {"domain_not_verified": 1}
+        assert body["entitlements"] == {
+            "subscription": "Pro",
+            "requests_per_minute": 600,
+            "includes_stealer_logs": False,
+            "includes_kanon": True,
+            "domains_verified": 2,
+        }
+        assert body["pacing"]["applied_requests_per_minute"] == 4
+        assert body["domains"] == [
+            {"domain": "example.com", "status": "unscanned", "reason": "domain_not_verified"},
+            {"domain": "other.example", "status": "asked", "reason": None},
+        ]
+        assert body["unscanned_total"] == 1
+
+    @pytest.mark.asyncio
+    async def test_a_domain_the_scan_never_reached_is_not_reported_as_asked(
+        self, client, db_session, auth_headers_viewer
+    ):
+        """A scan stopped by its own budget cannot claim it asked about what is left."""
+        await self._finished_scan(
+            db_session,
+            domains=["example.com"],
+            summary={"budget_exhausted": True, "skipped_reasons": {"request_budget_exhausted": 1}},
+        )
+        body = (
+            await client.get(
+                "/api/v1/breaches/provider-readiness", headers=auth_headers_viewer
+            )
+        ).json()
+        assert body["domains"] == [
+            {"domain": "example.com", "status": "unknown", "reason": "scan_stopped_short"}
+        ]
+
+    @pytest.mark.asyncio
+    async def test_the_last_finished_scan_is_the_one_reported(
+        self, client, db_session, auth_headers_viewer
+    ):
+        from datetime import datetime, timedelta, timezone
+
+        older = await self._finished_scan(
+            db_session, domains=["old.example"], summary={}, status="success"
+        )
+        older.finished_at = datetime.now(timezone.utc) - timedelta(days=1)
+        newer = await self._finished_scan(
+            db_session,
+            domains=["new.example"],
+            summary={"skipped_reasons": {"domain_not_verified": 1}},
+        )
+        await db_session.commit()
+        assert newer.finished_at >= older.finished_at
+        body = (
+            await client.get(
+                "/api/v1/breaches/provider-readiness", headers=auth_headers_viewer
+            )
+        ).json()
+        assert body["scan_job_id"] == str(newer.id)
+        assert [row["domain"] for row in body["domains"]] == ["new.example"]
+
+    @pytest.mark.asyncio
+    async def test_the_data_class_labels_come_from_the_sources_that_published_them(
+        self, client, db_session, auth_headers_viewer
+    ):
+        await self._connector(
+            db_session,
+            readiness={"data_class_labels": {"Passwords": "Account passwords"}},
+        )
+        await self._connector(
+            db_session,
+            status="disabled",
+            readiness={"data_class_labels": {"Passwords": "from a disabled source"}},
+        )
+        body = (
+            await client.get(
+                "/api/v1/breaches/provider-readiness", headers=auth_headers_viewer
+            )
+        ).json()
+        assert body["data_class_labels"] == {"Passwords": "Account passwords"}
+
+    @pytest.mark.asyncio
+    async def test_a_source_that_publishes_no_labels_leaves_the_stored_names(
+        self, client, db_session, auth_headers_viewer
+    ):
+        await self._connector(db_session, readiness={"credentials_configured": True})
+        body = (
+            await client.get(
+                "/api/v1/breaches/provider-readiness", headers=auth_headers_viewer
+            )
+        ).json()
+        assert body["data_class_labels"] == {}
+
+    @pytest.mark.asyncio
+    async def test_the_readiness_read_requires_a_session(self, client):
+        r = await client.get("/api/v1/breaches/provider-readiness")
+        assert r.status_code == 401

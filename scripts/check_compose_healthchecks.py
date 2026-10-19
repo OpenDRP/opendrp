@@ -22,13 +22,34 @@ badly, and both are easy to lose in a later edit:
    healthy. That is how a `celery-beat` without `AUDIT_CHAIN_KEYS` shipped: the
    scheduler holds the alert delivery tick, so findings were stored and no
    notification was ever sent.
-4. **The network split and the broker password are still in place.** Connectors
+4. **Every service is hardened, and the exceptions are stated.** `security_opt:
+   no-new-privileges`, `cap_drop: [ALL]` and (where the process can live with it)
+   a read-only root filesystem are what turn a compromised service into a
+   contained one. Three services — the datastores and the web server — shipped
+   without any of it, and nothing failed: hardening is invisible until the day it
+   is needed. A service that cannot carry it belongs in `_HARDENING_EXCEPTIONS`
+   *with the reason written out*, so a deliberate exception and a forgotten line
+   do not look the same.
+5. **The documented resource limits are the ones in this file.** The tables in
+   `docs/configuration.md` told an operator that a limit was 1 GB while Compose
+   said something else, and they listed eight services out of twenty-six:
+   capacity planning from a page that disagrees with the deployment is worse than
+   no page. The table is parsed and compared here rather than trusted.
+6. **The network split and the broker password are still in place.** Connectors
    are third-party code by this platform's own design, and they are one Compose
    edit away from being re-attached to the network that holds PostgreSQL and an
    unauthenticated-task-injecting broker. Nothing at runtime complains: the
    stack comes up healthy and the isolation is simply gone. So the file is
    checked rather than trusted, and `REDIS_URL` is checked for a password in the
    same breath, because a password that no client sends is decoration.
+7. **The trusted proxy range is the edge, and only the edge.** A trusted network
+   is a network whose `X-Forwarded-For` entries are believed, so whichever range
+   is appended to `TRUSTED_PROXY_IPS` can write any address it likes into the
+   audit trail. The parent range is the wrong answer for a reason that is easy
+   to miss: it contains the connector network, and connectors are the one part of
+   the deployment this platform did not write. The appended range is therefore
+   parsed, required to be the edge subnet, and compared against the parent, data
+   and connector subnets.
 
 The first two are declared once, in a shared `x-logging` anchor, which makes the
 failure mode of a forgotten line a *missing* key rather than a wrong value. A
@@ -109,6 +130,23 @@ _REQUIRED_APP_SETTINGS = _REFUSED_WITHOUT + _REQUIRED_TO_WORK
 _REDIS_URL_WITH_PASSWORD = re.compile(r"redis(?:s)?://[^@/]*:[^@/]+@", re.IGNORECASE)
 
 _SERVICE_LINE = re.compile(r"^(\s*)([A-Za-z0-9._-]+):(\s*(.*?))?\s*$")
+
+#: Service -> why it is allowed to carry no container hardening. The reason is
+#: part of the entry on purpose: an exception list without one is how "we will
+#: look at this later" becomes permanent. Empty is the correct state — every
+#: service in `docker-compose.yml` is hardened — and the mechanism exists so that
+#: a future service has to be named here rather than quietly skipped.
+_HARDENING_EXCEPTIONS: dict[str, str] = {}
+
+#: The operations reference that documents the limits, and the row shape the
+#: gate parses: `| `postgres` | `1.5g` | `1.0` | `256` |`. Values are compared
+#: exactly as Compose writes them, so a limit changed in one place and not the
+#: other fails the build instead of waiting for an operator to notice.
+_LIMITS_DOC = Path("docs") / "configuration.md"
+_LIMITS_TABLE_ROW = re.compile(
+    r"^\|\s*`(?P<service>[a-z0-9-]+)`\s*\|\s*`(?P<mem>[^`]+)`\s*\|\s*"
+    r"`(?P<cpus>[^`]+)`\s*\|\s*`(?P<pids>[^`]+)`\s*\|$"
+)
 
 
 class Service:
@@ -293,16 +331,39 @@ def _dockerfile_has_healthcheck(compose_dir: Path, service: Service) -> bool:
 #: default is what a fresh checkout gets, so that is what can be checked here.
 _SUBNET_LINE = re.compile(r"^\s+-\s*subnet:\s*(?:\$\{[A-Za-z0-9_]+:-)?(?P<value>[^}\s]+)", re.MULTILINE)
 
+#: The interpolation a `TRUSTED_PROXY_IPS` value ends with, after the comma that
+#: separates it from the operator's own list: Compose appends the range the proxy
+#: itself lives in, so that nginx is recognised as a hop. The comma is part of
+#: the pattern so that a value which *only* names the operator's own variable —
+#: nothing appended — is read as a missing append rather than as a wrong range.
+_TRUSTED_PROXY_APPEND = re.compile(
+    r",\s*\$\{(?P<variable>[A-Za-z0-9_]+):-(?P<default>[^}]+)\}\s*$"
+)
+
+
+#: The networks a trusted range may not reach into, and what the answer would
+#: be if it did. Reaching in counts in both directions: a trusted range inside
+#: one of these is a container in it, and one containing it is every container in
+#: it. The parent range is not listed here — the edge subnet is *inside* it, so
+#: containment alone would flag the correct configuration — and is handled
+#: separately, as an entry that contains the parent.
+_UNTRUSTABLE_NETWORKS = {
+    _DATA_NETWORK: "the data network holds the API's own siblings and the datastores",
+    _CONNECTOR_NETWORK: "connectors are code this platform did not write",
+}
+
 
 def _check_subnet_hierarchy(text: str, declared: dict[str, str]) -> list[str]:
-    """Every network subnet must sit inside the range the proxy trust uses.
+    """The subnets sit inside the parent, and only the edge may be trusted.
 
-    `TRUSTED_PROXY_IPS` names the parent range, because nginx reaches the API
-    from an address in one of these subnets and an audit row must record the real
-    client rather than the proxy's container address. If a subnet is moved
-    outside the parent, everything still starts — the audit trail just starts
-    recording proxy addresses — so the relationship is checked rather than
-    documented.
+    Two relationships, both of which fail quietly at runtime. A subnet moved
+    outside the parent stops the outbound guard recognising the deployment's own
+    addresses; a subnet moved outside the *edge* range means nginx is no longer a
+    recognised hop, so every audit row records the proxy's container address
+    instead of the client's. The third failure is the one this check was extended
+    for: naming the parent range trusted — nginx reaches the API from one of
+    these subnets, so appending the whole address space makes every container in
+    it able to forge the client address in the audit trail.
     """
     parent_match = re.search(
         r"^\s+OPENDRP_NETWORK_SUBNET:\s*\$\{OPENDRP_NETWORK_SUBNET:-([^}]+)\}",
@@ -321,6 +382,7 @@ def _check_subnet_hierarchy(text: str, declared: dict[str, str]) -> list[str]:
         return [f"OPENDRP_NETWORK_SUBNET default is not a network: {exc}"]
 
     failures: list[str] = []
+    resolved: dict[str, ipaddress._BaseNetwork] = {}
     for name, block in declared.items():
         match = _SUBNET_LINE.search(block)
         if match is None:
@@ -335,12 +397,137 @@ def _check_subnet_hierarchy(text: str, declared: dict[str, str]) -> list[str]:
         except ValueError as exc:
             failures.append(f"network `{name}` subnet is not a network: {exc}")
             continue
+        resolved[name] = subnet
         if not subnet.subnet_of(parent):
             failures.append(
                 f"network `{name}` subnet {subnet} is outside OPENDRP_NETWORK_SUBNET "
                 f"({parent}): nginx would no longer be a trusted proxy and audit "
                 f"entries would record the proxy address"
             )
+    failures.extend(_check_proxy_trust(text, resolved, parent))
+    return failures
+
+
+def _overlaps(
+    trusted: ipaddress._BaseNetwork, network: ipaddress._BaseNetwork
+) -> bool:
+    """Whether a trusted range reaches into another range, either way round."""
+    try:
+        return trusted.overlaps(network)
+    except TypeError:  # an IPv4 range beside an IPv6 one
+        return False
+
+
+def _contains(
+    outer: ipaddress._BaseNetwork, inner: ipaddress._BaseNetwork
+) -> bool:
+    """Whether ``outer`` covers ``inner`` (equal ranges included)."""
+    try:
+        return outer.supernet_of(inner) or outer == inner
+    except TypeError:  # an IPv4 range beside an IPv6 one
+        return False
+
+
+def _check_proxy_trust(
+    text: str,
+    resolved: dict[str, ipaddress._BaseNetwork],
+    parent: ipaddress._BaseNetwork,
+) -> list[str]:
+    """Only the edge subnet may be appended to `TRUSTED_PROXY_IPS`.
+
+    Read from the services rather than from one expected line, because the same
+    mistake can be made in any of them and a service that omits the append is
+    the quieter defect of the two: the deployment starts, and the audit trail
+    silently names the proxy container for every action.
+    """
+    failures: list[str] = []
+    edge = resolved.get(_EDGE_NETWORK)
+    if edge is None:
+        failures.append(
+            f"network `{_EDGE_NETWORK}` declares no subnet, so the range a request "
+            f"from the web server has to be trusted from cannot be checked"
+        )
+
+    untrustable: list[tuple[str, ipaddress._BaseNetwork, str]] = []
+    for field_name, why in _UNTRUSTABLE_NETWORKS.items():
+        network = resolved.get(field_name)
+        if network is None:
+            continue
+        untrustable.append((field_name, network, why))
+
+    services, _line = parse_services(text)
+    appended: list[str] = []
+    for service in services:
+        if service.env(_APPLICATION_MARKER) is None:
+            continue
+        value = (service.env("TRUSTED_PROXY_IPS") or "").strip()
+        if not value:
+            # A missing value is `_check_application_settings`'s finding.
+            continue
+        match = _TRUSTED_PROXY_APPEND.search(value)
+        if match is None:
+            failures.append(
+                f"service `{service.name}` (line {service.line_number}) sets "
+                f"`TRUSTED_PROXY_IPS` without appending the network the web "
+                f"server reaches it from: nginx is then not a recognised hop and "
+                f"every audit row records the proxy's container address instead "
+                f"of the client's"
+            )
+            continue
+        variable = match.group("variable")
+        appended.append(variable)
+        if variable != "OPENDRP_EDGE_SUBNET":
+            failures.append(
+                f"service `{service.name}` (line {service.line_number}) appends "
+                f"${{{variable}}} to `TRUSTED_PROXY_IPS`, and "
+                f"{_UNTRUSTABLE_NETWORKS.get(variable, 'that is not the edge network')}: "
+                f"a container in a trusted network can put any address it likes in "
+                f"`X-Forwarded-For` and have it written into the audit trail. "
+                f"Append ${{OPENDRP_EDGE_SUBNET}} instead"
+            )
+        try:
+            trusted = ipaddress.ip_network(match.group("default").strip(), strict=False)
+        except ValueError as exc:
+            failures.append(
+                f"service `{service.name}` (line {service.line_number}) appends a "
+                f"`TRUSTED_PROXY_IPS` range that is not a network: {exc}"
+            )
+            continue
+        if _contains(trusted, parent):
+            failures.append(
+                f"service `{service.name}` (line {service.line_number}) trusts "
+                f"{trusted}, which covers OPENDRP_NETWORK_SUBNET ({parent}) and "
+                f"therefore every network in the deployment — the connector "
+                f"network included, and connectors are code this platform did not "
+                f"write. A container in a trusted network can put any address it "
+                f"likes in `X-Forwarded-For` and have it written into the audit "
+                f"trail. Trust loopback and the edge subnet only"
+            )
+        else:
+            for field_name, network, why in untrustable:
+                if _overlaps(trusted, network):
+                    failures.append(
+                        f"service `{service.name}` (line {service.line_number}) "
+                        f"trusts {trusted}, which covers {field_name} ({network}): "
+                        f"{why}, so its containers could write any address they "
+                        f"liked into the audit trail. Trust loopback and the edge "
+                        f"subnet only"
+                    )
+        if edge is not None and trusted != edge:
+            failures.append(
+                f"service `{service.name}` (line {service.line_number}) trusts "
+                f"{trusted} while the edge network is {edge}: the two disagree, so "
+                f"either the web server is not recognised as a hop or a range "
+                f"nobody uses is trusted"
+            )
+
+    if not appended:
+        failures.append(
+            "no service running the application appends a trusted range to "
+            "`TRUSTED_PROXY_IPS`: the web server reaches the API from its own "
+            "network, so its `X-Forwarded-For` is ignored and every audit row "
+            "records the proxy address"
+        )
     return failures
 
 
@@ -463,7 +650,97 @@ def _check_network_split(services: list[Service], declared: dict[str, str]) -> l
     return failures
 
 
-def check(text: str, compose_dir: Path) -> list[str]:
+def _check_hardening(services: list[Service]) -> list[str]:
+    """Every service is hardened, or is named in the exception list. """
+    failures: list[str] = []
+    for service in services:
+        exception = _HARDENING_EXCEPTIONS.get(service.name)
+        if exception is not None:
+            if not exception.strip():
+                failures.append(
+                    f"service `{service.name}` is listed in "
+                    f"_HARDENING_EXCEPTIONS without a reason: an exception "
+                    f"nobody has to justify is one nobody revisits"
+                )
+            continue
+        missing = [
+            key for key in ("security_opt", "cap_drop") if not service.has(key)
+        ]
+        if missing:
+            failures.append(
+                f"service `{service.name}` (line {service.line_number}) lacks "
+                f"container hardening: {', '.join(missing)}. `no-new-privileges` "
+                f"and dropping every capability are what keep a compromised "
+                f"service a contained one; if this service cannot carry them, "
+                f"add it to _HARDENING_EXCEPTIONS with the reason"
+            )
+    return failures
+
+
+def _check_documented_limits(text: str, limits_doc: Path) -> list[str]:
+    """The limits an operator reads are the limits Compose applies.
+
+    Only the per-service rows are compared here. The totals a page may quote are
+    derived from them, so a wrong total is a documentation defect this gate
+    cannot see — which is why the page is expected to state the rows it is
+    summing rather than a number on its own.
+    """
+    try:
+        document = limits_doc.read_text(encoding="utf-8")
+    except OSError as exc:
+        return [
+            f"cannot read the resource table ({limits_doc}): {exc} — the limits "
+            f"an operator plans capacity from have to be checkable"
+        ]
+
+    documented: dict[str, tuple[str, str, str]] = {}
+    failures: list[str] = []
+    for number, line in enumerate(document.splitlines(), start=1):
+        match = _LIMITS_TABLE_ROW.match(line.strip())
+        if match is None:
+            continue
+        name = match.group("service")
+        if name in documented:
+            failures.append(
+                f"{limits_doc}:{number}: `{name}` appears twice in the resource "
+                f"table; the second row would silently win"
+            )
+        documented[name] = (match.group("mem"), match.group("cpus"), match.group("pids"))
+
+    services, _line = parse_services(text)
+    for service in services:
+        row = documented.get(service.name)
+        if row is None:
+            failures.append(
+                f"service `{service.name}` is not in the resource table of "
+                f"{limits_doc}: a service an operator cannot see is a service "
+                f"whose memory, CPU and PID bounds are not planned for"
+            )
+            continue
+        expected = tuple(
+            service.inline.get(key, "").strip().strip('"').strip("'")
+            for key in ("mem_limit", "cpus", "pids_limit")
+        )
+        if row != expected:
+            failures.append(
+                f"the resource table says `{service.name}` is "
+                f"{row[0]} / {row[1]} CPU / {row[2]} PIDs while Compose sets "
+                f"{expected[0]} / {expected[1]} CPU / {expected[2]} PIDs"
+            )
+
+    known = {service.name for service in services}
+    for name in sorted(set(documented) - known):
+        failures.append(
+            f"the resource table documents `{name}`, which is not a service in "
+            f"this Compose file: a row that outlives its service is a limit an "
+            f"operator would try to reason about"
+        )
+    return failures
+
+
+def check(
+    text: str, compose_dir: Path, limits_doc: Path | None = None
+) -> list[str]:
     failures: list[str] = []
     services, services_line = parse_services(text)
 
@@ -475,6 +752,10 @@ def check(text: str, compose_dir: Path) -> list[str]:
     failures.extend(_check_subnet_hierarchy(text, declared))
     failures.extend(_check_broker_authentication(services))
     failures.extend(_check_application_settings(services))
+    failures.extend(_check_hardening(services))
+    failures.extend(
+        _check_documented_limits(text, limits_doc or (compose_dir / _LIMITS_DOC))
+    )
 
     for service in services:
         missing_limits = [
@@ -560,9 +841,11 @@ def main(argv: list[str]) -> int:
 
     services, _line = parse_services(text)
     print(
-        f"compose gate: OK — {len(services)} services, each with a healthcheck "
-        f"and a bounded logging policy; an authenticated broker; and the "
-        f"edge/data/connector network split and resource limits intact"
+        f"compose gate: OK — {len(services)} services, each with a healthcheck, "
+        f"a bounded logging policy and container hardening; an authenticated "
+        f"broker; the edge/data/connector network split intact with only the edge "
+        f"trusted for forwarded addresses; and every documented resource limit "
+        f"equal to the one this file sets"
     )
     return 0
 

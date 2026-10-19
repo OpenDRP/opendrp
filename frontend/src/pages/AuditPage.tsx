@@ -59,6 +59,10 @@ interface AuditLog {
   timestamp: string;
   action: string;
   user_email?: string;
+  user_id?: string;
+  seq?: number;
+  entry_hash?: string;
+  actor_identity_source?: string;
   ip_address?: string;
   details?: Record<string, any>;
 }
@@ -74,6 +78,11 @@ export default function AuditPage() {
   const [page, setPage] = useState(1);
   const [size, setSize] = useState(20);
   const [search, setSearch] = useState("");
+  const [requestId, setRequestId] = useState("");
+  const [jobId, setJobId] = useState("");
+  const [actorId, setActorId] = useState("");
+  const [outcome, setOutcome] = useState("");
+  const integrity = useQuery({ queryKey: ["audit-integrity"], queryFn: endpoints.auditIntegrity, staleTime: 60_000 });
   const debouncedSearch = useDebounce(search, 400);
   const [actionFilter, setActionFilter] = useState<string | undefined>();
   const [userEmail, setUserEmail] = useState("");
@@ -87,11 +96,15 @@ export default function AuditPage() {
       size,
       search: debouncedSearch || undefined,
       action: actionFilter,
+      request_id: requestId || undefined,
+      job_id: jobId || undefined,
+      user_id: actorId || undefined,
+      outcome: outcome || undefined,
       user_email: debouncedUserEmail || undefined,
       from_date: buildUtcDate(fromDate),
       to_date: toDateUtc(),
     }),
-    [page, size, debouncedSearch, actionFilter, debouncedUserEmail, fromDate, toDate]
+    [page, size, debouncedSearch, actionFilter, debouncedUserEmail, fromDate, toDate, requestId, jobId, actorId, outcome]
   );
 
   const { data: actionsData, isLoading: actionsLoading } = useQuery<AuditActionsCatalog>({
@@ -219,7 +232,7 @@ export default function AuditPage() {
     return g;
   }, [actionsData]);
 
-  const { data, isLoading, isError, refetch, isFetching } = useQuery({
+  const { data, isLoading, isPlaceholderData, isError, refetch, isFetching } = useQuery({
     queryKey: ["audit-logs", appliedFilters],
     queryFn: () => endpoints.listAuditLogs(appliedFilters),
     staleTime: 15_000,
@@ -228,6 +241,10 @@ export default function AuditPage() {
 
   function resetFilters() {
     setSearch("");
+    setRequestId("");
+    setJobId("");
+    setActorId("");
+    setOutcome("");
     setActionFilter(undefined);
     setUserEmail("");
     setFromDate("");
@@ -323,8 +340,7 @@ export default function AuditPage() {
       key: "details",
       title: "Details Summary",
       minWidth: 300,
-      render: (r) => (          <div className="text-sm leading-relaxed">{describeAuditEntry(r)}</div>
-      ),
+      render: (r) => (<div className="text-sm leading-relaxed">{describeAuditEntry(r)}<details><summary className="cursor-pointer">Raw JSON / identifiers</summary><p className="font-mono text-xs">Event {r.id} · seq {r.seq ?? "unknown"} · actor {r.user_id ?? "system"}</p><p className="text-xs">Identity: {r.actor_identity_source ?? "unrecorded"}</p><pre className="whitespace-pre-wrap break-all text-xs">{JSON.stringify(r.details ?? {}, null, 2)}</pre><p className="font-mono text-xs break-all">Hash: {r.entry_hash ?? "unavailable"}</p></details></div>),
     },
   ];
 
@@ -334,7 +350,7 @@ export default function AuditPage() {
         <div>
           <h1 className="text-2xl font-bold">Audit Log</h1>
           <p className="text-muted-foreground text-sm mt-1">
-            Immutable activity trail across the platform. {TIME_ZONE_HINT}.
+            Tamper-evident activity trail across the platform. {TIME_ZONE_HINT}.
           </p>
         </div>
         <div className="flex items-center gap-2">
@@ -346,6 +362,7 @@ export default function AuditPage() {
         </div>
       </div>
 
+      <Card><CardHeader><CardTitle className="text-base">Integrity and archive status</CardTitle></CardHeader><CardContent>{integrity.isError ? <p>Integrity status unavailable — verification is not established.</p> : integrity.data ? <><p>Committed: {integrity.data.committed?.through_seq ?? "unknown"} · Retired: {integrity.data.retired?.through_seq ?? 0}</p><p>Last check: {integrity.data.last_verification?.at ?? "never"}</p><p>Full check: {integrity.data.full_verification?.at ?? "never"} · cursor {integrity.data.full_verification?.cursor ?? 0}/{integrity.data.full_verification?.upper_seq ?? 0} · {integrity.data.full_verification?.failure_reason ? `BROKEN: ${integrity.data.full_verification.failure_reason} at ${integrity.data.full_verification.failure_seq}` : integrity.data.full_verification?.in_progress ? "in progress" : "idle"}</p><p>Archive: {integrity.data.archive?.configured ? "configured" : "missing — retention blocked"} · Hold: {integrity.data.archive?.hold ? "active" : "off"}</p></> : <p>Loading integrity status…</p>}</CardContent></Card>
       <Card>
         <CardHeader className="pb-4">
           <CardTitle className="text-base">Filters</CardTitle>
@@ -357,6 +374,7 @@ export default function AuditPage() {
           </CardDescription>
         </CardHeader>
         <CardContent>
+          <div className="flex flex-wrap gap-3 mb-3"><Input aria-label="Audit request ID" placeholder="Exact request ID" value={requestId} onChange={(e) => { setRequestId(e.target.value); setPage(1); }} /><Input aria-label="Audit job UUID" placeholder="Exact job UUID" value={jobId} onChange={(e) => { setJobId(e.target.value); setPage(1); }} /><Input aria-label="Audit actor UUID" placeholder="Exact actor UUID" value={actorId} onChange={(e) => { setActorId(e.target.value); setPage(1); }} /><select aria-label="Audit outcome" value={outcome} onChange={(e) => { setOutcome(e.target.value); setPage(1); }}><option value="">All outcomes</option><option value="success">Non-failure actions</option><option value="failure">Failure actions</option></select></div>
           <div className="grid grid-cols-1 md:grid-cols-3 lg:grid-cols-6 gap-3">
             <div className="relative lg:col-span-2">
               <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
@@ -494,7 +512,7 @@ export default function AuditPage() {
               setPage(1);
             }}
             storageKey="audit-table-widths-v1"
-            loading={isLoading}
+            loading={isLoading || isPlaceholderData}
             isError={isError}
             errorDescription="The audit trail could not be loaded. This is an evidence gap, not an empty trail."
             onRetry={() => refetch()}

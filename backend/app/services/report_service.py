@@ -4,93 +4,312 @@ import uuid
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.services.breach_severity import severity_label, severity_rank_case
+
+
+def _breach_kpi_caption(kpi: dict, key: str) -> str:
+    """The caption a breach KPI key carries, taken from the report's own data.
+
+    The caption travels with the number, so the sentence printed beside a figure is the
+    one the shared rule wrote for it (WI-16). A report rendered from data an older build
+    gathered has no captions; it falls back to this wording rather than printing a blank.
+    """
+    captions = (kpi.get("breach_kpi") or {}).get("captions") or {}
+    declared = captions.get(key)
+    if isinstance(declared, str) and declared:
+        return declared
+    return "incidents the configured sources added to their own catalogues in the last 7 days"
+
+
+def _report_pdf_text_values(report_data: dict, generated_by_email: str) -> list[str]:
+    """Return row-field strings actually sent to PDF cells, tables, and footers."""
+    values = [generated_by_email]
+    for asset in report_data.get("assets", []):
+        values.extend(
+            str(value)
+            for value in (
+                getattr(asset, "asset_value", ""),
+                getattr(asset, "asset_type", ""),
+                getattr(asset, "criticality", ""),
+                "YES" if getattr(asset, "is_active", False) else "NO",
+            )
+        )
+    for finding in report_data.get("phishing", []):
+        values.extend(
+            str(value or "-")
+            for value in (
+                getattr(finding, "phishing_domain", ""),
+                getattr(finding, "ip_address", None),
+                getattr(finding, "detection_source", ""),
+                getattr(finding, "status", ""),
+            )
+        )
+    for breach in report_data.get("breaches", []):
+        values.extend(
+            str(value or "-")
+            for value in (
+                getattr(breach, "matched_email", None),
+                getattr(breach, "breach_name", ""),
+                getattr(breach, "domain", ""),
+                # Rendered in their own columns, so the class and the severity are part
+                # of the text the PDF receives and are validated like every other value
+                # that reaches a cell.
+                getattr(breach, "exposure_kind", None) or "breach",
+                severity_label(getattr(breach, "severity", None)),
+                getattr(breach, "breach_date", ""),
+            )
+        )
+    for section_key in ("exposure", "dns"):
+        for row in report_data.get(section_key, []):
+            values.extend((str(row.subject), str(row.source), str(row.first_seen_at), str(row.last_seen_at)))
+            if section_key == "exposure":
+                values.extend(
+                    str(value)
+                    for value in (
+                        row.matched_asset,
+                        (row.payload or {}).get("port", "-"),
+                        (row.payload or {}).get("protocol", "unknown"),
+                        row.observed_at or "unknown",
+                    )
+                )
+            else:
+                values.extend((str(row.observation_type), str(row.value or "-")))
+    return values
+
+
+def _find_unicode_pdf_font() -> str | None:
+    """Return the first configured or known system Unicode font, if present."""
+    candidates = (
+        os.environ.get("OPENDRP_PDF_FONT"),
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/tru/dejavu/DejaVuSans.ttf",
+        "/usr/local/share/fonts/DejaVuSans.ttf",
+        "C:/Windows/Fonts/DejaVuSans.ttf",
+        "C:/Windows/Fonts/arial.ttf",
+        "C:/Windows/Fonts/arialuni.ttf",
+    )
+    return next((candidate for candidate in candidates if candidate and os.path.isfile(candidate)), None)
+
+
+def _validate_pdf_text_unicode(report_data: dict, generated_by_email: str) -> None:
+    """Reject text a core PDF font would silently corrupt or fail to encode."""
+    import re
+
+    for value in _report_pdf_text_values(report_data, generated_by_email):
+        if re.search(r"[^\x00-\xff]", value):
+            raise ValueError(
+                "PDF Unicode font is unavailable; install DejaVu Sans or configure OPENDRP_PDF_FONT"
+            )
+        try:
+            value.encode("latin-1")
+        except UnicodeEncodeError as exc:
+            raise ValueError(
+                "PDF Unicode font is unavailable; install DejaVu Sans or configure OPENDRP_PDF_FONT"
+            ) from exc
+
 
 class ReportService:
     def __init__(self, db: AsyncSession):
         self.db = db
         self.last_truncation_metadata: dict | None = None
+        self.snapshot_at: str | None = None
 
     async def gather_report_data(self) -> dict:
-        from sqlalchemy import select, func
-        from datetime import timedelta
-        from app.models import Asset, Breach, DrpPhishingDomain
+        """Gather a bounded report from one short, consistent DB snapshot.
 
-        total_assets = (await self.db.execute(select(func.count(Asset.id)))).scalar_one()
-        total_phishing = (await self.db.execute(select(func.count(DrpPhishingDomain.id)))).scalar_one()
-        total_breaches = (await self.db.execute(select(func.count(Breach.id)))).scalar_one()
+        The session must not contain pending writes: report generation commits
+        the snapshot before handing its data to the PDF renderer. PostgreSQL uses
+        a read-only REPEATABLE READ transaction; SQLite receives an explicit read
+        transaction for deterministic unit-test semantics.
+        """
+        from datetime import timedelta
+
+        from sqlalchemy import func, select, text
+        from app.models import Asset, Breach, DrpPhishingDomain
+        from app.services.breach_kpi import breach_kpi
+        from app.models.dns_observation import DNSObservation
+        from app.models.source_observation import SourceObservation
+        from app.core.config import settings
+
+        if self.db.in_transaction():
+            sync_session = self.db.sync_session
+            if sync_session.new or sync_session.dirty or sync_session.deleted:
+                raise RuntimeError("report data gathering requires a clean database session")
+
         now = datetime.now(timezone.utc)
         seven_days_ago = now - timedelta(days=7)
-        active7d = (await self.db.execute(
-            select(func.count(DrpPhishingDomain.id)).where(DrpPhishingDomain.created_at >= seven_days_ago)
-        )).scalar_one()
-        kpi = {
-            "total_assets": total_assets,
-            "total_phishing": total_phishing,
-            "total_breaches": total_breaches,
-            "active_threats_7d": active7d,
-        }
-        from app.core.config import settings
-        row_limit = settings.REPORT_MAX_ROWS
-        # Reuse the KPI counts for truncation metadata; do not add another
-        # round-trip per section merely to explain the row limit.
-        asset_total = int(total_assets)
-        phishing_total = int(total_phishing)
-        breach_total = int(total_breaches)
-        assets = list((await self.db.execute(select(Asset).order_by(Asset.criticality.desc(), Asset.asset_type).limit(row_limit))).scalars().all())
-        assets_by_criticality: dict[str, int] = {}
-        for a in assets:
-            assets_by_criticality[a.criticality] = assets_by_criticality.get(a.criticality, 0) + 1
-        phishing = list((await self.db.execute(select(DrpPhishingDomain).order_by(DrpPhishingDomain.created_at.desc()).limit(row_limit))).scalars().all())
-        phishing_by_source: dict[str, int] = {}
-        for p in phishing:
-            phishing_by_source[p.detection_source] = phishing_by_source.get(p.detection_source, 0) + 1
-        breaches = list((await self.db.execute(select(Breach).order_by(Breach.created_at.desc()).limit(row_limit))).scalars().all())
-        self.last_truncation_metadata = {
-            "limit": row_limit,
-            "sections": {
-                "assets": {"total": asset_total, "included": len(assets), "truncated": asset_total > len(assets)},
-                "phishing": {"total": phishing_total, "included": len(phishing), "truncated": phishing_total > len(phishing)},
-                "breaches": {"total": breach_total, "included": len(breaches), "truncated": breach_total > len(breaches)},
-            },
-            "truncated": any((asset_total > len(assets), phishing_total > len(phishing), breach_total > len(breaches))),
-        }
-        return {
-            "generated_at_iso": now.isoformat(),
-            "kpi": kpi,
-            "assets": assets,
-            "assets_by_criticality": assets_by_criticality,
-            "phishing": phishing,
-            "phishing_by_source": phishing_by_source,
-            "breaches": breaches,
-            "truncation": self.last_truncation_metadata,
-        }
+        settings_row_limit = settings.REPORT_MAX_ROWS
+        row_limit = min(int(settings_row_limit), 50000)
+        if row_limit < 1:
+            raise ValueError("REPORT_MAX_ROWS must be positive")
+        try:
+            connection = await self.db.connection()
+            dialect = connection.dialect.name
+            if dialect == "postgresql":
+                # This must be the first statement of the transaction. It fixes
+                # one MVCC view and prevents report SELECTs from observing
+                # different ingestion commits under PostgreSQL READ COMMITTED.
+                await self.db.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"))
+            elif dialect == "sqlite":
+                # SQLAlchemy's SQLite autobegin is logical; explicitly BEGIN so
+                # consecutive reads share the same SQLite read snapshot too.
+                await connection.exec_driver_sql("BEGIN")
+
+            total_inventory_assets = int((await self.db.execute(select(func.count(Asset.id)))).scalar_one())
+            total_assets = int((await self.db.execute(
+                select(func.count(Asset.id)).where(Asset.is_active.is_(True))
+            )).scalar_one())
+            total_phishing = int((await self.db.execute(select(func.count(DrpPhishingDomain.id)))).scalar_one())
+            # The breach half of the KPI is the shared rule the dashboard reads too, read
+            # inside this snapshot: a report that disagreed with the page about the same
+            # installation would be worse than either number alone (WI-16).
+            breach = await breach_kpi(self.db, now=now)
+            total_breaches = breach["total_findings"]
+            open_statuses = ("active", "investigating")
+            active_phishing = int((await self.db.execute(
+                select(func.count(DrpPhishingDomain.id)).where(
+                    DrpPhishingDomain.created_at >= seven_days_ago,
+                    DrpPhishingDomain.status.in_(open_statuses),
+                )
+            )).scalar_one())
+            kpi = {
+                "total_assets": total_assets,
+                "total_phishing": total_phishing,
+                "total_breaches": total_breaches,
+                "active_threats_7d": active_phishing + int(breach["active_findings_7d"]),
+                # A finding is what happened to one of our accounts; an incident is what a
+                # source added to its catalogue, whether or not any address of ours is in
+                # it. Reporting only the first let a quiet week of scanning read as a quiet
+                # week of incidents (F-09).
+                "new_breach_incidents_7d": breach["new_incidents_7d"],
+                "breach_kpi": breach,
+            }
+
+            assets = list((await self.db.execute(
+                select(Asset).order_by(
+                    Asset.criticality.desc(), Asset.asset_type, Asset.id
+                ).limit(row_limit)
+            )).scalars().all())
+            phishing = list((await self.db.execute(
+                select(DrpPhishingDomain).order_by(
+                    DrpPhishingDomain.created_at.desc(), DrpPhishingDomain.id.desc()
+                ).limit(row_limit)
+            )).scalars().all())
+            # Loudest first, the same order the list offers: a report read top-down is
+            # a triage, and alphabetical severity would put an address list above a
+            # plaintext credential (F-13, WI-28).
+            breaches = list((await self.db.execute(
+                select(Breach).order_by(
+                    severity_rank_case(Breach.severity).desc(),
+                    Breach.created_at.desc(),
+                    Breach.id.desc(),
+                ).limit(row_limit)
+            )).scalars().all())
+            exposure_query = select(SourceObservation).where(SourceObservation.module == "exposure")
+            exposure_total = int((await self.db.execute(
+                select(func.count(SourceObservation.id)).where(SourceObservation.module == "exposure")
+            )).scalar_one())
+            dns_total = int((await self.db.execute(select(func.count(DNSObservation.id)))).scalar_one())
+            exposure = list((await self.db.execute(
+                exposure_query.order_by(SourceObservation.last_seen_at.desc(), SourceObservation.id.desc()).limit(row_limit)
+            )).scalars().all())
+            dns = list((await self.db.execute(
+                select(DNSObservation).order_by(
+                    DNSObservation.last_seen_at.desc(), DNSObservation.id.desc()
+                ).limit(row_limit)
+            )).scalars().all())
+
+            assets_by_criticality: dict[str, int] = {}
+            for asset in assets:
+                assets_by_criticality[asset.criticality] = assets_by_criticality.get(asset.criticality, 0) + 1
+            phishing_by_source: dict[str, int] = {}
+            for finding in phishing:
+                source = finding.detection_source or "unknown"
+                phishing_by_source[source] = phishing_by_source.get(source, 0) + 1
+
+            totals = {
+                "assets": total_inventory_assets,
+                "phishing": total_phishing,
+                "breaches": total_breaches,
+                "exposure": exposure_total,
+                "dns": dns_total,
+            }
+            included = {
+                "assets": len(assets),
+                "phishing": len(phishing),
+                "breaches": len(breaches),
+                "exposure": len(exposure),
+                "dns": len(dns),
+            }
+            sections = {
+                name: {
+                    "total": totals[name],
+                    "included": included[name],
+                    "limit": row_limit,
+                    "truncated": totals[name] > included[name],
+                }
+                for name in totals
+            }
+            self.snapshot_at = now.isoformat()
+            self.last_truncation_metadata = {
+                "snapshot_at": self.snapshot_at,
+                "limit": row_limit,
+                "sections": sections,
+                "truncated": any(section["truncated"] for section in sections.values()),
+            }
+            result = {
+                "generated_at_iso": now.isoformat(),
+                "snapshot_at": self.snapshot_at,
+                "kpi": kpi,
+                "assets": assets,
+                "assets_by_criticality": assets_by_criticality,
+                "phishing": phishing,
+                "phishing_by_source": phishing_by_source,
+                "breaches": breaches,
+                "exposure": exposure,
+                "dns": dns,
+                "truncation": self.last_truncation_metadata,
+            }
+            # Release both the snapshot and its connection before PDF rendering.
+            await self.db.commit()
+            return result
+        except BaseException:
+            await self.db.rollback()
+            raise
 
     @staticmethod
     def generate_pdf_sync(file_path: str, report_data: dict, generated_by_email: str) -> None:
         from fpdf import FPDF
         import os
 
+        unicode_font = _find_unicode_pdf_font()
+        if unicode_font is None:
+            _validate_pdf_text_unicode(report_data, generated_by_email)
+
         class OpenDRPReport(FPDF):
             def __init__(self):
                 super().__init__()
                 self.alias_nb_pages()
-                # Prefer a bundled/system Unicode font. Helvetica is retained as
-                # a fallback for minimal installations, but never silently drops
-                # Cyrillic, accented names, or non-ASCII provider data.
-                import os
-                candidates = [
-                    os.environ.get("OPENDRP_PDF_FONT"),
-                    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-                    "/usr/share/fonts/tru/dejavu/DejaVuSans.ttf",
-                    "/usr/local/share/fonts/DejaVuSans.ttf",
-                ]
-                self.unicode_font = next((p for p in candidates if p and os.path.isfile(p)), None)
+                # Font selection and Unicode validation use the same discovered
+                # file, so a supported platform font cannot be detected and then
+                # ignored by the renderer.
+                self.unicode_font = unicode_font
                 if self.unicode_font:
                     self.add_font("DejaVu", style="", fname=self.unicode_font, uni=True)
                     bold = self.unicode_font.replace("DejaVuSans.ttf", "DejaVuSans-Bold.ttf")
+                    if not os.path.isfile(bold):
+                        bold = os.path.join(os.path.dirname(self.unicode_font), "arialbd.ttf")
                     if os.path.isfile(bold):
                         self.add_font("DejaVu", style="B", fname=bold, uni=True)
                 self._opendrp_font_family = "DejaVu" if self.unicode_font else "Helvetica"
+
+            def set_font(self, family, style="", size=0):
+                selected = self._opendrp_font_family if family in {"Helvetica", "DejaVu"} else family
+                if selected == "DejaVu":
+                    registered = {str(key).lower() for key in self.fonts}
+                    if f"{selected}{style}".lower() not in registered:
+                        style = "B" if "B" in style and f"{selected}B".lower() in registered else ""
+                return FPDF.set_font(self, selected, style, size)
 
             def header(self):
                 if self.page_no() == 1:
@@ -115,23 +334,8 @@ class ReportService:
 
         pdf = OpenDRPReport()
         pdf.set_auto_page_break(auto=True, margin=25)
-        # All report text goes through the selected family. On the production
-        # image this is DejaVu Sans; the fallback keeps PDF generation available
-        # in stripped-down test/dev environments.
-        def set_safe_font(family, style="", size=0):
-            selected = pdf._opendrp_font_family if family in {"Helvetica", "DejaVu"} else family
-            # fpdf2 stores registered styles by lower-case family/style keys.
-            # The production image ships regular and bold DejaVu faces, but not
-            # italic. Map unsupported styles to a registered face instead of
-            # asking fpdf2 to resolve e.g. ``dejavuI`` and failing the whole PDF.
-            if selected == "DejaVu":
-                registered = {str(key).lower() for key in pdf.fonts}
-                requested = f"{selected}{style}".lower()
-                if requested not in registered:
-                    bold_key = f"{selected}B".lower()
-                    style = "B" if "B" in style and bold_key in registered else ""
-            return FPDF.set_font(pdf, selected, style, size)
-        pdf.set_font = set_safe_font
+        # OpenDRPReport.set_font routes all document text through the chosen
+        # Unicode-capable family, including automatic page headers/footers.
 
         pdf.add_page()
         pdf.set_fill_color(17, 24, 39)
@@ -168,10 +372,14 @@ class ReportService:
 
         kv(pdf, "Generated At:", report_data.get("generated_at_iso", "")[:19] + " UTC")
         kv(pdf, "Generated By:", generated_by_email)
-        kv(pdf, "Total Assets:", report_data['kpi']['total_assets'])
+        kv(pdf, "Active Assets:", report_data['kpi']['total_assets'])
         kv(pdf, "Phishing Threats:", report_data['kpi']['total_phishing'])
-        kv(pdf, "Credential Breaches:", report_data['kpi']['total_breaches'])
-        kv(pdf, "Active 7d Threats:", report_data['kpi']['active_threats_7d'])
+        kv(pdf, "Breach Findings:", report_data['kpi']['total_breaches'])
+        kv(pdf, "Active Threats (7d):", report_data['kpi']['active_threats_7d'])
+        # The two are not the same number and the report says so where the numbers are
+        # printed: findings are about our accounts, incidents are about what the sources
+        # added to their catalogues (WI-16).
+        kv(pdf, "New Breach Incidents (7d):", report_data['kpi'].get('new_breach_incidents_7d', 0))
         pdf.ln(30)
         pdf.set_font("Helvetica", "I", 9)
         pdf.set_text_color(150, 150, 150)
@@ -188,20 +396,36 @@ class ReportService:
             pdf.line(10, pdf.get_y() + 2, 200, pdf.get_y() + 2)
             pdf.ln(10)
 
+        def section_counts(section_key: str, rows: list) -> None:
+            info = (report_data.get("truncation") or {}).get("sections", {}).get(section_key, {})
+            included = info.get("included", len(rows))
+            total = info.get("total", len(rows))
+            limit = info.get("limit", (report_data.get("truncation") or {}).get("limit", "n/a"))
+            suffix = "; TRUNCATED" if info.get("truncated") else ""
+            pdf.set_font("Helvetica", "", 9)
+            pdf.set_text_color(75, 85, 99)
+            pdf.cell(0, 6, f"{included} included / {total} total; limit {limit}{suffix}", ln=1)
+
         section_heading("EXECUTIVE SUMMARY", "1")
         pdf.set_font("Helvetica", "", 11)
         pdf.set_text_color(55, 65, 81)
         pdf.multi_cell(0, 7,
-            "The following report summarizes the cybersecurity posture of protected assets as monitored by "
-            "the OpenDRP Digital Risk Protection (DRP) platform. It includes an inventory of protected assets, "
-            "active phishing and brand-impersonation threats detected via DNS mutation scanning (dnstwist) and Shodan "
-            "Hunting, plus credential leaks identified through HaveIBeenPwned integration.\n")
+            "The following report summarizes inventory, phishing, breach, Exposure, and DNS Security "
+            "observations collected by the configured sources of the OpenDRP platform. Counts describe "
+            "stored records; provider observations are not, by themselves, proof of ownership or compromise.\n")
+        for section_key, section_label in (("assets", "Assets"), ("phishing", "Phishing"), ("breaches", "Breach findings"), ("exposure", "Exposure"), ("dns", "DNS Security")):
+            info = (report_data.get("truncation") or {}).get("sections", {}).get(section_key, {})
+            pdf.set_font("Helvetica", "", 9)
+            truncation_flag = "; TRUNCATED" if info.get("truncated") else ""
+            pdf.cell(0, 6, f"{section_label}: {info.get('included', len(report_data.get(section_key, [])))} included / {info.get('total', len(report_data.get(section_key, [])))} total; limit {info.get('limit', (report_data.get('truncation') or {}).get('limit', 'n/a'))}{truncation_flag}", ln=1)
+        pdf.cell(0, 6, f"Snapshot collected at: {report_data.get('snapshot_at') or report_data.get('generated_at_iso', '')}", ln=1)
+        pdf.ln(2)
         kpi = report_data['kpi']
         boxes = [
             ("PROTECTED ASSETS", kpi['total_assets'], "Building2"),
             ("PHISHING THREATS", kpi['total_phishing'], "ShieldAlert"),
-            ("CREDENTIAL LEAKS", kpi['total_breaches'], "AlertTriangle"),
-            ("NEW THREATS (7D)", kpi['active_threats_7d'], "Activity"),
+            ("BREACH FINDINGS", kpi['total_breaches'], "AlertTriangle"),
+            ("ACTIVE THREATS (7D)", kpi['active_threats_7d'], "Activity"),
         ]
         x = 10
         y = pdf.get_y()
@@ -226,7 +450,7 @@ class ReportService:
         pdf.set_y(y + box_h + 12)
         pdf.set_font("Helvetica", "B", 12)
         pdf.set_text_color(17, 24, 39)
-        pdf.cell(0, 8, "Asset Criticality Distribution", 0, 1)
+        pdf.cell(0, 8, "Asset Criticality Distribution (included rows)", 0, 1)
         data = report_data.get("assets_by_criticality") or {}
         colors = {"critical": (220, 38, 38), "high": (234, 88, 12), "medium": (234, 179, 8), "low": (16, 185, 129)}
         for crit in ["critical", "high", "medium", "low"]:
@@ -244,6 +468,8 @@ class ReportService:
         pdf.ln(5)
 
         section_heading("PROTECTED ASSETS INVENTORY", "2")
+        assets = report_data.get("assets", [])
+        section_counts("assets", assets)
         headers = ["#", "Asset Value", "Type", "Criticality", "Active"]
         widths = [8, 82, 35, 28, 17]
         pdf.set_fill_color(17, 24, 39)
@@ -253,7 +479,6 @@ class ReportService:
             pdf.cell(widths[i], 10, str(h), border=1, align="C", fill=True)
         pdf.ln()
         fill = False
-        assets = report_data.get("assets", [])
         pdf.set_font("Helvetica", "", 9)
         pdf.set_text_color(17, 24, 39)
         for idx, a in enumerate(assets, 1):
@@ -279,6 +504,8 @@ class ReportService:
             fill = not fill
 
         section_heading("PHISHING & BRAND IMPERSONATION THREATS", "3")
+        phishing = report_data.get("phishing", [])
+        section_counts("phishing", phishing)
         headers = ["#", "Phishing Domain", "IP", "Source", "Status"]
         widths = [8, 70, 33, 30, 20]
         pdf.set_fill_color(17, 24, 39)
@@ -287,11 +514,10 @@ class ReportService:
         for i, h in enumerate(headers):
             pdf.cell(widths[i], 10, str(h), border=1, align="C", fill=True)
         pdf.ln()
-        phishing = report_data.get("phishing", [])
         fill = False
         pdf.set_font("Helvetica", "", 9)
         pdf.set_text_color(17, 24, 39)
-        for idx, p in enumerate(phishing[:500], 1):
+        for idx, p in enumerate(phishing, 1):
             if pdf.get_y() > 270:
                 pdf.add_page()
                 pdf.set_fill_color(17, 24, 39)
@@ -312,24 +538,26 @@ class ReportService:
                 pdf.cell(widths[i], 8, str(c)[:60], border=1, align=align, fill=True)
             pdf.ln()
             fill = not fill
-        phishing_truncation = (report_data.get("truncation") or {}).get("sections", {}).get("phishing", {})
-        if phishing_truncation.get("truncated"):
-            pdf.cell(0, 8, f"... truncated at {phishing_truncation.get('included', len(phishing))} rows, total: {phishing_truncation.get('total')}", 0, 1)
 
-        section_heading("CREDENTIAL LEAKS - HAVEIBEENPWNED", "4")
-        headers = ["#", "Matched Email", "Breach", "Domain", "Breach Date"]
-        widths = [8, 60, 55, 40, 27]
+        section_heading("BREACH FINDINGS", "4")
+        breaches = report_data.get("breaches", [])
+        section_counts("breaches", breaches)
+        # The class of exposure is its own column: a compromised account is a password
+        # reset and a stealer log is a session to revoke, so a report that names the
+        # incident without it leaves the reader to find out elsewhere (WI-21). The token
+        # printed is the one the API filters on, not a second vocabulary.
+        headers = ["#", "Matched Email", "Breach", "Domain", "Exposure", "Severity", "Breach Date"]
+        widths = [8, 44, 46, 28, 24, 22, 18]
         pdf.set_fill_color(17, 24, 39)
         pdf.set_text_color(255, 255, 255)
         pdf.set_font("Helvetica", "B", 10)
         for i, h in enumerate(headers):
             pdf.cell(widths[i], 10, str(h), border=1, align="C", fill=True)
         pdf.ln()
-        breaches = report_data.get("breaches", [])
         fill = False
         pdf.set_font("Helvetica", "", 9)
         pdf.set_text_color(17, 24, 39)
-        for idx, b in enumerate(breaches[:500], 1):
+        for idx, b in enumerate(breaches, 1):
             if pdf.get_y() > 270:
                 pdf.add_page()
                 pdf.set_fill_color(17, 24, 39)
@@ -344,33 +572,58 @@ class ReportService:
                 pdf.set_fill_color(249, 250, 251)
             else:
                 pdf.set_fill_color(255, 255, 255)
-            cells = [idx, b.matched_email, b.breach_name, b.domain, str(b.breach_date)]
+            cells = [
+                idx,
+                b.matched_email,
+                b.breach_name,
+                b.domain,
+                getattr(b, "exposure_kind", None) or "breach",
+                severity_label(getattr(b, "severity", None)),
+                str(b.breach_date),
+            ]
             for i, c in enumerate(cells):
                 align = "L" if i in (1, 2, 3) else "C"
                 pdf.cell(widths[i], 8, str(c)[:60], border=1, align=align, fill=True)
             pdf.ln()
             fill = not fill
 
-        breach_truncation = (report_data.get("truncation") or {}).get("sections", {}).get("breaches", {})
-        if breach_truncation.get("truncated"):
-            pdf.cell(0, 8, f"... truncated at {breach_truncation.get('included', len(breaches))} rows, total: {breach_truncation.get('total')}", 0, 1)
 
         section_heading("CONCLUSION & RECOMMENDATIONS", "5")
         pdf.set_font("Helvetica", "", 11)
         pdf.set_text_color(55, 65, 81)
+        breach_payload = kpi.get("breach_kpi") or {}
+        undated_incidents = int(breach_payload.get("undated_incidents", 0) or 0)
+        undated_note = (
+            f"    ({undated_incidents} stored incidents carry no date from their source, so they cannot be counted in that window.)\n"
+            if undated_incidents > 0
+            else ""
+        )
+        # The class of exposure behind the findings total, from the same payload the
+        # dashboard reads: a compromised account and a stealer-log row are one number to
+        # the KPI and two different jobs for the operator (WI-16).
+        kinds = breach_payload.get("findings_by_exposure_kind") or {}
+        kinds_note = (
+            f"  - {_breach_kpi_caption(kpi, 'findings_by_exposure_kind')}: "
+            + ", ".join(f"{kind} {int(count)}" for kind, count in kinds.items())
+            + ".\n"
+            if kinds
+            else ""
+        )
         pdf.multi_cell(0, 7,
             "SUMMARY: The OpenDRP platform has identified the following security posture:\n"
-            f"  - {kpi['total_assets']} digital assets under continuous monitoring.\n"
-            f"  - {kpi['total_phishing']} active phishing / brand-impersonation threats detected "
-            "(via dnstwist mutation scanning + Shodan Hunting: SSL cert / http.title / favicon hash).\n"
-            f"  - {kpi['total_breaches']} credential-leak records linked to protected accounts from HaveIBeenPwned.\n\n"
+            f"  - {kpi['total_assets']} active asset records are present in the inventory.\n"
+            f"  - {kpi['total_phishing']} phishing findings are stored (all statuses).\n"
+            f"  - {kpi['total_breaches']} breach findings are stored (all configured sources).\n"
+            f"  - {kpi['active_threats_7d']} phishing and breach findings are active or under investigation and were created in the last 7 days.\n"
+            f"  - {kpi.get('new_breach_incidents_7d', 0)} {_breach_kpi_caption(kpi, 'new_incidents_7d')}.\n"
+            + undated_note
+            + kinds_note
+            + "\n"
             "RECOMMENDATIONS:\n"
-            " 1. Priority remediation: Investigate CRITICAL phishing domains and initiate abuse reports\n"
-            "    with the hosting providers / registrars (see abuse contacts in the Phishing module).\n"
-            " 2. Compromised credentials: Force password reset and MFA re-enrollment for breached accounts.\n"
-            " 3. Continuous monitoring: Keep DNSTwist (every 6h) and Shodan daily schedules enabled.\n"
-            " 4. Alert tuning: Ensure Alert Recipient Email and Telegram integration are configured in System Settings.\n"
-            " 5. Review asset inventory: Confirm all high/critical assets are onboarded with correct types.\n"
+            " 1. Validate high-priority findings against their source and current status before taking action.\n"
+            " 2. For confirmed account exposure, follow the organization's credential-response policy.\n"
+            " 3. Review passive observations for relevance; shared infrastructure is not proof of ownership.\n"
+            " 4. Confirm enabled sources, scan budgets, schedules, alert recipients, and asset coverage.\n"
         )
         pdf.ln(10)
         pdf.set_draw_color(34, 197, 94)
@@ -379,9 +632,29 @@ class ReportService:
         pdf.ln(5)
         pdf.set_font("Helvetica", "I", 10)
         pdf.set_text_color(100, 116, 139)
-        pdf.cell(0, 6, f"Report generated by OpenDRP Platform v1.0 on {report_data.get('generated_at_iso', '')[:19]} UTC", 0, 1, align="C")
+        pdf.cell(0, 6, f"Report generated by OpenDRP Platform on {report_data.get('generated_at_iso', '')[:19]} UTC", 0, 1, align="C")
         pdf.cell(0, 6, f"Initiator: {generated_by_email}", 0, 1, align="C")
 
+        for section, label in (("exposure", "Exposure"), ("dns", "DNS Security")):
+            rows = report_data.get(section, [])
+            pdf.add_page()
+            pdf.set_font("Helvetica", "B", 18)
+            pdf.set_text_color(17, 24, 39)
+            pdf.cell(0, 12, label, ln=1)
+            pdf.set_font("Helvetica", "", 9)
+            pdf.multi_cell(0, 5, "Passive provider observations, not verified vulnerabilities. Shared infrastructure is not proof of ownership. Missing or truncated results do not resolve earlier evidence.")
+            section_counts(section, rows)
+            if not rows:
+                pdf.cell(0, 8, "No observations included.", ln=1)
+            for row in rows:
+                details = f"{row.subject} | source: {row.source} | first: {row.first_seen_at} | last: {row.last_seen_at}"
+                if section == "exposure":
+                    details += f" | asset: {row.matched_asset} | service: {row.payload.get('port', '-')} / {row.payload.get('protocol', 'unknown')} | provider observed: {row.observed_at or 'unknown'}"
+                else:
+                    details += f" | {row.observation_type}: {row.value or '-'}"
+                pdf.set_x(pdf.l_margin)
+                pdf.multi_cell(pdf.w-pdf.l_margin-pdf.r_margin, 5, details)
+                pdf.ln(2)
         os.makedirs(os.path.dirname(file_path), exist_ok=True)
         pdf.output(file_path)
         if os.path.getsize(file_path) < 10240:
@@ -399,9 +672,22 @@ class ReportService:
         from app.core.artifact_path import artifact_filename, artifact_path
         from app.core.config import settings
 
-        data = await self.gather_report_data()
         import asyncio
+
         loop = asyncio.get_running_loop()
+        generation_started = loop.time()
+        try:
+            data = await asyncio.wait_for(
+                self.gather_report_data(),
+                timeout=settings.REPORT_GENERATION_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError as exc:
+            raise TimeoutError("report generation exceeded its configured time limit during data collection") from exc
+
+        remaining_timeout = settings.REPORT_GENERATION_TIMEOUT_SECONDS - (loop.time() - generation_started)
+        if remaining_timeout <= 0:
+            raise TimeoutError("report generation exceeded its configured time limit before PDF rendering")
+
         target = artifact_path(report_id)
         # A timeout cannot stop a Python thread already executing fpdf2. Use a
         # unique sibling for every attempt and shield the executor future: the
@@ -431,11 +717,9 @@ class ReportService:
                 pass
 
         render_future.add_done_callback(_cleanup_late_render)
+        remaining_timeout = settings.REPORT_GENERATION_TIMEOUT_SECONDS - (loop.time() - generation_started)
         try:
-            await asyncio.wait_for(
-                asyncio.shield(render_future),
-                timeout=settings.REPORT_GENERATION_TIMEOUT_SECONDS,
-            )
+            await asyncio.wait_for(asyncio.shield(render_future), timeout=remaining_timeout)
             os.replace(temporary, target)
         except asyncio.TimeoutError:
             timed_out = True

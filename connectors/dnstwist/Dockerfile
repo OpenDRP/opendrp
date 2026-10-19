@@ -4,8 +4,18 @@ FROM python:3.12-slim
 # python3-dnspython (skipped by --no-install-recommends), yet the CLI's
 # shebang points at the system python and hard-fails at runtime with
 # "missing DNSPython library" without it — install it explicitly.
+#
+# dnstwist is pinned to the exact Debian version, and the connector refuses to run
+# any job whose `dnstwist --version` reports another release
+# (`_EXPECTED_DNSTWIST_VERSION` in main.py, checked by
+# tests/test_dnstwist_cli_version.py). The CLI is not an implementation detail here:
+# the connector parses its JSON, uses its fuzzer vocabulary and depends on its
+# resolved-address dictionary, so a different release can return fewer look-alikes
+# for the same domain — a change that would otherwise arrive silently in a rebuild.
+# The pin is a Debian version; a base-image bump whose archive serves another one
+# fails the build rather than the scan.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends dnstwist python3-dnspython \
+    && apt-get install -y --no-install-recommends dnstwist=0~20250130-1 python3-dnspython \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -15,7 +25,7 @@ COPY connectors/base /opt/sdk
 RUN pip install --no-cache-dir /opt/sdk
 
 COPY connectors/dnstwist/requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir -r /app/requirements.txt
+RUN pip install --no-cache-dir --require-hashes -r /app/requirements.txt
 
 COPY connectors/dnstwist/main.py /app/main.py
 

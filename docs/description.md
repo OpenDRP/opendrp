@@ -1,588 +1,761 @@
-# OpenDRP
+# OpenDRP — technical reference
 
-## Dashboard and report production safeguards
+This page is for someone changing the code: module internals, the rule that links
+findings to assets, the connector protocol, the authentication and session design,
+and the audit trail. [README.md](../README.md) is the platform's description —
+architecture, services and Compose profiles, modules and the asset model,
+configuration, operations, alerts, settings and retention, the UI and the security
+model all live there — and the runbooks are in [deployment.md](deployment.md),
+[upgrading.md](upgrading.md), [backup-restore.md](backup-restore.md),
+[dns-security.md](dns-security.md), [source-intelligence.md](source-intelligence.md),
+[observability.md](observability.md), [security.md](security.md) and
+[production-readiness.md](production-readiness.md).
 
-Alert delivery is durable and asynchronous: finding ingestion writes a persistent
-queue event and never waits for SMTP or Telegram. A worker groups events by completed
-connector job, sends one bounded summary, retries only transient failures, and records
-per-event retry state. `ALERT_DELIVERY_TIMEOUT_SECONDS`, `ALERT_DELIVERY_MAX_ATTEMPTS`,
-`ALERT_AGGREGATION_DELAY_SECONDS`, and the message-size limits control this behavior.
+Each section below names the code that owns the behaviour. Where a page and the
+code disagree, the code is what the platform does.
 
-Dashboard timeline data is aggregated in one database query rather than issuing
-one query per day and per finding type. Empty days are filled in the API response,
-so charts retain a stable 30-day shape without the N+1 database load.
+## 1. Modules and their storage
 
-Report generation is asynchronous and bounded. `REPORT_MAX_ROWS` limits the
-inventory and finding rows embedded in one PDF, while
-`REPORT_GENERATION_TIMEOUT_SECONDS` bounds PDF rendering. Reports are rendered
-with DejaVu Sans when the runtime image provides it, preserving Unicode text
-(including Cyrillic); the artifact is published atomically only after rendering
-completes. Each completed report also stores truncation metadata: the UI marks
-reports whose assets, phishing findings, or breaches exceeded the configured
-`REPORT_MAX_ROWS` limit, and shows the included/total section counts without
-changing the report's complete KPI totals.
+The module registry is rows in `drp_modules` (section 1.5). Four modules ship with
+the platform, each with its own typed table, write adapter and endpoints; a module
+an operator declares instead uses the generic `drp_findings` path.
 
-Connector errors persisted by the core are sanitized before storage: provider
-URLs, tokens, passwords, and response control characters are not copied into
-`last_error`. Connector health therefore exposes a useful state without turning
-provider diagnostics into a credential disclosure.
+| Module | Table | Finding kind | Asset types it consumes |
+|---|---|---|---|
+| `phishing` | `drp_phishing_domains` | `phishing` | `domain` |
+| `breaches` | `drp_breaches` | `breach` | `email_account`, `domain` |
+| `dns` | `dns_security_observations` | `dns_observation` | `domain` |
+| `exposure` | `source_observations` | `exposure` | `domain`, `ip_address` |
 
-SMTP and WHOIS destination resolution is bounded by `OUTBOUND_DNS_TIMEOUT_SECONDS`.
-DNS work runs outside the event loop and provider/WHOIS probes have explicit
-wall-clock limits, so a broken resolver cannot exhaust API workers.
+### 1.1 Phishing
 
-# Technical Description
+Stored in `drp_phishing_domains`. The DNSTwist connector reads active `domain`
+assets, runs mutations and DNS resolution, and submits candidates with
+`detection_source=dnstwist`; the Shodan connector asks its configured questions and
+submits with `detection_source` naming the one that matched. Accepted findings may be
+enriched with WHOIS data by the core (`app/services/phishing/`).
 
-## 1. Scope and purpose
+What the DNSTwist worker asks for is chosen in **classes** (`typo`, `idn`,
+`bitsquatting`, `plural`, `subdomain`, `dictionary`, `various`, `tld`, default `typo`)
+rather than as a raw fuzzer list, because several techniques are useless — or refused
+by the CLI — without their companion dictionary: a class brings both. The candidate
+bound (`DNSTWIST_MAX_CANDIDATES`) is applied where it costs nothing, before any name is
+resolved, and a shortened set is reported. Two further options are off by default
+because they widen the scan's network footprint rather than a provider bill: the CLI's
+MX check plus one free SPF TXT question (so `mx_without_spf` is answered rather than
+inferred) and page similarity (`--lsh tlsh`, reported as unavailable when the TLSh
+module is absent — `--phash` and screenshots are deliberately never used).
 
-OpenDRP is a self-hosted Digital Risk Protection platform. It maintains a monitored-asset inventory and detects external exposure through phishing, brand-abuse, infrastructure, and breach-data sources.
+Shodan capabilities are independent and configured per connector: the three
+original questions (`scan_ssl_text`, `scan_http_title`, `scan_favicon`) and the
+five added with the budget-and-filters wave, which default to *off* because each
+spends query credits on a question an operator confirms against their own account
+first (`connectors/shodan/live_check.py`):
 
-The implemented platform provides:
+| capability | the question | costs |
+|---|---|---|
+| `scan_http_body` | the brand in a page body | 1 credit per search, counted before it is paged |
+| `scan_cert_subject` | a **confirmed** candidate's own certificate name (`ssl.cert.subject.cn`) | 1 credit per candidate |
+| `scan_html_hash` | other hosts serving our page's HTML (`http.html_hash`, read from the free lookup — Shodan computes the hash, so the platform can never recompute it) | 1 credit per pivot |
+| `scan_pivots` | what else the actor behind a found host runs (`org:`/`net:`), capped by `max_pivots` | 1 credit per pivot, the `org:` one counted first |
+| `scan_host_lookup` | what a host *is* (`/shodan/host/{ip}`: ASN, organisation, title, icon hash, JARM, certificate names) | **no query credits** |
 
-- asset management for domains, IP addresses, email accounts, and keyword indicators;
-- phishing discovery through DNSTwist and Shodan connectors;
-- HIBP breach monitoring through a connector;
-- manual and scheduled scans;
-- normalized finding ingestion, deduplication, and alert dispatch;
-- administrator-configured email and Telegram notifications, with explicit SMTP STARTTLS, implicit TLS or trusted plain-relay mode;
-- asynchronous PDF reports;
-- role-based access control and refresh-token rotation;
-- structured audit records and JSON audit output.
+The connector registry is the source of truth — an administrator's choice in the
+connector configuration takes precedence, and the `SHODAN_SCAN_*` environment
+values are the fallback until one is set. Disabling a capability stops that query;
+disabling all of them completes the job without an external search. Shodan receives
+active `domain`, `keyword_domain` and `keyword_title` assets as targets, confirmed
+candidates as certificate targets, and active domains and IP addresses as
+exclusions: excluded names become `-domain:`/`-hostname:` negatives *inside* the
+paid query (capped by `max_exclusions`), so infrastructure the operator already
+monitors is neither paid for nor reported back as a look-alike, and the local
+filter still guarantees one is never stored.
 
-## 2. Architectural principles
+What a scan may spend is a per-connector policy rather than a constant: `max_pages`
+replaces the connector's old three-page ceiling, and a broad expression is counted
+(`/shodan/host/count`) before any page of it is fetched, so a result set an operator
+cannot read to the end is refused by name (`expression_too_broad`) and an empty one
+costs no search request at all. The summary says what the scan could not do
+(`skipped`) and what the allowed work cost — `spent`, `budget_left`, `daily_budget`,
+`daily_budget_left`, `retry_after_seconds`, `pages`, `billed_pages` (the pages past
+the first, which is the unit the vendor bills) and `free_lookups` — and a budget
+refusal stops the scan with a named reason instead of failing it as a provider
+error.
 
-### 2.1 Core and connectors
+Every accepted candidate also carries the platform's own confidence in it, scored from
+the facts it observed (`young_domain`, `mx_without_spf`, `title_match`,
+`favicon_perceptual_match`, `html_similarity`, `brand_in_body`, `source_corroboration`,
+`parked_hint`, `aged_domain`, `tls_issuer_reuse`) and stored on the row with the trail
+of signal rows behind it, so "why is this candidate at 80?" is answered from data
+rather than by re-deriving the weights of whatever build happened to run. The score
+decides how the candidate is reported: at or above `ALERT_CONFIDENCE_DIRECT` it is
+announced, between that and `ALERT_CONFIDENCE_DIGEST` it waits for one daily digest, and
+below is list-only.
 
-The system is split into a stateless platform core and independent connectors.
+The facts a *provider* reported are scored from the evidence the platform already
+stored, not by asking again: a page a connector found by matching the brand in its
+title is a `title_match`, one it found through the page body is a `brand_in_body`,
+and one matched by the provider's own perceptual icon hash is a
+`favicon_perceptual_match` (`app/services/phishing_score_service.py`,
+`OBSERVATION_SIGNALS`). The derivation runs with every accepted finding and
+reconciles rather than appends: a signal whose evidence is gone is retracted, so a
+candidate the module stops seeing in a title search does not keep the twenty points a
+title match is worth.
 
-The **core** is a FastAPI application that owns:
+Registration facts — the registrar, an abuse contact, the date the name was registered —
+are resolved by the core after a candidate is stored, and the pass that resolves them
+paces itself the way registries require (`backend/app/services/phishing/whois_service.py`,
+`backend/app/services/ingestion_events.py`). The candidate row is the cache: a candidate
+that already carries its registrar and registration date is never asked about again. Each
+*answering server* — the registry behind the name's top-level domain — is asked at most
+once per pass, so a scan's forty look-alikes under one TLD reach it as a trickle instead
+of a burst. A registry that answers “limit exceeded” is not retried once per candidate:
+the event and every other pending event of that registry wait out a pause measured in
+minutes, because that refusal was about our address rather than about the name. Each
+outcome is written on the outbox row as its own reason: `whois_facts_known` (nothing to
+ask), `whois_pacing` (this pass's slot went to another name at the same registry),
+`whois_no_record` (the registry says nobody has registered the name — re-asked twice a day,
+because a name nobody owns can be registered), `whois_rate_limited` (the pause),
+`whois_unavailable` (no answer arrived: thirty seconds doubling to an hour),
+`whois_target_refused` (our own destination policy refused the target, which is terminal),
+and `*_exhausted` once a best-effort lookup has spent its eight attempts. Nothing of this
+appears in a connector's job summary: the enrichment is core-side, and the outbox row and
+the log are where it is read.
 
-- authentication and authorization;
-- asset, finding, job, report, settings, connector, and audit state;
-- validation and normalization of all API and connector input;
-- deduplication and persistence;
-- scan scheduling and job creation;
-- alert fan-out;
-- administrative connector configuration.
+Which sources reported a candidate is read from the evidence rows and shown beside the
+score it corroborates: the candidate list and the candidate's own response carry `sources`
+(the distinct names) and `source_count`, and the alert message prints the same fact as
+`Sources`. The names are the connector-declared identities, so “two providers reported
+this” is a claim a reader can check — and a candidate with no evidence rows says so
+instead of reprinting the single connector that *found* it, which is `detection_source`.
 
-A **connector** is a separate container that:
+The budget itself is an installation's own decision, not only the deployment's. The
+Settings page's **Alert budget** section stores six values in `system_settings` — the two
+thresholds, whether the digest runs and at which UTC hour, how long a finding that no
+configured channel can receive is held, and whether a *revision* of an already reported
+candidate is a second message. A field left blank is not zero: it is “not decided here”,
+and the deployment's `ALERT_*` environment keeps answering that one, which is why the
+page prints the values in force next to the fields that override them. A saved row that
+contradicts itself — a digest threshold at or above the direct one — is refused as a
+whole, by the save that would create it and by every reader that finds one, and the
+environment answers until it is fixed. The digest's hour is read when the digest runs,
+not when a worker starts, so the hourly tick only sends in the hour the operator chose.
 
-1. registers itself with the core;
-2. polls for work;
-3. scans its external source using its own API key or toolchain;
-4. submits normalized findings;
-5. reports completion or failure.
+A person who has looked at the candidate outranks that number. An analyst's **verdict**
+(`confirmed` or `rejected`, with the reason recorded, and its author and time) is stored
+on the same row and read before the score: a confirmed candidate is announced however
+low it scores *and* re-announced when the thing changes, while a rejected one is silent —
+in every later scan and in the digest — without leaving the list an operator works from.
+Every decision and un-decision is one row in the audit trail naming the verdict it
+replaced and the score it overrode.
 
-The core does not give connectors database credentials. Connector-to-core requests carry that connector's own `X-Connector-Token` credential: the core issues one token per connector (shown once at issuance, stored only as a SHA-256 digest), resolves the caller from that token alone, and supports per-connector rotation and revocation. There is no platform-wide connector secret, so one leaked token cannot be replayed as another connector. The optional `X-Connector-Name` header is checked for agreement only. Provider API keys are connector-owned runtime secrets and are not present in the core settings model or API.
+Status is `active`, `investigating` or `resolved`, in `drp_phishing_domains.status`.
+A detection that matched a monitored keyword or domain is not a takeover: there is
+no takedown workflow, and nothing in the platform requests one.
 
-The core uses an async SQLAlchemy engine. PostgreSQL deployments use connection pooling configured by `DB_POOL_SIZE`, `DB_MAX_OVERFLOW`, `DB_POOL_RECYCLE_SECONDS`, `DB_POOL_TIMEOUT_SECONDS`, and `DB_POOL_USE_LIFO`.
+### 1.2 Breaches
 
-### 2.2 Runtime topology
+Stored in `drp_breaches`. The HIBP connector reads active `email_account` assets
+through breached-account lookups and active `domain` assets through breached-domain
+lookups, expanding an alias domain into per-address findings; it applies its own
+provider rate limit and submits normalized records. The core validates every
+submission before persisting and never calls a provider itself.
 
-```text
-React SPA --> Nginx --> FastAPI core --> PostgreSQL
-                         |       |
-                         |       +--> Redis
-                         |       +--> Celery worker
-                         |       +--> Celery Beat
-                         |
-                         +<-- connector-dnstwist
-                         +<-- connector-shodan
-                         +<-- connector-hibp
-```
+Storage is provider-neutral: the core keeps what any breach source can supply
+(incident name, matched value, disclosure date, affected-account count, exposed
+data classes) plus an `attributes` payload for whatever else the reporting source
+knows — its own classification flags, catalog timestamps, a secret sample. A
+source declares its own payload shape instead of being fitted into another
+vendor's fields, and the UI renders declared attributes generically.
 
-The default Compose deployment publishes the frontend on port `3000` and the backend on port `8000`. PostgreSQL and Redis use named volumes. Reports and the Celery Beat schedule use `reports_store` as local runtime storage. The API does not execute report work in-process when Celery is unavailable; it marks the job failed and returns `503`, avoiding replica-local background state. Nginx serves the React SPA with a single-file fallback (`try_files $uri /index.html`), rather than probing `$uri/`: this is important because `/assets` is both a client route and the build output directory. The fallback prevents a route-specific slash redirect to the internal port and keeps navigation on the configured browser origin.
+Not every row is a breach of an account. A name in a paste and an address on a
+stealer-log site are exposure of the same identifier in a different kind of
+document, and the row says which: `exposure_kind` is `breach`, `paste` or
+`stealer_log`, and the module's identity does not move for it — a paste or a
+stealer-log entry carries its identifier inside `breach_name` (`paste:<id>`,
+`stealerlog:<site>`), so the unique pairs stay `(source_id, breach_name,
+matched_email)` and `(source_id, breach_name, matched_domain)`. Neither class
+arrives with a disclosure date; the row records the instant the platform first saw
+it, marked `attributes.metadata_incomplete`, and re-reads of the same undated row
+leave that instant alone — otherwise every scan would report its own clock as a
+corrected date. The page filters by class, and the message says which class it is
+about.
 
-## 3. Modules and data sources
+An address need not be sent to ask about it. When the subscription says it includes the
+hash-range search, the breach lookup becomes the first six characters of the address's
+SHA-1 and the answer is matched back on the remaining suffix, so the platform learns the
+same incidents without putting the address in a URL; each incident is then read from the
+catalogue exactly as a domain alias reads it, and both forms store the same row. The job
+summary says which form ran and whose decision that was, a refused range answer is never
+downgraded to the address form, and the one route that only exists in address form — the
+paste lookup — is named in the summary and can be switched off, which is what makes "no
+address leaves" a state an operator can actually reach.
 
-### 3.1 Phishing module
+The HIBP worker's stealer-log pass is not part of every scan: the routes are sold
+with a separate, much lower allowance, so the worker asks only when the operator
+turned `stealer_logs_enabled` on, the subscription explicitly includes stealer
+logs, and `stealer_logs_interval_hours` (default a week) has elapsed since the
+newest stealer-log sighting the core holds. The interval is read from the core's
+job params, so a restarted worker does not spend the week twice. Pastes are asked
+per monitored address on every scan; stealer-log rows are asked per address and
+per domain, with the site list bounded per identifier and the remainder counted.
 
-The phishing module stores look-alike or suspicious infrastructure in `drp_phishing_domains`.
+Deduplication is per source account: the identity of a breach row is
+`(source_id, breach_name, matched_email)`, with a partial unique index on
+`(source_id, breach_name, matched_domain)` where `matched_email IS NULL`
+(`backend/app/models/breach.py`). Two
+sources reporting the same incident about the same address are therefore two rows:
+the same breach seen by two providers is evidence, not a duplicate.
 
-#### DNSTwist connector
+Each row also says which class of exposure it records — `exposure_kind`: an account
+compromised (`breach`, the default and the only class the module could represent before
+the column existed), a name that appeared in a paste, or a site found in a stealer log.
+The class is a closed vocabulary that ingestion validates a finding against: a value
+outside it is refused by name rather than stored under a heading nobody chose. It is
+*not* part of any identity — a paste or a stealer log carries its own identifier inside
+`breach_name` (`paste:<id>`, `stealerlog:<site>`) — so the unique pairs above, and the
+indexes behind them, are unchanged by it. `GET /api/v1/breaches?exposure_kind=…` keeps
+one class, the list page offers the same set, and the column is shown so a list filtered
+to one class still says what each row is.
 
-- Reads active assets of type `domain`.
-- Runs DNSTwist mutations and DNS resolution.
-- Submits phishing candidates with `detection_source=dnstwist`.
-- The core may enrich accepted findings with WHOIS data.
+A domain a source will not search because the account has not enrolled it is a
+different answer from a domain with no findings, and the readiness card says which —
+so it can also carry the remedy. `POST /api/v1/breaches/domain-verification` queues one
+step of the source's own enrolment flow as an ordinary `breaches.<source>` job: `generate`
+answers with the TXT value a person has to publish, `verify` checks whether the source
+can now see it. The request names the source when several enabled connectors could be
+asked, because the domain is enrolled in one account's dashboard and not in every
+source's; the step is queued outside the connector's scan admission slot, so verifying a
+domain is possible while a scheduled scan is running — which is when an operator is
+waiting; and it is audited whether or not it could be queued, because "nobody asked" and
+"nobody could ask" are different states. The attempt stores no finding: it is a fact
+about the account's access to the domain, reported per domain in
+`provider-readiness.verifications` with the record exactly as the source stated it and a
+reason from the worker's own vocabulary when it was refused. A verification job is never
+read as "the last scan", so a record issued by hand cannot replace the domains, pace and
+entitlements a real scan reported.
 
-#### Shodan connector
+A morning's findings are triaged, not just listed. `severity` is derived by the core
+from the classes of data a row exposed — plaintext credentials, security questions and
+payment data are `critical`, hashed credentials `high`, addresses and phone numbers
+`medium`, an address list `low`, and a class the rule has never seen leaves the row
+`unknown` rather than calling it harmless — and it is written when the row is written
+(`backend/app/services/breach_severity.py`), so the badge, `?severity=` and
+`?sort=severity` read one value instead of three computations. The list also filters by
+the operator's `status`, by the source's own flag (`verified`, `spam`, `fabricated`,
+`sensitive`, asked of the stored payload), by source and by domain, and orders by finding
+date, incident date, size or severity rank — loudest first, because the letters of the
+severity names would put an address list above a password leak. Each row names
+`email_incident_count`, how many incidents the platform already holds about that address
+across all filters: one account handled once is the difference between triage and four
+independent decisions. The PDF's breach section uses the same order and the same severity
+column as the page.
 
-The Shodan connector supports independent capabilities:
+For display and for the cascade delete, a breach row resolves against the current
+inventory in this order: an exact `email_account` asset matching `matched_email`
+wins, otherwise the domain (`matched_domain`, or the domain part of a monitored
+address), otherwise the provider's raw values stay visible with no asset attached.
+The rule itself is section 3.
 
-- `scan_ssl_text`: search SSL certificate text;
-- `scan_http_title`: search HTTP page titles;
-- `scan_favicon`: search favicon hashes.
+### 1.3 DNS Security
 
-The connector receives capability configuration from the connector registry. Environment variables are fallback values. Registry configuration takes precedence. Disabling a capability prevents that query from running; disabling all capabilities completes the job without external searches.
+The `dns` module stores evolving, source-scoped observations in
+`dns_security_observations` rather than immutable findings: a resolver RRset is
+refreshed in place as it changes, and provenance is the connector and source
+account that observed it. Six workers consume the active inventory —
+`dns-rdap` (registration and expiry), `dns-resolver` (current RRsets),
+`dns-ctlogs` (historical certificate evidence, including wildcards),
+`dns-virustotal` (historical passive DNS and subdomains), `dns-tlsprobe` (the
+certificate each host and port serves right now, from one bounded handshake per
+address) and `dns-shodan` (what each of our own addresses serves as an independent
+index saw it, plus a per-scan capped search for where else a certificate of ours is
+being served; the only DNS worker that also consumes `ip_address` assets) — and each
+declares its own `dns.*` job type and holds its own core-issued credential. Their token and provider configuration, quotas and source limits are in
+`dns-security.md`.
 
-Shodan receives active `domain`, `keyword_domain`, and `keyword_title` targets. Active domains and IP addresses are also passed as exclusions to reduce false positives for owned infrastructure.
+Expiry is an alertable fact only where a check establishes it. Registration-expiry
+reminders need a successful, fresh RDAP check (`DNS_EXPIRY_MAX_AGE_HOURS`), and
+exact-certificate expiry reminders need a separately verified, completed CT check,
+and served-certificate reminders (`kind="tls"`) need a fresh successful handshake;
+all three kinds use 30/14/7/3/1-day thresholds plus one reminder after expiry. Historical CT
+evidence, DNS TTLs and provider-supplied expiry metadata do not establish an
+alertable expiry, and wildcard CT evidence can never establish a concrete asset or
+ownership — which is why promoting an observation is an explicit, audited
+operator action.
 
-Phishing statuses are `active`, `investigating`, and `resolved`, stored in `drp_phishing_domains.status`. The product has no takedown workflow.
+The evidence the five workers collect is also read as a *certificate* rather than as
+a row: `tls_certificate_identities` holds one row per fingerprint — the same
+fingerprint is never two certificates — and `tls_certificate_sightings` holds one row
+per certificate, address, port and observing source, so re-observing a fact refreshes
+it instead of stacking a duplicate. The daily sweep projects the observations into
+that shape and then scores it, which is what turns "a certificate of ours" and "an
+address that is not ours" into one alert naming the foreign address, the organisation
+and the signals that fired. A verdict (`expected`, `shared_infrastructure`,
+`confirmed_foreign`, `rejected`) or a `certificate_scope_exceptions` row is what keeps
+a judged sighting from being re-alerted, and no provider read in this path sends
+traffic to third-party infrastructure. The tables, the rules and the review API are in
+`dns-security.md`.
 
-### 3.2 Breaches module
+The module id is `dns`. `dns_security` is accepted as an alias wherever a module
+id is read (`app/services/module_aliases.py`), which keeps a connector or a script
+written against the older spelling working; the table and the settings column keep
+their `dns_security_*` names. The manual scan route queues only sources with a
+recent heartbeat and reports the offline ones separately rather than pretending
+they ran.
 
-The HIBP connector reads:
+### 1.4 Exposure
 
-- active `email_account` assets through breached-account lookups;
-- active `domain` assets through breached-domain lookups, expanding aliases into per-email findings.
+The `exposure` module records what a provider observes about monitored addresses
+and domains in `source_observations`, through the `exposure` adapter. Two optional
+workers feed it — `exposure.netlas` (profile `netlas`) and the endpoint workers
+`exposure.netlas-endpoints` / `exposure.shodan-endpoints` (profiles
+`netlas-endpoints` and `shodan-endpoints`) — each with its own token, and their
+readiness declares the operations they can perform. A row carries the observed
+subject, the service it was seen on (port, transport, protocol), the provider
+observation time, first and last seen, and the triage status `observed`,
+`investigating` or `resolved`. Promotion (`POST
+/api/v1/exposure/observations/{observation_id}/asset`) creates a `domain` or
+`ip_address` asset at `medium` criticality and records the observation, its source
+and the resulting asset in the audit trail. Observing a host behind shared
+infrastructure or a CDN does not establish ownership, which is why the UI says so
+at the moment of promotion.
 
-The connector applies its provider's request rate limit and submits normalized breach records. The core validates external data before persistence and deduplicates using breach name plus matched email or matched domain.
+### 1.5 The module registry
 
-All provider scans are executed by connector containers. The core creates connector jobs and accepts normalized findings; it does not perform provider HTTP requests or subprocess scans.
-
-Breach storage is provider-neutral. The core stores the fields every breach source can supply — incident name, matched asset, date, affected-account count, exposed data classes — plus an `attributes` payload for whatever the reporting source knows beyond that (its classification flags, an exposed-secret sample, its own catalog timestamps). A source therefore declares its own payload shape instead of being fitted into another vendor's field set, and the UI renders declared attributes generically (known keys with friendly labels, unknown keys humanized). Submissions that still use the pre-generalization top-level form keep working: those keys are folded into `attributes`.
-
-For display and cleanup, breach records are resolved against the current asset inventory:
-
-1. an exact `email_account` asset matching `matched_email` has priority — when both a
-   mailbox and its parent domain are monitored, the finding is about the mailbox;
-2. the domain (`matched_domain`, or the domain part of `matched_email`) is used when
-   no email asset matches;
-3. raw finding values remain available when no current asset resolves.
-
-### 3.3 Module registry
-
-The module set is **data**: it lives in `drp_modules`, not in a constant in core
-code, so onboarding a data source whose findings do not fit the phishing or
-breach tables is a row plus a connector registration rather than a core release,
-a migration and a frontend change. A module declares:
+`app/services/module_registry.py` reads `drp_modules`. A module declares:
 
 | Field | Meaning |
 |---|---|
-| `id` | module id; the `connector_type` a connector registers under |
-| `label`, `description` | what the UI shows in navigation and the module page |
-| `finding_kind` | the schema submissions validate against; one kind identifies one module |
-| `asset_types` | inventory sections its connectors receive in a scan (its "appetite") |
-| `fields` | declared field specification findings are validated against |
-| `dedup_fields` | fields that identify a finding; together they form the dedup key |
-| `title_field` | declared field shown as the finding's title |
-| `storage` | where findings land (see below) |
+| `id` | module id, and the `connector_type` its connectors register under |
+| `label`, `description` | what navigation and the module page show |
+| `finding_kind` | the schema submissions validate against; one kind belongs to one module |
+| `asset_types` | the inventory sections its connectors receive in a scan |
+| `fields` | the declared field specification findings are validated against |
+| `dedup_fields` | the fields that identify a finding; together they are the dedup key |
+| `title_field` | the declared field shown as the finding's title |
+| `storage` | `native` (typed table and adapter) or `generic` (`drp_findings`) |
 
-The core owns finding **storage, deduplication, audit and alerting** — that is what
-keeps a plugin from writing to the database directly. What a module owns is the
-shape of its own findings. Two storage modes exist:
+A declaration must name its fields and at least one dedup field, and the registry
+refuses one that would store every submission afresh, reuses an id or a finding
+kind, or names a title field it did not declare. Declared fields are immutable
+once findings exist against them, because stored rows would otherwise change shape
+without a migration; the label and description stay editable, and a module can be
+disabled without deleting it. A disabled module's connectors are refused work.
 
-- **native** — the platform's original modules (`phishing`, `breaches`) keep their
-typed tables and write adapters, so existing behaviour and queries are unchanged;
-- **generic** — a module an operator declares stores validated findings as JSON in
-`drp_findings`, deduplicated on the key its declared `dedup_fields` produce, read
-back through `GET /api/v1/findings`. The native modules keep their own richer,
-module-specific endpoints and are not served by that route.
+The core owns storage, deduplication, audit and alerting for every module. That
+boundary is the point of the registry: a connector submits findings and never
+writes to the database.
 
-A declared module must specify its fields and at least one dedup field: the
-registry rejects a declaration that would store every submission afresh, reuses
-an existing id or finding kind, or names a title field it did not declare. Fields
-are immutable after declaration, because findings already stored against the
-previous specification would otherwise silently change shape — the label and
-description remain editable, and a module can be disabled without deleting it.
+## 2. Ingestion, validation and deduplication
 
-Administrators manage the registry over the API (viewers may read):
+`app/services/ingestion_service.py` is the only writer of findings. A submission
+batch is validated against the finding kind the connector declared at registration
+(the payload models are `extra="forbid"`, so an undeclared field is a rejection
+rather than a silent write), then deduplicated on the module's key.
+
+The response counts are the contract a connector author writes against:
+`received`, `created`, `updated`, `unchanged`, `accepted` and `rejected`. `accepted`
+counts what the submission did store — created rows and refreshed rows together —
+and `rejected` counts what it did not store, which includes a duplicate as well as
+a malformed entry or one whose dedup key is missing. A re-scan of an unchanged
+target therefore reports `rejected` for those rows, and a connector must not treat
+a non-zero `rejected` as a failed job on its own; a job fails on a rejected count
+only when the core reports the batch as unusable.
+
+Behaviour is per finding kind:
+
+- a **phishing** row that already exists is refreshed in place — its fields are
+  updated and the row reports `updated`, or `unchanged` when nothing differed —
+  rather than being refused, because a look-alike that is still resolving today is
+  a live detection;
+- a **breach** row is deduplicated on the key in section 1.2, per source account;
+- a **DNS observation** is source-scoped, so the same subject observed by two
+  workers is two rows with two provenances, and a resolver RRset is refreshed
+  instead of appended;
+- an **exposure** observation is keyed on its subject and service identity, so a
+  repeated provider answer updates `last_seen` instead of duplicating the row.
+
+After storage the core queues alerts for what was newly stored and writes the audit
+rows for the job; alert delivery itself is asynchronous (section 5).
+
+## 3. The asset matching rule
+
+`app/services/asset_matching.py` holds one rule, and every feature that needs to
+know whether a finding concerns an asset uses it: the asset list's per-module
+counters, the asset page, `?has_findings=true`, the export and the cascade delete.
+One rule in one place is what stops "3 findings" on a row from disagreeing with the
+two findings a delete would remove.
+
+Matching is case-insensitive and aware of the trailing dot and of IDNA. A key set
+(`key_variants`) is built per asset so that a finding written in the Unicode
+spelling of a punycode host still matches: PostgreSQL cannot decode IDNA, so both
+spellings are carried as literal keys instead of being left to a database-side
+comparison that cannot make it. `RELATED_FINDING_MODULES` names the modules whose
+rows count as "findings about this asset" — phishing, breaches, dns, exposure and
+generic findings — and deleting a monitored **domain** also removes the breach
+findings about mailboxes at that domain, while deleting one mailbox never touches
+its domain.
+
+The involvement read is grouped rather than per asset, and its predicates are
+covered by the expression indexes the baseline creates.
+Both are decisions with a measurement behind them: on 2000 assets, 100k breaches
+and 50k phishing findings, evaluating the predicates once per row cost 7.6 s for a
+page of 20 rows (19 s for 50) and exceeded `statement_timeout` when used as a list
+filter, because the rule compares `lower(rtrim(trim(x), '.'))` — an expression a
+plain column index cannot serve — and the email-to-domain branch asked for its
+domains with a leading-wildcard `LIKE`. The grouped read with the expression
+indexes answers the same page in about 0.1 s (0.2 s for 50 rows) and the
+inventory-wide filter in about 0.8 s, with the same counts and the same set of
+rows.
+
+Assets themselves are validated per type (FQDN pattern, IPv4/IPv6, email address,
+non-blank keyword) and canonicalized before storage — lowercase IDNA for domains,
+case-insensitive email domains, canonical IP text — and the database enforces
+uniqueness per type and canonical value. The inventory is global and single-tenant
+by design: there is no owner or tenant column, so roles decide what an account may
+do and never what it may see. Multi-tenancy would be a schema change plus a filter
+no route may forget, which is why it is a recorded limit rather than a latent
+assumption.
+
+Sort, search and paging are declared allowlists (`sort` over
+`created_at`, `updated_at`, `asset_value`, `asset_type`, `criticality`,
+`is_active`, and `order`; anything else is `422`), because the value reaches
+`ORDER BY` and caller input is never concatenated into a statement. Search also
+accepts a subnet, which answers "which of my assets sit in this network" through
+the same unique index, and refuses a subnet wider than 4096 addresses rather than
+answering it in part. A page and its `total` come from one statement
+(`count(*) OVER ()`), so they cannot describe two different snapshots.
+
+The inventory page drives the batch endpoint from row selection on the current
+page: activate, deactivate and one criticality change travel as a single request
+over at most 500 ids, and a batch delete stays administrator-only and requires the
+operator to type `DELETE` first. Selection is deliberately limited to the page —
+a batch names ids, and "everything matching the filter" would need the filter, not
+the page, to define it. An asset's own page reads its record once (`GET /assets/{id}`,
+which is also what writes `asset.view`) and shows criticality, creation and update
+times; the findings tabs remain paged reads. A breach or phishing finding can be
+taken under monitoring from its row: the value the module already matched becomes
+an asset through the same throttle and audit path as the DNS and exposure
+promotions, including for a value that was already monitored.
+
+## 4. Jobs and the connector protocol
+
+### 4.1 Job types and statuses
+
+`JobType` (`backend/app/models/job.py`) enumerates only the types the core creates
+on its own behalf: `report.generate` and `system`. Every other job type belongs to
+exactly one connector, which declares it at registration; a type is namespaced
+(`<module>.<connector>`) and the core hands each job to the single connector that
+claimed that type. `GET /api/v1/connectors/modules` reports the modules and job
+types that are actually registered, which is what the module pages filter job
+history with.
+
+A job stores its creator, connector parameters, result summary, error message,
+task ID and lifecycle timestamps. Its status is `pending`, `running`, `success`,
+`partial`, `error`, `cancelled` or `skipped`; `partial` is what a provider that
+served some capabilities and refused others produces, and it is deliberately not
+reported as a clean success or as an empty result.
+
+### 4.2 Claiming work
+
+`GET /api/v1/connectors/me/work` claims one pending job **by job type**, taking a
+row lock with `SKIP LOCKED`, so two workers polling the same connector cannot
+receive the same job and a connector can never claim a sibling's or another
+module's work. A lease token comes back with the job, heartbeats are expected
+during long work, and an expired lease returns the job to `pending` for a bounded
+number of attempts before it becomes `error` and releases its provider admission
+slot. A connector can complete or fail only a job it claimed.
+
+### 4.3 The findings submission contract
 
 ```text
-GET    /api/v1/modules           (viewer+)
-POST   /api/v1/modules           (admin — declare a module)
-PATCH  /api/v1/modules/{id}      (admin — rename, redescribe, enable/disable)
-GET    /api/v1/findings          (viewer+ — generic findings, filter by ?module=)
-PATCH  /api/v1/findings/{finding_id}    (analyst+ — triage a finding status)
-```
-
-## 4. Asset model and lifecycle
-
-Each asset has:
-
-- a UUID;
-- one of `domain`, `ip_address`, `email_account`, `keyword_domain`, or `keyword_title`;
-- a value up to 512 characters, unique within its asset type after canonicalization;
-- criticality `low`, `medium`, `high`, or `critical`;
-- an active flag;
-- creation and update timestamps.
-
-Asset input validation is type-dependent:
-
-- domains must match the supported FQDN pattern;
-- IP assets must be valid IPv4 or IPv6 values;
-- email assets must be valid email addresses;
-- keyword assets must not be blank.
-
-Access rules:
-
-- viewers can list and view assets;
-- analysts and administrators can create and update assets;
-- only administrators can delete assets.
-
-### 4.1 Optional cascade deletion
-
-Asset deletion is intentionally non-cascading by default because findings contain denormalized values and may be useful after an asset configuration change.
-
-The administrator may explicitly request:
-
-```text
-DELETE /api/v1/assets/{asset_id}?cascade_findings=true
-```
-
-When enabled, matching phishing, breach and generic module findings are removed in the same transaction. The UI exposes this as the **Delete related findings** confirmation checkbox. The audit event includes the cascade flag and deletion counts.
-
-### 4.2 Orphan cleanup
-
-Orphan cleanup is separate from asset deletion and is administrator-only:
-
-```text
-POST /api/v1/phishing/threats/cleanup-orphans
-POST /api/v1/breaches/cleanup-orphans
-```
-
-An orphan finding has no matching existing asset. Inactive assets still count as existing assets. Breach cleanup recognizes an exact email asset, an exact domain asset, and a domain extracted from a matched email. Each endpoint deletes only its own module's orphan findings and records the number deleted in the audit trail.
-
-### 4.3 Integrity, search, and database behavior
-
-Asset values are canonicalized before storage and matching: domains use lowercase IDNA form, email domains are case-insensitive, and IP addresses use canonical textual form. The database enforces uniqueness per asset type and canonical value, so a case variant cannot create a second monitoring target while a keyword and a domain may legitimately share text. Pagination is spelled `size` everywhere: there is no second spelling to keep in step.
-
-User administration is administrator-only. The user listing endpoint (`GET /api/v1/users`) supports filtering by `role`, `is_active`, and substring `search`. Demoting, deactivating, or deleting an active administrator is rejected when it would remove the last active administrator; the check locks the active-admin set in PostgreSQL to prevent concurrent operations from bypassing the invariant. Deactivation revokes the user's refresh sessions immediately.
-
-Asset, user, and audit searches escape wildcard characters, pagination is bounded, and listings use deterministic ordering. PostgreSQL statement and pool timeouts remain enabled; when a query exceeds the configured limit, the API returns a retryable `503` response with `code: database_busy` instead of an opaque error.
-
-## 5. Job and connector protocol
-
-### 5.1 Job types
-
-Job types are **open by design**: a connector declares its own at registration
-(the manifest protocol, §5.3) and the core accepts any namespaced value
-(`<module>.<connector>`), handing each job to the single connector that declared
-it. The core enumerates only the types it creates on its own behalf:
-
-- `report.generate`;
-- `system`.
-
-Every other job type belongs to exactly one connector, which declares it at
-registration. The first-party connectors declare `phishing.dnstwist`,
-`phishing.shodan`, and `breaches.hibp`; the targeted lookups on the breach page
-(`POST /breaches/scan-email`, `POST /breaches/scan-domain`) are scans of the breaches
-module and therefore run as `breaches.hibp`. `GET /api/v1/connectors/modules`
-reports the modules and declared job types that are actually registered, and the
-module pages use it to filter job history.
-
-Jobs have a status of `pending`, `running`, `success`, `error`, `cancelled`, or `skipped`. They store the creator, connector parameters, result summary, error message, task ID, and lifecycle timestamps.
-
-### 5.2 Connector lifecycle
-
-Connector-side routes are authenticated with that connector's own `X-Connector-Token` credential (issued by the admin API or the `manage_connector_tokens` CLI; there is no shared secret):
-
-```text
-POST /api/v1/connectors/register
-GET  /api/v1/connectors/me/work
 POST /api/v1/connectors/me/findings/{job_id}
 POST /api/v1/connectors/me/complete/{job_id}
 POST /api/v1/connectors/me/heartbeat
+GET  /api/v1/connectors/me/credential
+GET  /api/v1/connectors/me/control
+POST /api/v1/connectors/me/quota/provider
+POST /api/v1/connectors/me/quota/virustotal
+POST /api/v1/connectors/me/readiness
 ```
 
-A findings submission returns `{"accepted": n, "rejected": m}`, where the counts
-mean **newly stored** versus **not stored**. A duplicate is therefore reported as
-`rejected`, not as an error: re-scanning the same target is normal and expected,
-and the figure means the submission stored nothing new. Malformed entries and
-payloads whose dedup key is missing are counted the same way, so a connector must
-not treat a non-zero `rejected` as a failure by itself.
-
-`GET /me/work` claims one pending job **by job type** using a row lock with
-`SKIP LOCKED`. A job type is owned by exactly one connector, so a connector can
-only ever claim its own work — never a sibling's, and never another module's.
-The core records the claiming connector and the module in the job parameters. A
-connector can complete or fail only a job claimed by itself.
-
-Administrator and reader routes expose registry management and credential
-lifecycle:
-
-```text
-GET    /api/v1/connectors
-GET    /api/v1/connectors/modules      (viewer+)
-GET    /api/v1/connectors/jobs
-GET    /api/v1/connectors/health       (viewer+)
-PATCH  /api/v1/connectors/{connector_id}/status
-PATCH  /api/v1/connectors/{connector_id}/config
-POST   /api/v1/connectors/provision    (creates the row and issues its token)
-POST   /api/v1/connectors/{connector_id}/token   (issue or rotate)
-DELETE /api/v1/connectors/{connector_id}/token   (revoke, keep the connector)
-```
-
-A connector cannot register itself into existence: a credential is issued to a
-connector that already has a row, so provisioning creates both together. That
-row carries a *reserved* job type (`<module>.<name>`, which this connector alone
-owns) because a row must name the work it can be given; the connector replaces it
-with the type it declares when it first registers, and the registration API
-requires that declaration, so no job type is ever inferred for a connector that
-never declared one. The plaintext is returned exactly once, stored only as a
-SHA-256 digest, and the registry API exposes just a public prefix plus
-issue/last-used timestamps.
-Rotation invalidates the previous token immediately; revocation keeps the
-connector's configuration, job history and audit trail.
-
-Modules are **data, not a closed set** (§3.3): `connector_type` is any module id
-in the registry, so a connector for a module an operator declared registers like
-any other. Registration refuses an id that is unknown or disabled. Connector
-statuses are `enabled` and `disabled`.
-
-### 5.3 Connector manifest
-
-Registration carries a self-declared manifest, which is what makes the platform
-plugin-driven rather than a closed set of known connectors:
-
-| Field | Meaning |
-|---|---|
-| `connector_type` | module the connector feeds (must exist and be enabled in `drp_modules`) |
-| `default_job_type` | the job type this connector alone claims |
-| `finding_kind` | which finding schema its submissions validate as — a native kind (`phishing`, `breach`) or the declaring module's own |
-| `asset_types` | asset inventory sections it receives in a scan |
-| `config_schema` | operator-editable settings (`key -> {type, label, default}`) |
-
-The core validates the declaration (module coherent with the finding kind, job
-type namespaced and unclaimed, asset types known, config keys safe) and stores
-it in `drp_connectors.manifest`. Submissions are validated by the declared
-finding kind, the config API is driven by the declared schema (declared defaults
-materialized, declared types enforced, undeclared keys dropped), and the scan
-payload carries only the declared inventory sections. Rows written before the
-manifest column existed resolve to the documented defaults for their module, so
-no backfill is required.
-
-## 6. Scheduling
-
-Schedules are stored in the singleton `system_settings` row:
-
-```json
-{"days": [1, 2, 3, 4, 5], "hour": 2, "minute": 30}
-```
-
-- `days` uses `0=Sunday` through `6=Saturday`;
-- `hour` is `0..23`;
-- `minute` is `0..59`;
-- all times are UTC.
-
-The default schedules are weekdays at night:
-
-- phishing: Monday-Friday at `02:30` UTC;
-- breaches: Monday-Friday at `03:30` UTC.
-
-Celery Beat runs a one-minute task. At a matching minute, the core uses Redis `SET NX` with a short TTL to prevent duplicate dispatch and creates one pending job for every enabled connector in the module.
-
-Manual `Rescan` uses the same connector job creation path immediately. The phishing page queues DNSTwist and Shodan independently; the breaches page queues HIBP. Rescans are asynchronous: the connector claims a job under a renewable lease, sends heartbeats during long work, and the UI polls until terminal state before refreshing findings. If a connector disappears, an expired lease returns the job to `pending` for a bounded number of attempts; after the retry limit it becomes `error` and releases its provider admission slot. Provider authentication, rate-limit, and network failures are recorded as structured job details rather than silently becoming an empty successful result.
-
-Before a job is committed, the core also acquires one Redis-backed admission slot per connector. The slot is shared by manual scans, scheduled scans, users, and API replicas, so a second scan for the same provider returns `409` instead of spending another provider quota. The guard fails closed with `503` when Redis cannot enforce it; a one-hour TTL and ownership-checked release recover from crashed workers. The per-user manual throttle remains a separate UX safeguard and does not replace this provider-wide guard. A missing connector is reported as `no_connector`; database and unexpected enqueue failures are not rewritten as that status.
-
-## 7. Alerts and integrations
-
-Administrators can enable email and Telegram channels independently.
-
-### Email alerts
-
-Recipients can be selected from active users of any role through `alert_email_user_ids`. An optional additional address is supported by `alert_recipient_email`. Recipients are deduplicated before dispatch.
-
-SMTP configuration includes host, port, username, password, and sender address. SMTP password and sender/recipient secret fields are Fernet-encrypted at rest. The Settings UI saves the current SMTP form before sending a test email, so a newly entered configuration is tested immediately rather than the previous persisted values. Mailtrap Sandbox commonly uses port `2525` with STARTTLS; port `465` uses implicit TLS. Use the exact hostname and credentials shown by the Mailtrap integration page.
-
-### Telegram alerts
-
-The settings model supports multiple `telegram_chat_ids`, one ID per entry, and that list is the only Telegram destination: the earlier single `telegram_chat_id` field was removed in v0.1.0 (a request still carrying it is rejected, not silently accepted). The Telegram bot token is encrypted at rest. `POST /api/v1/settings/validate-telegram` uses Telegram `getChat` with the stored token and returns a safe per-chat result without exposing the token. The Settings UI validates all chats before sending a test message; inaccessible chats are reported with stable reasons such as `chat_not_found`, `bot_blocked`, or `insufficient_rights`. Delivery is attempted per chat so one invalid chat does not prevent delivery to the others.
-
-Both channels use retry logic. Finding notifications are persisted before delivery, aggregated by job and threat type, and tracked independently per channel and recipient; a successful email does not mark a failed Telegram delivery as sent. Dispatch success and failure are written to the audit trail. Telegram validation and test endpoints are available to administrators:
-
-```text
-POST /api/v1/settings/test-email
-POST /api/v1/settings/validate-telegram
-POST /api/v1/settings/test-telegram
-```
-
-## 8. Reports
-
-A report request creates a `reports` row and a `report.generate` job. Celery executes the report task, writes a PDF into `REPORTS_STORE_DIR`, and updates the report status:
-
-- `pending`;
-- `generating`;
-- `completed`;
-- `failed`.
-
-Authenticated users with viewer access can list and download completed reports. Only administrators can delete reports. Deleting a report also attempts to remove its file from local storage.
-
-## 9. Identity, authorization, and security
-
-### Roles
-
-- `admin`: user administration, settings, connector administration, audit access, report deletion, asset deletion, and all analyst/viewer capabilities;
-- `analyst`: asset creation/update, finding updates/deletion, scans, and report generation;
-- `viewer`: read-only access to permitted application data.
-
-### Authentication
-
-- Passwords are bcrypt hashes. New passwords are at least 12 characters and no more than 72 UTF-8 bytes (the bcrypt input boundary), with an uppercase letter and a digit. Sign-in accepts any password the account may hold, including one an administrator set through the CLI, which is a stronger check than the creation policy and is applied to the *current* password rather than to the new one.
-- Login uses email/password authentication and records success/failure/lock events.
-- Redis rate limiting protects email and IP keys.
-- Database fields track failed attempts and lock expiry.
-- Access tokens are JWTs.
-- **A browser session is restored from the cookie, never from the browser.** The access token is held in memory and a reload therefore drops it; the session of record is the `HttpOnly` refresh cookie. So every page load asks `POST /auth/refresh` once, from `main.tsx` and before the app decides what to render, and adopts the answer; **nothing about the session is written to browser storage at all**. It is asked rather than inferred because a client-side record cannot carry that decision: a private window, cleared site data, a denied-storage profile, or a read that fails outright all leave a valid server-side session looking absent, and the API is the only party that knows. Asking it *imperatively* rather than from a `persist` rehydration callback is not a style choice either: hydration runs while the module graph is still being evaluated, and a cycle between two modules can hand the running code a binding that does not exist yet — which, in a store that catches its own errors, is indistinguishable from "this browser has no session". `lib/session-bridge.ts` carries the full account, `lib/api.ts` reaches the session through it rather than importing the store, and both `vite.config.ts` (fails the build) and `src/lib/moduleGraph.test.ts` (walks the graph) refuse the cycle coming back. The refresh itself is single-flight, shared with the `401` interceptor: the token is rotated on use, so two overlapping presentations of it read as re-use and revoke the whole family. A refusal is handled quietly, since a browser that never signed in is not one whose session expired, and the API deletes the cookie when it refuses the token in it — the client presents that token on every load, so a dead one would otherwise be retried, and audited as `auth.refresh.failure`, once per load until it expired. Signing out ends the session on both sides for the same reason: local state first, then `POST /auth/logout`, which revokes the family. Clearing only the browser would leave the cookie valid for its whole lifetime, and the next load would restore the session the operator had just ended.
-- Refresh token families are stored in `drp_refresh_families`, rotated on use, and revoked on reuse detection, password reset, password change, and account removal. The revocation itself is one shared implementation (`app/services/refresh_sessions.py`) because three callers need it — the users router, the auth router and the admin CLI — and each records how many sessions it ended (`refresh_families_revoked`) in its audit details.
-- **A TOTP second factor is available for every role** and is enforced at login for accounts that enable it (`totp_enabled_at`). Invalid, missing, and recovery-code MFA attempts have a dedicated lockout budget so OTP guessing cannot bypass throttling or consume the password budget. The code is requested only after the password verifies, so the endpoint cannot be used to discover which accounts have a factor. Each accepted code is single-use — the counter it matched is stored in `totp_last_used_step`, which closes the replay window that the ±1-step clock-skew tolerance would otherwise open. A wrong code counts towards the same lockout as a wrong password; a *missing* code is refused without consuming an attempt, so a misconfigured integration cannot lock out its own operator. The secret is Fernet ciphertext under `ENCRYPTION_KEY`.
-- Enrolment is self-service (`/auth/mfa/setup` requires the password again, then `/auth/mfa/enable` verifies a code); the UI offers an SVG QR code and manual URI/secret entry. Successful enrolment displays ten one-time recovery codes exactly once; only bcrypt hashes are stored, and a recovery code can replace the TOTP code at login. Removal requires both the password and a live code. Recovery is a human path: an administrator clears another user's factor through `POST /users/{id}/mfa/reset` (audited as `user.mfa.reset` and refused for the caller's own account), while a locked-out administrator uses `python -m scripts.manage_admin mfa-off`, which needs access to the deployment rather than to a browser.
-- **A credential somebody else chose is treated as temporary.** `POST /auth/password` is how an account holder sets their own password — an administrator can only assign one — and it rotates the session (the response carries a new access token, every other refresh family is revoked with reason `password_change`) so the operator is not signed out by their own action. Two per-account flags drive the flow: `must_change_password`, set whenever a password is assigned *for* someone (creating a user over the API, an administrator reset, `manage_admin create`/`reset`), and `must_enrol_mfa`, set whenever a factor is removed *for* them (`POST /users/{id}/mfa/reset`, `manage_admin mfa-off`). While either is set, every authenticated route is refused with `403` and the marker `onboarding_required` — except `/auth/me`, `/auth/password`, `GET /auth/mfa` and, once the password step is done, `/auth/mfa/setup` and `/auth/mfa/enable`. The order is the server's, because both enrolment endpoints re-check the password: a factor must not be attached while a temporary password is in force, or it would be bound to a credential its owner is about to discard. It is checked inside `get_current_user` (like the request rate limit) so a route added later cannot forget it, and it is deliberately **not** audited: the state was audited when the administrator created it (`user.password_reset` / `user.mfa.reset` carry `onboarding_required` in their details), and a row per refused request would be noise — it is emitted as the structured log event `credential_onboarding_required` instead. Completing a step clears the flag by evidence only: the password endpoint, and a code verified by `/auth/mfa/enable` (which records `was_required`). The escape hatch for an account that cannot complete the flow is `python -m scripts.manage_admin onboarding-off` from the host.
-- **The deployment-wide policy `REQUIRE_MFA_FOR_ADMINS` is a step of the same flow, not a filter on admin pages.** An administrator with no enrolled factor is refused by the gate above on *every* route, with the marker `mfa_required` and an audit row (`auth.mfa.required`, carrying the `reason` that produced it), because an administrator acting without a second factor is itself the signal. It is asked at sign-in rather than discovered later: every user payload carries `mfa_required_by_policy`, computed by `app/core/mfa_policy.py` from the setting and the account's enrolment — no flag is written to `users`, so enrolling one clears it and turning the setting off releases every account at once. The policy applies to administrators only, since they are the account that can create users, read the trail and change settings, and `require_admin` keeps the same check as a second line of defence. Its recovery is the setting: `manage_admin onboarding-off` releases an account's *own* steps, not this one, so an administrator who cannot enrol is released by `REQUIRE_MFA_FOR_ADMINS=false` and a recreated container. `manage_admin list` reports the state as `mfa (policy)`, which is what answers the support call when the account itself looks clean.
-- The Security page provides self-service password change, one-time MFA recovery-code rotation, active-session listing/revocation, and recent security activity for the signed-in account. The session list holds only sessions that can still be used — every sign-in writes a `drp_refresh_families` row and every password change rotates the session, so an account quickly owns rows it can no longer act through, and listing them under a card titled "active sessions" made a session its owner had just closed read as an unknown device. What *ended* a session is an audit event (`auth.password.changed` counts the other sessions it signed out, `auth.session.revoked` and `auth.sessions.revoked_others` name theirs) and appears in the activity list beside it; the nightly sweep removes revoked rows once their refresh tokens can no longer be presented (`JWT_REFRESH_TOKEN_EXPIRE_DAYS`), since until then the row is what answers a replayed token with `family_revoked` instead of `family_not_found`. The last active administrator cannot be demoted, deactivated, or deleted. Each listed event is described in words ("Second factor turned on" for `auth.mfa.enrolled`), a refusal names its reason ("Sign-in attempt refused — the password did not match an active account"), and a replayed refresh token says so, with the action code kept beneath as the name the audit log and a support request use. `GET /auth/security-activity` returns codes, so the wording lives in `frontend/src/lib/audit.ts`, shared with the audit log: an event must not be described two ways depending on who is reading it. An action the UI has no sentence for is humanized together with its details rather than printed as a code, and `audit.test.ts` fails when an action the endpoint can return has no description of its own.
-- `ENCRYPTION_PREVIOUS_KEYS` and `JWT_PREVIOUS_SECRET_KEYS` allow a secret to be rotated without invalidating stored ciphertext or signing every user out; `scripts/rotate_keys` generates, reports and re-encrypts. The procedure is in [`upgrading.md`](upgrading.md#rotating-secrets).
-
-### Input and transport protection
-
-- Pydantic validation covers user, asset, schedule, connector, HIBP, SMTP, Telegram, UUID, enum, and pagination input.
-- SQLAlchemy query construction uses bound parameters.
-- Connector registration accepts only allowlisted metadata fields.
-- Connector configuration is validated by connector type; Shodan capability keys are explicit.
-- FastAPI and Nginx set security headers.
-- CORS origins are configured by environment.
-- Compose requires database, JWT, Fernet, proxy, and CORS configuration values before startup; production additionally rejects placeholder-like secrets. Connector tokens are deliberately *not* interpolation-required: a missing one would otherwise make every `docker compose` command — including the one that issues tokens — fail, so a blank token instead fails closed at the connector (refuses to start) and at the core (rejects an unknown credential).
-- Production deployments must set unique JWT and Fernet encryption secrets.
-- `ALERT_HEALTH_CHECK_TIMEOUT_SECONDS` bounds outbound alert-channel probes and transport calls.
-- `AUTHENTICATED_RATE_LIMIT_PER_MINUTE` (default 600, `0` disables) bounds authenticated requests per account. Because every read writes an audit row, an unthrottled credential could amplify load on PostgreSQL and on the audit pipeline; the block is audited once per window so the limiter does not itself become that amplifier. The check fails open when Redis is unavailable, trading strictness for availability.
-
-## 10. Audit trail
-
-Important authentication, administrative, scan, connector, finding-ingestion, alert, report, and read events are audited.
-
-Each structured event contains:
-
-```json
-{
-  "timestamp": "2026-09-06T00:00:00+00:00",
-  "user_id": "UUID or null",
-  "action": "asset.create",
-  "ip_address": "client or internal service address",
-  "details": {}
-}
-```
-
-Rows are stored in `drp_audit_logs`. The same event is emitted as JSON to application output for log pipelines such as Elastic Security (see [`observability.md`](observability.md) for the collector recipe). The stdout line carries exactly the five fields above — a sixth would reach a SIEM index that maps the documented shape — so request correlation is recorded inside `details.request_id`. Audit access is administrator-only and supports action, user, date, email, and text filters, and audit history is swept by the nightly retention task described in [`backup-restore.md`](backup-restore.md).
-
-## 11. API route groups
-
-The public health and authentication routes are:
-
-```text
-GET  /api/v1/health
-GET  /api/v1/ready
-POST /api/v1/auth/login
-GET  /api/v1/auth/me
-POST /api/v1/auth/password
-POST /api/v1/auth/refresh
-POST /api/v1/auth/logout
-GET  /api/v1/auth/mfa
-POST /api/v1/auth/mfa/setup
-POST /api/v1/auth/mfa/enable
-POST /api/v1/auth/mfa/disable
-POST /api/v1/auth/mfa/recovery-codes/rotate
-GET  /api/v1/auth/sessions
-DELETE /api/v1/auth/sessions/{family_id}
-POST /api/v1/auth/sessions/revoke-others
-GET  /api/v1/auth/security-activity
-```
-
-Core route groups:
-
-```text
-/api/v1/dashboard
-/api/v1/assets
-/api/v1/phishing
-/api/v1/breaches
-/api/v1/reports
-/api/v1/jobs
-/api/v1/modules
-/api/v1/alerts
-```
-
-Administrator route groups:
-
-```text
-/api/v1/users
-/api/v1/settings
-/api/v1/audit
-/api/v1/connectors
-```
-
-The exact implemented routes and role matrix are maintained in [README.md](../README.md).
-
-## 12. Deployment and operations
-
-The supported deployment is Docker Compose, on Linux or on Windows through
-Docker Desktop with the WSL 2 backend. The development shape bind-mounts
-`./backend`, `./connectors` and `./reports_store`; the production shape uses
-pinned images and named volumes instead. See [`deployment.md`](deployment.md)
-for the complete production procedure and resource profile.
-
-Provisioning is one command, and it writes the secrets rather than asking the
-operator to invent them:
-
-```bash
-python setup.py                 # answers -> .env, secrets from the OS CSPRNG
-docker compose up -d --build
-docker compose ps
-curl http://localhost:8000/api/v1/health
-curl http://localhost:8000/api/v1/ready
-```
-
-`setup.py` needs **Python 3.8 or newer and nothing else** — standard library
-only, no `pip install`, no `cryptography` (the Fernet key is built from `secrets`
-and `base64` and verified by decoding it), no network. It asks only what has no
-safe default — the release to run (offered as the version this checkout
-declares, because `make up` builds the images from it), the public URL the UI is
-served from (with the shape of an answer printed in the prompt), the loopback
-bindings this host publishes, which connectors to enable, and whether
-administrator routes need a second factor. It refuses to overwrite an
-`.env` that already holds secrets, and it refuses to write one that git would
-commit, so the file the deployment depends on cannot reach the repository by
-accident. `--check` audits an existing `.env` against the template and the
-startup rules, `--repair` fills only the gaps, `--force` rotates the secrets
-while keeping the replaced ones verifiable (see [upgrading.md](upgrading.md)).
-Without a host Python it runs in a container:
-`docker run --rm -it -v "$PWD":/work -w /work python:3.12-alpine python setup.py`.
-
-`.env.example` is the configuration reference, and it is checked rather than
-trusted: `scripts/check_env_template.py` (CI job `repo-hygiene`, `make check-env`)
-fails the build when a variable a Compose file reads is undocumented, when a
-setting the template documents is never passed into a container, when a Compose
-file shadows one with a literal value, or when a setting that belongs to one
-connector is named as if it belonged to the platform (`.env` is a single
-namespace, so `SHODAN_SCAN_SSL_TEXT` rather than `SCAN_SSL_TEXT`).
-
-`make` wraps the common operations (`up`, `down`, `restart`, `health`, `logs`,
-`migrate`, `test-backend`, `typecheck-backend`, `seed-demo`, `clean`) but is
-optional — `make` does not ship with Git for Windows, and [README.md](../README.md)
-lists the direct `docker compose` equivalent of every target. Every command in
-those instructions is a single line, so it pastes into bash, PowerShell or
-`cmd.exe` unchanged: `scripts/check_portable_commands.py` (CI job `repo-hygiene`,
-`make check-commands`) fails the build when one of them grows a shell-specific line
-continuation or a value quoted the way only one shell reads.
-
-Database changes are applied by Alembic; deployments run `alembic upgrade head` (the current head is the initial revision in
-`backend/alembic/versions`, `0001_initial_schema`) rather than
-applying [db.sql](db.sql) independently — the reference DDL is a readable
-snapshot, not a migration path. The current migration head is `0001_initial_schema`; always run the migration gates rather than relying on a copied schema snapshot — `scripts/check_migrations.py` verifies the revision graph, and `scripts/check_schema_drift.py` verifies that the schema the revisions build contains exactly the tables and columns the models map (a model column no revision creates is a process that cannot start). The API container applies pending revisions itself
-at startup, serialised by a PostgreSQL advisory lock (`backend/scripts/migrate.py`),
-so two replicas starting together cannot race.
-
-CI runs Python compilation, the backend suite, a coverage floor, per-module
-critical-coverage gates, frontend typecheck/build, and Compose interpolation
-validation on Linux. The same workflow audits the shipped dependency sets
-(`pip-audit` over the backend runtime requirements, `npm audit --omit=dev` over the
-frontend, plus dependency review on pull requests), fails when an ignore rule keeps
-source out of the repository, and runs the PostgreSQL/Redis integration suite with
-a guard that fails the job when it did not actually run. Runtime checks must still
-be performed against the target deployment, including PostgreSQL migrations and
-connector registration.
-
-### Provider credentials
-
-Provider credentials never live in the core: they are connector runtime secrets
-(`SHODAN_API_KEY`, `HIBP_API_KEY` — connector environment variables in `.env`),
-and the core stores none of them. `system_settings` holds only the settings the
-core itself uses, which is why its encrypted columns are limited to SMTP and the
-Telegram token.
-
-### Repository hygiene
-
-Generated PDFs, runtime databases, Celery Beat state, `.env`, dependency
-directories, build output and caches are local artifacts; `.gitignore` and
-`.dockerignore` keep them out of the repository and out of the build context.
-Real credentials live only in `.env`, which is never committed — see
-[SECURITY.md](../SECURITY.md) for how to report an exposure.
+Submissions are counted as in section 2 and the batch is refused when it exceeds
+the connector SDK's per-batch limit. `GET /me/credential` answers with the provider
+key of the source account the connector is bound to — the core stores it as Fernet
+ciphertext under `ENCRYPTION_KEY` and returns the plaintext only to that connector,
+audited and marked `no-store`. `POST /me/quota/provider` reserves a provider
+operation against the account's approved budget, and `POST /me/quota/virustotal`
+answers `410` because a VirusTotal reservation is an ordinary `lookup` bucket
+reservation. `POST /me/readiness` publishes what the connector can do; an idle
+report cannot clear a real error. `connectors/README.md` is the full contract for
+connector authors.
+
+### 4.4 Credentials and the manifest
+
+Registration (`POST /api/v1/connectors/register`) carries a self-declared manifest:
+the module it feeds (`connector_type`, which must exist and be enabled), the single
+job type it claims (`default_job_type`), the finding kind its submissions validate
+as, the asset types it receives, and the operator-editable settings it exposes
+(`config_schema`). The core validates the declaration — module coherent with the
+finding kind, job type namespaced and unclaimed, asset types known, config keys
+safe — and stores it in `drp_connectors.manifest`, so submission validation, the
+configuration form and the scan payload all follow the connector's own declaration.
+
+A credential is issued to a connector that already has a row, so provisioning —
+`POST /api/v1/connectors/provision`, or `python -m scripts.manage_connector_tokens
+issue` — creates the row and the token together. The row reserves a job type
+(`<module>.<name>`) because a row must name the work it can be given; the connector
+replaces it with the type it declares when it first registers, so a job type is
+never inferred for a connector that never declared one. The plaintext is returned
+exactly once and stored only as a SHA-256 digest; the registry exposes a public
+prefix and issue/last-used timestamps. Rotation invalidates the previous token
+immediately and revocation keeps the connector's configuration, job history and
+audit trail. Requests carry the connector's own `X-Connector-Token`; the optional
+`X-Connector-Name` header is checked for agreement only, and the name in an error
+report is a diagnostic hint, never an identity.
+
+### 4.5 Scheduling and provider admission
+
+Schedules are JSON in the `system_settings` singleton: dedicated columns for
+`phishing`, `breaches` and `dns`, and the generic `schedules` map that lets a
+declared module have one. Days are `0=Sunday` through `6=Saturday`; the hour and
+minute are UTC. Celery Beat runs the one-minute task, which examines the current
+minute and the nine before it; `schedule_occurrences` records the
+connector-and-UTC-minute pairs that have already run, so deduplication survives the
+deletion of the job it produced, and a Redis guard with two-second connect and read
+deadlines and a 900-second TTL covers a replica racing another. Downtime longer
+than that window is not backfilled.
+
+Before a job is committed, the core also takes one Redis-backed admission slot per
+connector, shared by manual scans, scheduled scans, users and API replicas, so a
+second simultaneous scan of the same provider answers `409` instead of spending
+another provider quota. The guard fails closed with `503` when Redis cannot enforce
+it, a one-hour TTL and an ownership-checked release recover from a crashed worker,
+and a missing connector is reported as `no_connector` rather than being folded into
+a database failure. The per-user manual throttle (`rate_limit_minutes`, 0 for
+unlimited, capped at 1440) is a separate UX safeguard and does not replace this
+guard.
+
+## 5. Reports and alert delivery
+
+A report request creates a `reports` row and a `report.generate` job. The worker
+collects its snapshot in one short transaction, releases the connection, renders
+the PDF, publishes it with an atomic rename into the configured report store, and
+moves the row through `pending`, `generating`, `completed` or `failed`.
+`REPORT_MAX_ROWS` bounds each section and the PDF states the total, the included
+count, the limit and whether it truncated; `REPORT_QUEUE_MAX_PENDING` refuses
+further admissions with `429`; `REPORT_GENERATION_TIMEOUT_SECONDS` bounds the whole
+operation. Deletion and retention record a retryable cleanup intent before removing
+the row, and files leave storage only through the configured resolver, so a worker
+crash between the two cannot lose a file's only reference. The API never renders a
+report in process: without Celery the job is marked failed and the request answers
+`503`, which is what keeps a replica stateless. Reports are readable by any
+authenticated account in the installation by design — `created_by` records
+provenance, not an authorization boundary — and only administrators delete one.
+
+The report's breach figures and the dashboard's are one computation
+(`app/services/breach_kpi.py`), because two implementations of "how bad is it"
+already drifted apart once: the KPI counts stored findings at any status, the active
+count is findings that are active or under investigation and were created inside the
+window, and `new_breach_incidents_7d` is what the sources added to their own incident
+catalogues in that same window — incidents that exist whether or not any address of
+ours is in them, which is the only number that answers "is there new trouble out there"
+rather than "did a scan meet a new address". Every figure travels with a caption naming
+what it counts, and both surfaces print the caption the rule wrote beside the number it
+describes, so the PDF and the page cannot explain one figure two ways. The findings total
+travels split by class of exposure as well (`findings_by_exposure_kind`, summing to the
+total it splits), because "how much exposure do we have" and "which exposure is it" are
+answered by one computation rather than by a second count that could disagree with it.
+
+Finding alerts are durable before they are announced: ingestion writes a delivery
+event and moves on. `app/services/alert_delivery_service.py` and
+`app/tasks/alert_tasks.py` group events by completed connector job, render one
+bounded message per job, finding type and channel, and keep per-recipient state, so
+a channel's failure never marks another recipient as delivered. A finding whose
+installation has no channel configured yet is held rather than dropped — for
+`ALERT_NO_CHANNEL_RETRY_HOURS`, because the channel may be configured tomorrow —
+and the save that first makes delivery possible reports everything held as one
+digest rather than replaying it. The delivery row is
+`pending`, `delivering`, `sent`, `failed` or `ambiguous`; transient failures are
+retried within the attempt budget with the provider's `Retry-After` honoured, while
+a configuration or authentication refusal is terminal and needs an operator.
+Acceptance-unknown attempts become `ambiguous` and hold their recipient for
+`ALERT_RECIPIENT_HOLD_SECONDS` rather than being replayed at once; the hold ends
+with the window — the deliveries return to the queue — and an administrator can
+end it early from the alerts view once the message has been reconciled with the
+recipient. The platform still offers no bulk-delete for that state.
+
+## 6. Authentication, sessions and authorization
+
+### 6.1 Passwords and sign-in
+
+Passwords are bcrypt hashes (`bcrypt` directly). A new password needs at least 12
+characters, an uppercase letter and a digit, and no more than 72 UTF-8 bytes, which
+is the hash function's input boundary. Sign-in checks the password the account
+currently holds — including one an administrator assigned — and records success,
+failure and lock events. Failed attempts are throttled in Redis by email and by
+client address and tracked in database lockout fields, and every refusal answers
+identically: an unknown address, a wrong password, a disabled account and a locked
+account cannot be distinguished from the response, with the reason kept in the
+audit trail.
+
+A password assigned *for* someone sets `must_change_password`, and removing a
+factor *for* someone sets `must_enrol_mfa`. While either flag is set, every
+authenticated route is refused with `403` and the marker `onboarding_required`,
+except `/auth/me`, `/auth/password`, `GET /auth/mfa` and — once the password step
+is done — the enrolment endpoints. The check lives inside `get_current_user` so a
+route added later cannot forget it. The refusal itself is not audited (the
+condition was audited when it was created) and is emitted as the structured log
+event `credential_onboarding_required` instead. The escape hatch for an account
+that cannot complete the flow is `python -m scripts.manage_admin onboarding-off`,
+run from the host.
+
+`REQUIRE_MFA_FOR_ADMINS` is a step of the same flow rather than a filter on admin
+pages: with it on, an administrator without an enrolled factor is refused by the
+credential gate with the marker `mfa_required` and an `auth.mfa.required` event,
+and the enrolment endpoints stay reachable so recovery is possible. User payloads
+carry `mfa_required_by_policy`, computed from the setting and the account's
+enrolment, so the requirement is visible at sign-in rather than discovered later.
+
+### 6.2 Tokens and sessions
+
+Access tokens are JWTs signed with PyJWT; the accepted algorithms are pinned to
+`HS256`/`HS384`/`HS512` in configuration, so `none` or a mismatched `alg` cannot be
+accepted, and the check is unconditional because a development instance issues
+tokens a production instance would accept. Refresh token families live in
+`drp_refresh_families`, rotate on use, and are revoked on reuse detection,
+administrator reset, self-service password change, MFA recovery, deactivation and
+account removal. The revocation is one shared implementation
+(`app/services/refresh_sessions.py`) because the users router, the auth router and
+the admin CLI all need it, and the lifecycle events record how many families were
+revoked.
+
+The session of record is the `HttpOnly` refresh cookie, not browser storage: the
+access token is held in memory, so a reload drops it and every page load asks
+`POST /api/v1/auth/refresh` once before the app decides what to render. Asking
+rather than inferring is deliberate — a private window, cleared site data or a
+denied-storage profile all make a valid server-side session look absent, and only
+the API knows — and the single-flight refresh is shared with the `401` interceptor
+because two overlapping presentations of a rotated token read as reuse and revoke
+the family. Signing out ends the session on both sides: local state first, then
+`POST /api/v1/auth/logout`, so the cookie cannot restore the session the operator
+just ended. The refresh endpoint deletes the cookie when it refuses the token in
+it, and every refused presentation would otherwise be retried and audited once per
+page load until it expired. The nightly sweep removes revoked rows only once their
+tokens can no longer be presented, because until then the row is what answers a
+replayed token with `family_revoked` instead of `family_not_found`.
+
+### 6.3 Second factor
+
+TOTP is available to every role and enforced at sign-in for accounts that enrolled.
+The secret is Fernet ciphertext under `ENCRYPTION_KEY` and is *not* rewrapped by the
+key-rotation tooling, which is why an operator keeps the older key until every
+factor has been re-enrolled or cleared (`manage_admin mfa-off`) — see
+`upgrading.md#rotating-secrets`. The code is requested only after the password
+verifies, so the endpoint cannot be used to discover which accounts have a factor;
+each accepted code is single-use (the matched counter is stored in
+`totp_last_used_step`, closing the replay window the ±1-step tolerance opens), and
+invalid or missing codes consume their own MFA lockout budget so guessing cannot
+exhaust the password budget. Enrolment is self-service and shows ten one-time
+recovery codes exactly once, of which only HMAC-SHA256 digests are stored — keyed
+from `ENCRYPTION_KEY` and its previous values, so the slow password hash and the
+per-code `bcrypt` comparison are not spent on values that are already 59 random
+bits; a hash written by an earlier release still verifies and is spent on use. Removal needs
+the password and a live code, an administrator can clear another account's factor
+(`POST /api/v1/users/{user_id}/mfa/reset`, refused for the caller's own account),
+and a locked-out administrator is released from the host with
+`python -m scripts.manage_admin mfa-off`.
+
+### 6.4 Roles, authorization and the administrator invariant
+
+Authorization reads the account's current role and active flag from the database on
+every authenticated request rather than trusting a claim in the token, so
+deactivating an account takes effect immediately. All `/api/v1/users` management
+routes require `admin`. Demoting, deactivating or deleting the last active
+administrator is rejected, and on PostgreSQL the check locks the active-admin set
+in a transaction-scoped advisory lock so two concurrent requests cannot both pass
+it and leave the installation without an administrator. An administrator cannot
+deactivate or delete their own account; self-demotion is allowed only while
+another active administrator remains.
+
+Report generation is the one deliberate exception to the viewer role: it creates an
+asynchronous job owned by the requesting account and is bounded by the per-user
+report throttle, while report visibility stays installation-wide.
+
+## 7. The audit trail
+
+### 7.1 What is recorded
+
+Rows live in `drp_audit_logs` and the same event is emitted to stdout as one JSON
+line carrying exactly five fields — `timestamp`, `user_id`, `action`,
+`ip_address`, `details`. A sixth top-level field would reach a SIEM index that maps
+the documented shape, which is why request correlation lives inside
+`details.request_id`; `docs/observability.md` is the collector recipe and the
+detections built on those events.
+
+Reads are recorded once per result set rather than once per request: `asset.list`
+is written for the first page of a listing, because the pages that continue it are
+the same read, while `asset.view` records every individual lookup. Its details
+record what was asked for, including `has_findings`, and `asset.findings.list`
+records the counters it returned, so "who looked at this asset's involvement" is
+answerable without storing the rows themselves.
+
+State-changing account and session operations commit their audit row in the same
+transaction or do not happen: if the record cannot be persisted the operation is
+rolled back and the API answers `503` with `code: audit_unavailable` and
+`Retry-After: 5`. Sign-out and connector heartbeats are best-effort by design, so
+the guarantee is about the audited set rather than about every request. Update
+details carry before/after values for changed `email`, `full_name`, `role`,
+`rate_limit_minutes` and `is_active` fields, and never a password, hash, TOTP
+secret or recovery code.
+
+### 7.2 The chain
+
+`app/core/audit_chain.py` chains each row: `entry_hash`, `prev_hash` and `key_id`
+are stored (`AUDIT_CHAIN_KEYS` with `AUDIT_CHAIN_PREVIOUS_KEYS` keeping an older key
+verifiable through a rotation), and a few detail keys are reserved — the chain
+markers and the transport marker — so a client-supplied `details` cannot forge
+them. Verification detects a deleted suffix or a deleted set of rows and refuses
+subsequent appends; the scheduled pass defaults to a full sweep of the retained
+chain with a persisted upper checkpoint and a fenced cursor, checks a bounded
+number of entries per run and resumes after a restart. Verification never repairs
+history: a chain that does not verify stays that way until an operator accounts for
+it, and `GET /api/v1/audit/integrity` reports the state the check left behind.
+
+Retention removes only a contiguous prefix that has already been archived,
+verified and receipted: `python -m scripts.audit_archive` exports the prefix with
+its manifest, a missing archive directory, a corrupt file, a revalidation mismatch
+or `AUDIT_RETENTION_HOLD` blocks the deletion, and the database holds the receipt.
+Local signatures are tamper-evidence, not write-once storage — a database rewritten
+in full, or an archive deleted along with its manifest, is only detectable against
+a copy kept off the host that holds the database, which is why the committed tip
+belongs somewhere else.
+
+## 8. Where the rest is written down
+
+- the deployment shape, the service and profile inventory, and the installer
+  (`setup.py`) — [README.md](../README.md#quick-start),
+  [README.md](../README.md#services-and-persistence),
+  [deployment.md](deployment.md);
+- configuration ownership, defaults and the per-service resource table —
+  [configuration.md](configuration.md), [README.md](../README.md#configuration);
+- the module registry, the asset model and the identity flows as operators meet
+  them — [README.md](../README.md#modules-findings-and-the-asset-model),
+  [README.md](../README.md#identity-sessions-and-mfa);
+- operations, alert delivery, retention and the audit chain —
+  [README.md](../README.md#operations),
+  [README.md](../README.md#alerts-settings-and-retention);
+- upgrades, destructive revisions and secret rotation — [upgrading.md](upgrading.md);
+- backups, what a dump contains and how a restore is verified —
+  [backup-restore.md](backup-restore.md);
+- logs, the SIEM path and the audit contract — [observability.md](observability.md);
+- the security model, what the operator must verify and the accepted risks —
+  [security.md](security.md);
+- the measured state of the repository and its known limitations —
+  [production-readiness.md](production-readiness.md);
+- the route inventory (method, path, required role) — [api.md](api.md), with the
+  running schema as the authority outside production;
+- writing a connector — [connectors/README.md](../connectors/README.md);
+- the DNS Security workers — [dns-security.md](dns-security.md);
+- the optional passive-intelligence workers, accounts and quotas —
+  [source-intelligence.md](source-intelligence.md).

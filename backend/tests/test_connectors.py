@@ -130,6 +130,7 @@ class TestWorkClaiming:
             api_version="1.0",
             default_job_type="phishing.dnstwist",
         )
+        conn.provider = None  # this test exercises the generic connector lifecycle
         await svc.enqueue_module_scan(
             connector_type="phishing", created_by=None, title="T", params={"trigger": "manual"}
         )
@@ -168,17 +169,23 @@ class TestWorkClaiming:
             api_version="1.0",
             default_job_type="phishing.dnstwist",
         )
-        await svc.enqueue_module_scan(connector_type="phishing", created_by=None, title="T")
+        queued = await svc.enqueue_module_scan(connector_type="phishing", created_by=None, title="T")
         await svc.set_status(conn.id, "disabled")
         assert await svc.claim_work(conn) is None
 
         jobs = await svc.list_enabled_by_type("phishing")
         assert jobs == []
+        await db_session.refresh(queued[0])
+        assert queued[0].status == "cancelled"
+        assert queued[0].finished_at is not None
         await svc.set_status(conn.id, "enabled")
+        assert await svc.claim_work(conn) is None  # Cancelled work never resumes.
+        fresh = await svc.enqueue_module_scan(connector_type="phishing", created_by=None, title="Fresh")
         claimed = await svc.claim_work(conn)
-        assert claimed is not None
+        assert claimed is not None and claimed.id == fresh[0].id
 
         await svc.fail_job(conn, claimed.id, error="cleanup", lease_token=claimed.lease_token)
+        await db_session.delete(queued[0])
         await db_session.delete(claimed)
         await db_session.delete(conn)
         await db_session.commit()
@@ -469,14 +476,14 @@ class TestIngestion:
         findings = [
             {"phishing_domain": f"evil-{uuid.uuid4().hex[:8]}.com", "matched_asset": "example.com", "ip_address": "1.2.3.4"},
         ]
-        with patch("app.services.ingestion_service.AlertDeliveryService.enqueue", new_callable=AsyncMock):
+        with patch("app.services.ingestion_events.AlertDeliveryService.enqueue", new_callable=AsyncMock):
             accepted, rejected = await ingest_findings(db_session, connector=conn, job_id=None, findings=findings)
         assert (accepted, rejected) == (1, 0)
 
-        # Duplicate (same domain) is silently rejected.
-        with patch("app.services.ingestion_service.AlertDeliveryService.enqueue", new_callable=AsyncMock):
+        # An identical replay is successful and does not create a new entity.
+        with patch("app.services.ingestion_events.AlertDeliveryService.enqueue", new_callable=AsyncMock):
             accepted2, rejected2 = await ingest_findings(db_session, connector=conn, job_id=None, findings=findings)
-        assert (accepted2, rejected2) == (0, 1)
+        assert (accepted2, rejected2) == (1, 0)
         await db_session.refresh(conn)  # re-load after internal commits
 
         # Missing domain is rejected.
@@ -516,9 +523,9 @@ class TestIngestion:
             for domain in domains
         ]
         with patch(
-            "app.services.ingestion_service.AlertDeliveryService.enqueue",
+            "app.services.ingestion_events.AlertDeliveryService.enqueue",
             new_callable=AsyncMock,
-        ), patch("app.services.phishing.whois_service.WhoisService.enrich", new_callable=AsyncMock):
+        ):
             accepted, rejected = await ingest_findings(
                 db_session,
                 connector=conn,
@@ -553,12 +560,15 @@ class TestIngestion:
         await db_session.commit()
 
         suffix = uuid.uuid4().hex[:6]
+        #: Every finding that is meant to be *accepted* carries a date: a finding with
+        #: no usable date is refused (`missing_breach_date`, WI-02), which is what makes
+        #: the two below it rejected rather than stored with an invented one.
         findings = [
-            {"breach_name": f"TestBreach-{suffix}", "matched_email": f"user-{suffix}@example.com", "pwn_count": 5, "data_classes": ["Emails"]},
+            {"breach_name": f"TestBreach-{suffix}", "matched_email": f"user-{suffix}@example.com", "breach_date": "2020-01-01", "pwn_count": 5, "data_classes": ["Emails"]},
             {"breach_name": f"NoMatch-{suffix}"},  # no matched_email/domain
             {"matched_email": "a@b.c"},  # no breach_name
         ]
-        with patch("app.services.ingestion_service.AlertDeliveryService.enqueue", new_callable=AsyncMock):
+        with patch("app.services.ingestion_events.AlertDeliveryService.enqueue", new_callable=AsyncMock):
             accepted, rejected = await ingest_findings(db_session, connector=conn, job_id=None, findings=findings)
         assert (accepted, rejected) == (1, 2)
         await db_session.refresh(conn)  # re-load after internal commits
@@ -586,14 +596,20 @@ class TestIngestion:
         # ingestion: a delivery outage must not fail an accepted finding.
         alert_mock = AsyncMock(return_value=None)
         with patch(
-            "app.services.ingestion_service.AlertDeliveryService.enqueue", alert_mock
+            "app.services.ingestion_events.AlertDeliveryService.enqueue", alert_mock
         ):
             domain = f"alerted-{uuid.uuid4().hex[:8]}.com"
             ok = await ingest_phishing_finding(
                 db_session, conn, {"phishing_domain": domain, "matched_asset": "a.com"}
             )
             assert ok is True
-            alert_mock.assert_awaited_once()
+            alert_mock.assert_not_awaited()
+            from app.models import IngestionEvent
+            from sqlalchemy import select
+            events = list((await db_session.execute(select(IngestionEvent).where(IngestionEvent.kind == "notification"))).scalars())
+            assert len(events) == 1
+            assert events[0].payload["phishing_domain"] == domain
+            assert events[0].processed_at is None
 
         from sqlalchemy import delete
 
@@ -640,10 +656,10 @@ class TestConnectorConfigContract:
                 "max_pages": {"type": "int", "default": 3},
             },
         )
-        # Declared defaults are materialized and unknown keys dropped.
-        valid = validate_connector_config(
-            manifest, {"scan_certificates": False, "injected": "x"}
-        )
+        # Unknown keys are refused rather than silently losing an operator edit.
+        with pytest.raises(Exception, match="unknown config key"):
+            validate_connector_config(manifest, {"injected": "x"})
+        valid = validate_connector_config(manifest, {"scan_certificates": False})
         assert valid == {
             "scan_certificates": False,
             "scan_titles": True,
@@ -659,8 +675,9 @@ class TestConnectorConfigContract:
         # A connector that declared no schema accepts scalars only — never a
         # nested object in the JSON column.
         bare = build_manifest(module_spec=phishing, job_type="phishing.bare")
-        passthrough = validate_connector_config(bare, {"foo": 1, "bad": {"nested": 1}})
-        assert passthrough == {"foo": 1}
+        with pytest.raises(Exception, match="must be a scalar"):
+            validate_connector_config(bare, {"foo": 1, "bad": {"nested": 1}})
+        assert validate_connector_config(bare, {"foo": 1}) == {"foo": 1}
 
     @pytest.mark.asyncio
     async def test_config_persists_and_reaches_work_payload(self, db_session):

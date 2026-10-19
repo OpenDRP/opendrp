@@ -25,9 +25,10 @@ for:
   position would be re-pointed at a different key by the next rotation.
 """
 
+import uuid
 from datetime import datetime
 
-from sqlalchemy import BigInteger, DateTime, JSON, SmallInteger, String, UUID
+from sqlalchemy import BigInteger, DateTime, Index, JSON, SmallInteger, String, Uuid
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import Base, TimestampMixin, UUIDMixin
@@ -39,14 +40,15 @@ AUDIT_CHAIN_STATE_ID = 1
 
 class AuditLog(Base, UUIDMixin):
     __tablename__ = "drp_audit_logs"
+    __table_args__ = (Index("ix_audit_timestamp_id", "timestamp", "id"),)
 
     timestamp: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
         index=True,
     )
-    user_id: Mapped[UUID | None] = mapped_column(
-        UUID(as_uuid=True),
+    user_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
         nullable=True,
         index=True,
     )
@@ -115,6 +117,15 @@ class AuditChain(Base, TimestampMixin):
         default=AUDIT_CHAIN_STATE_ID,
         server_default=str(AUDIT_CHAIN_STATE_ID),
     )
+    full_verify_upper_seq: Mapped[int] = mapped_column(BigInteger, default=0, server_default="0", nullable=False)
+    full_verify_upper_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    full_verify_cursor: Mapped[int] = mapped_column(BigInteger, default=0, server_default="0", nullable=False)
+    full_verify_cursor_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    last_full_verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_failure_seq: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    last_failure_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    committed_seq: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0, server_default="0")
+    committed_tip_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     retired_through_seq: Mapped[int] = mapped_column(
         BigInteger,
         nullable=False,
@@ -132,3 +143,13 @@ class AuditChain(Base, TimestampMixin):
         DateTime(timezone=True),
         nullable=True,
     )
+
+
+class AuditArchive(Base):
+    __tablename__ = "audit_archives"
+    first_seq: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    last_seq: Mapped[int] = mapped_column(BigInteger, nullable=False, unique=True)
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    manifest_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    retired_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

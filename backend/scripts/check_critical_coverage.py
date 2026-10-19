@@ -3,6 +3,14 @@
 pytest-cov's ``--cov-fail-under`` applies to the combined report. This small
 CI gate closes that loophole by reading the JSON report and checking every
 required source file independently.
+
+The module list is also the list the runs measure: ``--cov-args`` prints the
+``--cov=`` flags for `THRESHOLDS`, and CI and the Makefile call it instead of
+carrying a second copy. Two lists drift, and the way this gate fails when they
+do is the worst kind — the report holds no entry for a module the gate names,
+so the job reports a missing measurement while the coverage it asked about was
+fine. A release shipped exactly that, and the second and third copies are gone:
+adding a module here now measures it as well.
 """
 
 from __future__ import annotations
@@ -49,6 +57,70 @@ THRESHOLDS: dict[str, float] = {
     # WHOIS is an untrusted external API; its parsing/error branches must stay
     # covered because enrichment feeds the phishing findings.
     "app/services/phishing/whois_service.py": 80.0,
+    # The next five were the gap the audit named: they sat outside every
+    # per-module gate while the aggregate floor hid them, and each is a place
+    # where a regression costs data or quota rather than a wrong pixel. The
+    # matcher decides which asset a finding belongs to (and a bug there is a
+    # finding attributed to the wrong customer), the scan admission decides how
+    # much work a scan may start, the quota service decides how many provider
+    # requests an account may spend, retention is the only code that deletes
+    # history, and the integrity pass is what reads the audit chain.
+    "app/services/asset_matching.py": 90.0,
+    "app/services/scan_admission.py": 90.0,
+    "app/tasks/retention_tasks.py": 80.0,
+    "app/services/provider_quota.py": 75.0,
+    "app/tasks/integrity_tasks.py": 70.0,
+    # The boundaries this release adds. Each is a place where an untrusted input,
+    # a secret or the platform's own record is handled: the scrape token gate and
+    # the label shaping that keeps a request value out of a metric, the two halves
+    # of the audit pair (one reads the chain, the other deletes history only after
+    # the archive verifies), the validator for provider observations and the write
+    # path a declared module's findings arrive through, the outbox drain that
+    # settles a claim over a network call, the provider-credential store, the
+    # redaction every outbound message passes, and the resolution a connector's
+    # stored identity depends on.
+    "app/api/v1/routers/metrics.py": 90.0,
+    "app/core/metrics.py": 85.0,
+    "app/services/audit_verification.py": 90.0,
+    "app/services/audit_archive.py": 75.0,
+    "app/services/dns_security_service.py": 85.0,
+    "app/services/source_observations.py": 90.0,
+    "app/services/ingestion_events.py": 90.0,
+    "app/services/source_accounts.py": 80.0,
+    "app/services/alert_content.py": 80.0,
+    "app/services/module_aliases.py": 90.0,
+    # The candidate's score and the band it routes into (WI-08/WI-12, W1.7). Every
+    # alert decision reads this number — the budget asks it what to send, the digest
+    # asks it what to hold, and the list shows it as the reason a candidate is worth
+    # a morning — so a regression here is a message an operator never got or a channel
+    # that never stops, not a wrong pixel. Measured at 96% by the phishing tests alone
+    # (158 statements), so 90 is a floor rather than a target; the gate exists to keep
+    # a later change from quietly spending that margin.
+    "app/services/phishing_score_service.py": 90.0,
+    # The other half of that decision (W1.8): which values the budget routes by,
+    # where each came from, and whether a stored row is allowed to be honoured at
+    # all. A defect here does not produce a wrong number — it produces a threshold
+    # nobody saved, or a contradictory row that is obeyed instead of refused, and
+    # both read on the channel as "the platform got quieter today". Measured at 100%
+    # by the alert-policy and phishing-digest suites (47 statements), so 95 is a
+    # floor the module already clears on its own tests.
+    "app/services/alert_policy.py": 95.0,
+    # The breach triage and catalogue rules the list, the report and the dashboard read
+    # (F-09, F-13, WI-16). Severity decides what an operator handles first, the KPI rule
+    # decides what number two surfaces print for the same fact, and the catalogue diff is
+    # what makes a new incident visible before an address is added. A regression in any
+    # of them is a quieter platform or a number that disagrees with itself, not a wrong
+    # pixel. Measured at 98%, 100% and 91% by their own suites, so these are floors.
+    "app/services/breach_catalogue.py": 90.0,
+    "app/services/breach_kpi.py": 95.0,
+    "app/services/breach_severity.py": 85.0,
+    # The invitation is a credential that never passes through the administrator
+    # who creates the account (U-7): the token is issued here, only its digest is
+    # stored, and spending it is what sets the first password. A regression either
+    # mails a link that does not work or accepts one that should have expired, so
+    # it is gated with the other issuers. Measured at 91% by
+    # tests/test_user_invitations.py (46 statements), so 90 is a floor.
+    "app/services/invitations.py": 90.0,
 }
 
 
@@ -83,8 +155,23 @@ def check_report(report_path: Path) -> list[str]:
 
 
 def main(argv: list[str]) -> int:
+    if argv == ["--cov-args"]:
+        # What a run needs to measure every module this gate checks. Printed for
+        # a shell to substitute, so the flags stay in one place. Dotted module
+        # names, which is the spelling `pytest-cov` documents, not the file path
+        # `THRESHOLDS` is keyed by.
+        print(
+            " ".join(
+                "--cov=" + module.removesuffix(".py").replace("/", ".")
+                for module in THRESHOLDS
+            )
+        )
+        return 0
     if len(argv) != 1:
-        print("usage: python scripts/check_critical_coverage.py COVERAGE_JSON")
+        print(
+            "usage: python scripts/check_critical_coverage.py [--cov-args] "
+            "COVERAGE_JSON"
+        )
         return 2
     report_path = Path(argv[0])
     if not report_path.is_file():

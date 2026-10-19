@@ -1,21 +1,50 @@
 -- OpenDRP PostgreSQL reference schema
 --
--- Migration head: 0001_initial_schema
+-- Schema baseline: 0001_initial_schema, the only revision this release ships
+-- and therefore the current head. `backend/alembic/versions/` holds that one
+-- file and it creates everything below: identity and sessions, monitored assets,
+-- phishing, breaches and the incident catalogue, the module and connector registries, jobs, connector
+-- observations, DNS Security inventory and expiry monitoring, reports, settings,
+-- the tamper-evident audit trail with its archive bookkeeping, and the durable
+-- alert delivery queue.
 --
--- This file documents the resulting PostgreSQL schema. The application is
--- migration-driven: deploy with `alembic upgrade head` and do not apply this
--- file as an independent migration source.
+-- This file is a reference snapshot for reading, not a migration source. The
+-- platform is migration-driven: deploy with `python -m scripts.migrate` (or
+-- `alembic upgrade head`) and never apply this DDL instead. A database an
+-- earlier build created already holds this schema and is adopted by recording
+-- 0001_initial_schema as its revision; `scripts/migrate.py` does that itself
+-- and `docs/upgrading.md` states the procedure.
+--
+-- `backend/tests/test_schema_reference_gate.py` compares this file with the
+-- models on every run: a table or column the models map and this file omits, or
+-- one this file names and no model maps, fails the `backend` job. The file is a
+-- snapshot an operator reads, and that test is what keeps it one.
+--
+-- The seed rows the revision inserts are not repeated here: the built-in
+-- modules, the connectors this release ships and their source accounts live in
+-- the revision itself, and `tests/test_module_registry.py` compares the modules
+-- with `app/services/module_registry.py`. Alembic's own `alembic_version` table,
+-- which records the applied revision, is not part of the platform schema and is
+-- omitted.
 --
 -- Secrets stored in system_settings are Fernet ciphertext at rest. No secret
 -- values belong in this file, .env.example, or the public repository.
 
-CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+-- ---------------------------------------------------------------------------
+-- Extensions
+-- ---------------------------------------------------------------------------
+
+CREATE EXTENSION IF NOT EXISTS pg_trgm WITH SCHEMA public;
+
+COMMENT ON EXTENSION pg_trgm IS 'text similarity measurement and index searching based on trigrams';
+
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp" WITH SCHEMA public;
+
+COMMENT ON EXTENSION "uuid-ossp" IS 'generate universally unique identifiers (UUIDs)';
 
 -- ---------------------------------------------------------------------------
 -- Enumerated types
 -- ---------------------------------------------------------------------------
-
-CREATE TYPE user_role AS ENUM ('admin', 'analyst', 'viewer');
 
 CREATE TYPE asset_type AS ENUM (
     'domain',
@@ -25,430 +54,916 @@ CREATE TYPE asset_type AS ENUM (
     'keyword_title'
 );
 
--- ---------------------------------------------------------------------------
--- Identity and monitored assets
--- ---------------------------------------------------------------------------
-
-CREATE TABLE users (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    email VARCHAR(255) NOT NULL,
-    password_hash VARCHAR(255) NOT NULL,
-    role user_role NOT NULL DEFAULT 'viewer',
-    is_active BOOLEAN NOT NULL DEFAULT TRUE,
-    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    failed_login_attempts INTEGER NOT NULL DEFAULT 0,
-    locked_until TIMESTAMP WITH TIME ZONE,
-    full_name VARCHAR(255),
-    last_login_at TIMESTAMP WITH TIME ZONE,
-    rate_limit_minutes INTEGER NOT NULL DEFAULT 0,
-    -- Second factor (TOTP). The secret is Fernet ciphertext under
-    -- ENCRYPTION_KEY; totp_enabled_at is NULL until a code generated from it has
-    -- been verified, and totp_last_used_step makes each accepted code single-use.
-    totp_secret VARCHAR(1024),
-    totp_enabled_at TIMESTAMP WITH TIME ZONE,
-    totp_last_used_step INTEGER,
-    mfa_failed_attempts INTEGER NOT NULL DEFAULT 0,
-    mfa_locked_until TIMESTAMP WITH TIME ZONE,
-    mfa_recovery_codes JSON,
-    -- Credential onboarding. A password assigned for this account (created by an
-    -- administrator, reset by one, or set through the admin CLI) is temporary
-    -- until its owner replaces it through POST /auth/password; a factor removed
-    -- for the account must be enrolled again. While either is true the API refuses
-    -- every authenticated route except the ones that complete the step.
-    must_change_password BOOLEAN NOT NULL DEFAULT FALSE,
-    must_enrol_mfa BOOLEAN NOT NULL DEFAULT FALSE,
-    CONSTRAINT uq_users_email UNIQUE (email)
-);
-
-CREATE UNIQUE INDEX ix_users_email ON users (email);
-
-CREATE TABLE assets (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    asset_type asset_type NOT NULL,
-    asset_value VARCHAR(512) NOT NULL,
-    normalized_value VARCHAR(512),
-    criticality VARCHAR(50) NOT NULL DEFAULT 'medium',
-    is_active BOOLEAN NOT NULL DEFAULT TRUE,
-    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE INDEX ix_assets_asset_type ON assets (asset_type);
-CREATE UNIQUE INDEX uq_assets_type_normalized_value
-    ON assets (asset_type, normalized_value)
-    WHERE normalized_value IS NOT NULL;
-
--- ---------------------------------------------------------------------------
--- Phishing findings
--- ---------------------------------------------------------------------------
-
-CREATE TABLE drp_phishing_domains (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    phishing_domain VARCHAR(512) NOT NULL,
-    matched_asset VARCHAR(512) NOT NULL,
-    ip_address VARCHAR(255),
-    web_ports VARCHAR(255),
-    detection_source VARCHAR(100) NOT NULL,
-    original_domain VARCHAR(512),
-    whois_registrar VARCHAR(255),
-    whois_abuse_email VARCHAR(255),
-    domain_created_at TIMESTAMP WITH TIME ZONE,
-    status VARCHAR(50) NOT NULL DEFAULT 'active',
-    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    CONSTRAINT uq_drp_phishing_domains_phishing_domain
-        UNIQUE (phishing_domain)
-);
-
--- SQLAlchemy declares both the unique constraint index and the indexed model
--- column. PostgreSQL therefore contains both indexes in migrated databases.
-CREATE UNIQUE INDEX ix_drp_phishing_domains_phishing_domain
-    ON drp_phishing_domains (phishing_domain);
-CREATE INDEX ix_drp_phishing_domains_status
-    ON drp_phishing_domains (status);
-
--- ---------------------------------------------------------------------------
--- Breach findings (any provider)
--- ---------------------------------------------------------------------------
---
--- Named for what it stores, not for the first source that filled it: the
--- connector protocol accepts breach findings from any provider.
-
-CREATE TABLE drp_breaches (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    breach_name VARCHAR(255) NOT NULL,
-    title VARCHAR(255) NOT NULL,
-    domain VARCHAR(255) NOT NULL,
-    breach_date DATE NOT NULL,
-    pwn_count INTEGER NOT NULL DEFAULT 0,
-    description TEXT,
-    data_classes JSON NOT NULL DEFAULT '[]'::json,
-    matched_email VARCHAR(255),
-    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    matched_domain VARCHAR(255),
-    status VARCHAR(50) NOT NULL DEFAULT 'active',
-    -- Provider-specific payload: classification flags, exposed-secret samples,
-    -- the source's own catalog timestamps. The columns above are the fields
-    -- every breach source can supply; these belong to the reporting source.
-    attributes JSON NOT NULL DEFAULT '{}'::json,
-    CONSTRAINT uq_breach_email
-        UNIQUE (breach_name, matched_email)
-);
-
--- Partial index for domain deduplication when no specific mailbox is reported (0026).
-CREATE UNIQUE INDEX uq_breach_domain_only
-    ON drp_breaches (breach_name, matched_domain)
-    WHERE matched_domain IS NOT NULL AND matched_email IS NULL;
-
-CREATE INDEX ix_drp_breaches_matched_email
-    ON drp_breaches (matched_email);
-CREATE INDEX ix_drp_breaches_matched_domain
-    ON drp_breaches (matched_domain);
-CREATE INDEX ix_drp_breaches_status
-    ON drp_breaches (status);
-
--- ---------------------------------------------------------------------------
--- Reports and jobs
--- ---------------------------------------------------------------------------
-
-CREATE TABLE reports (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    report_name VARCHAR(255) NOT NULL,
-    created_by UUID REFERENCES users(id) ON DELETE SET NULL,
-    -- An artifact *name* ("<uuid>.pdf"), never a path: the directory comes from
-    -- REPORTS_STORE_DIR and the value is resolved inside it, so a row cannot
-    -- point the reader at a file the platform never wrote. See
-    -- app/core/artifact_path.py.
-    file_path VARCHAR(512) NOT NULL,
-    status VARCHAR(50) NOT NULL DEFAULT 'pending',
-    is_truncated BOOLEAN NOT NULL DEFAULT FALSE,
-    truncation_metadata JSON,
-    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE TABLE jobs (
-    id UUID PRIMARY KEY NOT NULL,
-    job_type VARCHAR(50) NOT NULL,
-    status VARCHAR(32) NOT NULL DEFAULT 'pending',
-    created_by UUID REFERENCES users(id) ON DELETE SET NULL,
-    task_id VARCHAR(128),
-    title VARCHAR(255),
-    error_message TEXT,
-    params JSON,
-    result_summary JSON,
-    started_at TIMESTAMP WITH TIME ZONE,
-    finished_at TIMESTAMP WITH TIME ZONE,
-    -- Connector job leases. Leases bound job ownership, track heartbeats, and
-    -- allow zombie jobs to be reclaimed safely.
-    lease_expires_at TIMESTAMP WITH TIME ZONE,
-    last_heartbeat_at TIMESTAMP WITH TIME ZONE,
-    attempt_count INTEGER NOT NULL DEFAULT 0,
-    claimed_by_connector VARCHAR(100),
-    lease_token VARCHAR(64),
-    created_at TIMESTAMP WITH TIME ZONE NOT NULL,
-    updated_at TIMESTAMP WITH TIME ZONE NOT NULL,
-    CONSTRAINT ck_jobs_job_type_len
-        CHECK (char_length(job_type) BETWEEN 1 AND 50),
-    CONSTRAINT ck_jobs_status_len
-        CHECK (char_length(status) BETWEEN 1 AND 32)
-);
-
-CREATE INDEX ix_jobs_job_type ON jobs (job_type);
-CREATE INDEX ix_jobs_status ON jobs (status);
-CREATE INDEX ix_jobs_created_by ON jobs (created_by);
-CREATE INDEX ix_jobs_task_id ON jobs (task_id);
-CREATE INDEX ix_jobs_lease_expires_at ON jobs (lease_expires_at);
-
--- ---------------------------------------------------------------------------
--- Connector registry
--- ---------------------------------------------------------------------------
-
-CREATE TABLE drp_connectors (
-    id UUID PRIMARY KEY,
-    name VARCHAR(100) NOT NULL,
-    connector_type VARCHAR(32) NOT NULL,
-    status VARCHAR(32) NOT NULL DEFAULT 'enabled',
-    api_version VARCHAR(32),
-    -- Job type the connector declared for itself (namespaced, uniquely owned,
-    -- required at registration: it is the work this connector alone claims).
-    default_job_type VARCHAR(50) NOT NULL,
-    -- Self-declared manifest: module, job_type, finding_kind, asset_types and
-    -- the operator-editable config_schema. Registration always writes one; the
-    -- read path normalises it against the module registry.
-    manifest JSON,
-    config JSON,
-    last_seen_at TIMESTAMP WITH TIME ZONE,
-    last_error VARCHAR(2000),
-    info JSON,
-    -- Per-connector credential: SHA-256 digest of a machine-generated token.
-    -- The plaintext is shown once at issuance and never stored. NULL means the
-    -- connector cannot authenticate yet; there is no shared connector secret.
-    token_hash VARCHAR(64),
-    --: Public prefix of the token, so an operator can tell which one is in use.
-    token_prefix VARCHAR(16),
-    token_created_at TIMESTAMP WITH TIME ZONE,
-    token_last_used_at TIMESTAMP WITH TIME ZONE,
-    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    CONSTRAINT ck_connectors_status
-        CHECK (status IN ('enabled', 'disabled'))
-    -- No CHECK on connector_type: the module set is data (drp_modules), so any
-    -- registered module id is a valid value. 0018 dropped the constraint 0009
-    -- created here, which had pinned the column to the two built-in modules.
-);
-
-CREATE UNIQUE INDEX ix_drp_connectors_name
-    ON drp_connectors (name);
-CREATE INDEX ix_drp_connectors_connector_type
-    ON drp_connectors (connector_type);
--- One credential identifies exactly one connector.
-CREATE UNIQUE INDEX ix_drp_connectors_token_hash
-    ON drp_connectors (token_hash);
-
--- ---------------------------------------------------------------------------
--- Module registry and generic findings
--- ---------------------------------------------------------------------------
---
--- The module set is data: onboarding a data source whose findings do not fit the
--- phishing/breach tables is a row here plus a connector registration, not a core
--- release. A module declares how its findings are identified (dedup_fields),
--- validated (fields) and displayed (label, title_field), and which inventory it
--- consumes (asset_types).
-
-CREATE TABLE drp_modules (
-    id VARCHAR(32) PRIMARY KEY,
-    label VARCHAR(120) NOT NULL,
-    description TEXT,
-    -- Finding kind the core validates this module's submissions against. One
-    -- kind identifies one module.
-    finding_kind VARCHAR(32) NOT NULL,
-    -- Inventory sections the module's connectors consume (e.g. domain).
-    asset_types JSON NOT NULL,
-    -- Declared field specification: findings are validated against it.
-    fields JSON NOT NULL,
-    -- Fields that identify a finding; together they form the dedup key.
-    dedup_fields JSON NOT NULL,
-    title_field VARCHAR(64),
-    -- Where findings land: {"kind": "table", "table": ..., "adapter": ...} for
-    -- a module the core persists natively, {"kind": "generic", "adapter":
-    -- "generic"} for one stored in drp_findings.
-    storage JSON NOT NULL,
-    enabled BOOLEAN NOT NULL DEFAULT TRUE,
-    -- TRUE for the modules the platform ships with; they are seeded by 0018.
-    builtin BOOLEAN NOT NULL DEFAULT FALSE,
-    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    CONSTRAINT uq_modules_finding_kind UNIQUE (finding_kind)
-);
-
--- Findings for modules that use generic storage. The core still owns the write,
--- dedup and audit; only the shape of the payload is module-declared (JSON) rather
--- than a typed table. A module with a native adapter keeps its own table.
-
-CREATE TABLE drp_findings (
-    id UUID PRIMARY KEY,
-    module VARCHAR(32) NOT NULL
-        REFERENCES drp_modules (id) ON DELETE RESTRICT,
-    finding_kind VARCHAR(32) NOT NULL,
-    connector_name VARCHAR(100) NOT NULL,
-    job_id UUID,
-    -- Deterministic key built from the module's declared dedup fields.
-    dedup_key VARCHAR(512) NOT NULL,
-    title VARCHAR(512) NOT NULL,
-    matched_asset VARCHAR(512),
-    status VARCHAR(50) NOT NULL DEFAULT 'active',
-    -- Validated payload, shaped by the module's declared field specification.
-    payload JSON NOT NULL,
-    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    CONSTRAINT uq_findings_module_dedup UNIQUE (module, dedup_key)
-);
-
-CREATE INDEX ix_drp_findings_connector_name ON drp_findings (connector_name);
-CREATE INDEX ix_drp_findings_status ON drp_findings (status);
-CREATE INDEX ix_drp_findings_module_created ON drp_findings (module, created_at);
-
--- ---------------------------------------------------------------------------
--- Singleton platform settings
--- ---------------------------------------------------------------------------
-
-CREATE TABLE system_settings (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    -- Provider API keys are connector-owned and are not stored in core settings.
-    smtp_host VARCHAR(255),
-    smtp_user VARCHAR(255),
-    smtp_password VARCHAR(1024),
-    smtp_from_email VARCHAR(1024),
-    smtp_port INTEGER NOT NULL DEFAULT 587,
-    smtp_security_mode VARCHAR(16) NOT NULL DEFAULT 'starttls' CHECK (smtp_security_mode IN ('starttls', 'ssl', 'plain')),
-    alert_recipient_email VARCHAR(1024),
-    telegram_bot_token VARCHAR(1024),
-    email_alerts_enabled BOOLEAN NOT NULL DEFAULT FALSE,
-    telegram_alerts_enabled BOOLEAN NOT NULL DEFAULT FALSE,
-    -- JSON array of selected active user UUID strings.
-    alert_email_user_ids JSON,
-    -- JSON array of Telegram chat ID strings.
-    telegram_chat_ids JSON,
-    -- {"days": [0..6, 0=Sunday], "hour": 0..23, "minute": 0..59} UTC.
-    schedule_phishing JSON,
-    schedule_breaches JSON,
-    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
+CREATE TYPE user_role AS ENUM (
+    'admin',
+    'analyst',
+    'viewer'
 );
 
 -- ---------------------------------------------------------------------------
--- Audit trail and refresh-token families
--- ---------------------------------------------------------------------------
-
-CREATE TABLE drp_audit_logs (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    timestamp TIMESTAMP WITH TIME ZONE NOT NULL,
-    user_id UUID,
-    action VARCHAR(120) NOT NULL,
-    ip_address VARCHAR(64) NOT NULL,
-    details JSON NOT NULL DEFAULT '{}'::json,
-    -- Hash chain. ``seq`` is the monotonic position, unique because a duplicate
-    -- position is the "delete a row and renumber" shape it exists to catch;
-    -- ``entry_hash`` is the HMAC over this row's five fields and the previous
-    -- entry's hash, keyed from AUDIT_CHAIN_KEYS in the environment (never from
-    -- this database). It is NOT NULL: the single writer signs inside the
-    -- inserting transaction, so a row without a hash did not come from the
-    -- platform. ``prev_hash`` is NULL only for the first entry of a chain, which
-    -- links to nothing. ``key_id`` is the fingerprint of the key that signed the
-    -- row rather than its position in the configured list, so a key rotation
-    -- does not re-point old rows at a different key. See app/core/audit_chain.py.
-    seq BIGINT NOT NULL DEFAULT nextval('drp_audit_logs_seq_seq'),
-    entry_hash VARCHAR(64) NOT NULL,
-    prev_hash VARCHAR(64),
-    key_id SMALLINT NOT NULL DEFAULT 0,
-    CONSTRAINT uq_drp_audit_logs_seq UNIQUE (seq)
-);
-
-CREATE INDEX ix_drp_audit_logs_timestamp
-    ON drp_audit_logs (timestamp);
-CREATE INDEX ix_drp_audit_logs_user_id
-    ON drp_audit_logs (user_id);
-CREATE INDEX ix_drp_audit_logs_action
-    ON drp_audit_logs (action);
-CREATE INDEX ix_drp_audit_logs_entry_hash
-    ON drp_audit_logs (entry_hash);
-CREATE INDEX ix_drp_audit_logs_user_timestamp
-    ON drp_audit_logs (user_id, timestamp);
-
--- One row per installation: what retention legitimately deleted, and how far
--- verification has already run. Without the retirement watermark, an age-based
--- sweep would make every subsequent verification report a breach.
-CREATE TABLE drp_audit_chain (
-    id SMALLINT PRIMARY KEY DEFAULT 1,
-    retired_through_seq BIGINT NOT NULL DEFAULT 0,
-    retired_tip_hash VARCHAR(64),
-    last_verified_seq BIGINT NOT NULL DEFAULT 0,
-    last_verified_at TIMESTAMP WITH TIME ZONE,
-    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE TABLE drp_refresh_families (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    family_id UUID NOT NULL,
-    user_id UUID NOT NULL,
-    last_jti VARCHAR(120),
-    last_issued_at TIMESTAMP WITH TIME ZONE,
-    revoked BOOLEAN NOT NULL DEFAULT FALSE,
-    revoked_at TIMESTAMP WITH TIME ZONE,
-    revoked_reason VARCHAR(120),
-    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    CONSTRAINT uq_drp_refresh_families_family_id UNIQUE (family_id)
-);
-
-CREATE UNIQUE INDEX ix_drp_refresh_families_family_id
-    ON drp_refresh_families (family_id);
-CREATE INDEX ix_drp_refresh_families_user_id
-    ON drp_refresh_families (user_id);
-CREATE INDEX ix_drp_refresh_families_revoked
-    ON drp_refresh_families (revoked);
-
--- ---------------------------------------------------------------------------
--- Alert delivery queue
+-- Tables and their sequences
 -- ---------------------------------------------------------------------------
 
 CREATE TABLE alert_deliveries (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    job_id UUID REFERENCES jobs(id) ON DELETE SET NULL,
-    threat_type VARCHAR(100) NOT NULL,
-    channel VARCHAR(20) NOT NULL,  -- concrete destination: 'email' or 'telegram'
-    target VARCHAR(512),
-    payload JSON NOT NULL,
-    status VARCHAR(20) NOT NULL DEFAULT 'pending',
-    attempts INTEGER NOT NULL DEFAULT 0,
-    next_attempt_at TIMESTAMP WITH TIME ZONE,
-    locked_at TIMESTAMP WITH TIME ZONE,
-    sent_at TIMESTAMP WITH TIME ZONE,
-    last_error TEXT,
-    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
+    id uuid DEFAULT uuid_generate_v4() NOT NULL,
+    job_id uuid,
+    threat_type character varying(100) NOT NULL,
+    channel character varying(20) NOT NULL,
+    target character varying(512),
+    payload json NOT NULL,
+    status character varying(20) DEFAULT 'pending'::character varying NOT NULL,
+    attempts integer DEFAULT 0 NOT NULL,
+    next_attempt_at timestamp with time zone,
+    locked_at timestamp with time zone,
+    sent_at timestamp with time zone,
+    last_error text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    lease_token character varying(64),
+    batch_id character varying(64),
+    parts json,
+    acknowledged_parts integer DEFAULT 0 NOT NULL
 );
 
-CREATE INDEX ix_alert_deliveries_job_id ON alert_deliveries (job_id);
-CREATE INDEX ix_alert_deliveries_status ON alert_deliveries (status);
-CREATE INDEX ix_alert_deliveries_next_attempt_at ON alert_deliveries (next_attempt_at);
-CREATE INDEX ix_alert_deliveries_threat_type ON alert_deliveries (threat_type);
-CREATE INDEX ix_alert_deliveries_channel ON alert_deliveries (channel);
-CREATE INDEX ix_alert_deliveries_target ON alert_deliveries (target);
+CREATE TABLE alert_recipient_state (
+    key character varying(64) NOT NULL,
+    next_send_at timestamp with time zone,
+    lease_token character varying(64),
+    lease_expires_at timestamp with time zone
+);
+
+CREATE TABLE assets (
+    id uuid DEFAULT uuid_generate_v4() NOT NULL,
+    asset_type asset_type NOT NULL,
+    asset_value character varying(512) NOT NULL,
+    normalized_value character varying(512),
+    criticality character varying(50) DEFAULT 'medium'::character varying NOT NULL,
+    is_active boolean DEFAULT true NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+CREATE TABLE audit_archives (
+    first_seq bigint NOT NULL,
+    last_seq bigint NOT NULL,
+    content_hash character varying(64) NOT NULL,
+    manifest_name character varying(255) NOT NULL,
+    created_at timestamp with time zone NOT NULL,
+    retired_at timestamp with time zone
+);
+
+CREATE SEQUENCE audit_archives_first_seq_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+ALTER SEQUENCE audit_archives_first_seq_seq OWNED BY audit_archives.first_seq;
+
+CREATE TABLE breach_catalogue (
+    id uuid DEFAULT uuid_generate_v4() NOT NULL,
+    source character varying(100) NOT NULL,
+    breach_name character varying(255) NOT NULL,
+    title character varying(255) DEFAULT ''::character varying NOT NULL,
+    domain character varying(255) DEFAULT ''::character varying NOT NULL,
+    breach_date date,
+    added_date timestamp with time zone,
+    modified_date timestamp with time zone,
+    pwn_count integer DEFAULT 0 NOT NULL,
+    data_classes json DEFAULT '[]'::json NOT NULL,
+    attributes json DEFAULT '{}'::json NOT NULL,
+    last_synced_at timestamp with time zone DEFAULT now() NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+CREATE TABLE certificate_scope_exceptions (
+    id uuid NOT NULL,
+    match_kind character varying(16) NOT NULL,
+    match_value character varying(255) NOT NULL,
+    reason character varying(1000),
+    created_by uuid,
+    expires_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+CREATE TABLE dns_expiry_monitors (
+    id uuid NOT NULL,
+    asset_id uuid NOT NULL,
+    kind character varying(32) NOT NULL,
+    subject character varying(253) NOT NULL,
+    state character varying(32) NOT NULL,
+    checked_at timestamp with time zone NOT NULL,
+    successful_at timestamp with time zone,
+    expires_at timestamp with time zone,
+    certificate_id character varying(128),
+    not_before timestamp with time zone,
+    observation_id uuid,
+    cycle character varying(64),
+    alerted_thresholds json NOT NULL,
+    stale_alerted_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+CREATE TABLE dns_security_observations (
+    id uuid NOT NULL,
+    observation_key character varying(64) NOT NULL,
+    observation_type character varying(32) NOT NULL,
+    subject character varying(253) NOT NULL,
+    record_type character varying(16),
+    value character varying(1000),
+    source character varying(32) NOT NULL,
+    first_seen_at timestamp with time zone NOT NULL,
+    last_seen_at timestamp with time zone NOT NULL,
+    expires_at timestamp with time zone,
+    status character varying(16) DEFAULT 'current'::character varying NOT NULL,
+    metadata_json json DEFAULT '{}'::json NOT NULL,
+    alerted_thresholds json DEFAULT '[]'::json NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+CREATE TABLE drp_audit_chain (
+    id smallint DEFAULT '1'::smallint NOT NULL,
+    retired_through_seq bigint DEFAULT '0'::bigint NOT NULL,
+    retired_tip_hash character varying(64),
+    last_verified_seq bigint DEFAULT '0'::bigint NOT NULL,
+    last_verified_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    committed_seq bigint DEFAULT '0'::bigint NOT NULL,
+    committed_tip_hash character varying(64),
+    full_verify_upper_seq bigint DEFAULT '0'::bigint NOT NULL,
+    full_verify_upper_hash character varying(64),
+    full_verify_cursor bigint DEFAULT '0'::bigint NOT NULL,
+    full_verify_cursor_hash character varying(64),
+    last_full_verified_at timestamp with time zone,
+    last_failure_seq bigint,
+    last_failure_reason character varying(64)
+);
+
+CREATE SEQUENCE drp_audit_logs_seq_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+CREATE TABLE drp_audit_logs (
+    id uuid DEFAULT uuid_generate_v4() NOT NULL,
+    "timestamp" timestamp with time zone NOT NULL,
+    user_id uuid,
+    action character varying(120) NOT NULL,
+    ip_address character varying(64) NOT NULL,
+    details json DEFAULT '{}'::json NOT NULL,
+    seq bigint DEFAULT nextval('drp_audit_logs_seq_seq'::regclass) NOT NULL,
+    entry_hash character varying(64) NOT NULL,
+    prev_hash character varying(64),
+    key_id smallint DEFAULT '0'::smallint NOT NULL
+);
+
+CREATE TABLE drp_breaches (
+    id uuid DEFAULT uuid_generate_v4() NOT NULL,
+    breach_name character varying(255) NOT NULL,
+    title character varying(255) NOT NULL,
+    domain character varying(255) NOT NULL,
+    breach_date date NOT NULL,
+    pwn_count integer DEFAULT 0 NOT NULL,
+    description text,
+    data_classes json DEFAULT '[]'::json NOT NULL,
+    matched_email character varying(255),
+    matched_domain character varying(255),
+    status character varying(50) DEFAULT 'active'::character varying NOT NULL,
+    exposure_kind character varying(32) DEFAULT 'breach'::character varying NOT NULL,
+    severity character varying(16) DEFAULT 'unknown'::character varying NOT NULL,
+    attributes json DEFAULT '{}'::json NOT NULL,
+    last_seen_at timestamp with time zone,
+    verified_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    source_id character varying(100) NOT NULL
+);
+
+CREATE TABLE drp_connectors (
+    id uuid DEFAULT uuid_generate_v4() NOT NULL,
+    name character varying(100) NOT NULL,
+    connector_type character varying(32) NOT NULL,
+    status character varying(32) DEFAULT 'enabled'::character varying NOT NULL,
+    api_version character varying(32),
+    default_job_type character varying(50) NOT NULL,
+    manifest json,
+    config json,
+    last_seen_at timestamp with time zone,
+    last_error character varying(2000),
+    info json,
+    token_hash character varying(64),
+    token_prefix character varying(16),
+    token_created_at timestamp with time zone,
+    token_last_used_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    provider character varying(32),
+    quota_group character varying(64),
+    readiness json,
+    last_success_at timestamp with time zone,
+    source_account_id uuid,
+    aliases json DEFAULT '[]'::json NOT NULL,
+    CONSTRAINT ck_connectors_status CHECK (((status)::text = ANY ((ARRAY['enabled'::character varying, 'disabled'::character varying])::text[])))
+);
+
+CREATE TABLE drp_findings (
+    id uuid NOT NULL,
+    module character varying(32) NOT NULL,
+    finding_kind character varying(32) NOT NULL,
+    connector_name character varying(100) NOT NULL,
+    job_id uuid,
+    dedup_key character varying(512) NOT NULL,
+    title character varying(512) NOT NULL,
+    matched_asset character varying(512),
+    status character varying(50) DEFAULT 'active'::character varying NOT NULL,
+    payload json NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+CREATE TABLE drp_modules (
+    id character varying(32) NOT NULL,
+    label character varying(120) NOT NULL,
+    description text,
+    finding_kind character varying(32) NOT NULL,
+    asset_types json NOT NULL,
+    fields json NOT NULL,
+    dedup_fields json NOT NULL,
+    title_field character varying(64),
+    storage json NOT NULL,
+    enabled boolean DEFAULT true NOT NULL,
+    builtin boolean DEFAULT false NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+CREATE TABLE drp_phishing_domains (
+    id uuid DEFAULT uuid_generate_v4() NOT NULL,
+    phishing_domain character varying(512) NOT NULL,
+    matched_asset character varying(512) NOT NULL,
+    ip_address character varying(255),
+    web_ports character varying(255),
+    detection_source character varying(100) NOT NULL,
+    original_domain character varying(512),
+    whois_registrar character varying(255),
+    whois_abuse_email character varying(255),
+    domain_created_at timestamp with time zone,
+    status character varying(50) DEFAULT 'active'::character varying NOT NULL,
+    confidence smallint DEFAULT '0'::smallint NOT NULL,
+    signals json DEFAULT '{}'::json NOT NULL,
+    digest_queued_at timestamp with time zone,
+    verdict character varying(32),
+    verdict_reason character varying(2000),
+    verdict_by uuid,
+    verdict_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+CREATE TABLE drp_refresh_families (
+    id uuid DEFAULT uuid_generate_v4() NOT NULL,
+    family_id uuid NOT NULL,
+    user_id uuid NOT NULL,
+    last_jti character varying(120),
+    last_issued_at timestamp with time zone,
+    revoked boolean DEFAULT false NOT NULL,
+    revoked_at timestamp with time zone,
+    revoked_reason character varying(120),
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+CREATE TABLE ingestion_events (
+    id uuid NOT NULL,
+    event_key character varying(128) NOT NULL,
+    kind character varying(32) NOT NULL,
+    module character varying(32) NOT NULL,
+    entity_id uuid NOT NULL,
+    job_id uuid,
+    payload json NOT NULL,
+    processed_at timestamp with time zone,
+    attempts integer DEFAULT 0 NOT NULL,
+    next_attempt_at timestamp with time zone,
+    last_error character varying(128),
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+CREATE TABLE jobs (
+    id uuid NOT NULL,
+    job_type character varying(50) NOT NULL,
+    status character varying(32) DEFAULT 'pending'::character varying NOT NULL,
+    created_by uuid,
+    task_id character varying(128),
+    title character varying(255),
+    error_message text,
+    params json,
+    result_summary json,
+    started_at timestamp with time zone,
+    finished_at timestamp with time zone,
+    lease_expires_at timestamp with time zone,
+    last_heartbeat_at timestamp with time zone,
+    attempt_count integer DEFAULT 0 NOT NULL,
+    claimed_by_connector character varying(100),
+    lease_token character varying(64),
+    created_at timestamp with time zone NOT NULL,
+    updated_at timestamp with time zone NOT NULL,
+    connector_id uuid,
+    schedule_key character varying(128),
+    CONSTRAINT ck_jobs_job_type_len CHECK (((char_length((job_type)::text) >= 1) AND (char_length((job_type)::text) <= 50))),
+    CONSTRAINT ck_jobs_status_len CHECK (((char_length((status)::text) >= 1) AND (char_length((status)::text) <= 32)))
+);
+
+CREATE TABLE phishing_candidate_signals (
+    id uuid NOT NULL,
+    candidate_id uuid NOT NULL,
+    name character varying(64) NOT NULL,
+    value json NOT NULL,
+    confidence smallint DEFAULT '0'::smallint NOT NULL,
+    observed_at timestamp with time zone,
+    source character varying(100)
+);
+
+CREATE TABLE report_artifact_cleanup (
+    artifact_name character varying(255) NOT NULL,
+    requested_at timestamp with time zone DEFAULT now() NOT NULL,
+    available_at timestamp with time zone DEFAULT now() NOT NULL,
+    attempts integer DEFAULT 0 NOT NULL,
+    last_error text,
+    report_id uuid
+);
+
+CREATE TABLE report_audit_outbox (
+    id uuid NOT NULL,
+    event_key character varying(255) NOT NULL,
+    action character varying(80) NOT NULL,
+    report_id uuid NOT NULL,
+    job_id uuid,
+    details json NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    available_at timestamp with time zone DEFAULT now() NOT NULL,
+    attempts integer DEFAULT 0 NOT NULL,
+    last_error text
+);
+
+CREATE TABLE report_queue_control (
+    id integer NOT NULL,
+    touched_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+CREATE SEQUENCE report_queue_control_id_seq
+    AS integer
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+ALTER SEQUENCE report_queue_control_id_seq OWNED BY report_queue_control.id;
+
+CREATE TABLE reports (
+    id uuid DEFAULT uuid_generate_v4() NOT NULL,
+    report_name character varying(255) NOT NULL,
+    created_by uuid,
+    file_path character varying(512) NOT NULL,
+    status character varying(50) DEFAULT 'pending'::character varying NOT NULL,
+    is_truncated boolean DEFAULT false NOT NULL,
+    truncation_metadata json,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    generation_started_at timestamp with time zone
+);
+
+CREATE TABLE schedule_occurrences (
+    key character varying(128) NOT NULL,
+    job_id uuid,
+    created_at timestamp with time zone NOT NULL
+);
+
+CREATE TABLE source_accounts (
+    id uuid NOT NULL,
+    source_id character varying(32) NOT NULL,
+    name character varying(64) NOT NULL,
+    credential_ref character varying(128),
+    policy json NOT NULL,
+    access_state character varying(32) NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    api_key_encrypted text,
+    api_key_hint character varying(16)
+);
+
+CREATE TABLE source_observations (
+    id uuid NOT NULL,
+    module character varying(32) NOT NULL,
+    source character varying(100) NOT NULL,
+    observation_key character varying(64) NOT NULL,
+    subject character varying(253) NOT NULL,
+    matched_asset character varying(512) NOT NULL,
+    candidate_id uuid,
+    job_id uuid,
+    first_seen_at timestamp with time zone NOT NULL,
+    last_seen_at timestamp with time zone NOT NULL,
+    observed_at timestamp with time zone,
+    status character varying(32) NOT NULL,
+    payload json NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    connector_id uuid,
+    source_account_id uuid,
+    provenance json DEFAULT '{}'::json NOT NULL
+);
+
+CREATE TABLE system_settings (
+    id uuid DEFAULT uuid_generate_v4() NOT NULL,
+    smtp_host character varying(255),
+    smtp_user character varying(255),
+    smtp_password character varying(1024),
+    smtp_from_email character varying(1024),
+    smtp_port integer DEFAULT 587 NOT NULL,
+    smtp_security_mode character varying(16) DEFAULT 'starttls'::character varying NOT NULL,
+    alert_recipient_email character varying(1024),
+    telegram_bot_token character varying(1024),
+    telegram_chat_ids json,
+    email_alerts_enabled boolean DEFAULT false NOT NULL,
+    telegram_alerts_enabled boolean DEFAULT false NOT NULL,
+    alert_email_user_ids json,
+    schedule_phishing json,
+    schedule_breaches json,
+    alert_confidence_direct smallint,
+    alert_confidence_digest smallint,
+    alert_phishing_digest_enabled boolean,
+    alert_phishing_digest_hour_utc smallint,
+    alert_no_channel_retry_hours smallint,
+    alert_candidate_change_notifications boolean,
+    alert_breach_noise_policy character varying(32),
+    alert_breach_digest_threshold smallint,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    schedule_dns_security json,
+    schedule_exposure json,
+    schedules json,
+    singleton_key integer DEFAULT 1 NOT NULL,
+    version integer DEFAULT 1 NOT NULL,
+    CONSTRAINT ck_system_settings_singleton CHECK ((singleton_key = 1)),
+    CONSTRAINT ck_system_settings_smtp_security_mode CHECK (((smtp_security_mode)::text = ANY ((ARRAY['starttls'::character varying, 'ssl'::character varying, 'plain'::character varying])::text[])))
+);
+
+CREATE TABLE tls_certificate_identities (
+    id uuid NOT NULL,
+    fingerprint_sha256 character varying(64) NOT NULL,
+    fingerprint_sha1 character varying(40),
+    spki_sha256 character varying(64),
+    serial_hex character varying(128),
+    subject_dn character varying(1000),
+    issuer_dn character varying(1000),
+    not_before timestamp with time zone,
+    not_after timestamp with time zone,
+    san_dns json DEFAULT '[]'::json NOT NULL,
+    key_algo character varying(64),
+    origin character varying(32) NOT NULL,
+    first_seen_at timestamp with time zone NOT NULL,
+    last_seen_at timestamp with time zone NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+CREATE TABLE tls_certificate_sightings (
+    id uuid NOT NULL,
+    identity_id uuid NOT NULL,
+    subject character varying(253),
+    ip character varying(64),
+    port integer,
+    source character varying(32) NOT NULL,
+    observed_at timestamp with time zone NOT NULL,
+    first_seen_at timestamp with time zone NOT NULL,
+    last_seen_at timestamp with time zone NOT NULL,
+    is_ours boolean DEFAULT false NOT NULL,
+    confidence smallint DEFAULT '0'::smallint NOT NULL,
+    signals json DEFAULT '{}'::json NOT NULL,
+    verdict character varying(32) DEFAULT 'candidate'::character varying NOT NULL,
+    reviewed_by uuid,
+    reviewed_at timestamp with time zone,
+    review_note character varying(2000),
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+CREATE TABLE users (
+    id uuid DEFAULT uuid_generate_v4() NOT NULL,
+    email character varying(255) NOT NULL,
+    password_hash character varying(255) NOT NULL,
+    role user_role DEFAULT 'viewer'::user_role NOT NULL,
+    is_active boolean DEFAULT true NOT NULL,
+    full_name character varying(255),
+    last_login_at timestamp with time zone,
+    failed_login_attempts integer DEFAULT 0 NOT NULL,
+    locked_until timestamp with time zone,
+    rate_limit_minutes integer DEFAULT 0 NOT NULL,
+    totp_secret character varying(1024),
+    totp_enabled_at timestamp with time zone,
+    totp_last_used_step integer,
+    mfa_failed_attempts integer DEFAULT 0 NOT NULL,
+    mfa_locked_until timestamp with time zone,
+    mfa_recovery_codes json,
+    must_change_password boolean DEFAULT false NOT NULL,
+    must_enrol_mfa boolean DEFAULT false NOT NULL,
+    invitation_token_hash character varying(64),
+    invitation_expires_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL
+);
 
 -- ---------------------------------------------------------------------------
--- Migration and deployment notes
+-- Column defaults, primary keys and unique constraints
 -- ---------------------------------------------------------------------------
---
--- OpenDRP v0.1.0 initial schema baseline:
--- 1. 0001_initial_schema creates the complete schema for identity (users,
---    refresh families), monitored assets, phishing domains, breaches, module
---    registry, generic findings, jobs, connector registry, reports, system
---    settings, audit logs with tamper-evident HMAC hash chain, and persistent
---    alert deliveries queue.
---
--- Run Alembic instead of applying this reference DDL directly:
---     alembic upgrade head
+
+ALTER TABLE ONLY audit_archives ALTER COLUMN first_seq SET DEFAULT nextval('audit_archives_first_seq_seq'::regclass);
+
+ALTER TABLE ONLY report_queue_control ALTER COLUMN id SET DEFAULT nextval('report_queue_control_id_seq'::regclass);
+
+ALTER TABLE ONLY alert_deliveries
+    ADD CONSTRAINT alert_deliveries_pkey PRIMARY KEY (id);
+
+ALTER TABLE ONLY alert_recipient_state
+    ADD CONSTRAINT alert_recipient_state_pkey PRIMARY KEY (key);
+
+ALTER TABLE ONLY audit_archives
+    ADD CONSTRAINT audit_archives_last_seq_key UNIQUE (last_seq);
+
+ALTER TABLE ONLY audit_archives
+    ADD CONSTRAINT audit_archives_pkey PRIMARY KEY (first_seq);
+
+ALTER TABLE ONLY dns_expiry_monitors
+    ADD CONSTRAINT dns_expiry_monitors_pkey PRIMARY KEY (id);
+
+ALTER TABLE ONLY drp_audit_chain
+    ADD CONSTRAINT drp_audit_chain_pkey PRIMARY KEY (id);
+
+ALTER TABLE ONLY drp_findings
+    ADD CONSTRAINT drp_findings_pkey PRIMARY KEY (id);
+
+ALTER TABLE ONLY ingestion_events
+    ADD CONSTRAINT ingestion_events_event_key_key UNIQUE (event_key);
+
+ALTER TABLE ONLY ingestion_events
+    ADD CONSTRAINT ingestion_events_pkey PRIMARY KEY (id);
+
+ALTER TABLE ONLY assets
+    ADD CONSTRAINT pk_assets PRIMARY KEY (id);
+
+ALTER TABLE ONLY dns_security_observations
+    ADD CONSTRAINT pk_dns_security_observations PRIMARY KEY (id);
+
+ALTER TABLE ONLY drp_audit_logs
+    ADD CONSTRAINT pk_drp_audit_logs PRIMARY KEY (id);
+
+ALTER TABLE ONLY drp_breaches
+    ADD CONSTRAINT pk_drp_breaches PRIMARY KEY (id);
+
+ALTER TABLE ONLY drp_connectors
+    ADD CONSTRAINT pk_drp_connectors PRIMARY KEY (id);
+
+ALTER TABLE ONLY drp_modules
+    ADD CONSTRAINT pk_drp_modules PRIMARY KEY (id);
+
+ALTER TABLE ONLY drp_phishing_domains
+    ADD CONSTRAINT pk_drp_phishing_domains PRIMARY KEY (id);
+
+ALTER TABLE ONLY drp_refresh_families
+    ADD CONSTRAINT pk_drp_refresh_families PRIMARY KEY (id);
+
+ALTER TABLE ONLY jobs
+    ADD CONSTRAINT pk_jobs PRIMARY KEY (id);
+
+ALTER TABLE ONLY report_artifact_cleanup
+    ADD CONSTRAINT pk_report_artifact_cleanup PRIMARY KEY (artifact_name);
+
+ALTER TABLE ONLY report_audit_outbox
+    ADD CONSTRAINT pk_report_audit_outbox PRIMARY KEY (id);
+
+ALTER TABLE ONLY report_queue_control
+    ADD CONSTRAINT pk_report_queue_control PRIMARY KEY (id);
+
+ALTER TABLE ONLY reports
+    ADD CONSTRAINT pk_reports PRIMARY KEY (id);
+
+ALTER TABLE ONLY system_settings
+    ADD CONSTRAINT pk_system_settings PRIMARY KEY (id);
+
+ALTER TABLE ONLY users
+    ADD CONSTRAINT pk_users PRIMARY KEY (id);
+
+ALTER TABLE ONLY schedule_occurrences
+    ADD CONSTRAINT schedule_occurrences_pkey PRIMARY KEY (key);
+
+ALTER TABLE ONLY source_accounts
+    ADD CONSTRAINT source_accounts_pkey PRIMARY KEY (id);
+
+ALTER TABLE ONLY source_observations
+    ADD CONSTRAINT source_observations_pkey PRIMARY KEY (id);
+
+ALTER TABLE ONLY drp_breaches
+    ADD CONSTRAINT uq_breach_email UNIQUE (source_id, breach_name, matched_email);
+
+ALTER TABLE ONLY dns_expiry_monitors
+    ADD CONSTRAINT uq_dns_expiry_monitor_asset_kind UNIQUE (asset_id, kind);
+
+ALTER TABLE ONLY dns_security_observations
+    ADD CONSTRAINT uq_dns_observation_source_key UNIQUE (source, observation_key);
+
+ALTER TABLE ONLY drp_audit_logs
+    ADD CONSTRAINT uq_drp_audit_logs_seq UNIQUE (seq);
+
+ALTER TABLE ONLY drp_connectors
+    ADD CONSTRAINT uq_drp_connectors_name UNIQUE (name);
+
+ALTER TABLE ONLY drp_phishing_domains
+    ADD CONSTRAINT uq_drp_phishing_domains_phishing_domain UNIQUE (phishing_domain);
+
+ALTER TABLE ONLY drp_refresh_families
+    ADD CONSTRAINT uq_drp_refresh_families_family_id UNIQUE (family_id);
+
+ALTER TABLE ONLY drp_findings
+    ADD CONSTRAINT uq_findings_module_dedup UNIQUE (module, dedup_key);
+
+ALTER TABLE ONLY jobs
+    ADD CONSTRAINT uq_jobs_schedule_key UNIQUE (schedule_key);
+
+ALTER TABLE ONLY drp_modules
+    ADD CONSTRAINT uq_modules_finding_kind UNIQUE (finding_kind);
+
+ALTER TABLE ONLY report_audit_outbox
+    ADD CONSTRAINT uq_report_audit_outbox_event_key UNIQUE (event_key);
+
+ALTER TABLE ONLY source_accounts
+    ADD CONSTRAINT uq_source_account UNIQUE (source_id, name);
+
+ALTER TABLE ONLY source_observations
+    ADD CONSTRAINT uq_source_observation UNIQUE (module, source, observation_key);
+
+ALTER TABLE ONLY system_settings
+    ADD CONSTRAINT uq_system_settings_singleton_key UNIQUE (singleton_key);
+
+ALTER TABLE ONLY users
+    ADD CONSTRAINT uq_users_email UNIQUE (email);
+
+ALTER TABLE ONLY breach_catalogue
+    ADD CONSTRAINT pk_breach_catalogue PRIMARY KEY (id);
+
+ALTER TABLE ONLY breach_catalogue
+    ADD CONSTRAINT uq_breach_catalogue_incident UNIQUE (source, breach_name);
+
+ALTER TABLE ONLY certificate_scope_exceptions
+    ADD CONSTRAINT certificate_scope_exceptions_pkey PRIMARY KEY (id);
+
+ALTER TABLE ONLY certificate_scope_exceptions
+    ADD CONSTRAINT uq_certificate_scope_exception UNIQUE (match_kind, match_value);
+
+ALTER TABLE ONLY phishing_candidate_signals
+    ADD CONSTRAINT phishing_candidate_signals_pkey PRIMARY KEY (id);
+
+ALTER TABLE ONLY tls_certificate_identities
+    ADD CONSTRAINT tls_certificate_identities_pkey PRIMARY KEY (id);
+
+ALTER TABLE ONLY tls_certificate_identities
+    ADD CONSTRAINT uq_tls_identity_fingerprint_sha256 UNIQUE (fingerprint_sha256);
+
+ALTER TABLE ONLY tls_certificate_sightings
+    ADD CONSTRAINT tls_certificate_sightings_pkey PRIMARY KEY (id);
+
+ALTER TABLE ONLY tls_certificate_sightings
+    ADD CONSTRAINT uq_tls_sighting_identity_endpoint_source UNIQUE (identity_id, ip, port, source);
+
+
+-- ---------------------------------------------------------------------------
+-- Indexes
+-- ---------------------------------------------------------------------------
+
+CREATE INDEX ix_alert_deliveries_batch_id ON alert_deliveries USING btree (batch_id);
+
+CREATE INDEX ix_alert_deliveries_channel ON alert_deliveries USING btree (channel);
+
+CREATE INDEX ix_alert_deliveries_job_id ON alert_deliveries USING btree (job_id);
+
+CREATE INDEX ix_alert_deliveries_next_attempt_at ON alert_deliveries USING btree (next_attempt_at);
+
+CREATE INDEX ix_alert_deliveries_status ON alert_deliveries USING btree (status);
+
+CREATE INDEX ix_alert_deliveries_target ON alert_deliveries USING btree (target);
+
+CREATE INDEX ix_alert_deliveries_threat_type ON alert_deliveries USING btree (threat_type);
+
+CREATE INDEX ix_alert_delivery_due ON alert_deliveries USING btree (status, next_attempt_at, created_at);
+
+CREATE INDEX ix_assets_asset_type ON assets USING btree (asset_type);
+
+CREATE INDEX ix_assets_asset_value_trgm ON assets USING gin (asset_value gin_trgm_ops);
+
+CREATE INDEX ix_assets_created_at_id ON assets USING btree (created_at, id);
+
+CREATE INDEX ix_assets_normalized_value_key ON assets USING btree (lower(rtrim(TRIM(BOTH FROM COALESCE(normalized_value, asset_value)), '.'::text)));
+
+CREATE INDEX ix_assets_normalized_value_trgm ON assets USING gin (normalized_value gin_trgm_ops);
+
+CREATE INDEX ix_audit_job_id ON drp_audit_logs USING btree (((details ->> 'job_id'::text)));
+
+CREATE INDEX ix_audit_request_id ON drp_audit_logs USING btree (((details ->> 'request_id'::text)));
+
+CREATE INDEX ix_audit_timestamp_id ON drp_audit_logs USING btree ("timestamp", id);
+
+CREATE INDEX ix_breach_catalogue_source_domain ON breach_catalogue USING btree (source, domain);
+
+CREATE INDEX ix_dns_expiry_monitor_due ON dns_expiry_monitors USING btree (state, expires_at);
+
+CREATE INDEX ix_dns_observation_expires ON dns_security_observations USING btree (expires_at);
+
+CREATE INDEX ix_dns_observation_source_seen ON dns_security_observations USING btree (source, last_seen_at);
+
+CREATE INDEX ix_dns_observation_subject_type ON dns_security_observations USING btree (subject, observation_type);
+
+CREATE INDEX ix_dns_security_observations_observation_type ON dns_security_observations USING btree (observation_type);
+
+CREATE INDEX ix_dns_security_observations_source ON dns_security_observations USING btree (source);
+
+CREATE INDEX ix_dns_security_observations_subject ON dns_security_observations USING btree (subject);
+
+CREATE INDEX ix_dns_security_observations_subject_key ON dns_security_observations USING btree (lower(rtrim(TRIM(BOTH FROM subject), '.'::text)));
+
+CREATE INDEX ix_dns_security_observations_value_key ON dns_security_observations USING btree (lower(rtrim(TRIM(BOTH FROM value), '.'::text)));
+
+CREATE INDEX ix_drp_audit_logs_action ON drp_audit_logs USING btree (action);
+
+CREATE INDEX ix_drp_audit_logs_entry_hash ON drp_audit_logs USING btree (entry_hash);
+
+CREATE INDEX ix_drp_audit_logs_timestamp ON drp_audit_logs USING btree ("timestamp");
+
+CREATE INDEX ix_drp_audit_logs_user_id ON drp_audit_logs USING btree (user_id);
+
+CREATE INDEX ix_drp_audit_logs_user_timestamp ON drp_audit_logs USING btree (user_id, "timestamp");
+
+CREATE INDEX ix_drp_breaches_exposure_kind ON drp_breaches USING btree (exposure_kind);
+
+CREATE INDEX ix_drp_breaches_matched_domain ON drp_breaches USING btree (matched_domain);
+
+CREATE INDEX ix_drp_breaches_severity ON drp_breaches USING btree (severity);
+
+CREATE INDEX ix_drp_breaches_matched_domain_key ON drp_breaches USING btree (lower(rtrim(TRIM(BOTH FROM matched_domain), '.'::text)));
+
+CREATE INDEX ix_drp_breaches_matched_email ON drp_breaches USING btree (matched_email);
+
+CREATE INDEX ix_drp_breaches_matched_email_domain ON drp_breaches USING btree (lower(split_part((matched_email)::text, '@'::text, 2)));
+
+CREATE INDEX ix_drp_breaches_matched_email_key ON drp_breaches USING btree (lower(rtrim(TRIM(BOTH FROM matched_email), '.'::text)));
+
+CREATE INDEX ix_drp_breaches_status ON drp_breaches USING btree (status);
+
+CREATE INDEX ix_drp_connectors_connector_type ON drp_connectors USING btree (connector_type);
+
+CREATE UNIQUE INDEX ix_drp_connectors_name ON drp_connectors USING btree (name);
+
+CREATE UNIQUE INDEX ix_drp_connectors_token_hash ON drp_connectors USING btree (token_hash);
+
+CREATE INDEX ix_drp_findings_connector_name ON drp_findings USING btree (connector_name);
+
+CREATE INDEX ix_drp_findings_matched_asset ON drp_findings USING btree (matched_asset);
+
+CREATE INDEX ix_drp_findings_matched_asset_key ON drp_findings USING btree (lower(rtrim(TRIM(BOTH FROM matched_asset), '.'::text)));
+
+CREATE INDEX ix_drp_findings_module_created ON drp_findings USING btree (module, created_at);
+
+CREATE INDEX ix_drp_findings_status ON drp_findings USING btree (status);
+
+CREATE INDEX ix_drp_phishing_domains_matched_asset ON drp_phishing_domains USING btree (matched_asset);
+
+CREATE INDEX ix_drp_phishing_domains_matched_asset_key ON drp_phishing_domains USING btree (lower(rtrim(TRIM(BOTH FROM matched_asset), '.'::text)));
+
+CREATE UNIQUE INDEX ix_drp_phishing_domains_phishing_domain ON drp_phishing_domains USING btree (phishing_domain);
+
+CREATE INDEX ix_drp_phishing_domains_status ON drp_phishing_domains USING btree (status);
+
+CREATE UNIQUE INDEX ix_drp_refresh_families_family_id ON drp_refresh_families USING btree (family_id);
+
+CREATE INDEX ix_drp_refresh_families_revoked ON drp_refresh_families USING btree (revoked);
+
+CREATE INDEX ix_drp_refresh_families_user_id ON drp_refresh_families USING btree (user_id);
+
+CREATE INDEX ix_jobs_connector_id ON jobs USING btree (connector_id);
+
+CREATE INDEX ix_jobs_created_by ON jobs USING btree (created_by);
+
+CREATE INDEX ix_jobs_job_type ON jobs USING btree (job_type);
+
+CREATE INDEX ix_jobs_lease_expires_at ON jobs USING btree (lease_expires_at);
+
+CREATE INDEX ix_jobs_status ON jobs USING btree (status);
+
+CREATE INDEX ix_jobs_task_id ON jobs USING btree (task_id);
+
+CREATE INDEX ix_phishing_candidate_signals_candidate ON phishing_candidate_signals USING btree (candidate_id);
+
+
+CREATE INDEX ix_report_artifact_cleanup_available_at ON report_artifact_cleanup USING btree (available_at);
+
+CREATE INDEX ix_report_artifact_cleanup_report_id ON report_artifact_cleanup USING btree (report_id);
+
+CREATE INDEX ix_report_audit_outbox_available_at ON report_audit_outbox USING btree (available_at);
+
+CREATE INDEX ix_report_audit_outbox_report_id ON report_audit_outbox USING btree (report_id);
+
+CREATE INDEX ix_reports_created_at ON reports USING btree (created_at);
+
+CREATE INDEX ix_reports_status ON reports USING btree (status);
+
+CREATE INDEX ix_source_observations_matched_asset ON source_observations USING btree (matched_asset);
+
+CREATE INDEX ix_source_observations_matched_asset_key ON source_observations USING btree (lower(rtrim(TRIM(BOTH FROM matched_asset), '.'::text)));
+
+CREATE INDEX ix_source_observations_module_seen ON source_observations USING btree (module, last_seen_at);
+
+CREATE INDEX ix_tls_exception_kind_value ON certificate_scope_exceptions USING btree (match_kind, match_value);
+
+CREATE INDEX ix_tls_identity_serial ON tls_certificate_identities USING btree (serial_hex);
+
+CREATE INDEX ix_tls_identity_spki ON tls_certificate_identities USING btree (spki_sha256);
+
+CREATE INDEX ix_tls_sighting_identity ON tls_certificate_sightings USING btree (identity_id);
+
+CREATE INDEX ix_tls_sighting_ip ON tls_certificate_sightings USING btree (ip);
+
+CREATE INDEX ix_tls_sighting_verdict ON tls_certificate_sightings USING btree (verdict);
+
+
+CREATE UNIQUE INDEX ix_users_email ON users USING btree (email);
+
+CREATE UNIQUE INDEX uq_assets_type_normalized_value ON assets USING btree (asset_type, normalized_value) WHERE (normalized_value IS NOT NULL);
+
+CREATE UNIQUE INDEX uq_breach_domain_only ON drp_breaches USING btree (source_id, breach_name, matched_domain) WHERE ((matched_domain IS NOT NULL) AND (matched_email IS NULL));
+
+-- ---------------------------------------------------------------------------
+-- Foreign keys
+-- ---------------------------------------------------------------------------
+
+ALTER TABLE ONLY alert_deliveries
+    ADD CONSTRAINT alert_deliveries_job_id_fkey FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE SET NULL;
+
+ALTER TABLE ONLY certificate_scope_exceptions
+    ADD CONSTRAINT certificate_scope_exceptions_created_by_fkey FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE SET NULL;
+
+
+ALTER TABLE ONLY dns_expiry_monitors
+    ADD CONSTRAINT dns_expiry_monitors_asset_id_fkey FOREIGN KEY (asset_id) REFERENCES assets(id) ON DELETE CASCADE;
+
+ALTER TABLE ONLY dns_expiry_monitors
+    ADD CONSTRAINT dns_expiry_monitors_observation_id_fkey FOREIGN KEY (observation_id) REFERENCES dns_security_observations(id) ON DELETE SET NULL;
+
+ALTER TABLE ONLY drp_connectors
+    ADD CONSTRAINT drp_connectors_source_account_id_fkey FOREIGN KEY (source_account_id) REFERENCES source_accounts(id) ON DELETE SET NULL;
+
+ALTER TABLE ONLY drp_findings
+    ADD CONSTRAINT drp_findings_module_fkey FOREIGN KEY (module) REFERENCES drp_modules(id) ON DELETE RESTRICT;
+
+ALTER TABLE ONLY drp_refresh_families
+    ADD CONSTRAINT fk_drp_refresh_families_user_id_users FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE;
+
+ALTER TABLE ONLY jobs
+    ADD CONSTRAINT fk_jobs_created_by_users FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE SET NULL;
+
+ALTER TABLE ONLY reports
+    ADD CONSTRAINT fk_reports_created_by_users FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE SET NULL;
+
+ALTER TABLE ONLY ingestion_events
+    ADD CONSTRAINT ingestion_events_job_id_fkey FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE SET NULL;
+
+ALTER TABLE ONLY jobs
+    ADD CONSTRAINT jobs_connector_id_fkey FOREIGN KEY (connector_id) REFERENCES drp_connectors(id) ON DELETE SET NULL;
+
+ALTER TABLE ONLY schedule_occurrences
+    ADD CONSTRAINT schedule_occurrences_job_id_fkey FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE SET NULL;
+
+ALTER TABLE ONLY phishing_candidate_signals
+    ADD CONSTRAINT phishing_candidate_signals_candidate_id_fkey FOREIGN KEY (candidate_id) REFERENCES drp_phishing_domains(id) ON DELETE CASCADE;
+
+
+ALTER TABLE ONLY source_observations
+    ADD CONSTRAINT source_observations_candidate_id_fkey FOREIGN KEY (candidate_id) REFERENCES drp_phishing_domains(id) ON DELETE CASCADE;
+
+ALTER TABLE ONLY source_observations
+    ADD CONSTRAINT source_observations_connector_id_fkey FOREIGN KEY (connector_id) REFERENCES drp_connectors(id) ON DELETE SET NULL;
+
+ALTER TABLE ONLY source_observations
+    ADD CONSTRAINT source_observations_source_account_id_fkey FOREIGN KEY (source_account_id) REFERENCES source_accounts(id) ON DELETE SET NULL;
+
+ALTER TABLE ONLY tls_certificate_sightings
+    ADD CONSTRAINT tls_certificate_sightings_identity_id_fkey FOREIGN KEY (identity_id) REFERENCES tls_certificate_identities(id) ON DELETE CASCADE;
+
+ALTER TABLE ONLY tls_certificate_sightings
+    ADD CONSTRAINT tls_certificate_sightings_reviewed_by_fkey FOREIGN KEY (reviewed_by) REFERENCES users(id) ON DELETE SET NULL;
+

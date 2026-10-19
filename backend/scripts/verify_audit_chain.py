@@ -17,7 +17,7 @@ Run inside the backend container:
     docker compose exec backend python -m scripts.verify_audit_chain --full
     python -m scripts.verify_audit_chain --ndjson /backups/audit-2026-09.ndjson
 
-Exit codes: 0 verified, 1 the chain does not verify, 2 unusable input.
+Exit codes: 0 fully verified, 1 broken, 2 unusable input, 3 incomplete (row cap).
 """
 
 from __future__ import annotations
@@ -79,7 +79,7 @@ async def _verify_database(
         )
     else:
         _print_report(result, full=full, keys=len(chain_keys()))
-    return 0 if result.ok else 1
+    return (3 if result.truncated else 0) if result.ok else 1
 
 
 def _verify_ndjson(path: Path) -> int:

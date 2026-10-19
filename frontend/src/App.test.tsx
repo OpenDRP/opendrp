@@ -25,6 +25,7 @@ vi.mock("@/pages/DashboardPage", () => ({ default: () => <div>Dashboard page</di
 vi.mock("@/pages/AssetsPage", () => ({ default: () => <div>Assets page</div> }));
 vi.mock("@/pages/PhishingPage", () => ({ default: () => <div>Phishing page</div> }));
 vi.mock("@/pages/BreachesPage", () => ({ default: () => <div>Breaches page</div> }));
+vi.mock("@/pages/DNSSecurityPage", () => ({ default: () => <div>DNS Security page</div> }));
 vi.mock("@/pages/ReportsPage", () => ({ default: () => <div>Reports page</div> }));
 vi.mock("@/pages/SecurityPage", () => ({ default: () => <div>Security page</div> }));
 vi.mock("@/pages/OnboardingPage", () => ({ default: () => <div>Onboarding page</div> }));

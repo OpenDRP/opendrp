@@ -10,7 +10,8 @@ frontend sources never reached GitHub and the published build could not resolve
 
 This check lists the files git reports as ignored, keeps only the ones that look
 like source, and fails if any of them is outside a known build or dependency
-directory. Run it from the repository root:
+directory or a directory whose ignore rule is deliberate (see
+`ALLOWED_IGNORED_DIRS` below). Run it from the repository root:
 
     python scripts/check_tracked_sources.py [repo-root]
 
@@ -20,6 +21,7 @@ a git checkout (the backend container mounts only its own subtree).
 
 from __future__ import annotations
 
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -51,6 +53,13 @@ SOURCE_SUFFIXES = {
 
 # Filenames without a useful suffix that still carry source.
 SOURCE_NAMES = {"Dockerfile", "Makefile", ".gitattributes", ".gitignore", ".dockerignore"}
+
+#: A directory that is a Python virtual environment: `.venv`, `venv3`,
+#: `.venv-alerts`, `.venv313`. The shape is `venv` (optionally dot-prefixed,
+#: as `.gitignore` spells it) followed only by a version or a suffix. Letters are
+#: part of that suffix -- `.venv-alerts` is a name a developer really used -- and
+#: leaving them out of the class is why the gate failed on its own author.
+_VENV_DIR = re.compile(r"^\.?venv[0-9a-z._-]*$", re.IGNORECASE)
 
 # Directories whose ignored contents are expected: dependencies, caches and
 # build output. Anything else that is ignored is treated as a mistake.
@@ -87,6 +96,24 @@ ALLOWED_IGNORED = {
     "coverage-full.json",
 }
 
+# Directories whose ignored contents are deliberate for a reason other than being
+# build output: `docs/internal/` holds the audits and remediation plans this
+# project wrote for itself, and `.gitignore` keeps them out of the repository on
+# purpose -- the decision and its reason are recorded in
+# `docs/internal/repo-hygiene-cleanup-2026-10-11.md`. A checkout that happens to
+# hold them is therefore not a checkout that is missing source, which is the
+# defect this gate exists for. The `lib/` incident that motivated the gate is the
+# opposite case -- real code under an ignored directory -- and still fails.
+ALLOWED_IGNORED_DIRS = {"docs/internal"}
+
+
+def _is_in_allowed_ignored_dir(path: str) -> bool:
+    """True for a path inside a directory whose ignore rule is deliberate."""
+    return any(
+        path == directory or path.startswith(f"{directory}/")
+        for directory in ALLOWED_IGNORED_DIRS
+    )
+
 
 def _run(args: list[str], root: Path) -> str:
     result = subprocess.run(args, cwd=root, capture_output=True, text=True, check=False)
@@ -111,7 +138,15 @@ def _ignored_files(root: Path) -> list[str]:
 
 
 def _is_artifact(path: str) -> bool:
-    return bool(set(Path(path).parts) & ARTIFACT_DIRS)
+    parts = set(Path(path).parts)
+    if parts & ARTIFACT_DIRS:
+        return True
+    # A virtual environment is an artifact whatever it is called. `.venv`,
+    # `venv` and `env` are the names the rules knew; a developer who keeps two of
+    # them side by side (`.venv313`, `.venv-alerts`) got a red `repo-hygiene` job
+    # for a file that has nothing to do with the change being tested. The shape
+    # is matched rather than listed, so the next name does not need a commit.
+    return any(_VENV_DIR.match(part) for part in parts)
 
 
 def _looks_like_source(path: str) -> bool:
@@ -149,6 +184,7 @@ def main(argv: list[str]) -> int:
         path
         for path in _ignored_files(root)
         if Path(path).name not in ALLOWED_IGNORED
+        and not _is_in_allowed_ignored_dir(path)
         and not _is_artifact(path)
         and _looks_like_source(path)
     ]

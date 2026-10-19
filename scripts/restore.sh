@@ -14,8 +14,8 @@
 #
 # Typical use, in this order:
 #
-#   docker compose stop backend celery-worker celery-beat connector-dnstwist \
-#                        connector-shodan connector-hibp
+#   docker compose stop backend celery-worker celery-beat connector-phishing-dnstwist \
+#                        connector-phishing-shodan connector-breaches-hibp
 #   make restore FILE=backups/opendrp-20260913T041500Z.dump
 #   docker compose up -d
 #
@@ -68,7 +68,7 @@ if [ "${others:-0}" -gt 0 ]; then
     fail "${others} other client connection(s) to '${PGDATABASE}'.
        Stop the services that hold them first, then restore:
          docker compose stop backend celery-worker celery-beat \\
-                              connector-dnstwist connector-shodan connector-hibp"
+                              connector-phishing-dnstwist connector-phishing-shodan connector-breaches-hibp"
 fi
 
 if [ "${RESTORE_SKIP_SAFETY_COPY:-0}" != "1" ]; then

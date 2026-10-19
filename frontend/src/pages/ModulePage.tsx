@@ -12,7 +12,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { useToast } from "@/components/ui/use-toast";
 import { useModules } from "@/hooks/useModules";
 import { describeApiError } from "@/lib/api";
-import { formatDateTime } from "@/lib/datetime";
+import { TIME_ZONE_HINT, formatDateTime } from "@/lib/datetime";
 import { updateFindingStatus } from "@/lib/findings";
 import { fetchModuleFindings } from "@/lib/modules";
 import { useIsAnalystPlus } from "@/store/auth";
@@ -285,8 +285,7 @@ export default function ModulePage() {
           </p>
           <p className="text-xs text-muted-foreground mt-1">
             Module <span className="font-mono">{module.id}</span> · deduplicated on{" "}
-            {module.dedup_fields.map((name) => fieldLabel(module, name)).join(", ")} · all
-            times UTC
+            {module.dedup_fields.map((name) => fieldLabel(module, name)).join(", ")} · {TIME_ZONE_HINT}
           </p>
         </div>
         <Button variant="outline" onClick={() => refetchFindings()} disabled={isFetching}>

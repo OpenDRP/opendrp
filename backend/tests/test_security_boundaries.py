@@ -9,11 +9,13 @@ from app.api.deps import (
     extract_ip,
     get_current_user,
     require_admin,
-    require_analyst_or_admin,
-    require_viewer_plus,
+    require_analyse,
+    require_active_account,
 )
 from app.core.config import Settings, settings
 from app.schemas.connector import BreachFinding, PhishingFinding
+
+pytestmark = pytest.mark.usefixtures("without_testing_switch")
 
 
 def test_production_rejects_placeholder_like_secrets():
@@ -101,6 +103,29 @@ def test_extract_ip_ignores_forwarded_ip_from_untrusted_client():
     assert extract_ip(request) == "198.51.100.5"
 
 
+def test_extract_ip_does_not_believe_a_connector_network_address(monkeypatch):
+    """The connector network is the one part of the deployment we did not write.
+
+    Trusting its range is exactly what a connector would need to have its own
+    ``X-Forwarded-For`` entry win, and a forged client address is indistinguishable
+    from a real one once it is in the audit row. The edge, and only the edge, is
+    the hop in front of the API.
+    """
+    monkeypatch.setattr(
+        settings, "TRUSTED_PROXY_IPS", "127.0.0.1,::1,172.18.10.0/24"
+    )
+
+    forged = _request("172.18.30.7", {"x-forwarded-for": "203.0.113.9"})
+    assert extract_ip(forged) == "172.18.30.7"
+
+    # From the edge the same header is believed, and the client-supplied
+    # leftmost entry still loses to the hop nearest to us.
+    from_edge = _request(
+        "172.18.10.9", {"x-forwarded-for": "203.0.113.9, 198.51.100.7"}
+    )
+    assert extract_ip(from_edge) == "198.51.100.7"
+
+
 def test_extract_ip_without_request_is_unknown():
     assert extract_ip(None) == "unknown"
 
@@ -171,25 +196,32 @@ async def test_role_dependencies_enforce_admin_analyst_and_active_viewer():
     admin = _user("admin")
     analyst = _user("analyst")
     viewer = _user("viewer")
-    # `require_admin` is the one gate that is async and takes the request and the
-    # session: the optional second-factor requirement sits on top of the role
-    # check, and a refusal has to be audited with the address it came from.
+    # Every role gate is async and takes the request and the session now: the
+    # optional second-factor requirement sits on top of the role check, and a
+    # refusal has to be audited (`authz.denied`) with the address and route it
+    # came from — so a refusal needs the same context the check does.
     request = _request("127.0.0.1", {})
     db = AsyncMock()
     assert await require_admin(request, admin, db) is admin
-    assert require_analyst_or_admin(admin) is admin
-    assert require_analyst_or_admin(analyst) is analyst
-    assert require_viewer_plus(viewer) is viewer
+    assert await require_analyse(request, admin, db) is admin
+    assert await require_analyse(request, analyst, db) is analyst
+    assert await require_active_account(request, viewer, db) is viewer
 
     with pytest.raises(Exception) as exc_info:
         await require_admin(request, viewer, db)
     assert exc_info.value.status_code == 403
     with pytest.raises(Exception) as exc_info:
-        require_analyst_or_admin(viewer)
+        await require_analyse(request, viewer, db)
     assert exc_info.value.status_code == 403
+    # Activation is not re-checked here. `get_current_user` refuses an inactive
+    # account on every route (the test above pins that), and re-checking it was
+    # part of what made the old predicate read like a boundary while it enforced
+    # nothing. What this guard answers is the capability question — so a role the
+    # table does not know, which is the shape a fourth `UserRole` takes before it
+    # is placed there, is refused rather than silently admitted.
     with pytest.raises(Exception) as exc_info:
-        require_viewer_plus(_user("viewer", active=False))
-    assert exc_info.value.status_code == 401
+        await require_active_account(request, _user("auditor"), db)
+    assert exc_info.value.status_code == 403
 
 
     with pytest.raises(ValueError):

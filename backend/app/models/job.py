@@ -7,7 +7,7 @@ from datetime import datetime
 from enum import Enum as PyEnum
 from typing import Any
 
-from sqlalchemy import UUID, DateTime, ForeignKey, JSON, String, Text
+from sqlalchemy import DateTime, ForeignKey, JSON, String, Text, Uuid
 from sqlalchemy.orm import Mapped, mapped_column, relationship, validates
 
 from app.core.database import Base, TimestampMixin, UUIDMixin
@@ -59,11 +59,12 @@ class Job(Base, UUIDMixin, TimestampMixin):
         index=True,
     )
     created_by: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True),
+        Uuid(as_uuid=True),
         ForeignKey("users.id", ondelete="SET NULL"),
         nullable=True,
         index=True,
     )
+    schedule_key: Mapped[str | None] = mapped_column(String(128), nullable=True, unique=True)
     task_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
     title: Mapped[str | None] = mapped_column(String(255), nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -80,6 +81,7 @@ class Job(Base, UUIDMixin, TimestampMixin):
     lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     last_heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     attempt_count: Mapped[int] = mapped_column(default=0, nullable=False)
+    connector_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("drp_connectors.id", ondelete="SET NULL"), nullable=True, index=True)
     claimed_by_connector: Mapped[str | None] = mapped_column(String(100), nullable=True)
     lease_token: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
@@ -106,3 +108,10 @@ class Job(Base, UUIDMixin, TimestampMixin):
         if vs not in _JOB_STATUSES:
             raise ValueError(f"status invalid: {vs}")
         return vs
+
+
+class ScheduleOccurrence(Base):
+    __tablename__ = "schedule_occurrences"
+    key: Mapped[str] = mapped_column(String(128), primary_key=True)
+    job_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("jobs.id", ondelete="SET NULL"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

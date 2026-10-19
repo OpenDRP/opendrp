@@ -17,6 +17,8 @@ stay HS256 JWTs signed with ``JWT_SECRET_KEY``, so existing password hashes and
 already-issued refresh-token families keep working.
 """
 
+import asyncio
+import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 from uuid import uuid4
@@ -137,3 +139,36 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
         )
     except (ValueError, TypeError, UnicodeEncodeError):
         return False
+
+
+#: A real bcrypt hash of a value nothing knows, used to keep a login for an
+#: unknown address as expensive as one for a known address.
+#:
+#: Computed at import rather than on the first failed sign-in. It was built
+#: lazily inside the handler, which moved a ~230 ms bcrypt call into the first
+#: request that happened to miss — on the event loop, in the one place the code
+#: was trying not to be observable. At import the cost lands on process start,
+#: where nothing is waiting on it, and the request path is uniform from the first
+#: attempt.
+DUMMY_PASSWORD_HASH = hash_password(secrets.token_urlsafe(32))
+
+
+async def hash_password_async(password: str) -> str:
+    """Hash a password without occupying the event loop.
+
+    bcrypt is deliberately slow — 12 rounds is ~230 ms on the hardware this was
+    measured on — and it releases the GIL, so moving it to a worker thread costs
+    nothing in throughput while it stops one sign-in from freezing every other
+    request in the process. Five logins used to block the loop for 1.16 s
+    (measured, see ``docs/production-readiness.md``); the same five now leave the
+    loop answering in a few milliseconds.
+
+    The synchronous ``hash_password`` stays for the CLI and the seed script, which
+    have no event loop to protect.
+    """
+    return await asyncio.to_thread(hash_password, password)
+
+
+async def verify_password_async(plain_password: str, hashed_password: str) -> bool:
+    """Verify a password on a worker thread; see ``hash_password_async``."""
+    return await asyncio.to_thread(verify_password, plain_password, hashed_password)

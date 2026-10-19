@@ -13,6 +13,13 @@ _DEFAULT_ENCRYPTION_KEY = "Z0FBQUFBQm1hbmRvbV9rZXlfZm9yX2ZlbmNyeXB0aW9uXzMyYnl0Z
 # would let a public key be used as an HMAC secret).
 JWT_ALGORITHMS_ALLOWED = frozenset({"HS256", "HS384", "HS512"})
 
+#: What ``ALERT_BREACH_NOISE_POLICY`` accepts, as one list rather than a rule in two
+#: places. It lives here instead of beside :mod:`app.services.alert_policy` because
+#: the schema below validates it while this module is still importing, and a module
+#: that reads ``settings`` cannot be imported from that point; the policy module
+#: imports this name the other way round.
+BREACH_NOISE_POLICIES: tuple[str, ...] = ("store_only_spam", "verified_only", "all")
+
 _INSECURE_SECRET_MARKERS = (
     "changethis",
     "change-me",
@@ -117,6 +124,7 @@ class Settings(BaseSettings):
     # Pinned image/release identifier. Production deployments must provide a
     # semantic version rather than the moving `latest` tag.
     OPENDRP_VERSION: str = Field(default="")
+    DNS_EXPIRY_MAX_AGE_HOURS: int = Field(default=48, ge=1, le=720)
     #: Minimum level for platform log records. Audit events ignore it: they are
     #: records rather than diagnostics, and no level setting may be able to stop
     #: the platform recording who deleted an asset. See core/logging_config.py.
@@ -140,6 +148,14 @@ class Settings(BaseSettings):
     # routes only — ``/auth/mfa/*`` stays reachable so the administrator can fix
     # their own situation, and each refusal is audited as ``auth.mfa.required``.
     REQUIRE_MFA_FOR_ADMINS: bool = Field(default=False)
+    # The same policy expressed as a list of roles, because "which accounts owe a
+    # factor" is a deployment decision and "administrators only" was only ever one
+    # answer to it. Comma-separated role names; an empty value with the flag above
+    # false means the factor stays optional for everybody. Both settings are read:
+    # the roles here plus `admin` when the flag is set (app/core/mfa_policy.py is
+    # the single reader), so enabling the list never silently disables the flag an
+    # installation already relies on.
+    REQUIRE_MFA_ROLES: str = Field(default="")
     # Keys that may still *decrypt* stored values but no longer encrypt:
     # comma-separated, newest first, and empty outside a rotation. Together with
     # `scripts/rotate_keys` they make replacing `ENCRYPTION_KEY` a procedure that
@@ -163,6 +179,11 @@ class Settings(BaseSettings):
     CONNECTOR_JOB_LEASE_SECONDS: int = Field(default=180, ge=30, le=86400)
     CONNECTOR_JOB_MAX_ATTEMPTS: int = Field(default=3, ge=1, le=20)
     ALERT_HEALTH_CHECK_TIMEOUT_SECONDS: int = Field(default=15, ge=1, le=60)
+    # How long a channel's probe result is reused before the next health request
+    # dials again. The question changes on the scale of minutes, and every miss
+    # is a real SMTP handshake held from a pool of four; ``0`` answers every
+    # request with a probe, which is what the endpoint did before the cache.
+    ALERT_HEALTH_CACHE_SECONDS: int = Field(default=60, ge=0, le=3600)
     # One wall-clock budget for a single provider delivery attempt. It applies
     # consistently to SMTP and Telegram; retries are bounded separately.
     ALERT_DELIVERY_TIMEOUT_SECONDS: float = Field(default=20, ge=1, le=300)
@@ -170,12 +191,96 @@ class Settings(BaseSettings):
     ALERT_DELIVERY_RETRY_BASE_SECONDS: float = Field(default=2, ge=0.1, le=60)
     # Findings from one connector job wait briefly in the durable queue so the
     # worker can send one summary instead of one message per finding.
+    ALERT_RECIPIENT_INTERVAL_SECONDS: float = Field(default=1, ge=0, le=3600)
+    # How long a recipient stays held after a delivery whose outcome is unknown
+    # (a worker died mid-send, or an SMTP thread timed out). A timed-out thread
+    # may still have delivered, so retrying immediately would duplicate the
+    # notification; holding forever would silence that recipient for good, which
+    # is the failure this setting exists to bound. An operator may end the hold
+    # early from the alerts view once they have reconciled the ambiguity.
+    ALERT_RECIPIENT_HOLD_SECONDS: int = Field(default=900, ge=60, le=86400)
+    AUDIT_ARCHIVE_DIR: str = ""
+    AUDIT_RETENTION_HOLD: bool = False
+    ALERT_HISTORY_RETENTION_DAYS: int = Field(default=90, ge=0, le=3650)
+    #: How long a certificate identity or sighting is kept after it was last observed.
+    #: The sighting tables grow with every scan and every provider read, so they need
+    #: the same bound the alert history has; 0 disables the sweep.
+    TLS_CERTIFICATE_RETENTION_DAYS: int = Field(default=365, ge=0, le=3650)
     ALERT_AGGREGATION_DELAY_SECONDS: int = Field(default=10, ge=0, le=300)
+    # The phishing module's alert budget (WI-07): a candidate's confidence score
+    # decides how loudly the channel reports it. At or above the direct threshold
+    # the candidate alerts as soon as its signals are known; between the two it
+    # waits for the daily digest; below the digest threshold it is list-only, which
+    # is where most lookalikes belong. The score itself is `Σ weights` computed by
+    # app/services/phishing_score_service.py from the facts a candidate was observed
+    # with, and the thresholds are settings because how noisy a channel may be is a
+    # deployment's policy rather than a fact about a lookalike.
+    ALERT_CONFIDENCE_DIRECT: int = Field(default=60, ge=1, le=100)
+    ALERT_CONFIDENCE_DIGEST: int = Field(default=30, ge=0, le=99)
+    # The daily digest is the middle band's channel: a candidate that is not worth
+    # interrupting someone for is still reported once a day, so the channel is
+    # neither silent nor noisy. Turning it off makes the budget binary — only
+    # candidates at or above the direct threshold are ever delivered, and
+    # everything below is list-only — which is a legitimate choice for an
+    # installation that wants the safest possible signal in its inbox.
+    ALERT_PHISHING_DIGEST_ENABLED: bool = True
+    #: The UTC hour the digest runs at, and the only knob that moves it. 06:15 is
+    #: deliberately after the default scan slots (02:30 and 03:30) so one message
+    #: carries the night's candidates rather than half of them; the quarter hour is
+    #: after the 05:30 DNS sweep as well, because both alerts share one queue.
+    ALERT_PHISHING_DIGEST_HOUR_UTC: int = Field(default=6, ge=0, le=23)
+    # A notification no configured channel can receive is *held*, not consumed:
+    # an installation is pointed at a mail server at some point, and the finding
+    # recorded before that is still worth reporting then. This is how long the
+    # drain waits before it tries such a row again, which is also what keeps a
+    # deployment with no channel from re-walking its whole backlog on every pass;
+    # the save that makes delivery possible reports what was held as one digest
+    # rather than waiting this window out. ``0`` holds nothing — a notification no
+    # channel can receive is consumed where it stands, which is what the platform
+    # did before this window existed.
+    ALERT_NO_CHANNEL_RETRY_HOURS: int = Field(default=24, ge=0, le=8760)
+    # A candidate is reported when it is first seen; whether a *revision* of one
+    # already reported is a second message is a deployment's choice. On, the
+    # channel says so when the thing moves to another address, publishes another
+    # port or is re-attributed to another brand — the four fields a connector
+    # actually revises on a live candidate (WI-03). Off, the row is still updated
+    # and the change is still visible in the list and its evidence; only the
+    # message is withheld, which is what an installation whose lookalikes flap on
+    # a shared host has asked for.
+    ALERT_CANDIDATE_CHANGE_NOTIFICATIONS: bool = True
+    # Credential breaches are the one module whose source classifies its own
+    # incidents, and two of those classes are not evidence a credential leaked:
+    # ``IsSpamList`` and ``IsFabricated`` are the provider saying so itself. This
+    # decides what the channel does with them. ``store_only_spam`` (the default)
+    # keeps the row - it is still visible in the list, with its flag - and sends no
+    # message; ``verified_only`` also silences an incident the source has not
+    # confirmed; ``all`` reports everything, which is what the platform did before
+    # this decision existed. Silence always needs a positive flag to act on: an
+    # incident whose flags never arrived is reported rather than assumed clean.
+    ALERT_BREACH_NOISE_POLICY: str = "store_only_spam"
+    # A scan that finds a hundred new incidents is a backlog, not a report: past
+    # this many new incidents in one scan, the scan's remaining notifications wait
+    # for the daily digest instead of arriving as separate messages. The hour is
+    # the phishing digest's (``ALERT_PHISHING_DIGEST_HOUR_UTC``), so an
+    # installation has one "summary hour" rather than two. ``0`` switches the
+    # deferral off and restores one message per scan.
+    ALERT_BREACH_DIGEST_THRESHOLD: int = Field(default=20, ge=0, le=500)
+    # An incident that was already reported is reported again only when it says
+    # something new (WI-08): the classes of data grew, the row came back after being
+    # resolved, or the number of affected accounts rose by at least this much. The
+    # floor exists because a source re-publishes an incident's count as it refines
+    # it - a correction of three accounts out of ten million is not news, and an
+    # installation that alerted on every such edit would be alerting on the source's
+    # bookkeeping.
+    ALERT_BREACH_GROWTH_FLOOR: int = Field(default=1, ge=1, le=1000000000)
     ALERT_MAX_FINDINGS_PER_MESSAGE: int = Field(default=50, ge=1, le=500)
     ALERT_MAX_TELEGRAM_MESSAGE_LENGTH: int = Field(default=3800, ge=500, le=4096)
     OUTBOUND_DNS_TIMEOUT_SECONDS: float = Field(default=3.0, ge=1, le=30)
     REPORT_MAX_ROWS: int = Field(default=5000, ge=100, le=50000)
     REPORT_GENERATION_TIMEOUT_SECONDS: int = Field(default=120, ge=10, le=1800)
+    REPORT_QUEUE_MAX_PENDING: int = Field(default=100, ge=1, le=10000)
+    REPORT_ENQUEUE_MAX_RETRIES: int = Field(default=2, ge=0, le=10)
+    REPORT_WORKER_CONCURRENCY: int = Field(default=2, ge=1, le=32)
 
     # Data retention. An audit table that receives a row per read is the fastest
     # growing object in the schema, and generated reports accumulate on disk
@@ -231,6 +336,38 @@ class Settings(BaseSettings):
     #: Shows up in ``pg_stat_activity``, which is how an operator finds out which
     #: container is holding the pool when the API is slow.
     DB_APPLICATION_NAME: str = Field(default="opendrp")
+
+    # --- Limits a schema migration runs under -------------------------------------
+    # A migration is the one process that changes the schema while the platform is
+    # still serving, so it is also the one most likely to wait on a lock: an
+    # ``ALTER TABLE`` behind an open transaction, or the baseline's index builds,
+    # which wait for every writer to finish. Without a bound that wait is invisible
+    # — the API container is simply unhealthy while `scripts.migrate` blocks, and
+    # the log names nothing — which is what these two settings close.
+    #
+    # They are deliberately *not* ``DB_LOCK_TIMEOUT_MS``/``DB_STATEMENT_TIMEOUT_MS``:
+    # the application's 5s lock bound is right for a request and wrong for an
+    # upgrade, and its 30s statement bound would fail the documented maintenance
+    # window on a populated database, where building the index families is the
+    # longest statement this platform ever runs.
+    #: How long a migration waits for a lock before failing with PostgreSQL's
+    #: ``lock_timeout`` error, which names the wait instead of looking like a hang.
+    #: 0 waits forever, which is what the bound exists to replace.
+    MIGRATION_LOCK_TIMEOUT_MS: int = Field(default=30000, ge=0, le=3600000)
+    #: How long one migration statement may run. 0 (the default) leaves it
+    #: unbounded on purpose: the index build in `docs/upgrading.md`'s maintenance
+    #: window is legitimate work, and an operator who wants it bounded sets this.
+    MIGRATION_STATEMENT_TIMEOUT_MS: int = Field(default=0, ge=0, le=86400000)
+
+    # --- Metrics -------------------------------------------------------------------
+    # The scrape token for `GET /api/v1/metrics`, presented as `X-Metrics-Token`.
+    # Empty — the default — means the endpoint does not exist: it answers 404, and
+    # nothing about the installation's backlog, connectors or audit position is
+    # published to whoever asks. Set it to enable scraping; the value is a
+    # credential like any other, which is why the production validator below
+    # refuses a short or placeholder one. Generate with:
+    #   python -c "import secrets; print(secrets.token_urlsafe(32))"
+    METRICS_TOKEN: str = Field(default="")
 
     UVICORN_WORKERS: int = Field(default=1, ge=1, le=32)
     # Never trust forwarded headers from arbitrary clients. In deployments with
@@ -305,6 +442,28 @@ class Settings(BaseSettings):
         )
         return keys
 
+    @field_validator("REQUIRE_MFA_ROLES")
+    @classmethod
+    def _validate_mfa_roles(cls, value: str) -> str:
+        """Refuse a role name this platform does not have.
+
+        A typo here is silent in the worst direction: the policy would require
+        nothing, every account would sail past the gate, and the operator would
+        believe the deployment demands a second factor. The names are the members
+        of ``UserRole`` (``app/models/user.py``); they are repeated here because
+        that module imports this one, and ``tests/test_mfa.py`` keeps the two in
+        step by requiring every member to be accepted.
+        """
+        known = {"admin", "analyst", "viewer"}
+        names = [item.strip().lower() for item in (value or "").split(",") if item.strip()]
+        unknown = sorted({name for name in names if name not in known})
+        if unknown:
+            raise ValueError(
+                f"REQUIRE_MFA_ROLES names unknown roles: {', '.join(unknown)} "
+                f"(known: {', '.join(sorted(known))})"
+            )
+        return ",".join(names)
+
     @field_validator("TRUSTED_PROXY_IPS", "UVICORN_FORWARDED_ALLOW_IPS")
     @classmethod
     def _validate_proxy_allowlist(cls, value: str, info) -> str:
@@ -326,6 +485,41 @@ class Settings(BaseSettings):
             except ValueError as exc:
                 raise ValueError(f"{info.field_name} contains invalid IP/CIDR: {candidate}") from exc
         return raw
+
+    @model_validator(mode="after")
+    def _validate_alert_confidence_bands(self):
+        """A digest threshold at or above the direct one leaves no middle band.
+
+        `ALERT_CONFIDENCE_DIGEST = ALERT_CONFIDENCE_DIRECT` reads as "digest
+        everything from 60 up", and is indistinguishable from switching the digest
+        off: every score that would have been digested alerts immediately instead,
+        so the feature looks configured while doing nothing. Clamping one value to
+        the other would decide for the operator which of the two they meant; the
+        pair is refused at startup instead, which names the setting to fix.
+        """
+        if self.ALERT_CONFIDENCE_DIGEST >= self.ALERT_CONFIDENCE_DIRECT:
+            raise ValueError(
+                "ALERT_CONFIDENCE_DIGEST must be below ALERT_CONFIDENCE_DIRECT: "
+                f"got {self.ALERT_CONFIDENCE_DIGEST} and "
+                f"{self.ALERT_CONFIDENCE_DIRECT}, which leaves no digest band"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_breach_noise_policy(self):
+        """An unrecognised policy would silently mean "report everything".
+
+        The value decides whether a spam or fabricated incident reaches the channel,
+        so a typo has to fail at startup rather than fall through to the loudest
+        branch: an operator who wrote ``store-only-spam`` asked for silence and must
+        not get the opposite while the setting looks configured.
+        """
+        if self.ALERT_BREACH_NOISE_POLICY not in BREACH_NOISE_POLICIES:
+            raise ValueError(
+                "ALERT_BREACH_NOISE_POLICY must be one of "
+                f"{', '.join(BREACH_NOISE_POLICIES)}: got {self.ALERT_BREACH_NOISE_POLICY!r}"
+            )
+        return self
 
     @model_validator(mode="after")
     def _validate_hsts(self):
@@ -444,6 +638,65 @@ class Settings(BaseSettings):
                     f"Set OPENDRP_NETWORK_SUBNET and the three subnet variables to "
                     f"one consistent set (see .env.example and docker-compose.yml)."
                 )
+
+        # Trusting a network means believing the addresses it puts in
+        # ``X-Forwarded-For``, so the trust list may name the edge — the only hop
+        # in front of the API — and nothing else of the deployment's own space.
+        # The connector network exists precisely to hold code this platform did
+        # not write (see docker-compose.yml), and the data network holds the API's
+        # own siblings; either one trusted means a container in it can attribute
+        # its actions to any address it likes. The parent range is refused for the
+        # same reason and because naming it is how the connector subnet starts
+        # being trusted by accident, which is the defect this check closes.
+        internal: list[tuple[str, object]] = []
+        for field_name, value in (
+            ("OPENDRP_DATA_SUBNET", self.OPENDRP_DATA_SUBNET),
+            ("OPENDRP_CONNECTOR_SUBNET", self.OPENDRP_CONNECTOR_SUBNET),
+        ):
+            try:
+                internal.append(
+                    (field_name, ipaddress.ip_network(str(value).strip(), strict=False))
+                )
+            except ValueError:
+                continue  # already reported by the loop above
+
+        for item in str(self.TRUSTED_PROXY_IPS).split(","):
+            entry = item.strip()
+            if not entry:
+                continue
+            try:
+                trusted = ipaddress.ip_network(entry, strict=False)
+            except ValueError:
+                continue  # a single address, or a value `extract_ip` ignores
+            for field_name, network in internal:
+                try:
+                    overlapped = trusted.overlaps(network)  # type: ignore[arg-type]
+                except TypeError:  # an IPv4 entry beside an IPv6 range
+                    overlapped = False
+                if overlapped:
+                    raise ValueError(
+                        f"TRUSTED_PROXY_IPS contains {trusted}, which covers "
+                        f"{field_name} ({network}): a container in that network "
+                        f"could then write any address it liked into the audit "
+                        f"trail. Trust loopback and OPENDRP_EDGE_SUBNET only."
+                    )
+            # The parent range is refused when an entry *contains* it. Overlap is
+            # the wrong question here: the edge subnet lives inside the parent by
+            # design, so the shipped value overlaps it and trusting the edge is
+            # the intended configuration.
+            try:
+                too_broad = trusted.supernet_of(parent)  # type: ignore[arg-type]
+            except TypeError:
+                too_broad = False
+            if too_broad:
+                raise ValueError(
+                    f"TRUSTED_PROXY_IPS contains {trusted}, which spans "
+                    f"OPENDRP_NETWORK_SUBNET ({parent}) and therefore every "
+                    f"container in the deployment, connectors included: a "
+                    f"container in any of those networks could then write any "
+                    f"address it liked into the audit trail. Trust loopback and "
+                    f"OPENDRP_EDGE_SUBNET only."
+                )
         return self
 
     @model_validator(mode="after")
@@ -452,7 +705,22 @@ class Settings(BaseSettings):
         if self.APP_ENV.lower() != "production":
             return self
 
+        import os
         import re
+
+        # `TESTING` is not a deployment setting: it exists for the test suite and
+        # switches two controls off — scan admission (`scan_admission._testing_mode`)
+        # and the Redis-backed login lockout and rate limits (`core.rate_limit`).
+        # A copied test `.env` or a debugging export would otherwise remove both in
+        # production, silently, and nothing in the configuration would say so.
+        testing = os.environ.get("TESTING", "").strip().lower()
+        if testing and testing not in {"0", "false", "no", "off"}:
+            raise ValueError(
+                "TESTING must not be set in production: it disables scan admission "
+                "and the Redis-backed login lockout, so a leaked test environment "
+                "would remove two controls without saying so. Unset TESTING in the "
+                "deployment environment, or set it to 0."
+            )
 
         secret_fields = ("JWT_SECRET_KEY", "ENCRYPTION_KEY")
         for field_name in secret_fields:
@@ -524,6 +792,15 @@ class Settings(BaseSettings):
             )
         if not self.AUTH_COOKIE_SECURE:
             raise ValueError("AUTH_COOKIE_SECURE must be true in production")
+        # Metrics are optional: an installation that does not scrape them leaves
+        # the token empty and the endpoint absent. A token that *is* set is a
+        # shared credential with read access to the platform's operational
+        # picture, so it is held to the same bar as the other secrets here.
+        if self.METRICS_TOKEN:
+            if len(self.METRICS_TOKEN) < 32:
+                raise ValueError("METRICS_TOKEN must contain at least 32 characters")
+            if _looks_like_shipped_secret(self.METRICS_TOKEN):
+                raise ValueError("METRICS_TOKEN must not be a placeholder value")
         if not self.TRUSTED_PROXY_IPS.strip():
             raise ValueError("TRUSTED_PROXY_IPS must be explicit in production")
         if self.UVICORN_FORWARDED_ALLOW_IPS.strip() == "*":

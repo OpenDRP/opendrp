@@ -8,12 +8,14 @@ import {
   jobStatusLabel,
   jobTypeLabel,
   threatStatusLabel,
+  verdictLabel,
 } from "@/lib/labels";
 
 describe("job labels", () => {
   it("keeps phishing labels source-agnostic", () => {
     expect(jobTypeLabel("phishing.dnstwist")).toBe("Phishing scan");
     expect(jobTypeLabel("phishing.shodan")).toBe("Phishing scan");
+    expect(jobTypeLabel("phishing.netlas")).toBe("Phishing scan");
   });
 
   it("labels breach scans without naming a provider in generic wording", () => {
@@ -27,9 +29,44 @@ describe("job labels", () => {
   it("keeps a built-in fallback per module for when the registry is unknown", () => {
     // The registry is the source of truth; this table only covers the window
     // before it answers, so job history is never silently empty.
-    expect(FALLBACK_MODULE_JOB_TYPES.phishing).toContain("phishing.dnstwist");
     expect(FALLBACK_MODULE_JOB_TYPES.breaches).toContain("breaches.hibp");
     expect(FALLBACK_MODULE_JOB_TYPES.reports).toEqual(["report.generate"]);
+  });
+
+  it("names every phishing job type, including the keyed one", () => {
+    // The same failure the DNS list guards against (F-14): a keyed worker whose
+    // job type is absent here disappears from the Jobs table exactly when the
+    // registry cannot be reached.
+    expect(FALLBACK_MODULE_JOB_TYPES.phishing).toEqual([
+      "phishing.dnstwist",
+      "phishing.shodan",
+      "phishing.netlas",
+    ]);
+  });
+
+  it("names every DNS Security job type, including the keyed one", () => {
+    // A keyed worker whose job type is absent here disappears from the Jobs table
+    // exactly when the registry cannot be reached, which is when an operator is
+    // most likely to be looking for it (F-14 in the DNS & TLS audit).
+    expect(FALLBACK_MODULE_JOB_TYPES.dns).toEqual([
+      "dns.rdap",
+      "dns.resolver",
+      "dns.ctlogs",
+      "dns.virustotal",
+      "dns.netlas",
+      "dns.tlsprobe",
+      "dns.shodan",
+    ]);
+  });
+
+  it("labels DNS job types without naming the provider in generic wording", () => {
+    expect(jobTypeLabel("dns.rdap")).toBe("DNS registration lookup");
+    expect(jobTypeLabel("dns.tlsprobe")).toBe("TLS certificate probe");
+    // Two providers that both report passive DNS share one wording on purpose.
+    expect(jobTypeLabel("dns.virustotal")).toBe(jobTypeLabel("dns.netlas"));
+    // The provider that confirms what our own addresses serve is described by
+    // what it answers, so the label carries no vendor name.
+    expect(jobTypeLabel("dns.shodan")).toBe("Certificate exposure search");
   });
 
   it("humanizes a setting key a connector declared without a label", () => {
@@ -40,6 +77,14 @@ describe("job labels", () => {
     expect(jobStatusLabel("success")).toBe("Success");
     expect(threatStatusLabel("investigating")).toBe("Investigating");
     expect(threatStatusLabel("escalated")).toBe("Escalated");
+  });
+
+  it("names an analyst's decision without restating its effect", () => {
+    // "Confirmed" is the decision; what the channel does about it is a separate
+    // fact, stated where the reader is deciding (WI-12).
+    expect(verdictLabel("confirmed")).toBe("Confirmed");
+    expect(verdictLabel("rejected")).toBe("Rejected");
+    expect(verdictLabel("something_else")).toBe("Something else");
   });
 });
 

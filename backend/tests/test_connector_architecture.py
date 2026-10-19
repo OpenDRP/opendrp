@@ -6,6 +6,8 @@ from app.core.config import Settings
 from app.schemas.connector import BreachFinding, PhishingFinding
 from app.services.connector_credentials import generate_token, hash_token
 
+pytestmark = pytest.mark.usefixtures("without_testing_switch")
+
 
 _APP_ROOT = Path("app")
 

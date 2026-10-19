@@ -11,9 +11,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import extract_ip, get_db, require_admin
 from app.core.audit import AUDIT_ALLOWED_ACTIONS, AuditLogger
 from app.core.config import settings
-from app.models.audit import AuditLog
+from app.models.audit import AuditArchive, AuditLog
 from app.models.user import User
-from app.schemas.common import PaginatedResponse
+from app.schemas.common import MAX_PAGE_SIZE, PaginatedResponse
 
 router = APIRouter(prefix="/audit", tags=["Audit"])
 
@@ -38,6 +38,7 @@ AUDIT_ACTION_LABELS: dict[str, str] = {
     "auth.session.revoked": "Session revoked",
     "auth.sessions.revoked_others": "Other sessions revoked",
     "auth.mfa.recovery_codes.rotated": "MFA recovery codes rotated",
+    "authz.denied": "Access refused by a role gate",
     "asset.create": "Asset created",
     "asset.update": "Asset updated",
     "asset.delete": "Asset deleted",
@@ -71,6 +72,7 @@ AUDIT_ACTION_LABELS: dict[str, str] = {
     "breach.scan.start": "Breach scan started",
     "breach.scan.email": "Breach email scan completed",
     "breach.scan.domain": "Breach domain scan completed",
+    "breach.domain_verification.requested": "Breach domain verification requested",
     "alert.dispatch.success": "Alert dispatched",
     "alert.dispatch.failed": "Alert dispatch failed",
     "task.started": "Background task started",
@@ -82,11 +84,13 @@ AUDIT_ACTION_LABELS: dict[str, str] = {
     "user.updated": "User updated",
     "user.password_reset": "User password reset",
     "user.mfa.reset": "User second factor reset by an administrator",
-    "user.locked": "User locked / deactivated",
-    "user.unlocked": "User unlocked / activated",
+    "user.onboarding.cleared": "User released from credential onboarding by hand",
+    "user.locked": "User lockout set / account deactivated",
+    "user.unlocked": "User lockout released / account activated",
     "audit.log.view": "Audit log viewed",
     "audit.retention.purged": "Expired audit history purged",
     "audit.chain.verified": "Audit hash chain verified",
+    "audit.chain.progress": "Audit full-verification chunk completed",
     "audit.chain.broken": "Audit hash chain verification failed",
     "audit.integrity.view": "Audit integrity status viewed",
     "outbound.blocked": "Outbound destination refused",
@@ -97,6 +101,7 @@ AUDIT_ACTION_LABELS: dict[str, str] = {
     "connectors.list": "Connectors listed",
     "connector.registered": "Connector registered",
     "connector.findings.ingested": "Connector findings ingested",
+    "connector.catalogue.ingested": "Incident catalogue ingested",
     "connector.scan.completed": "Connector scan completed",
     "connector.scan.failed": "Connector scan failed",
     "connector.status.updated": "Connector status updated",
@@ -104,6 +109,15 @@ AUDIT_ACTION_LABELS: dict[str, str] = {
     "users.list": "Users list viewed",
     "users.view": "User viewed",
     "jobs.list": "Jobs list viewed",
+    "dns_security.certificates.list": "Certificate review list viewed",
+    "dns_security.certificate_exceptions.list": "Certificate scope exceptions viewed",
+    "tls.sighting.candidate": "Certificate sighting reopened for review",
+    "tls.sighting.expected": "Certificate deployment marked expected",
+    "tls.sighting.shared_infrastructure": "Certificate deployment marked shared infrastructure",
+    "tls.sighting.confirmed_foreign": "Certificate deployment confirmed foreign",
+    "tls.sighting.rejected": "Certificate deployment evidence rejected",
+    "tls.exception.added": "Certificate scope exception added",
+    "tls.exception.removed": "Certificate scope exception removed",
 }
 
 
@@ -181,7 +195,11 @@ async def audit_integrity(
         },
     )
 
+    archive = (await db.execute(select(AuditArchive).order_by(AuditArchive.last_seq.desc()).limit(1))).scalar_one_or_none()
     return {
+        "full_verification": {"upper_seq": state.full_verify_upper_seq, "cursor": state.full_verify_cursor, "in_progress": bool(state.full_verify_upper_hash), "at": state.last_full_verified_at, "failure_seq": state.last_failure_seq, "failure_reason": state.last_failure_reason},
+        "committed": {"through_seq": state.committed_seq, "tip_hash": state.committed_tip_hash},
+        "archive": {"configured": bool(settings.AUDIT_ARCHIVE_DIR), "hold": settings.AUDIT_RETENTION_HOLD, "last_seq": archive.last_seq if archive else None, "retired": bool(archive and archive.retired_at)},
         "retained": retained,
         "retired": retired,
         "last_verification": {
@@ -195,20 +213,33 @@ async def audit_integrity(
 @router.get("/logs", response_model=PaginatedResponse[Any])
 async def list_audit_logs(
     request: Request,
-    action: str | None = None,
+    action: str | None = Query(None, max_length=120),
+    after_seq: int | None = Query(None, ge=0),
+    request_id: str | None = Query(None, max_length=128),
+    job_id: uuid.UUID | None = None,
+    outcome: str | None = Query(None, pattern="^(success|failure)$"),
     user_id: uuid.UUID | None = None,
     user_email: str | None = None,
     search: str | None = None,
     from_date: datetime | None = None,
     to_date: datetime | None = None,
     page: int = Query(1, ge=1),
-    size: int = Query(10, ge=1, le=200),
+    size: int = Query(10, ge=1, le=MAX_PAGE_SIZE),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_admin),
 ):
     skip = (page - 1) * size
     conditions: list[ColumnElement[bool]] = []
 
+    if after_seq is not None:
+        conditions.append(AuditLog.seq > after_seq)
+    if request_id:
+        conditions.append(AuditLog.details["request_id"].as_string() == request_id)
+    if job_id:
+        conditions.append(AuditLog.details["job_id"].as_string() == str(job_id))
+    if outcome:
+        failure = or_(AuditLog.action.like("%.failed"), AuditLog.action.like("%.failure"), AuditLog.action == "audit.chain.broken")
+        conditions.append(failure if outcome == "failure" else ~failure)
     if action:
         allowed = [a for a in AUDIT_ALLOWED_ACTIONS if a.lower() == action.lower()]
         if allowed:
@@ -227,7 +258,7 @@ async def list_audit_logs(
         # dialect's treatment of an uncorrelated IN subquery when the audit row
         # contains a nullable user_id.
         conditions.append(
-            exists(
+            or_(AuditLog.details["actor_email"].as_string().ilike(like, escape="\\"), exists(
                 select(1)
                 .select_from(User)
                 .where(
@@ -235,7 +266,7 @@ async def list_audit_logs(
                     User.email.ilike(like, escape="\\"),
                 )
                 .correlate(AuditLog)
-            )
+            ))
         )
 
     if from_date:
@@ -270,7 +301,7 @@ async def list_audit_logs(
         select(AuditLog, User.email.label("user_email"))
         .outerjoin(User, AuditLog.user_id == User.id)
         .where(where_clause)
-        .order_by(AuditLog.timestamp.desc(), AuditLog.id.desc())
+        .order_by(AuditLog.seq.asc() if after_seq is not None else AuditLog.timestamp.desc(), AuditLog.id.desc())
         .offset(skip)
         .limit(size)
     )
@@ -282,7 +313,11 @@ async def list_audit_logs(
                 "id": str(log_row.id),
                 "timestamp": log_row.timestamp,
                 "user_id": str(log_row.user_id) if log_row.user_id else None,
-                "user_email": email,
+                "user_email": (log_row.details or {}).get("actor_email") or email,
+                "actor_identity_source": "snapshot" if (log_row.details or {}).get("actor_email") else "current_user_lookup",
+                "seq": log_row.seq,
+                "entry_hash": log_row.entry_hash,
+                "key_id": log_row.key_id,
                 "action": log_row.action,
                 "ip_address": log_row.ip_address,
                 "details": log_row.details or {},

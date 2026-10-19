@@ -15,6 +15,17 @@ wrong tree is worse than none: it is looked at and believed.
 
 The rules therefore are mechanical, not a convention:
 
+* every requirement line in one of the **shipped** manifests
+  (``backend/requirements.txt`` and the connector manifests) is an exact pin
+  **and** carries at least one ``--hash=sha256:`` continuation, because those are
+  the files the production images install with ``--require-hashes``. A pin
+  without a hash is a version a substituted artifact can satisfy;
+* ``requirements-dev.txt`` is pinned exactly but deliberately not hashed: it is
+  never installed into a shipped image, and its own toolchain (pytest, ruff, mypy)
+  has no bearing on what a release contains.
+
+Everything else:
+
 * ``backend/pyproject.toml`` declares no dependencies at all — not Poetry
   tables (``[tool.poetry.dependencies]``, ``[tool.poetry.group.*.dependencies]``),
   not PEP 621 ones (``[project] dependencies`` / ``optional-dependencies``).
@@ -64,6 +75,20 @@ _INCLUDE = re.compile(r"^-r\s+\S+$")
 #: The connector SDK is consumed from the build context (``file:///opt/sdk``),
 #: not from an index, so there is no version to pin it to.
 _DIRECT_REF = re.compile(r"^[A-Za-z0-9._-]+\s+@\s+file://\S+$")
+#: A hash line in a generated lock: `--hash=sha256:<64 hex>`, optionally with the
+#: backslash that continues the block to the next digest.
+_HASH_LINE = re.compile(r"^--hash=sha256:[0-9a-f]{64}(?:\s*\\)?$")
+
+#: The manifests that are installed into a shipped image with `--require-hashes`.
+#: `requirements-dev.txt` is deliberately absent: it never ships.
+_HASHED_REQUIREMENTS: Tuple[Path, ...] = (
+    Path("backend") / "requirements.txt",
+    Path("connectors") / "dnstwist" / "requirements.txt",
+    Path("connectors") / "shodan" / "requirements.txt",
+    Path("connectors") / "hibp" / "requirements.txt",
+    Path("connectors") / "dns_security" / "requirements.txt",
+    Path("connectors") / "intelligence" / "requirements.txt",
+)
 
 
 def check_pyproject(source: str) -> List[str]:
@@ -85,20 +110,46 @@ def check_pyproject(source: str) -> List[str]:
     return failures
 
 
-def check_requirements(relative: Path, source: str) -> List[str]:
+def check_requirements(
+    relative: Path, source: str, require_hashes: bool = False
+) -> List[str]:
     failures: List[str] = []
+    hash_count = 0
+    pinned_at = 0
+
     for number, line in enumerate(source.splitlines(), start=1):
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
             continue
-        if _INCLUDE.match(stripped) or _DIRECT_REF.match(stripped):
+        if _HASH_LINE.match(stripped):
+            hash_count += 1
             continue
-        if _EXACT_PIN.match(stripped):
+
+        if pinned_at and require_hashes and hash_count == 0:
+            failures.append(
+                f"{relative}:{pinned_at}: the pin carries no `--hash=sha256:` "
+                f"line, so `pip install --require-hashes` cannot verify the "
+                f"artifact it installs"
+            )
+        hash_count = 0
+
+        # A generated lock continues a pin onto the hash lines with a backslash;
+        # the pin itself is what has to be exact.
+        candidate = stripped[:-1].strip() if stripped.endswith("\\") else stripped
+        if _INCLUDE.match(candidate) or _DIRECT_REF.match(candidate):
+            continue
+        if _EXACT_PIN.match(candidate):
+            pinned_at = number
             continue
         failures.append(
             f"{relative}:{number}: {stripped!r} is not an exact pin — every "
             "requirement is `name==version` (or the SDK's `name @ file://…`, "
             "or `-r` include) so the build and the advisory scan see one tree"
+        )
+
+    if pinned_at and require_hashes and hash_count == 0:
+        failures.append(
+            f"{relative}:{pinned_at}: the pin carries no `--hash=sha256:` line"
         )
     return failures
 
@@ -118,7 +169,11 @@ def check(root: Path) -> List[str]:
         except OSError as exc:
             failures.append(f"{relative}: cannot read ({exc})")
             continue
-        failures.extend(check_requirements(relative, source))
+        failures.extend(
+            check_requirements(
+                relative, source, require_hashes=relative in _HASHED_REQUIREMENTS
+            )
+        )
 
     return failures
 
@@ -143,7 +198,8 @@ def main(argv: Sequence[str]) -> int:
 
     print(
         "dependency-source gate: OK — pyproject declares no dependencies, "
-        "every requirement is an exact pin"
+        "every requirement is an exact pin, and the shipped manifests pin a "
+        "hash for each of them"
     )
     return 0
 

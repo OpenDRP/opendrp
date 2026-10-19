@@ -5,8 +5,7 @@ that is checked when someone remembers to check it records the day a
 maintainer was curious, not the day something was deleted — and the entries a
 break was hiding are exactly the ones a later retention sweep will remove.
 
-So the check is a scheduled task, it is incremental (it starts where the
-previous pass finished), and a failure is loud in three places at once: the log
+So the check is a scheduled task, it defaults to a full retained-chain pass, and a failure is loud in three places at once: the log
 stream, the audit trail itself, and the operator's configured alert channel. The
 one thing it never does is repair anything — a chain that does not verify is the
 finding, and rewriting it would destroy the evidence.
@@ -40,35 +39,33 @@ async def _notify_break(details: dict) -> None:
     """
     try:
         from app.core.database import AsyncSessionLocal
-        from app.services.alert_service import AlertService
 
         subject = "[OpenDRP] Audit chain verification failed"
-        body = (
-            "<h2>Audit chain verification failed</h2>"
-            "<p>The stored audit trail does not hash-chain. This is either "
-            "database tampering or a corruption that must be explained.</p>"
-            f"<pre>{details}</pre>"
-            "<p>Run <code>python -m scripts.verify_audit_chain --full</code> and "
-            "compare the reported position against the SIEM's copy of the audit "
-            "stream.</p>"
-        )
         async with AsyncSessionLocal() as session:
-            await AlertService(session).send_operator_message(
-                subject=subject, html_body=body, plain_body=str(details)
-            )
+            import json
+            import uuid
+            from app.services.ingestion_events import record_event
+            event_id = uuid.uuid5(uuid.NAMESPACE_URL, "audit-chain-break:" + json.dumps({key: value for key, value in details.items() if key != "checked_at"}, sort_keys=True))
+            await record_event(session, kind="notification", module="module:operations", entity_id=event_id, payload={"title": subject, "fields": details})
+            await session.commit()
     except Exception as exc:  # pragma: no cover - depends on operator channels
         log.warning("audit_chain_alert_failed", err=str(exc)[:200])
 
 
 @celery_app.task(name="verify_audit_chain", ignore_result=False)
 @async_task
-async def verify_audit_chain_task(self=None, *, full: bool = False) -> dict:
+async def verify_audit_chain_task(self=None, *, full: bool = True) -> dict:
     """Celery entry point. ``full=True`` re-derives the whole retained chain."""
     from app.core.audit import AuditLogger
     from app.core.database import AsyncSessionLocal
 
     async with AsyncSessionLocal() as db:
-        result = await verify(db, full=full)
+        if full:
+            from app.services.audit_verification import verify_full_chunk
+            result = await verify_full_chunk(db)
+        else:
+            result = await verify(db)
+        await db.rollback()
 
     details = {
         **result.as_details(),
@@ -86,7 +83,7 @@ async def verify_audit_chain_task(self=None, *, full: bool = False) -> dict:
         async with AsyncSessionLocal() as session:
             await AuditLogger.emit(
                 session,
-                action=ACTION_CHAIN_VERIFIED if result.ok else ACTION_CHAIN_BROKEN,
+                action=("audit.chain.progress" if result.truncated else ACTION_CHAIN_VERIFIED) if result.ok else ACTION_CHAIN_BROKEN,
                 ip_address="internal:celery-beat",
                 user_id=None,
                 details=details,

@@ -5,187 +5,193 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import PhishingPage from "@/pages/PhishingPage";
 import { useAuthStore } from "@/store/auth";
 
-const {
-  listPhishingMock,
-  scanDnstwistMock,
-  scanShodanMock,
-  updatePhishingMock,
-  deletePhishingMock,
-  cleanOrphansMock,
-  toastMock,
-} = vi.hoisted(() => ({
-  listPhishingMock: vi.fn(),
-  scanDnstwistMock: vi.fn(),
-  scanShodanMock: vi.fn(),
-  updatePhishingMock: vi.fn(),
-  deletePhishingMock: vi.fn(),
-  cleanOrphansMock: vi.fn(),
-  toastMock: vi.fn(),
+const mocks = vi.hoisted(() => ({
+  list: vi.fn(),
+  toast: vi.fn(),
+  evidence: vi.fn(),
+  promote: vi.fn(),
 }));
-
 vi.mock("@/lib/api", () => ({
   endpoints: {
-    listPhishing: listPhishingMock,
-    scanDnstwist: scanDnstwistMock,
-    scanShodan: scanShodanMock,
-    updatePhishingThreat: updatePhishingMock,
-    deletePhishingThreat: deletePhishingMock,
-    cleanOrphanPhishing: cleanOrphansMock,
+    listPhishing: mocks.list,
+    phishingEvidence: mocks.evidence,
+    updatePhishingThreat: vi.fn(),
+    deletePhishingThreat: vi.fn(),
+    cleanOrphanPhishing: vi.fn(),
+    scanModule: vi.fn(),
+    promotePhishingAsset: mocks.promote,
   },
-  flattenErrorDetail: (detail: unknown) => String(detail ?? ""),
-  describeApiError: (error: any) => { const d = error?.response?.data?.detail; if (typeof d === "string") return d; if (Array.isArray(d)) return d.map((x: any) => x?.msg ?? String(x)).join("; "); return String(error?.message ?? error ?? ""); },
+  describeApiError: (error: Error) => error.message,
 }));
-
-vi.mock("@/components/ui/use-toast", () => ({ toast: toastMock }));
+vi.mock("@/hooks/useModuleJobTypes", () => ({ useModuleJobTypes: () => ["phishing.dnstwist"] }));
 vi.mock("@/components/JobsTable", () => ({ JobsTable: () => null }));
-vi.mock("@/components/DataTable", () => ({
-  PaginatedDataTable: ({ columns, rows, loading }: any) => (
-    <div>
-      {loading && rows.length === 0 ? <span>Loading table</span> : null}
-      {rows.map((row: any) => (
-        <div key={row.id}>
-          {columns.map((column: any) => (
-            <span key={column.key}>{column.render ? column.render(row) : row[column.key]}</span>
-          ))}
-        </div>
-      ))}
-    </div>
-  ),
-}));
-vi.mock("@/components/ui/confirm-dialog", () => ({
-  ConfirmDialog: ({ open, title, onConfirm, onCancel }: any) =>
-    open ? (
-      <div role="dialog">
-        <h2>{title}</h2>
-        <button onClick={onCancel}>Cancel confirmation</button>
-        <button onClick={onConfirm}>Confirm action</button>
-      </div>
-    ) : null,
+vi.mock("@/components/ui/use-toast", () => ({ toast: mocks.toast }));
+vi.mock("@/lib/scanPolling", () => ({
+  summarizeScanJobs: () => ({ pending: 0, succeeded: 0, failed: 0 }),
+  waitForScanJobs: async () => [],
 }));
 
-const threat = {
-  id: "threat-1",
-  phishing_domain: "evil-example.com",
-  matched_asset: "example.com",
-  ip_address: "203.0.113.10",
-  web_ports: "80,443",
+const young = {
+  id: "threat-young",
+  phishing_domain: "paypa1-login.example",
+  matched_asset: "paypal.com",
   detection_source: "dnstwist",
+  domain_created_at: "2026-10-03T00:00:00Z",
+  domain_age_days: 12,
+  confidence: 55,
+  signals: { young_domain: 25 },
+  alert_band: "digest",
   status: "active",
-  created_at: "2026-01-01T00:00:00Z",
-  updated_at: "2026-01-01T00:00:00Z",
+  created_at: "2026-10-15T00:00:00Z",
+  updated_at: "2026-10-15T00:00:00Z",
+} as const;
+
+const unresolved = {
+  ...young,
+  id: "threat-unresolved",
+  phishing_domain: "secure-chase.example",
+  domain_created_at: undefined,
+  domain_age_days: null,
 };
 
-function renderPage() {
-  const queryClient = new QueryClient({
-    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+function renderPage(role: "admin" | "analyst" | "viewer" = "analyst") {
+  useAuthStore.setState({
+    user: { id: "user-1", email: "user@example.com", role, is_active: true, rate_limit_minutes: 0, created_at: "2026-01-01", updated_at: "2026-01-01" },
+    token: "test",
+    isHydrated: true,
   });
-  return render(
-    <QueryClientProvider client={queryClient}>
-      <PhishingPage />
-    </QueryClientProvider>,
-  );
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
+  return render(<QueryClientProvider client={client}><PhishingPage /></QueryClientProvider>);
 }
 
-describe("PhishingPage", () => {
+describe("PhishingPage age of a registration (WI-05)", () => {
   beforeEach(() => {
-    listPhishingMock.mockReset().mockResolvedValue({
-      items: [threat],
+    vi.resetAllMocks();
+    mocks.list.mockResolvedValue({ items: [young, unresolved], total: 2, page: 1, size: 20, pages: 1 });
+    mocks.evidence.mockResolvedValue({ items: [] });
+  });
+
+  it("shows the age the server computed and says unknown when nobody resolved it", async () => {
+    renderPage();
+    expect(await screen.findByText("12 d")).toBeInTheDocument();
+    // A candidate whose registration date no source answered is not "0 d": the
+    // reader has to be able to tell an unresolved date from a brand-new domain.
+    expect(screen.getByText("unknown")).toBeInTheDocument();
+    expect(screen.getByRole("columnheader", { name: /Age/ })).toBeInTheDocument();
+  });
+
+  it("takes a look-alike under monitoring from its row (AWI-13)", async () => {
+    const user = userEvent.setup();
+    mocks.promote.mockResolvedValue({ already_exists: false, asset: { id: "asset-1" } });
+    renderPage("analyst");
+    await screen.findByText("paypa1-login.example");
+
+    await user.click(
+      screen.getAllByRole("button", { name: "Monitor this look-alike domain" })[0],
+    );
+
+    await waitFor(() => expect(mocks.promote).toHaveBeenCalledWith("threat-young"));
+    expect(mocks.toast).toHaveBeenCalledWith(
+      expect.objectContaining({ title: "Domain added" }),
+    );
+  });
+
+  it("keeps the newest finding first until the operator asks otherwise", async () => {
+    renderPage();
+    await waitFor(() =>
+      expect(mocks.list).toHaveBeenLastCalledWith(
+        expect.objectContaining({ sort: "created_at", order: "desc" }),
+      ),
+    );
+  });
+});
+
+/**
+ * W2.5: what the source evidence says.
+ *
+ * A row that *found* a name and a row that describes one the platform already had
+ * used to render identically (a source and a timestamp), so an operator could not tell
+ * a certificate claiming the brand from a registration record about a known candidate.
+ */
+describe("PhishingPage source evidence", () => {
+  beforeEach(() => {
+    vi.resetAllMocks();
+    mocks.list.mockResolvedValue({ items: [young], total: 1, page: 1, size: 20, pages: 1 });
+    mocks.evidence.mockResolvedValue({
+      items: [
+        {
+          source: "netlas",
+          matched_asset: "paypal.com",
+          observed_at: "2026-10-14T09:00:00Z",
+          first_seen_at: "2026-10-15T00:00:00Z",
+          last_seen_at: "2026-10-15T00:00:00Z",
+          fields: { capability: "certificate_brand", verdict: "candidate_not_verified" },
+        },
+        {
+          source: "netlas",
+          matched_asset: "paypal.com",
+          observed_at: null,
+          first_seen_at: "2026-10-15T00:00:00Z",
+          last_seen_at: "2026-10-15T00:00:00Z",
+          fields: {
+            capability: "mx",
+            registrar: "Fixture Registrar",
+            created: "2026-10-01T00:00:00Z",
+            mail_capable: false,
+          },
+        },
+      ],
+    });
+  });
+
+  it("names the question each row answers, its verdict and when the provider saw it", async () => {
+    const user = userEvent.setup();
+    renderPage();
+    await screen.findByText("12 d");
+    await user.click(screen.getAllByRole("button", { name: "Signals" })[0]);
+
+    expect(await screen.findByText(/Certificate claims the brand/)).toBeInTheDocument();
+    expect(screen.getByText(/Not verified yet/)).toBeInTheDocument();
+    expect(screen.getByText(/Registration record|Mail records/)).toBeInTheDocument();
+    expect(screen.getByText(/registrar: Fixture Registrar/)).toBeInTheDocument();
+    // A negative mail answer is an answer: the row says so instead of looking blank.
+    expect(screen.getByText(/no mail records/)).toBeInTheDocument();
+    // The provider's own time is reported as observed, and the platform's as first seen.
+    expect(screen.getByText(/observed: 2026-10-14 09:00:00/)).toBeInTheDocument();
+  });
+});
+
+describe("PhishingPage sources column (WI-30)", () => {
+  beforeEach(() => {
+    vi.resetAllMocks();
+    mocks.evidence.mockResolvedValue({ items: [] });
+  });
+
+  it("shows how many independent sources reported a candidate, and which", async () => {
+    mocks.list.mockResolvedValue({
+      items: [{ ...young, id: "threat-reported", sources: ["dnstwist", "netlas"], source_count: 2 }],
       total: 1,
       page: 1,
       size: 20,
       pages: 1,
     });
-    scanDnstwistMock.mockReset().mockResolvedValue({ status: "scheduled", job_ids: ["dnstwist-job"] });
-    scanShodanMock.mockReset().mockResolvedValue({ status: "scheduled", job_ids: ["shodan-job"] });
-    updatePhishingMock.mockReset().mockResolvedValue({});
-    deletePhishingMock.mockReset().mockResolvedValue({});
-    cleanOrphansMock.mockReset().mockResolvedValue({ deleted: 2 });
-    toastMock.mockReset();
-    useAuthStore.getState().clearAuth();
-    useAuthStore.setState({
-      user: {
-        id: "analyst-1",
-        email: "analyst@example.com",
-        role: "admin",
-        is_active: true,
-        rate_limit_minutes: 0,
-        created_at: "2026-01-01T00:00:00Z",
-        updated_at: "2026-01-01T00:00:00Z",
-      },
-      token: "access-token",
-      isHydrated: true,
-    });
-  });
 
-  it("loads threats and starts both connector scans", async () => {
-    const user = userEvent.setup();
     renderPage();
 
-    expect(await screen.findByText("evil-example.com")).toBeInTheDocument();
-    expect(screen.getByText("example.com")).toBeInTheDocument();
-    await user.click(screen.getByRole("button", { name: "Rescan" }));
-
-    await waitFor(() => {
-      expect(scanDnstwistMock).toHaveBeenCalledTimes(1);
-      expect(scanShodanMock).toHaveBeenCalledTimes(1);
-    });
-    expect(toastMock).toHaveBeenCalledWith(
-      expect.objectContaining({ title: "Rescan started" }),
-    );
+    expect(await screen.findByRole("columnheader", { name: /Sources/ })).toBeInTheDocument();
+    // The count *and* the names: two providers agreeing is the corroboration the
+    // score pays for, and one connector seen twice is not that.
+    expect(await screen.findByText("2 (dnstwist, netlas)")).toBeInTheDocument();
   });
 
-  it("reports a partial connector scan failure", async () => {
-    const user = userEvent.setup();
-    scanShodanMock.mockRejectedValueOnce(new Error("Shodan unavailable"));
+  it("says not recorded rather than naming the connector that found the candidate", async () => {
+    // No evidence rows recorded: the detection source is who *found* the name, which
+    // is a different fact from who reported it, and the column must not conflate them.
+    mocks.list.mockResolvedValue({ items: [young], total: 1, page: 1, size: 20, pages: 1 });
+
     renderPage();
-    await screen.findByText("evil-example.com");
 
-    await user.click(screen.getByRole("button", { name: "Rescan" }));
-    await waitFor(() =>
-      expect(toastMock).toHaveBeenCalledWith(
-        expect.objectContaining({
-          variant: "destructive",
-          title: "Rescan partially started",
-        }),
-      ),
-    );
-  });
-
-  it("surfaces the per-connector rate limit reason on a blocked rescan", async () => {
-    const user = userEvent.setup();
-    scanShodanMock.mockRejectedValueOnce({
-      response: {
-        status: 429,
-        data: { detail: "Rate limit: phishing rescan (shodan) is limited ..." },
-      },
-    });
-    renderPage();
-    await screen.findByText("evil-example.com");
-
-    await user.click(screen.getByRole("button", { name: "Rescan" }));
-    await waitFor(() =>
-      expect(toastMock).toHaveBeenCalledWith(
-        expect.objectContaining({
-          variant: "destructive",
-          title: "Rescan partially started",
-          description: expect.stringContaining("Rate limit"),
-        }),
-      ),
-    );
-  });
-
-  it("deletes a threat and cleans orphan entries after confirmation", async () => {
-    const user = userEvent.setup();
-    renderPage();
-    await screen.findByText("evil-example.com");
-
-    await user.click(screen.getByRole("button", { name: "Delete threat" }));
-    expect(screen.getByRole("dialog")).toBeInTheDocument();
-    await user.click(screen.getByRole("button", { name: "Confirm action" }));
-    await waitFor(() => expect(deletePhishingMock).toHaveBeenCalledWith("threat-1"));
-
-    await user.click(screen.getByRole("button", { name: "Clean orphan entries" }));
-    await user.click(screen.getByRole("button", { name: "Confirm action" }));
-    await waitFor(() => expect(cleanOrphansMock).toHaveBeenCalledTimes(1));
+    expect(await screen.findByText("not recorded")).toBeInTheDocument();
+    expect(screen.queryByText("1 (dnstwist)")).not.toBeInTheDocument();
   });
 });

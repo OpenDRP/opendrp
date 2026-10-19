@@ -1,3 +1,4 @@
+import asyncio
 from datetime import datetime, timezone
 from typing import AsyncGenerator
 from unittest.mock import AsyncMock, patch
@@ -195,8 +196,101 @@ class TestRefreshTokenRotation:
         assert fam.revoked is True
         assert fam.revoked_reason == "reuse_detected"
 
+    @pytest.mark.asyncio
+    async def test_concurrent_replay_of_one_refresh_token_never_issues_two_successors(
+        self, db_session, test_admin, monkeypatch
+    ):
+        from httpx import ASGITransport, AsyncClient
+        from sqlalchemy.ext.asyncio import AsyncSession
 
-class TestRedisRateLimit429:
+        from app.core import database
+
+        if db_session.get_bind().dialect.name != "postgresql":
+            pytest.skip("concurrent refresh rotation requires PostgreSQL row locks")
+        from app.api import deps
+
+        concurrent_sessions = []
+        family_select_barrier = asyncio.Barrier(2)
+        family_select_sessions = []
+        original_execute = AsyncSession.execute
+
+        async def synchronized_execute(session, statement, *args, **kwargs):
+            sql = str(statement).lower()
+            if (
+                "from drp_refresh_families" in sql
+                and "where drp_refresh_families.family_id =" in sql
+            ):
+                assert "for update" in sql, "refresh family must be selected with a PostgreSQL row lock"
+                family_select_sessions.append(session)
+                await asyncio.wait_for(family_select_barrier.wait(), timeout=10)
+            return await original_execute(session, statement, *args, **kwargs)
+
+        monkeypatch.setattr(AsyncSession, "execute", synchronized_execute)
+
+        async def login_db():
+            async with database.AsyncSessionLocal() as session:
+                yield session
+
+        async def override_db():
+            async with database.AsyncSessionLocal() as session:
+                concurrent_sessions.append(session)
+                yield session
+
+        app.dependency_overrides[deps.get_db] = login_db
+        try:
+            async with AsyncClient(transport=ASGITransport(app=app), base_url=BASE) as client:
+                login = await client.post(
+                    "/api/v1/auth/login",
+                    json={"email": test_admin.email, "password": "TestPass123!"},
+                )
+                assert login.status_code == 200, login.text
+                refresh_a = login.cookies.get("opendrp_refresh")
+                assert refresh_a
+
+                app.dependency_overrides[deps.get_db] = override_db
+
+                async def refresh_request():
+                    async with AsyncClient(
+                        transport=ASGITransport(app=app), base_url=BASE
+                    ) as request_client:
+                        return await request_client.post(
+                            "/api/v1/auth/refresh",
+                            json={"refresh_token": refresh_a},
+                        )
+
+                first, second = await asyncio.gather(
+                    refresh_request(),
+                    refresh_request(),
+                )
+        finally:
+            app.dependency_overrides.pop(deps.get_db, None)
+            for session in concurrent_sessions:
+                await session.close()
+
+        assert sorted((first.status_code, second.status_code)) == [200, 401]
+        assert len(family_select_sessions) == 2
+        assert family_select_sessions[0] is not family_select_sessions[1]
+        assert len(concurrent_sessions) == 2
+        assert concurrent_sessions[0] is not concurrent_sessions[1]
+        family = (
+            await db_session.execute(
+                select(RefreshTokenFamily).where(RefreshTokenFamily.user_id == test_admin.id)
+            )
+        ).scalar_one()
+        from app.core.security import decode_token
+
+        assert family.revoked is True
+        assert family.revoked_reason == "reuse_detected"
+        assert family.last_jti != decode_token(refresh_a)["jti"]
+        failures = list(
+            (
+                await db_session.execute(
+                    select(AuditLog).where(AuditLog.action == "auth.refresh.failure")
+                )
+            ).scalars()
+        )
+        assert sum(row.details.get("reason") == "reuse_detected" for row in failures) == 1
+
     @pytest.mark.asyncio
     async def test_redis_lock_triggers_429_retry_after_header(
         self, client, test_analyst

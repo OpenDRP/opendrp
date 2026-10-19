@@ -3,7 +3,7 @@ from typing import AsyncGenerator
 import uuid
 from uuid import uuid4
 
-from sqlalchemy import DateTime, UUID, func
+from sqlalchemy import DateTime, Uuid, func
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -48,6 +48,31 @@ def postgres_connect_args(settings_=settings) -> dict:
     return connect_args
 
 
+def migration_server_settings(settings_=settings) -> dict:
+    """Server-side bounds for the connection a schema migration runs on.
+
+    The values live in one place because the two migration entry points have to
+    agree: `alembic/env.py` (where the revision graph runs) passes them as
+    `server_settings`, and `scripts/migrate.py` renders the statement half into
+    its psycopg `options` and deliberately omits the lock half — that connection
+    waits for the migration slot by design. A bound only one of them carried
+    would be a bound the other path does not have, and the failure it prevents is
+    indistinguishable from a hung container: the API is started by the same
+    entrypoint that migrates, so a migration blocked on a lock reads as
+    "backend unhealthy" and nothing in the log names the wait.
+
+    ``statement_timeout`` is disabled (``0``) unless the operator set
+    ``MIGRATION_STATEMENT_TIMEOUT_MS``: the baseline builds its index families in
+    one transaction and on a populated database that build is legitimately long, so
+    inheriting the application's 30s bound would fail the documented maintenance
+    window instead of protecting it.
+    """
+    return {
+        "lock_timeout": str(int(settings_.MIGRATION_LOCK_TIMEOUT_MS)),
+        "statement_timeout": str(int(settings_.MIGRATION_STATEMENT_TIMEOUT_MS)),
+    }
+
+
 def engine_kwargs(url: str, settings_=settings) -> dict:
     """SQLAlchemy engine options for a database URL.
 
@@ -87,12 +112,38 @@ AsyncSessionLocal = async_sessionmaker(
 
 
 class Base(DeclarativeBase):
-    pass
+    #: Every ``Mapped[uuid.UUID]`` column resolves to the platform's UUID type, so a
+    #: column declared by annotation alone cannot pick a different one than the
+    #: columns declared explicitly. See the note on :class:`UUIDMixin`.
+    type_annotation_map = {uuid.UUID: Uuid(as_uuid=True)}
 
 
 class UUIDMixin:
+    """Primary key shared by every table, declared as ``Uuid`` and never ``UUID``.
+
+    The two names render the same type on PostgreSQL — ``UUID``, the native one — and
+    that is what the platform ships on. They differ where there is no native UUID:
+    ``sqlalchemy.UUID`` writes the literal type name ``UUID`` into every backend's
+    DDL, and SQLite has no such type, so it falls back to its affinity rules and
+    matches none of them: the column gets **NUMERIC** affinity. SQLite applies that
+    affinity to the value on insert, and a 32-character hex string made only of
+    decimal digits *is* a number to it — one too large for its 64-bit integer, so it
+    is stored as a REAL. Reading that row runs ``uuid.UUID(1e+32)`` inside the type's
+    own result processor and raises "'float' object has no attribute 'replace'", in
+    whichever test reads the row: `uuid4` produces such a hex about once in three
+    million draws, and the suite writes enough UUIDs that the failure arrives
+    eventually, in an unrelated module, with no failing code in the failing test.
+
+    ``sqlalchemy.Uuid`` is the type meant for that gap: on SQLite it renders
+    ``CHAR(32)`` — TEXT affinity, so the hex is stored verbatim — while on
+    PostgreSQL it still creates the native ``UUID`` column with no conversion in
+    either direction. The same value is stored either way (the type's SQLite bind
+    processor writes the same 32-character hex), so existing test databases stay
+    readable.
+    """
+
     id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True),
+        Uuid(as_uuid=True),
         primary_key=True,
         default=uuid4,
     )

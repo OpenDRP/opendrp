@@ -3,15 +3,23 @@ from pydantic import ValidationError
 
 from app.core.config import Settings, _parse_cors_origins
 
+pytestmark = pytest.mark.usefixtures("without_testing_switch")
+
 #: A production configuration that passes every other production check, so that
 #: the tests below fail only for the reason each one is about.
 _PRODUCTION = {
     "APP_ENV": "production",
-    "OPENDRP_VERSION": "0.1.1",
+    "OPENDRP_VERSION": "0.2.0",
     "JWT_SECRET_KEY": "j" * 48,
     "ENCRYPTION_KEY": "Zm9yLXRlc3Qtb25seS1mZXJuZXQta2V5LXZhbHVlLXBhZGRlZA==",
     "AUTH_COOKIE_SECURE": True,
     "TRUSTED_PROXY_IPS": "127.0.0.1,::1",
+    # Pinned rather than inherited: the production validator refuses a broker URL
+    # without a password unless its host is loopback, so a fixture that let the
+    # environment decide would pass in CI (`REDIS_URL=redis://127.0.0.1:6379/0`)
+    # and fail on a host whose value is `redis://redis:6379/0` — for a reason
+    # unrelated to what these tests assert.
+    "REDIS_URL": "redis://127.0.0.1:6379/0",
     "DATABASE_URL": "postgresql://opendrp:not-a-placeholder@postgres:5432/opendrp",
     # The audit chain key is required in production on purpose (see the validator):
     # a key derived from ENCRYPTION_KEY would change under a rotation and make
@@ -30,7 +38,33 @@ def test_production_requires_a_pinned_release_version():
 
 
 def test_production_accepts_a_pinned_release_version():
-    assert _production(OPENDRP_VERSION="0.1.1").OPENDRP_VERSION == "0.1.1"
+    assert _production(OPENDRP_VERSION="0.2.0").OPENDRP_VERSION == "0.2.0"
+
+
+class TestTestingFlag:
+    """`TESTING` is a test-suite switch, not a way to deploy without controls.
+
+    The flag turns scan admission fail-open and makes the rate limiter act as if
+    Redis were unreachable, which removes the login lockout. A test `.env` copied
+    into a deployment, or a debugging export inherited from a shell, would remove
+    both without a word; the production validator is where that has to be refused.
+    """
+
+    def test_the_testing_switch_is_refused_in_production(self, monkeypatch):
+        monkeypatch.setenv("TESTING", "1")
+        with pytest.raises(ValidationError, match="TESTING"):
+            _production()
+
+    @pytest.mark.parametrize("value", ["0", "false", "False", "no", "off", ""])
+    def test_an_explicit_off_value_is_accepted(self, monkeypatch, value):
+        """`TESTING=0` is the documented way to keep a shared environment file."""
+        monkeypatch.setenv("TESTING", value)
+        assert _production().APP_ENV == "production"
+
+    def test_development_may_still_use_the_testing_switch(self, monkeypatch):
+        """The suite and a developer's shell are the two places it belongs."""
+        monkeypatch.setenv("TESTING", "1")
+        assert Settings(APP_ENV="development").APP_ENV == "development"  # type: ignore[call-arg]
 
 
 
@@ -118,6 +152,63 @@ class TestNetworkRangeConsistency:
         assert len(s.deployment_networks) == 4
 
 
+class TestTrustedProxyRange:
+    """Only the edge may be trusted, never the deployment's own address space.
+
+    A trusted network is one whose `X-Forwarded-For` entries are believed, so the
+    value decides whose claims about a client address reach the audit chain. The
+    range that used to be named here was the parent — which contains the
+    connector network, and connectors are the one part of the deployment this
+    platform did not write. A compromised connector could then record its own
+    actions against any address it chose, and nothing at runtime complains: the
+    forge is a well-formed audit row.
+    """
+
+    def test_the_parent_range_is_rejected(self):
+        with pytest.raises(ValidationError, match="audit trail"):
+            Settings(TRUSTED_PROXY_IPS="127.0.0.1,::1,172.18.0.0/16")  # type: ignore[call-arg]
+
+    @pytest.mark.parametrize(
+        "entry",
+        [
+            "172.18.20.0/24",  # the data network
+            "172.18.30.0/24",  # the connector network
+            "172.18.30.7/32",  # one connector container
+        ],
+    )
+    def test_a_network_whose_containers_must_not_be_believed_is_rejected(self, entry):
+        with pytest.raises(ValidationError, match="audit trail"):
+            Settings(TRUSTED_PROXY_IPS=f"127.0.0.1,{entry}")  # type: ignore[call-arg]
+
+    def test_a_wider_range_that_contains_the_networks_is_rejected(self):
+        """Containment counts both ways: this is the parent range by another name."""
+        with pytest.raises(ValidationError, match="audit trail"):
+            Settings(TRUSTED_PROXY_IPS="172.16.0.0/12")  # type: ignore[call-arg]
+
+    def test_loopback_and_the_edge_subnet_are_accepted(self):
+        """The shipped shape: nginx reaches the API from the edge network."""
+        s = Settings(TRUSTED_PROXY_IPS="127.0.0.1,::1,172.18.10.0/24")  # type: ignore[call-arg]
+
+        assert s.TRUSTED_PROXY_IPS.endswith("172.18.10.0/24")
+
+    def test_an_ipv6_entry_beside_the_ipv4_networks_is_accepted(self):
+        """Different address families do not overlap, and must not raise."""
+        s = Settings(TRUSTED_PROXY_IPS="::1,fe80::/10")  # type: ignore[call-arg]
+
+        assert s.TRUSTED_PROXY_IPS == "::1,fe80::/10"
+
+    def test_a_deployment_that_moved_its_ranges_trusts_its_own_edge(self):
+        s = Settings(  # type: ignore[call-arg]
+            OPENDRP_NETWORK_SUBNET="10.99.0.0/16",
+            OPENDRP_EDGE_SUBNET="10.99.10.0/24",
+            OPENDRP_DATA_SUBNET="10.99.20.0/24",
+            OPENDRP_CONNECTOR_SUBNET="10.99.30.0/24",
+            TRUSTED_PROXY_IPS="127.0.0.1,10.99.10.0/24",
+        )
+
+        assert s.TRUSTED_PROXY_IPS.endswith("10.99.10.0/24")
+
+
 class TestProductionBrokerCredential:
     """Production must not reach a remote Redis without a password.
 
@@ -166,3 +257,23 @@ class TestSecondFactorPolicy:
 
     def test_it_can_be_turned_on(self):
         assert _production(REQUIRE_MFA_FOR_ADMINS=True).REQUIRE_MFA_FOR_ADMINS is True
+
+    def test_the_roles_list_is_empty_by_default(self):
+        assert Settings().REQUIRE_MFA_ROLES == ""  # type: ignore[call-arg]
+
+    def test_the_roles_list_is_normalised(self):
+        """Spacing and case are the operator's; the policy compares role names."""
+        assert Settings(REQUIRE_MFA_ROLES=" Admin , analyst ").REQUIRE_MFA_ROLES == "admin,analyst"  # type: ignore[call-arg]
+
+    def test_an_unknown_role_name_is_a_startup_failure(self):
+        """Otherwise a typo requires a factor from nobody and looks like it worked."""
+        with pytest.raises(ValidationError) as failure:
+            Settings(REQUIRE_MFA_ROLES="admin,root")  # type: ignore[call-arg]
+        assert "root" in str(failure.value)
+
+    def test_every_role_this_platform_has_is_accepted(self):
+        """The validator's name list and ``UserRole`` have to keep agreeing."""
+        from app.models.user import UserRole
+
+        for member in UserRole:
+            assert Settings(REQUIRE_MFA_ROLES=member.value).REQUIRE_MFA_ROLES == member.value  # type: ignore[call-arg]

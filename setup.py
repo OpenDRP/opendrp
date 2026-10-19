@@ -34,7 +34,7 @@ Usage
     python setup.py --check               # audit an existing .env, change nothing
     python setup.py --repair              # fill only the gaps (placeholders, empties)
     python setup.py --force               # rotate secrets, keeping the old ones valid
-    python setup.py --non-interactive --public-url https://drp.example.com --version 0.1.1
+    python setup.py --non-interactive --public-url https://drp.example.com --version 0.2.0
 
 Interactive runs ask only what has no safe default: the release to run (offered
 as the version this checkout declares), the public URL the UI is served from,
@@ -144,13 +144,16 @@ SENSITIVE_KEYS = frozenset(GENERATED_KEYS) | frozenset(
     ROTATION_PREVIOUS_KEY.values()
 )
 
-#: Connector name -> the task type its credential is issued for. dnstwist needs
-#: no account; the other two are useless without an API key, which is why the
-#: wizard asks about them separately.
+#: Connector name -> the task type its credential is issued for, and the connector
+#: label it is provisioned as. The key is what the wizard asks about (the
+#: provider); the label is the `CONNECTOR_NAME` and the Compose service suffix, so
+#: the commands this wizard prints name a service that exists. dnstwist needs no
+#: account; the other two are useless without an API key, which is why the wizard
+#: asks about them separately.
 CONNECTORS: Dict[str, Dict[str, str]] = {
-    "dnstwist": {"type": "phishing"},
-    "shodan": {"type": "phishing"},
-    "hibp": {"type": "breaches"},
+    "dnstwist": {"type": "phishing", "label": "phishing-dnstwist"},
+    "shodan": {"type": "phishing", "label": "phishing-shodan"},
+    "hibp": {"type": "breaches", "label": "breaches-hibp"},
 }
 
 #: The Compose file set an installation runs, and the only file set this wizard
@@ -192,6 +195,19 @@ BINDING_RE = re.compile(
 #: `scripts/check_version_consistency.py` already treats this assignment as the
 #: single source of truth for the platform version.
 VERSION_FILE = REPO_ROOT / "backend" / "app" / "__init__.py"
+
+# --- The database connection budget ----------------------------------------------
+#: What `docker-compose.yml` starts `postgres` with (`command: -c
+#: max_connections=...`). A budget above this is connections PostgreSQL refuses.
+POSTGRES_MAX_CONNECTIONS = 200
+#: Pool-holding processes besides the API: `celery-worker`,
+#: `celery-worker-alerts` and `celery-beat`, each of which opens its own pool.
+_CELERY_POOL_HOLDERS = 3
+#: Room the pools must leave for the clients that are not pools: the startup
+#: migration (which may hold a connection for the length of a maintenance
+#: window), a `pg_dump`, an operator's own session, and the slots PostgreSQL
+#: reserves for superusers.
+_MAINTENANCE_HEADROOM = 20
 
 
 def invalid_public_url_reason(value: str) -> Optional[str]:
@@ -824,27 +840,41 @@ def validate_values(values: Mapping[str, str]) -> List[Finding]:
                     )
                 )
 
-    # A deployment can pass every syntax check and still exhaust PostgreSQL or
-    # the host. Keep this as a warning: the wizard cannot know the database's
-    # max_connections, but it can show the operator the calculated budget.
+    # A deployment can pass every syntax check and still exhaust PostgreSQL. The
+    # sum below is the one `docs/configuration.md` ("Database pool budget")
+    # documents: every service that opens a pool reads the *same*
+    # `DB_POOL_SIZE`/`DB_MAX_OVERFLOW` — the API once per uvicorn worker, plus
+    # `celery-worker`, `celery-worker-alerts` and `celery-beat` — and the
+    # maintenance clients (`pg_dump`, the startup migration, an administrative
+    # `psql`) need room on top of it.
+    #
+    # The previous version of this sum read `CELERY_DB_POOL_SIZE` and
+    # `CELERY_DB_MAX_OVERFLOW`, which exist in no `Settings` field, in no
+    # `.env.example` entry and in no Compose file: it printed the budget of a
+    # configuration nobody could have, and the constant it compared against (80)
+    # had no relationship to the server's `max_connections`.
     try:
         workers = max(1, int(values.get("UVICORN_WORKERS", "1") or "1"))
         pool = max(1, int(values.get("DB_POOL_SIZE", "20") or "20"))
         overflow = max(0, int(values.get("DB_MAX_OVERFLOW", "10") or "10"))
-        worker_pool = max(1, int(values.get("CELERY_DB_POOL_SIZE", "10") or "10"))
-        worker_overflow = max(0, int(values.get("CELERY_DB_MAX_OVERFLOW", "5") or "5"))
-        connection_budget = workers * (pool + overflow) + worker_pool + worker_overflow + 12
-        if connection_budget > 80:
+        pool_holders = workers + _CELERY_POOL_HOLDERS
+        per_process = pool + overflow
+        connection_budget = pool_holders * per_process + _MAINTENANCE_HEADROOM
+        if connection_budget > POSTGRES_MAX_CONNECTIONS:
             findings.append(
                 Finding(
                     "warning",
                     f"the configured database connection budget is approximately "
-                    f"{connection_budget}; keep it below PostgreSQL max_connections "
-                    "with migration, backup and admin headroom.",
+                    f"{connection_budget} connections ({pool_holders} process pools "
+                    f"x {per_process}, plus {_MAINTENANCE_HEADROOM} for migrations, "
+                    f"pg_dump and administrative sessions), which does not fit the "
+                    f"max_connections={POSTGRES_MAX_CONNECTIONS} docker-compose.yml "
+                    "starts PostgreSQL with. Lower DB_POOL_SIZE, DB_MAX_OVERFLOW or "
+                    "UVICORN_WORKERS.",
                 )
             )
     except ValueError:
-        findings.append(Finding("error", "database pool and worker values must be integers."))
+        findings.append(Finding("error", "database pool values must be integers."))
 
     # `make up` builds the images from this checkout (`docker compose up -d
     # --build`), and an installation reports its version from two places:
@@ -871,25 +901,203 @@ def validate_values(values: Mapping[str, str]) -> List[Finding]:
     return findings
 
 
+#: `mem_limit` as Compose writes it: `1.5g`, `768m`, `512m`, `256m`.
+_MEM_LIMIT_LINE = re.compile(r"^\s+mem_limit:\s*[\"']?([0-9]+(?:\.[0-9]+)?)\s*([kKmMgG]?)")
+_CPUS_LINE = re.compile(r"^\s+cpus:\s*[\"']?([0-9]+(?:\.[0-9]+)?)")
+_SERVICE_HEADING = re.compile(r"^  ([A-Za-z0-9._-]+):\s*$")
+_PROFILES_LINE = re.compile(r"^\s+profiles:\s*\[([^\]]*)\]")
+_MEMORY_UNITS = {"": 1, "k": 1024, "m": 1024 ** 2, "g": 1024 ** 3}
+
+#: Bytes of `mem_limit` and cores of `cpus` per service, plus the profile it
+#: belongs to (empty for a service that is always started).
+ComposeService = Tuple[str, int, float, str]
+
+
+def _parse_size(value: str, unit: str) -> int:
+    return int(float(value) * _MEMORY_UNITS[unit.lower()])
+
+
+def _compose_services(path: Path) -> List[ComposeService]:
+    """Read one Compose file's per-service resource limits.
+
+    A hand-rolled scan rather than a YAML parser, for the same reason the
+    repository's checks have one: this script imports nothing outside the
+    standard library and runs before anything is installed.
+    """
+    services: List[ComposeService] = []
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return services
+
+    in_services = False
+    current: str | None = None
+    memory = 0
+    cpus = 0.0
+    profile = ""
+    #: The overlay files put the limits on a shared anchor (`x-intelligence:
+    #: &intelligence`) and every service merges it, so a service that declares
+    #: none of its own inherits the anchor's.
+    anchor_memory = 0
+    anchor_cpus = 0.0
+
+    def flush() -> None:
+        nonlocal current, memory, cpus, profile
+        if current is not None:
+            services.append(
+                (current, memory or anchor_memory, cpus or anchor_cpus, profile)
+            )
+        current, memory, cpus, profile = None, 0, 0.0, ""
+
+    for line in text.splitlines():
+        if line.startswith("services:"):
+            in_services = True
+            continue
+        if in_services and line and not line.startswith(" ") and not line.startswith("#"):
+            # A new top-level key ends the services block.
+            flush()
+            in_services = False
+            continue
+        if not in_services:
+            # Before `services:` come the anchor blocks. The first limits found
+            # there are the ones every service in this file merges.
+            limit = _MEM_LIMIT_LINE.match(line)
+            if limit is not None and not anchor_memory:
+                anchor_memory = _parse_size(limit.group(1), limit.group(2))
+            cores = _CPUS_LINE.match(line)
+            if cores is not None and not anchor_cpus:
+                anchor_cpus = float(cores.group(1))
+            continue
+        heading = _SERVICE_HEADING.match(line)
+        if heading is not None:
+            flush()
+            current = heading.group(1)
+            continue
+        if current is None:
+            continue
+        limit = _MEM_LIMIT_LINE.match(line)
+        if limit is not None:
+            memory = _parse_size(limit.group(1), limit.group(2))
+            continue
+        cores = _CPUS_LINE.match(line)
+        if cores is not None:
+            cpus = float(cores.group(1))
+            continue
+        profiles = _PROFILES_LINE.match(line)
+        if profiles is not None:
+            profile = profiles.group(1).strip().strip('"').strip("'")
+    flush()
+    return services
+
+
+def compose_resource_sets() -> List[Tuple[str, float, float]]:
+    """(label, GiB of mem_limit, cpus) for the base set and each profile.
+
+    Derived from the Compose files rather than hard-coded: a static threshold
+    warns about a host that is fine for the services it will actually run, and
+    stays silent about the one it is not.
+    """
+    services = _compose_services(REPO_ROOT / "docker-compose.yml")
+    if not services:
+        return []
+
+    sets: List[Tuple[str, float, float]] = []
+    base = [s for s in services if not s[3]]
+    if base:
+        sets.append(
+            (
+                "always-on",
+                sum(s[1] for s in base) / 1024 ** 3,
+                sum(s[2] for s in base),
+            )
+        )
+    for name in sorted({s[3] for s in services if s[3]}):
+        members = [s for s in services if s[3] == name]
+        sets.append(
+            (
+                f"{name} profile",
+                sum(s[1] for s in members) / 1024 ** 3,
+                sum(s[2] for s in members),
+            )
+        )
+
+    return sets
+
+
 def host_resource_findings() -> List[Finding]:
     """Best-effort host sizing warnings that work without third-party packages.
 
     Reported on every run: every run produces an installation meant to serve
     other people, so the host it will run on is exactly what is being prepared.
+
+    The numbers come from the Compose files, because the requirement depends on
+    which parts of the platform the operator enables: the always-on set is one
+    figure, and each profile (`backup`, and the keyed connector profiles) adds its
+    own. Reporting a single static threshold was why a host could pass this check
+    and still be too small for the set it was about to start.
     """
     findings: List[Finding] = []
     cpu_count = os.cpu_count() or 0
-    if cpu_count and cpu_count < 4:
-        findings.append(Finding("warning", f"host reports {cpu_count} CPU(s); production guidance recommends at least 4."))
-    try:
-        if hasattr(os, "sysconf"):
+    sets = compose_resource_sets()
+    base = sets[0] if sets else None
+
+    memory_gib: float | None = None
+    if hasattr(os, "sysconf"):
+        try:
             pages = os.sysconf("SC_PHYS_PAGES")
             page_size = os.sysconf("SC_PAGE_SIZE")
             memory_gib = pages * page_size / (1024 ** 3)
-            if memory_gib < 8:
-                findings.append(Finding("warning", f"host reports approximately {memory_gib:.1f} GiB RAM; production guidance recommends at least 8 GiB."))
-    except (OSError, ValueError, TypeError):
-        pass
+        except (OSError, ValueError, TypeError):
+            memory_gib = None
+
+    if base is None:
+        # The Compose files are not readable (a trimmed checkout, a packaged
+        # copy of this script): fall back to the guidance that does not depend on
+        # them rather than staying silent.
+        if cpu_count and cpu_count < 4:
+            findings.append(Finding("warning", f"host reports {cpu_count} CPU(s); production guidance recommends at least 4."))
+        if memory_gib is not None and memory_gib < 8:
+            findings.append(Finding("warning", f"host reports approximately {memory_gib:.1f} GiB RAM; production guidance recommends at least 8 GiB."))
+    else:
+        label, base_gib, base_cpu = base
+        # The limits are caps, so they are not memory the stack will use — but a
+        # host that cannot cover the caps has no headroom for the kernel, the
+        # Docker daemon and page cache, which is where an OOM kill comes from.
+        needed_gib = base_gib + 2
+        needed_cores = max(4, int(base_cpu + 0.999))
+        if cpu_count and cpu_count < needed_cores:
+            findings.append(
+                Finding(
+                    "warning",
+                    f"host reports {cpu_count} CPU(s); the {label} services declare "
+                    f"{base_cpu:.1f} cores of `cpus` limits, so {needed_cores} are "
+                    "recommended for this set.",
+                )
+            )
+        if memory_gib is not None and memory_gib < needed_gib:
+            findings.append(
+                Finding(
+                    "warning",
+                    f"host reports approximately {memory_gib:.1f} GiB RAM; the "
+                    f"{label} services declare {base_gib:.1f} GiB of `mem_limit` and "
+                    f"the OS and the Docker daemon sit on top of that, so at least "
+                    f"{needed_gib:.0f} GiB is recommended for this set.",
+                )
+            )
+        extra = [s for s in sets[1:]]
+        if extra:
+            listed = "; ".join(
+                f"{name} adds {gib:.1f} GiB / {cpu:.1f} cores"
+                for name, gib, cpu in extra
+            )
+            findings.append(
+                Finding(
+                    "note",
+                    "Enabling more of the platform raises the requirement: "
+                    f"{listed}. See docs/configuration.md, \"Resource settings\".",
+                )
+            )
+
     try:
         free_gib = shutil.disk_usage(REPO_ROOT).free / (1024 ** 3)
         if free_gib < 40:
@@ -1126,9 +1334,9 @@ def wizard(answers: Answers) -> Answers:
         validate=lambda value: (
             None
             if SEMVER_RE.match(value)
-            else "use a pinned semantic version such as 0.1.1; `latest` is not allowed"
+            else "use a pinned semantic version such as 0.2.0; `latest` is not allowed"
         ),
-        hint="e.g. 0.1.1",
+        hint="e.g. 0.2.0",
     ).lstrip("vV")
     answers.explicit.add("OPENDRP_VERSION")
 
@@ -1365,15 +1573,15 @@ def next_steps(answers: Answers, target: Path) -> List[str]:
         for name in answers.connectors:
             if has_make:
                 issue.append(
-                    f"     make connector-token NAME={name} "
+                    f"     make connector-token NAME={CONNECTORS[name]['label']} "
                     f"TYPE={CONNECTORS[name]['type']}"
                 )
             else:
                 issue.append(
                     f"     {compose} exec -T backend python -m "
-                    f"scripts.manage_connector_tokens issue {name} "
+                    f"scripts.manage_connector_tokens issue {CONNECTORS[name]['label']} "
                     f"--type {CONNECTORS[name]['type']} "
-                    f"--env CONNECTOR_TOKEN_{name.upper()}"
+                    f"--env CONNECTOR_TOKEN_{name.upper().replace('-', '_')}"
                 )
         skipped = [name for name in CONNECTORS if name not in answers.connectors]
         if skipped:
@@ -1382,7 +1590,9 @@ def next_steps(answers: Answers, target: Path) -> List[str]:
                 "once you add an API key)"
             )
         if not has_make:
-            workers = " ".join(f"connector-{name}" for name in answers.connectors)
+            workers = " ".join(
+                f"connector-{CONNECTORS[name]['label']}" for name in answers.connectors
+            )
             issue.append("")
             issue.append(
                 "     Each command prints `CONNECTOR_TOKEN_<NAME>=<token>` once. "
@@ -1619,7 +1829,7 @@ def parse_args(argv: Optional[Sequence[str]]) -> argparse.Namespace:
         "--version",
         dest="release_version",
         default=None,
-        help="pinned production release version, for example 0.1.1",
+        help="pinned production release version, for example 0.2.0",
     )
     parser.add_argument(
         "--connectors",

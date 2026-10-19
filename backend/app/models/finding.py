@@ -1,6 +1,6 @@
 import uuid
 
-from sqlalchemy import JSON, UUID, ForeignKey, Index, String, UniqueConstraint
+from sqlalchemy import JSON, Uuid, ForeignKey, Index, String, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import Base, TimestampMixin, UUIDMixin
@@ -36,13 +36,16 @@ class Finding(Base, UUIDMixin, TimestampMixin):
     connector_name: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
     #: Scan job that produced it. Deliberately not a foreign key: job history is
     #: prunable, while a finding must outlive the scan that found it.
-    job_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    job_id: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True), nullable=True)
     #: Declared-field values joined into one comparison key (unique per module).
     dedup_key: Mapped[str] = mapped_column(String(512), nullable=False)
     #: Human-readable headline for lists and alerts (the module's title field).
     title: Mapped[str] = mapped_column(String(512), nullable=False)
     #: Asset the finding was matched against, when the module declares one.
-    matched_asset: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    #: Indexed: it is the only column an asset-scoped read filters on (WI-15).
+    matched_asset: Mapped[str | None] = mapped_column(
+        String(512), nullable=True, index=True
+    )
     status: Mapped[str] = mapped_column(String(50), default="active", nullable=False, index=True)
     #: The validated payload: declared fields plus the source's own attributes.
     payload: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)

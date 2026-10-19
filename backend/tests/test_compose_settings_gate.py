@@ -22,6 +22,7 @@ shipping.
 from __future__ import annotations
 
 import importlib.util
+import ipaddress
 import sys
 from pathlib import Path
 
@@ -29,6 +30,11 @@ import pytest
 from pydantic import ValidationError
 
 from app.core.config import Settings
+
+# The gate builds production settings, and the suite sets `TESTING=1` for every
+# other test; production refuses that flag outright, so this module has to look
+# like a deployment rather than like the suite.
+pytestmark = pytest.mark.usefixtures("without_testing_switch")
 
 _ROOT = Path(__file__).resolve().parents[2]
 _GATE = _ROOT / "scripts" / "check_compose_healthchecks.py"
@@ -62,7 +68,7 @@ gate = _load(_GATE, "opendrp_test_check_compose_settings")
 #: the gate does not require Compose to pass it.
 _PRODUCTION: dict[str, str] = {
     "APP_ENV": "production",
-    "OPENDRP_VERSION": "0.1.1",
+    "OPENDRP_VERSION": "0.2.0",
     "JWT_SECRET_KEY": "j" * 48,
     "ENCRYPTION_KEY": "Zm9yLXRlc3Qtb25seS1mZXJuZXQta2V5LXZhbHVlLXBhZGRlZA==",
     "AUDIT_CHAIN_KEYS": "chain-key-for-tests-only-" * 3,
@@ -73,7 +79,7 @@ _PRODUCTION: dict[str, str] = {
 
 
 def _service(name: str, environment: dict[str, str]) -> str:
-    lines = [f"  {name}:", "    image: opendrp/backend:0.1.1", "    environment:"]
+    lines = [f"  {name}:", "    image: opendrp/backend:0.2.0", "    environment:"]
     lines.extend(f"      {key}: {value}" for key, value in environment.items())
     return "\n".join(lines) + "\n"
 
@@ -102,7 +108,9 @@ def test_the_services_that_run_the_application_are_the_ones_carrying_app_env() -
     services, _ = gate.parse_services(_COMPOSE.read_text(encoding="utf-8"))
     carrying = {service.name for service in services if service.env("APP_ENV")}
 
-    assert carrying == {"backend", "celery-worker", "celery-beat"}
+    # Every long-running process of the application, not just the API: the alert
+    # delivery worker reads the same settings, so it carries the same marker.
+    assert carrying == {"backend", "celery-worker", "celery-worker-alerts", "celery-beat"}
 
 
 # ==============================================================================
@@ -231,3 +239,144 @@ def test_the_cookie_flag_is_not_required_because_its_default_already_passes(
     monkeypatch.setenv("APP_ENV", "production")
 
     assert Settings(**_PRODUCTION).AUTH_COOKIE_SECURE is True
+
+
+# ==============================================================================
+# The range whose claims about a client address are believed
+# ==============================================================================
+#: The three networks as the shipped file declares them, so the fixtures below
+#: differ from `docker-compose.yml` only in the value under test.
+_NETWORKS = """
+networks:
+  opendrp-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: ${OPENDRP_DATA_SUBNET:-172.18.20.0/24}
+  opendrp-edge:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: ${OPENDRP_EDGE_SUBNET:-172.18.10.0/24}
+  opendrp-connectors:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: ${OPENDRP_CONNECTOR_SUBNET:-172.18.30.0/24}
+"""
+
+
+def _trusted_compose(trusted: str) -> str:
+    """One service running the application, the three networks, the parent range."""
+    return (
+        _compose(
+            _service(
+                "backend",
+                {
+                    "APP_ENV": "production",
+                    "OPENDRP_NETWORK_SUBNET": "${OPENDRP_NETWORK_SUBNET:-172.18.0.0/16}",
+                    "TRUSTED_PROXY_IPS": trusted,
+                },
+            )
+        )
+        + _NETWORKS
+    )
+
+
+def _subnet_findings(text: str) -> list[str]:
+    return gate._check_subnet_hierarchy(text, gate._declared_networks(text))
+
+
+def test_the_shipped_stack_trusts_the_edge_subnet_and_nothing_else() -> None:
+    """The real file, which is what CI checks."""
+    findings = _subnet_findings(_COMPOSE.read_text(encoding="utf-8"))
+
+    assert findings == [], "\n".join(findings)
+
+
+def test_loopback_and_the_edge_subnet_are_accepted() -> None:
+    text = _trusted_compose(
+        "${TRUSTED_PROXY_IPS:-127.0.0.1,::1},${OPENDRP_EDGE_SUBNET:-172.18.10.0/24}"
+    )
+
+    assert _subnet_findings(text) == []
+
+
+def test_the_parent_range_in_the_trust_list_is_reported() -> None:
+    """The defect this check was extended for: the parent holds the connectors."""
+    text = _trusted_compose(
+        "${TRUSTED_PROXY_IPS:-127.0.0.1,::1},${OPENDRP_NETWORK_SUBNET:-172.18.0.0/16}"
+    )
+
+    findings = _subnet_findings(text)
+    assert findings, "trusting the parent range has to be reported"
+    assert any(
+        "covers OPENDRP_NETWORK_SUBNET" in finding for finding in findings
+    ), findings
+    assert any("audit trail" in finding for finding in findings), findings
+
+
+def test_the_parent_is_refused_because_of_what_it_contains() -> None:
+    """The rule is about reach, not size — and the edge is inside the parent.
+
+    Checked against the helpers directly, because the value under test in a
+    Compose fixture is pinned to the edge variable: what has to hold is that the
+    parent covers the data network (so it is refused) while the edge subnet does
+    not, since the edge subnet legitimately sits inside the parent.
+    """
+    parent = ipaddress.ip_network("172.18.0.0/16")
+    edge = ipaddress.ip_network("172.18.10.0/24")
+    data = ipaddress.ip_network("172.18.20.0/24")
+
+    assert gate._contains(parent, data)
+    assert not gate._contains(edge, parent)
+    assert not gate._overlaps(edge, data)
+
+
+@pytest.mark.parametrize(
+    ("variable", "default"),
+    [("OPENDRP_DATA_SUBNET", "172.18.20.0/24"), ("OPENDRP_CONNECTOR_SUBNET", "172.18.30.0/24")],
+)
+def test_a_network_whose_containers_must_not_be_believed_is_reported(
+    variable: str, default: str
+) -> None:
+    text = _trusted_compose(
+        f"${{TRUSTED_PROXY_IPS:-127.0.0.1}},${{{variable}:-{default}}}"
+    )
+
+    findings = _subnet_findings(text)
+    assert findings, "a trusted container network has to be reported"
+    assert variable in findings[0]
+
+
+def test_a_service_that_omits_the_append_is_reported() -> None:
+    """The quieter defect: the audit trail names the proxy and nothing else does."""
+    text = _trusted_compose("${TRUSTED_PROXY_IPS:-127.0.0.1,::1}")
+
+    findings = _subnet_findings(text)
+    assert any("without appending" in finding for finding in findings), findings
+
+
+def test_a_stack_where_no_service_appends_a_range_is_reported() -> None:
+    """Not one hop is named in the stack: the addresses were written by hand.
+
+    The fixture has to carry the parent range, or the hierarchy check returns
+    before it can look at `TRUSTED_PROXY_IPS` at all; what it must *not* carry is
+    an appended `${...}` variable, which is what this rule is about.
+    """
+    text = _trusted_compose("127.0.0.1,::1")
+
+    findings = _subnet_findings(text)
+    assert any(
+        "no service running the application appends" in finding for finding in findings
+    ), findings
+
+
+def test_a_trusted_range_that_disagrees_with_the_edge_network_is_reported() -> None:
+    """A range nobody is behind is as wrong as one that is too wide."""
+    text = _trusted_compose(
+        "${TRUSTED_PROXY_IPS:-127.0.0.1},${OPENDRP_EDGE_SUBNET:-10.99.10.0/24}"
+    )
+
+    findings = _subnet_findings(text)
+    assert any("while the edge network is" in finding for finding in findings), findings

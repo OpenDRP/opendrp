@@ -67,7 +67,7 @@ ENV VITE_CANONICAL_ORIGIN=${VITE_CANONICAL_ORIGIN}
 # it, which is what makes a screenshot usable in a bug report. Defaulted to the
 # in-tree version rather than left unset, so a development build does not claim
 # to be a release it is not.
-ARG VITE_APP_VERSION=0.1.1
+ARG VITE_APP_VERSION=0.2.0
 ENV VITE_APP_VERSION=${VITE_APP_VERSION}
 ENV NODE_ENV=production
 
@@ -126,16 +126,27 @@ COPY ./docker/nginx/nginx.conf /etc/nginx/nginx.conf
 # Copy server block: serves SPA + proxies /api → http://backend:8000
 COPY ./docker/nginx/default.conf /etc/nginx/conf.d/default.conf
 
-# Renders /etc/nginx/hsts.inc from HSTS_ENABLED, HSTS_MAX_AGE and
+# Renders the HSTS include from HSTS_ENABLED, HSTS_MAX_AGE and
 # HSTS_INCLUDE_SUBDOMAINS at container start, because nginx cannot read an
 # environment variable and `add_header` cannot be made conditional. The nginx
 # entrypoint runs every executable *.sh in /docker-entrypoint.d/ before the server
 # starts, and the script checks its own output with `nginx -t`.
 COPY ./docker/nginx/hsts.sh /docker-entrypoint.d/40-opendrp-hsts.sh
-# A declared default as well, so the configuration parses in the built image and
-# in any start that bypasses the entrypoint; the entrypoint overwrites it.
-RUN chmod 0755 /docker-entrypoint.d/40-opendrp-hsts.sh \
-    && printf '# HSTS disabled until the entrypoint renders it.\n' > /etc/nginx/hsts.inc
+# Renders the trusted-proxy list the realip module needs, from the same
+# TRUSTED_PROXY_IPS the API uses. Without it the edge rate limits would key on
+# the terminator's address and every client of the installation would share one
+# bucket.
+COPY ./docker/nginx/realip.sh /docker-entrypoint.d/41-opendrp-realip.sh
+# Both fragments are written under /tmp/opendrp, which docker-compose.yml mounts
+# as a tmpfs: the root filesystem is read-only, so nothing else in this image
+# could be written. The HSTS include lands in /tmp/opendrp/hsts/, the trusted
+# proxy list in /tmp/opendrp/realip/ — the two directories the server block
+# includes from. The `include` directives that read them are globs for exactly
+# that reason — an image started without its entrypoints still parses its
+# configuration, it simply serves without the header and with no proxy trusted.
+RUN chmod 0755 \
+    /docker-entrypoint.d/40-opendrp-hsts.sh \
+    /docker-entrypoint.d/41-opendrp-realip.sh
 
 # Copy SPA build artifacts from builder stage
 COPY --from=builder /app/dist /usr/share/nginx/html

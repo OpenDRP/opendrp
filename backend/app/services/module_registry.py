@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.exceptions import BadRequestException, NotFoundException
 from app.models import Module
+from app.services.module_aliases import canonical_module_id
 from app.services.connector_manifest import (
     GENERIC_ADAPTER,
     ModuleSpec,
@@ -42,6 +43,11 @@ GENERIC_STORAGE: dict[str, str] = {"kind": "generic", "adapter": GENERIC_ADAPTER
 #: ``create_all`` databases (dev, tests) behave like migrated ones.
 BUILTIN_MODULE_DEFINITIONS: tuple[dict, ...] = (
     {
+        "id": "exposure", "label": "Exposure", "description": "Provider-observed external services; not a vulnerability verification.",
+        "finding_kind": "exposure", "asset_types": ["domain", "ip_address"], "fields": {}, "dedup_fields": [], "title_field": None,
+        "storage": {"kind": "table", "table": "source_observations", "adapter": "exposure"},
+    },
+    {
         "id": "phishing",
         "label": "Phishing",
         "description": "Look-alike and malicious domains impersonating your assets.",
@@ -62,6 +68,17 @@ BUILTIN_MODULE_DEFINITIONS: tuple[dict, ...] = (
         "dedup_fields": ["breach_name"],
         "title_field": "breach_name",
         "storage": {"kind": "table", "table": "drp_breaches", "adapter": "breach"},
+    },
+    {
+        "id": "dns",
+        "label": "DNS Security",
+        "description": "Current DNS records, registration data, certificate history, and threat-intelligence observations for monitored domains.",
+        "finding_kind": "dns_observation",
+        "asset_types": ["domain"],
+        "fields": {},
+        "dedup_fields": [],
+        "title_field": None,
+        "storage": {"kind": "table", "table": "dns_security_observations", "adapter": "dns_observation"},
     },
 )
 
@@ -108,7 +125,7 @@ async def load_modules(db: AsyncSession) -> dict[str, ModuleSpec]:
 
 
 async def get_module(db: AsyncSession, module_id: str) -> ModuleSpec | None:
-    row = await db.get(Module, str(module_id or "").strip().lower())
+    row = await db.get(Module, canonical_module_id(module_id))
     return spec_from_row(row) if row is not None else None
 
 
@@ -141,6 +158,7 @@ async def create_module(
     dedup_fields: list | None = None,
     title_field: str | None = None,
     asset_types: list | None = None,
+    commit: bool = True,
 ) -> ModuleSpec:
     """Declare a new module backed by generic storage.
 
@@ -194,8 +212,10 @@ async def create_module(
         builtin=False,
     )
     db.add(row)
-    await db.commit()
-    await db.refresh(row)
+    await db.flush()
+    if commit:
+        await db.commit()
+        await db.refresh(row)
     spec = spec_from_row(row)
     log.info(
         "module_declared",
@@ -206,19 +226,32 @@ async def create_module(
     return spec
 
 
-async def set_module_enabled(db: AsyncSession, module_id: str, *, enabled: bool) -> ModuleSpec:
+async def set_module_enabled(db: AsyncSession, module_id: str, *, enabled: bool, commit: bool = True) -> ModuleSpec:
     """Enable or disable a module.
 
-    Disabling stops new registrations for it; already-registered connectors keep
-    their jobs (the module may be temporarily off, not deleted), while ingestion
-    stays available so queued work can still land.
+    Disabling cancels pending jobs and denies further provider requests.
+    An already-sent passive request may finish and submit its evidence.
     """
     row = await db.get(Module, normalize_module_id(module_id))
     if row is None:
         raise NotFoundException("Module not found")
     row.enabled = bool(enabled)
-    await db.commit()
-    await db.refresh(row)
+    if not enabled:
+        from datetime import datetime, timezone
+        from app.models import Connector, Job, JobStatus
+        from app.services.scan_admission import release
+        connectors = list((await db.execute(select(Connector).where(Connector.connector_type == row.id))).scalars())
+        for connector in connectors:
+            pending = list((await db.execute(select(Job).where(Job.job_type == connector.default_job_type, Job.status == JobStatus.pending))).scalars())
+            for job in pending:
+                job.status = JobStatus.cancelled
+                job.finished_at = datetime.now(timezone.utc)
+                job.error_message = "Module disabled by administrator"
+                await release(connector.name, (job.params if isinstance(job.params, dict) else {}).get("scan_admission_token"))
+    await db.flush()
+    if commit:
+        await db.commit()
+        await db.refresh(row)
     log.info("module_toggled", module=row.id, enabled=row.enabled)
     return spec_from_row(row)
 
@@ -229,6 +262,7 @@ async def update_module_metadata(
     *,
     label: str | None = None,
     description: str | None = None,
+    commit: bool = True,
 ) -> ModuleSpec:
     """Rename/redescribe a module. Fields are immutable: findings already stored
     against the previous specification would otherwise silently change shape."""
@@ -242,8 +276,10 @@ async def update_module_metadata(
         row.label = clean
     if description is not None:
         row.description = str(description).strip()[:2000] or None
-    await db.commit()
-    await db.refresh(row)
+    await db.flush()
+    if commit:
+        await db.commit()
+        await db.refresh(row)
     return spec_from_row(row)
 
 

@@ -1,10 +1,11 @@
 """Tests for alert channel routing (Part 2) and scan schedules (Part 3)."""
 
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from sqlalchemy import select
 
 from app.services.alert_service import AlertService
 
@@ -218,13 +219,14 @@ class TestScheduleMatcher:
 class TestSchedulerTask:
     @pytest.fixture
     async def seeded_connectors(self, db_session):
-        """Register one enabled connector per module for scheduler tests."""
+        """Register one enabled, online connector per module for scheduler tests."""
         from app.models import Connector
 
         rows = [
-            Connector(name="dnstwist", connector_type="phishing", default_job_type="phishing.dnstwist"),
-            Connector(name="hibp", connector_type="breaches", default_job_type="breaches.hibp"),
+            Connector(name="dnstwist", connector_type="phishing", default_job_type="phishing.dnstwist", last_seen_at=datetime.now(timezone.utc)),
+            Connector(name="hibp", connector_type="breaches", default_job_type="breaches.hibp", last_seen_at=datetime.now(timezone.utc)),
         ]
+
         db_session.add_all(rows)
         await db_session.commit()
         yield rows
@@ -245,6 +247,19 @@ class TestSchedulerTask:
             assert any(f.startswith("phishing:") for f in res["fired"])
             assert not any(f.startswith("breaches:") for f in res["fired"])  # breaches schedule doesn't match
             assert dedup.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_registry_declared_module_schedule_enqueues_its_online_source(self, db_session):
+        from app.models import Connector, Module
+        from app.tasks import scheduler_tasks as st
+
+        db_session.add(Module(id="code_leak", label="Code leaks", finding_kind="code_leak", asset_types=["domain"], fields={"repository": {"type": "str"}}, dedup_fields=["repository"], title_field="repository", storage={"kind": "generic", "adapter": "generic"}, enabled=True, builtin=False))
+        db_session.add(Connector(name="leak-index", connector_type="code_leak", default_job_type="code_leak.index", last_seen_at=datetime.now(timezone.utc)))
+        await db_session.commit()
+        with patch.object(st, "_load_schedules", new_callable=AsyncMock, return_value={"schedules": {"code_leak": {"days": [1], "hour": 2, "minute": 30}}}), patch.object(st, "_try_acquire_dedup", return_value=True):
+            result = await st.refresh_scan_schedules_task.run.__wrapped__(None, datetime(2026, 9, 7, 2, 30, tzinfo=timezone.utc))
+        assert len(result["fired"]) == 1
+        assert result["fired"][0].startswith("code_leak:")
 
     @pytest.mark.asyncio
     async def test_dedup_prevents_double_fire(self, db_session, seeded_connectors):
@@ -271,6 +286,7 @@ class TestSettingsRoundTrip:
             telegram_chat_ids=["-100999", "@soc_team"],
             schedule_phishing={"days": [1, 3, 5], "hour": 1, "minute": 15},
             schedule_breaches={"days": [0, 6], "hour": 22, "minute": 0},
+            schedule_dns_security={"days": [2], "hour": 7, "minute": 10},
         )
         saved = await SettingsService(db_session).update_settings(s, upd)
         assert saved.email_alerts_enabled is True
@@ -278,6 +294,7 @@ class TestSettingsRoundTrip:
         assert saved.telegram_chat_ids == ["-100999", "@soc_team"]
         assert saved.schedule_phishing == {"days": [1, 3, 5], "hour": 1, "minute": 15}
         assert saved.schedule_breaches == {"days": [0, 6], "hour": 22, "minute": 0}
+        assert saved.schedule_dns_security == {"days": [2], "hour": 7, "minute": 10}
 
         # restore via ORM (portable across SQLite/Postgres test DBs)
         saved.email_alerts_enabled = False
@@ -297,7 +314,20 @@ class TestSettingsRoundTrip:
         with pytest.raises(ValidationError):
             SystemSettingsUpdate(schedule_breaches={"days": [1], "hour": 24, "minute": 0})
         with pytest.raises(ValidationError):
+            SystemSettingsUpdate(schedules={"custom": {"days": [1], "hour": True, "minute": 0}})
+        with pytest.raises(ValidationError):
             SystemSettingsUpdate(telegram_chat_ids=["not a chat id!"])
+
+    @pytest.mark.asyncio
+    async def test_unknown_dynamic_schedule_module_is_rejected(self, db_session):
+        from app.core.exceptions import BadRequestException
+        from app.models import Module
+        from app.schemas.settings import SystemSettingsUpdate
+        from app.services.settings_service import SettingsService
+        settings = await SettingsService(db_session).get_singleton()
+        with pytest.raises(BadRequestException):
+            await SettingsService(db_session).update_settings(settings, SystemSettingsUpdate(schedules={"unknown_module": {"days": [1], "hour": 5, "minute": 0}}))
+        assert set((await db_session.execute(select(Module.id))).scalars().all()) == {"phishing", "breaches", "dns", "exposure"}
 
     def test_chat_ids_accept_blob_string(self):
         from app.schemas.settings import SystemSettingsUpdate

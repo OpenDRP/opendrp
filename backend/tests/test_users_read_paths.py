@@ -1,20 +1,19 @@
-"""Characterization tests: users router read, pagination and toggle paths.
+"""Regression tests: users router read, update, and admin invariant paths.
 
-Part of the safe-refactoring plan (Step 1). These tests pin the CURRENT
-behavior of endpoints that had no direct coverage:
+These tests cover the user-list read paths and admin invariants that must not
+regress:
 
 * ``GET /users/brief``        — admin-only active-user checklist payload.
 * ``GET /users``              — pagination, email search, ``users.list`` audit.
 * ``GET /users/{user_id}``    — fetch + ``users.view`` audit, 404 branch.
-* ``PATCH /users/{id}/toggle-active`` — lock/unlock semantics, self-toggle and
-  last-admin guards, stale-lockout cleanup on revive, ``user.locked`` /
-  ``user.unlocked`` audit events.
+* ``PUT /users/{id}``         — activation is changed here and nowhere else
+  (RWI-04): lock/unlock semantics, the self-guard, the last-admin guard,
+  stale-lockout cleanup on revive, and the ``user.locked`` / ``user.unlocked``
+  audit shape both directions share.
 * ``PUT`` / ``DELETE`` 404 branches for missing users.
 
-They must stay green before AND after the upcoming refactor; a failure means
-behavior changed. Coverage before this file (full-suite, sysmon): 68% for
-``app/api/v1/routers/users.py`` with 66-79, 94-115, 125-135, 187, 298-326,
-349 uncovered.
+The PostgreSQL-only concurrency test is skipped on SQLite because SQLite ignores
+``SELECT FOR UPDATE``; it must run against an isolated PostgreSQL ``*_test`` DB.
 """
 
 from __future__ import annotations
@@ -196,18 +195,26 @@ class TestGetUser:
         assert r.status_code == 403, r.text
 
 
-class TestToggleActive:
+class TestActivationThroughUpdate:
+    """Activation has one path: ``PUT /users/{id}`` (RWI-04 / USR-15).
+
+    ``PATCH .../toggle-active`` was a second writer of ``user.locked`` /
+    ``user.unlocked`` with a different ``details`` shape, and the product never
+    called it — so a SIEM rule written against the traffic matched only one of two
+    routes doing the same thing. The tests below pin the surviving path, and the
+    audit shape both directions share.
+    """
+
     @pytest.mark.asyncio
-    async def test_lock_active_user(self, client, auth_headers_admin, db_session):
+    async def test_deactivating_a_user_is_audited_with_its_method(
+        self, client, auth_headers_admin, db_session
+    ):
         u = await _make_user(db_session, "lockme@example.com")
-        r = await client.patch(
-            f"/api/v1/users/{u.id}/toggle-active", headers=auth_headers_admin
+        r = await client.put(
+            f"/api/v1/users/{u.id}", json={"is_active": False}, headers=auth_headers_admin
         )
         assert r.status_code == 200, r.text
-        body = r.json()
-        assert body["is_active"] is False
-        assert body["action"] == "locked"
-        assert body["id"] == str(u.id)
+        assert r.json()["is_active"] is False
 
         await db_session.refresh(u)
         assert u.is_active is False
@@ -220,24 +227,25 @@ class TestToggleActive:
             ).scalars()
         )
         assert rows
-        assert rows[-1].details.get("method") == "toggle-active"
+        details = rows[-1].details
+        assert details.get("method") == "api_update"
+        assert details.get("target_user_id") == str(u.id)
 
     @pytest.mark.asyncio
-    async def test_unlock_inactive_user_clears_stale_lockout(
+    async def test_reactivating_a_user_clears_stale_lockout(
         self, client, auth_headers_admin, db_session
     ):
         from datetime import datetime, timedelta, timezone
 
-        u = await _make_user(db_session, "revive-toggle@example.com", active=False)
+        u = await _make_user(db_session, "revive-update@example.com", active=False)
         u.failed_login_attempts = 7
         u.locked_until = datetime.now(timezone.utc) + timedelta(minutes=10)
         await db_session.commit()
 
-        r = await client.patch(
-            f"/api/v1/users/{u.id}/toggle-active", headers=auth_headers_admin
+        r = await client.put(
+            f"/api/v1/users/{u.id}", json={"is_active": True}, headers=auth_headers_admin
         )
         assert r.status_code == 200, r.text
-        assert r.json()["action"] == "unlocked"
         assert r.json()["is_active"] is True
 
         await db_session.refresh(u)
@@ -252,90 +260,114 @@ class TestToggleActive:
             ).scalars()
         )
         assert rows
+        assert rows[-1].details.get("method") == "api_update"
 
     @pytest.mark.asyncio
-    async def test_cannot_toggle_self(self, client, auth_headers_admin, test_admin):
-        r = await client.patch(
-            f"/api/v1/users/{test_admin.id}/toggle-active", headers=auth_headers_admin
-        )
-        assert r.status_code == 409, r.text
-
-    @pytest.mark.asyncio
-    async def test_toggle_own_account_self_guard_preempts_last_admin_guard(
-        self, client, auth_headers_admin, test_admin
-    ):
-        """TODO(refactor-step-1): documents guard ordering, intentionally pinned.
-
-        For the sole active admin, self-toggle returns 409 "You cannot toggle
-        your own account" — the self-guard evaluates BEFORE the last-admin
-        guard, so that guard is unreachable through the HTTP API (it would only
-        apply to a *different* sole admin, but toggling yourself is the only way
-        to target an admin when you are the only other admin... which is you).
-        The last-admin branch inside ``toggle_active`` is exercised at unit level
-        in ``test_toggle_last_admin_guard_branch`` below.
-        """
-        r = await client.patch(
-            f"/api/v1/users/{test_admin.id}/toggle-active", headers=auth_headers_admin
-        )
-        assert r.status_code == 409, r.text
-        assert "toggle your own account" in r.json()["detail"].lower()
-
-    @pytest.mark.asyncio
-    async def test_toggle_second_admin_succeeds_while_first_stays_active(
+    async def test_both_directions_share_one_audit_field_set(
         self, client, auth_headers_admin, db_session
     ):
-        """With another active admin remaining, locking an admin is allowed."""
+        """A rule keyed on one direction must match the other (USR-15)."""
+        locking = await _make_user(db_session, "shape-lock@example.com")
+        reviving = await _make_user(db_session, "shape-unlock@example.com", active=False)
+        await client.put(
+            f"/api/v1/users/{locking.id}", json={"is_active": False}, headers=auth_headers_admin
+        )
+        await client.put(
+            f"/api/v1/users/{reviving.id}", json={"is_active": True}, headers=auth_headers_admin
+        )
+
+        locked = list(
+            (
+                await db_session.execute(
+                    select(AuditLog).where(AuditLog.action == "user.locked")
+                )
+            ).scalars()
+        )
+        unlocked = list(
+            (
+                await db_session.execute(
+                    select(AuditLog).where(AuditLog.action == "user.unlocked")
+                )
+            ).scalars()
+        )
+        assert locked and unlocked
+        assert set(locked[-1].details) == set(unlocked[-1].details)
+
+    @pytest.mark.asyncio
+    async def test_deactivating_a_second_admin_succeeds_while_one_remains(
+        self, client, auth_headers_admin, db_session
+    ):
         u = await _make_user(db_session, "second-admin@example.com", role="admin")
-        r = await client.patch(
-            f"/api/v1/users/{u.id}/toggle-active", headers=auth_headers_admin
+        r = await client.put(
+            f"/api/v1/users/{u.id}", json={"is_active": False}, headers=auth_headers_admin
         )
         assert r.status_code == 200, r.text
-        assert r.json()["action"] == "locked"
+        assert r.json()["is_active"] is False
 
     @pytest.mark.asyncio
-    async def test_toggle_last_admin_guard_branch(
-        self, db_session, test_admin
-    ):
-        """Unit-level pin: the last-admin guard inside ``toggle_active``.
-
-        The branch is unreachable over HTTP: the self-guard fires first for the
-        sole admin, and any authenticated caller is itself an active admin, so
-        ``_count_active_admins(exclude_id=target)`` is always >= 1 when the
-        target is a different user. To execute and pin the guard branch we call
-        the handler directly with an *inactive* acting admin (a state the API
-        cannot produce) so the exclusion count drops to zero.
-        """
-        from app.api.v1.routers.users import toggle_active
-        from app.core.exceptions import ConflictException
-
-        target = await _make_user(db_session, "sole-active-admin@example.com", role="admin")
-        # Force the (API-impossible) state: acting admin exists but is inactive,
-        # making the target the only ACTIVE admin.
-        test_admin.is_active = False
-        await db_session.commit()
-
-        with pytest.raises(ConflictException, match="(?i)last active admin"):
-            await toggle_active(
-                request=None,
-                user_id=target.id,
-                db=db_session,
-                current_user=test_admin,
-            )
-
-    @pytest.mark.asyncio
-    async def test_toggle_unknown_user_404(self, client, auth_headers_admin):
-        r = await client.patch(
-            f"/api/v1/users/{uuid.uuid4()}/toggle-active", headers=auth_headers_admin
-        )
-        assert r.status_code == 404, r.text
-
-    @pytest.mark.asyncio
-    async def test_toggle_requires_admin(self, client, auth_headers_analyst, db_session):
-        u = await _make_user(db_session, "toggle-rbac@example.com")
-        r = await client.patch(
-            f"/api/v1/users/{u.id}/toggle-active", headers=auth_headers_analyst
+    async def test_requires_admin(self, client, auth_headers_analyst, db_session):
+        u = await _make_user(db_session, "update-rbac@example.com")
+        r = await client.put(
+            f"/api/v1/users/{u.id}", json={"is_active": False}, headers=auth_headers_analyst
         )
         assert r.status_code == 403, r.text
+
+
+class TestLastAdminConcurrencyPostgres:
+    @pytest.mark.asyncio
+    async def test_concurrent_admin_membership_changes_keep_one_active_admin(
+        self, client, db_session, auth_headers_admin, test_admin
+    ):
+        if db_session.get_bind().dialect.name != "postgresql":
+            pytest.skip("last-admin serialization requires PostgreSQL row locks")
+
+        import asyncio
+        from httpx import ASGITransport, AsyncClient
+        from app.api import deps
+        from app.core import database
+        from app.main import app
+
+        # Keep the existing fixture admin as the one that must survive; one
+        # concurrent operation creates an admin while another tries demoting it.
+        original = db_session
+        sessions = []
+
+        async def isolated_db():
+            async with database.AsyncSessionLocal() as session:
+                sessions.append(session)
+                yield session
+
+        app.dependency_overrides[deps.get_db] = isolated_db
+        try:
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as race_client:
+                first_result, second_result = await asyncio.gather(
+                    race_client.post(
+                        "/api/v1/users",
+                        headers=auth_headers_admin,
+                        json={"email": "concurrent-new-admin@example.com", "password": PASSWORD, "role": "admin"},
+                    ),
+                    race_client.put(
+                        f"/api/v1/users/{test_admin.id}",
+                        headers=auth_headers_admin,
+                        json={"role": "viewer"},
+                    ),
+                )
+        finally:
+            app.dependency_overrides.pop(deps.get_db, None)
+            for session in sessions:
+                await session.close()
+
+        assert first_result.status_code == 201, first_result.text
+        assert second_result.status_code in {200, 409}, second_result.text
+        await original.refresh(test_admin)
+        admins = (
+            await original.execute(
+                select(User.id).where(User.role == "admin", User.is_active.is_(True))
+            )
+        ).scalars().all()
+        assert admins
+        if second_result.status_code == 200:
+            assert len(admins) == 1
 
 
 class TestUpdateDeleteNotFoundBranches:
@@ -372,10 +404,10 @@ class TestUpdateDeleteNotFoundBranches:
     ):
         """Unit-level pin: the PUT last-admin deactivation guard.
 
-        As with ``toggle_active``, the branch is unreachable over HTTP: the
-        caller is always an active admin, so deactivating a *different* admin
-        always leaves at least one (the caller). Exercise the guard directly
-        with an inactive acting admin so the target is the only active one.
+        The branch is unreachable over HTTP: the caller is always an active
+        admin, so deactivating a *different* admin always leaves at least one
+        (the caller). Exercise the guard directly with an inactive acting admin
+        so the target is the only active one.
         """
         from app.api.v1.routers.users import update_user
         from app.core.exceptions import ConflictException

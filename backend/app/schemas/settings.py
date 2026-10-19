@@ -1,5 +1,8 @@
 import re
 import uuid
+from typing import Literal
+
+from app.services.module_aliases import canonical_module_id
 from datetime import datetime
 
 from pydantic import (
@@ -61,12 +64,37 @@ class SystemSettingsBase(BaseModel):
     # Telegram chat IDs, each validated in SystemSettingsUpdate.
     telegram_chat_ids: list[str] | None = None
 
+    # --- Alert budget (see app/services/alert_policy.py) ---
+    # The operator's half of the alert policy. ``None`` is not "off" or "zero":
+    # it is "this installation has not decided this one", and the environment's
+    # ``ALERT_*`` value answers it. The four numbers carry the same bounds the
+    # environment schema does, so a row cannot be written through the API that the
+    # resolver would have to refuse; the one relationship between two of them (the
+    # digest threshold stays below the direct one) is checked where both values are
+    # known — in the service, against the row as it will be saved, because a save
+    # may state only one of the pair.
+    alert_confidence_direct: int | None = Field(None, ge=1, le=100)
+    alert_confidence_digest: int | None = Field(None, ge=0, le=99)
+    alert_phishing_digest_enabled: bool | None = None
+    alert_phishing_digest_hour_utc: int | None = Field(None, ge=0, le=23)
+    alert_no_channel_retry_hours: int | None = Field(None, ge=0, le=8760)
+    alert_candidate_change_notifications: bool | None = None
+    # The breach module's half of the budget (see app/services/alert_policy.py).
+    # ``None`` is "not decided here", exactly as above; ``all`` restores the
+    # behaviour that reported spam and fabricated incidents like any other.
+    alert_breach_noise_policy: Literal["store_only_spam", "verified_only", "all"] | None = None
+    alert_breach_digest_threshold: int | None = Field(None, ge=0, le=500)
+
     # --- Scan schedules (UTC) ---
     schedule_phishing: dict | None = None
     schedule_breaches: dict | None = None
+    schedule_dns_security: dict | None = None
+    schedule_exposure: dict | None = None
+    schedules: dict[str, dict | None] | None = None
 
 
 class SystemSettingsUpdate(SystemSettingsBase):
+    expected_version: int | None = Field(None, ge=1)
     @field_validator("smtp_security_mode")
     @classmethod
     def _validate_smtp_security_mode(cls, v: str) -> str:
@@ -106,6 +134,8 @@ class SystemSettingsUpdate(SystemSettingsBase):
             return None
         if isinstance(v, str) and v.strip() == "":
             return None
+        if isinstance(v, bool) or isinstance(v, float):
+            raise ValueError("smtp_port: must be an integer")
         try:
             iv = int(v)
         except (ValueError, TypeError):
@@ -167,8 +197,8 @@ class SystemSettingsUpdate(SystemSettingsBase):
     def _validate_alert_email_user_ids(cls, v):
         if v is None:
             return None
-        if not isinstance(v, list):
-            raise ValueError("alert_email_user_ids: expected a list of user ids")
+        if not isinstance(v, list) or len(v) > 100:
+            raise ValueError("alert_email_user_ids: expected at most 100 user ids")
         out: list[str] = []
         for item in v:
             s = str(item).strip()
@@ -188,8 +218,8 @@ class SystemSettingsUpdate(SystemSettingsBase):
         if isinstance(v, str):
             # Accept a newline/comma separated blob from the UI textarea.
             v = [chunk for chunk in v.replace(",", "\n").split("\n")]
-        if not isinstance(v, list):
-            raise ValueError("telegram_chat_ids: expected a list of chat ids")
+        if not isinstance(v, list) or len(v) > 100:
+            raise ValueError("telegram_chat_ids: expected at most 100 chat ids")
         out: list[str] = []
         for item in v:
             s = str(item).strip()
@@ -203,13 +233,42 @@ class SystemSettingsUpdate(SystemSettingsBase):
                 out.append(s)
         return out
 
-    @field_validator("schedule_phishing", "schedule_breaches", mode="before")
+    @field_validator("schedules", mode="before")
+    @classmethod
+    def _validate_module_schedules(cls, value):
+        if value is None:
+            return None
+        if not isinstance(value, dict) or len(value) > 100:
+            raise ValueError("schedules: expected an object with at most 100 module entries")
+        validated = {}
+        for module_id, spec in value.items():
+            clean_id = canonical_module_id(str(module_id))
+            if clean_id in {"phishing", "breaches", "dns", "exposure"}:
+                raise ValueError("Built-in schedules must use their dedicated fields")
+            if not re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", clean_id):
+                raise ValueError("schedules: invalid module id")
+            if spec is None:
+                validated[clean_id] = None
+                continue
+            if not isinstance(spec, dict) or set(spec) != {"days", "hour", "minute"}:
+                raise ValueError(f"schedules.{clean_id}: expected days, hour, and minute")
+            days, hour, minute = spec["days"], spec["hour"], spec["minute"]
+            if not isinstance(days, list) or not days or any(type(day) is not int or not 0 <= day <= 6 for day in days):
+                raise ValueError(f"schedules.{clean_id}.days: non-empty weekday list 0..6")
+            if type(hour) is not int or not 0 <= hour <= 23:
+                raise ValueError(f"schedules.{clean_id}.hour: integer 0..23")
+            if type(minute) is not int or not 0 <= minute <= 59:
+                raise ValueError(f"schedules.{clean_id}.minute: integer 0..59")
+            validated[clean_id] = {"days": sorted(set(days)), "hour": hour, "minute": minute}
+        return validated
+
+    @field_validator("schedule_phishing", "schedule_breaches", "schedule_dns_security", "schedule_exposure", mode="before")
     @classmethod
     def _validate_schedule(cls, v):
         if v is None:
             return None
-        if not isinstance(v, dict):
-            raise ValueError("schedule: expected an object")
+        if not isinstance(v, dict) or set(v) != {"days", "hour", "minute"}:
+            raise ValueError("schedule: expected days, hour and minute only")
         days = v.get("days")
         hour = v.get("hour")
         minute = v.get("minute")
@@ -217,19 +276,20 @@ class SystemSettingsUpdate(SystemSettingsBase):
             raise ValueError("schedule.days: non-empty list of weekdays (0=Sun..6=Sat)")
         cleaned_days: list[int] = []
         for d in days:
-            if not isinstance(d, int) or not 0 <= d <= 6:
+            if type(d) is not int or not 0 <= d <= 6:
                 raise ValueError("schedule.days: each day must be an integer 0..6")
             if d not in cleaned_days:
                 cleaned_days.append(d)
-        if not isinstance(hour, int) or not 0 <= hour <= 23:
+        if type(hour) is not int or not 0 <= hour <= 23:
             raise ValueError("schedule.hour: integer 0..23")
-        if not isinstance(minute, int) or not 0 <= minute <= 59:
+        if type(minute) is not int or not 0 <= minute <= 59:
             raise ValueError("schedule.minute: integer 0..59")
         return {"days": sorted(cleaned_days), "hour": hour, "minute": minute}
 
 
 class SystemSettingsResponse(SystemSettingsBase):
     id: uuid.UUID
+    version: int
     created_at: datetime
     updated_at: datetime
 
@@ -246,6 +306,7 @@ class SystemSettingsResponse(SystemSettingsBase):
 
         fields = (
             "id",
+            "version",
             "created_at",
             "updated_at",
             "telegram_bot_token",
@@ -260,8 +321,19 @@ class SystemSettingsResponse(SystemSettingsBase):
             "telegram_alerts_enabled",
             "alert_email_user_ids",
             "telegram_chat_ids",
+            "alert_confidence_direct",
+            "alert_confidence_digest",
+            "alert_phishing_digest_enabled",
+            "alert_phishing_digest_hour_utc",
+            "alert_no_channel_retry_hours",
+            "alert_candidate_change_notifications",
+            "alert_breach_noise_policy",
+            "alert_breach_digest_threshold",
             "schedule_phishing",
             "schedule_breaches",
+            "schedule_dns_security",
+            "schedule_exposure",
+            "schedules",
         )
         result = {field: getattr(value, field, None) for field in fields}
         for field in (
@@ -292,6 +364,34 @@ class SystemSettingsResponse(SystemSettingsBase):
             # for callers that provide an already-plain value in production.
             decrypted = v
         return mask_value(decrypted, keep_first=2, keep_last=2)
+
+
+class AlertPolicyResponse(BaseModel):
+    """The alert budget as it is *in force*, not as it is stored (WI-13).
+
+    The Settings page edits the six columns; this is what the platform is routing
+    by right now, and the two are not the same thing: a value the operator never
+    stated is the deployment's, and a row that does not hold together is refused in
+    favour of it. ``source`` answers "did my save take effect?" and ``invalid``
+    names the fields that were refused, so the page can say which of the two
+    answered instead of showing six empty inputs and leaving the operator to guess.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    confidence_direct: int
+    confidence_digest: int
+    digest_enabled: bool
+    digest_hour_utc: int
+    no_channel_retry_hours: int
+    candidate_change_notifications: bool
+    #: The breach module's two values: which incidents the channel stores silently,
+    #: and how many new incidents one scan reports before the rest wait for the
+    #: digest (0 = no waiting).
+    breach_noise_policy: Literal["store_only_spam", "verified_only", "all"]
+    breach_digest_threshold: int
+    source: Literal["environment", "settings"]
+    invalid: list[str]
 
 
 class TestEmailRequest(BaseModel):

@@ -44,7 +44,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
-from sqlalchemy import func, select, text
+from sqlalchemy import func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
@@ -69,7 +69,12 @@ CHAIN_LOCK_KEY = 0x4F70656E44525032
 #: ``audit_key_id`` is here so that an *exported* stream, which has no ``key_id``
 #: column to read, can still name the key that signed a line — without it a
 #: rotated installation could not verify its own SIEM copy.
-RESERVED_DETAIL_KEYS = ("audit_hash", "audit_prev_hash", "audit_key_id")
+RESERVED_DETAIL_KEYS = (
+    "audit_persisted",
+    "audit_hash",
+    "audit_prev_hash",
+    "audit_key_id",
+)
 
 #: Bounds one verification pass, so a corrupt or enormous table cannot make the
 #: nightly task run for hours. A truncated pass still advances
@@ -202,7 +207,7 @@ def _dialect(db: AsyncSession) -> str:
 
 async def chain_state(db: AsyncSession) -> AuditChain:
     """The singleton chain-state row, created on first use."""
-    state = await db.get(AuditChain, AUDIT_CHAIN_STATE_ID)
+    state = (await db.execute(select(AuditChain).where(AuditChain.id == AUDIT_CHAIN_STATE_ID).execution_options(populate_existing=True))).scalar_one_or_none()
     if state is not None:
         return state
     state = AuditChain(
@@ -216,17 +221,21 @@ async def chain_state(db: AsyncSession) -> AuditChain:
 
 
 async def next_seq(db: AsyncSession) -> int:
-    """The position the next entry takes.
+    """The next committed position, without sequence gaps on rolled-back writes.
 
-    On PostgreSQL the sequence the migration created, which is what keeps the
-    position monotonic without a table scan. On SQLite the maximum, which is safe
-    because a single process writes there and the transaction is already open.
+    PostgreSQL sequence values are not transactional: ``nextval`` remains spent
+    if the audit insert later rolls back, and the verifier then mistakes that
+    ordinary database error for deleted history. Every PostgreSQL writer already
+    holds ``CHAIN_LOCK_KEY`` here, so the indexed MAX read is serialized across
+    replicas. The retirement watermark preserves monotonicity after retention
+    deletes the newest remaining row.
     """
-    if _dialect(db) == "postgresql":
-        value = await db.scalar(text("SELECT nextval('drp_audit_logs_seq_seq')"))
-        return int(value or 0)
     current = await db.scalar(select(func.max(AuditLog.seq)))
-    return int(current or 0) + 1
+    state = await chain_state(db)
+    highest = int(state.committed_seq or 0)
+    if max(int(current or 0), int(state.retired_through_seq or 0)) != highest:
+        raise RuntimeError("Audit committed checkpoint disagrees with retained tip; append refused")
+    return highest + 1
 
 
 async def tip_hash(db: AsyncSession) -> str:
@@ -238,10 +247,11 @@ async def tip_hash(db: AsyncSession) -> str:
     newest = await db.scalar(
         select(AuditLog.entry_hash).order_by(AuditLog.seq.desc()).limit(1)
     )
-    if newest:
-        return str(newest)
     state = await chain_state(db)
-    return str(state.retired_tip_hash or GENESIS_PREV_HASH)
+    actual = str(newest or state.retired_tip_hash or GENESIS_PREV_HASH)
+    if actual != str(state.committed_tip_hash or GENESIS_PREV_HASH):
+        raise RuntimeError("Audit committed tip hash mismatch; append refused")
+    return actual
 
 
 @dataclass
@@ -284,6 +294,9 @@ async def prepare_entry(
     entry_hash = compute_entry_hash(
         keys[0], payload=payload, prev_hash=prev_hash, key_id=key_id
     )
+    state = await chain_state(db)
+    state.committed_seq = seq
+    state.committed_tip_hash = entry_hash
     return ChainLink(
         seq=seq, prev_hash=prev_hash, entry_hash=entry_hash, key_id=key_id, keys=keys
     )
@@ -346,6 +359,9 @@ async def verify(
     since: int | None = None,
     full: bool = False,
     max_rows: int = DEFAULT_MAX_ROWS,
+    upper: tuple[int, str] | None = None,
+    anchor_hash: str | None = None,
+    persist: bool = True,
 ) -> ChainVerification:
     """Walk the retained chain and report the first entry that does not fit.
 
@@ -357,7 +373,17 @@ async def verify(
     Verification never repairs anything. A chain that does not verify is the
     finding; "fixing" it would destroy the only evidence that it was broken.
     """
+    if max_rows <= 0:
+        raise ValueError("max_rows must be positive")
+    # One MVCC snapshot contains checkpoint, retirement and rows. PostgreSQL
+    # REPEATABLE READ permits append/retire concurrently without a long lock.
+    if _dialect(db) == "postgresql":
+        if db.in_transaction():
+            raise RuntimeError("Verification requires a fresh transaction")
+        await db.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"))
     state = await chain_state(db)
+    upper_seq, upper_hash = upper or (int(state.committed_seq or 0), state.committed_tip_hash or GENESIS_PREV_HASH)
+    retired_seq = int(state.retired_through_seq or 0)
     from_seq = 0 if full else (state.last_verified_seq if since is None else since)
 
     anchor = await db.scalar(
@@ -374,12 +400,14 @@ async def verify(
     # been running longer than the retention window as tampered — on the pass an
     # operator runs after a restore, which is exactly when a false alarm costs
     # the most.
-    expected_prev: str = str(anchor or state.retired_tip_hash or GENESIS_PREV_HASH)
+    expected_prev: str = str(anchor_hash or anchor or state.retired_tip_hash or GENESIS_PREV_HASH)
+    if from_seq < retired_seq:
+        expected_prev = str(state.retired_tip_hash or GENESIS_PREV_HASH)
 
     result = ChainVerification(
         from_seq=from_seq,
         through_seq=from_seq,
-        retired_through_seq=state.retired_through_seq,
+        retired_through_seq=retired_seq,
     )
     # (fingerprint, key) pairs, so a row is checked against the key that claims to
     # have signed it rather than against whichever key is currently first.
@@ -388,7 +416,7 @@ async def verify(
     # of an incremental pass has to be checked for contiguity against where the
     # pass began, otherwise a deletion at the head of the new range is invisible
     # until the next full verification.
-    last_seq: int = from_seq
+    last_seq: int = max(from_seq, retired_seq)
 
     query = (
         select(
@@ -402,8 +430,9 @@ async def verify(
             AuditLog.prev_hash,
             AuditLog.key_id,
         )
-        .where(AuditLog.seq > from_seq)
+        .where(AuditLog.seq > from_seq, AuditLog.seq <= upper_seq)
         .order_by(AuditLog.seq)
+        .limit(max_rows + 1)
     )
     stream = await db.stream(query)
     try:
@@ -426,7 +455,7 @@ async def verify(
                 # Legitimate only while every skipped position is below the
                 # watermark retention recorded.
                 first_missing = last_seq + 1
-                if first_missing > state.retired_through_seq:
+                if first_missing > retired_seq:
                     result.first_broken_seq = first_missing
                     result.reason = REASON_GAP
                     break
@@ -484,15 +513,26 @@ async def verify(
     finally:
         await stream.close()
 
+    if result.ok and not result.truncated:
+        if last_seq != upper_seq:
+            result.first_broken_seq = last_seq + 1
+            result.reason = REASON_GAP
+        elif expected_prev != upper_hash:
+            result.first_broken_seq = upper_seq
+            result.reason = REASON_BROKEN_LINK
+
     # A truncated pass still advances the watermark for the prefix it did read,
     # which is what keeps a long first run from repeating its work every night.
     advanced_through = last_seq if result.ok else from_seq
     result.through_seq = int(advanced_through or from_seq)
 
-    if result.ok:
-        state.last_verified_seq = max(int(state.last_verified_seq or 0), result.through_seq)
-        state.last_verified_at = datetime.now(timezone.utc)
+    if persist:
+        # End the read snapshot before recording status, so concurrent appends
+        # cannot cause a serialization conflict on their chain-state row.
         await db.commit()
+        if result.ok:
+            await db.execute(update(AuditChain).where(AuditChain.id == AUDIT_CHAIN_STATE_ID).values(last_verified_seq=func.max(AuditChain.last_verified_seq, result.through_seq) if _dialect(db) == "sqlite" else func.greatest(AuditChain.last_verified_seq, result.through_seq), last_verified_at=datetime.now(timezone.utc)))
+            await db.commit()
     return result
 
 

@@ -7,7 +7,7 @@ COPY connectors/base /opt/sdk
 RUN pip install --no-cache-dir /opt/sdk
 
 COPY connectors/hibp/requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir -r /app/requirements.txt
+RUN pip install --no-cache-dir --require-hashes -r /app/requirements.txt
 
 COPY connectors/hibp/main.py /app/main.py
 

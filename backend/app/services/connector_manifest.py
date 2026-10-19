@@ -31,6 +31,8 @@ from __future__ import annotations
 
 import json
 import re
+
+from app.services.module_aliases import canonical_job_type, canonical_module_id
 from dataclasses import dataclass, field as dataclass_field
 from datetime import date
 from functools import lru_cache
@@ -51,7 +53,7 @@ from typing_extensions import Annotated
 
 from app.core.exceptions import BadRequestException
 from app.models.asset import AssetType
-from app.schemas.connector import BreachFinding, PhishingFinding, sanitize_attributes
+from app.schemas.connector import BreachFinding, ExposureFinding, PhishingFinding, sanitize_attributes
 
 # ---------------------------------------------------------------------------
 # Grammars and limits
@@ -98,6 +100,7 @@ PLATFORM_FINDING_FIELDS = ("matched_asset", "attributes")
 NATIVE_ADAPTER_MODELS: dict[str, type[BaseModel]] = {
     "phishing": PhishingFinding,
     "breach": BreachFinding,
+    "exposure": ExposureFinding,
 }
 GENERIC_ADAPTER = "generic"
 
@@ -206,7 +209,7 @@ def normalize_module_id(raw: str) -> str:
         raise BadRequestException(
             "module must be a lowercase identifier (letters, digits, underscore)"
         )
-    return module
+    return canonical_module_id(module)
 
 
 def normalize_finding_kind(raw: str) -> str:
@@ -225,7 +228,7 @@ def normalize_job_type(raw: str) -> str:
     no default: a connector without a declaration could claim nothing while
     still looking registered.
     """
-    job_type = str(raw or "").strip().lower()
+    job_type = canonical_job_type(raw)
     if not job_type:
         raise BadRequestException(
             "job type is required: declare '<module>.<connector>' so this "
@@ -474,6 +477,10 @@ def finding_adapter_for(spec: ModuleSpec) -> FindingBatchValidator | None:
     """
     if spec.adapter == GENERIC_ADAPTER:
         return FindingBatchValidator(declared_finding_model(spec))
+    if spec.adapter == "dns_observation":
+        from app.schemas.connector import DNSObservationPayload
+
+        return FindingBatchValidator(DNSObservationPayload)
     model = NATIVE_ADAPTER_MODELS.get(spec.adapter)
     if model is None:
         return None
@@ -636,8 +643,11 @@ def validate_connector_config(manifest: dict[str, Any], config: Any) -> dict[str
             raise BadRequestException(f"invalid config key '{key}'")
         field = schema.get(key)
         if field is None:
-            if not schema and isinstance(raw_value, (bool, int, float, str)):
-                cleaned[key] = raw_value
+            if schema:
+                raise BadRequestException(f"unknown config key '{key}'")
+            if not isinstance(raw_value, (bool, int, float, str)):
+                raise BadRequestException(f"config '{key}' must be a scalar")
+            cleaned[key] = raw_value
             continue
         cleaned[key] = _coerce_field(key, field, raw_value)
     # Materialize declared defaults so the connector always receives them.

@@ -12,11 +12,15 @@ describe("shared UI primitives", () => {
     const onRetry = vi.fn();
     const { rerender } = render(<ErrorState onRetry={onRetry} />);
     expect(screen.getByText("Unable to load data")).toBeInTheDocument();
+    // The failure replaces the data that was on screen, so it has to announce
+    // itself: a screen reader is told nothing by content that silently vanishes.
+    expect(screen.getByRole("alert")).toHaveTextContent("Unable to load data");
     await user.click(screen.getByRole("button", { name: "Try again" }));
     expect(onRetry).toHaveBeenCalledOnce();
 
     rerender(<ErrorState title="Custom error" description="Try later" />);
     expect(screen.getByText("Custom error")).toBeInTheDocument();
+    expect(screen.getByRole("alert")).toHaveTextContent("Try later");
     expect(screen.queryByRole("button", { name: "Try again" })).not.toBeInTheDocument();
   });
 

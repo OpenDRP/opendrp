@@ -193,6 +193,7 @@ class TestStorageContract:
             {
                 "breach_name": "DirectRisky",
                 "matched_email": "risky@direct.example",
+                "breach_date": "2026-02-03",
                 # A service caller can hand over anything; the payload is still
                 # filtered before it reaches the JSON column.
                 "attributes": {"ok_key": "value", "Bad-Key": "dropped", "nested": {"a": 1}},
@@ -285,12 +286,21 @@ class TestApiSurface:
                 {
                     "breach_name": "Newsource Leak",
                     "matched_domain": "newsource.example",
+                    "breach_date": "2026-02-03",
                     "attributes": {"feed": "underground-forum", "records": 1200},
                 }
             ],
         )
         assert resp.status_code == 200, resp.text
-        assert resp.json() == {"accepted": 1, "rejected": 0}
+        assert resp.json() == {
+            "received": 1,
+            "created": 1,
+            "updated": 0,
+            "unchanged": 0,
+            "accepted": 1,
+            "rejected": 0,
+            "errors": [],
+        }
 
         row = (
             await db_session.execute(

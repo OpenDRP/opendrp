@@ -6,11 +6,13 @@ from app.core.audit import AuditLogger
 from app.core.config import settings as core_settings
 from app.core.safe_errors import sanitize_external_error
 from app.schemas.settings import (
+    AlertPolicyResponse,
     SystemSettingsResponse,
     SystemSettingsUpdate,
     TestEmailRequest,
     TestTelegramRequest,
 )
+from app.services.alert_policy import resolve_alert_policy
 from app.services.settings_service import (
     _ENCRYPTED_FIELDS,
     SettingsService,
@@ -73,6 +75,20 @@ async def get_runtime_configuration(
     }
 
 
+@router.get("/alert-policy", response_model=AlertPolicyResponse)
+async def get_alert_policy(
+    db: AsyncSession = Depends(get_db),
+    user=Depends(require_admin),
+):
+    """The alert budget in force, resolved from the saved row and the environment.
+
+    Deliberately un-audited: it is a derived read of configuration the Settings
+    page has just fetched (and ``GET /settings`` is the audited row), so an audit
+    row here would double the log of every page visit without saying anything new.
+    """
+    return AlertPolicyResponse.model_validate(await resolve_alert_policy(db))
+
+
 @router.put("", response_model=SystemSettingsResponse)
 async def update_settings(
     request: Request,
@@ -87,21 +103,24 @@ async def update_settings(
     updated_fields = [
         k
         for k, v in raw_dump.items()
-        if not (
+        if k != "expected_version" and not (
             k in _ENCRYPTED_FIELDS
             and is_unchanged_masked_value(
                 v, getattr(s, _ENCRYPTED_FIELDS[k], None)
             )
         )
     ]
-    result = await service.update_settings(s, data)
+    result = await service.update_settings(s, data, commit=False)
     await AuditLogger.emit(
         db,
         action="settings.update",
         ip_address=extract_ip(request),
         user_id=user.id,
-        details={"updated_fields": updated_fields},
+        details={"updated_fields": updated_fields, "version": result.version},
+        require_persistence=True,
+        commit=False,
     )
+    await db.commit()
     return result
 
 
@@ -149,7 +168,7 @@ async def validate_telegram(
 
     s = await SettingsService(db).get_singleton()
     try:
-        result = await AlertService(db).validate_telegram_chats(s, req.chat_id)
+        result = await AlertService(db, user_id=user.id, ip_address=extract_ip(request)).validate_telegram_chats(s, req.chat_id)
     except Exception as e:
         await AuditLogger.emit(
             db,
@@ -174,14 +193,14 @@ async def send_test_telegram(
 
     s = await SettingsService(db).get_singleton()
     try:
-        result = await AlertService(db).send_test_telegram(s, req.chat_id)
+        result = await AlertService(db, user_id=user.id, ip_address=extract_ip(request)).send_test_telegram(s, req.chat_id)
     except Exception as e:
         await AuditLogger.emit(
             db,
             action="settings.test_telegram_failed",
             ip_address=extract_ip(request),
             user_id=user.id,
-            details={"chat_id": req.chat_id, "error": str(e)[:300]},
+            details={"chat_id": req.chat_id, "error": sanitize_external_error(e, limit=300)},
         )
         raise
     await AuditLogger.emit(

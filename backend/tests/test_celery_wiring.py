@@ -45,6 +45,13 @@ class TestCeleryWiring:
             entry: task for entry, task in scheduled.items() if task not in registered
         } == {}
 
+    def test_dns_expiry_alert_task_is_scheduled_once_daily(self):
+        from app.core.celery_app import celery_app
+
+        entry = celery_app.conf.beat_schedule["check-dns-expiry-alerts-daily"]
+        assert entry["task"] == "check_dns_expiry_alerts"
+        assert entry["options"]["queue"] == "alerts"
+
     def test_beat_schedule_runs_dynamic_scheduler_tick(self):
         """Scans are scheduled dynamically from system_settings; beat only runs
         the every-minute tick that reads them."""
@@ -98,8 +105,7 @@ class TestCeleryWiring:
                 return {int(v) for v in value}
             return {int(value)}
 
-        schedule = entry["schedule"]
-        assert (_cron_values(schedule.hour), _cron_values(schedule.minute)) != (4, 15)
+        assert entry["schedule"] == 60.0  # One bounded resumable chunk per minute.
 
     def test_only_core_tasks_are_exported(self):
         from app import tasks

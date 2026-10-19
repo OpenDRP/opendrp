@@ -2,7 +2,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
-from sqlalchemy import DateTime, String, UUID, Boolean, func
+from sqlalchemy import DateTime, ForeignKey, String, Uuid, Boolean, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import Base, UUIDMixin
@@ -12,13 +12,24 @@ class RefreshTokenFamily(Base, UUIDMixin):
     __tablename__ = "drp_refresh_families"
 
     family_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True),
+        Uuid(as_uuid=True),
         unique=True,
         nullable=False,
         index=True,
     )
+    # The schema owns the account's departure: a family whose user row is gone
+    # can never be presented again, but the retention sweep only deletes rows
+    # whose ``revoked_at`` has passed — so a family orphaned by a raw
+    # ``DELETE FROM users`` (an operator's SQL, a restore into a half-populated
+    # database) was never removed by anything. ``ON DELETE CASCADE`` is what
+    # makes "the account is gone" and "its sessions are gone" the same fact.
     user_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True),
+        Uuid(as_uuid=True),
+        ForeignKey(
+            "users.id",
+            ondelete="CASCADE",
+            name="fk_drp_refresh_families_user_id_users",
+        ),
         nullable=False,
         index=True,
     )

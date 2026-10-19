@@ -322,7 +322,7 @@ class TestTheDeploymentPolicyIsAStep:
             )
         ).scalars().all()
         assert rows and rows[-1].details["path"] == GATED_ROUTE
-        assert rows[-1].details["reason"] == "require_mfa_for_admins"
+        assert rows[-1].details["reason"] == "require_mfa"
         # The role is the value, not the enum's repr: a detail written as
         # `"UserRole.admin"` matches no rule anyone would write against it.
         assert rows[-1].details["role"] == "admin"
@@ -353,6 +353,50 @@ class TestTheDeploymentPolicyIsAStep:
         assert (await client.get(GATED_ROUTE, headers=headers)).status_code == 200
         me = await client.get("/api/v1/auth/me", headers=headers)
         assert me.json()["mfa_required_by_policy"] is False
+
+    @pytest.mark.anyio
+    async def test_a_listed_role_is_held_and_an_unlisted_one_is_not(
+        self, client, db_session, monkeypatch
+    ):
+        """RWI-16: the policy names roles, not just administrators.
+
+        Same gate, same marker and same audit row as the flag — an analyst the
+        installation requires a factor from is in exactly the situation an
+        administrator is, and a viewer is not, because no setting names that role.
+        """
+        monkeypatch.setattr(settings, "REQUIRE_MFA_FOR_ADMINS", False)
+        monkeypatch.setattr(settings, "REQUIRE_MFA_ROLES", "analyst")
+        analyst = await _user_with_flags(db_session, "analyst-mfa@example.com", role=UserRole.analyst)
+        viewer = await _user_with_flags(db_session, "viewer-mfa@example.com", role=UserRole.viewer)
+
+        refused = await client.get(GATED_ROUTE, headers=_headers(analyst))
+        assert refused.status_code == 403
+        assert "mfa_required" in refused.json()["detail"]
+
+        allowed = await client.get(GATED_ROUTE, headers=_headers(viewer))
+        assert allowed.status_code == 200
+
+        rows = (
+            await db_session.execute(
+                select(AuditLog).where(AuditLog.action == "auth.mfa.required")
+            )
+        ).scalars().all()
+        assert rows and rows[-1].details["role"] == "analyst"
+        assert rows[-1].details["reason"] == "require_mfa"
+
+    @pytest.mark.anyio
+    async def test_the_flag_and_the_list_are_read_together(
+        self, client, db_session, monkeypatch
+    ):
+        """Setting both demands the union: enabling the list cannot disable the flag."""
+        monkeypatch.setattr(settings, "REQUIRE_MFA_FOR_ADMINS", True)
+        monkeypatch.setattr(settings, "REQUIRE_MFA_ROLES", "analyst")
+        admin = await _user_with_flags(db_session, "union-admin@example.com", role=UserRole.admin)
+        analyst = await _user_with_flags(db_session, "union-analyst@example.com", role=UserRole.analyst)
+
+        for user in (admin, analyst):
+            response = await client.get(GATED_ROUTE, headers=_headers(user))
+            assert response.status_code == 403, f"{user.role} was not held"
 
     @pytest.mark.anyio
     async def test_the_sign_in_response_carries_the_requirement(

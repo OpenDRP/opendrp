@@ -15,13 +15,16 @@ connector here is provisioned (row + token) before it can call the core.
 """
 
 import uuid
+from datetime import date
 from unittest.mock import AsyncMock, patch
 
 import pytest
 from sqlalchemy import select
 
+from app.api import deps as api_deps
 from app.api.v1.routers import connectors as connectors_router
-from app.models import Breach, Connector, Job, PhishingDomain
+from app.core.rate_limit import RateLimiter
+from app.models import Breach, Connector, Job, PhishingDomain, SourceAccount
 from app.services.connector_credentials import ConnectorCredentials
 from app.services.connector_service import ConnectorService
 from app.services.job_service import JobService
@@ -404,6 +407,29 @@ class TestWork:
         assert resp.status_code == 403
 
     @pytest.mark.asyncio
+    async def test_readiness_accepts_safe_provider_error_and_preserves_until_success(self, client, db_session):
+        conn = await ConnectorService(db_session).register(
+            name="netlas", connector_type="exposure", default_job_type="exposure.netlas"
+        )
+        headers = await _auth(db_session, "netlas", "exposure")
+        readiness_url = "/api/v1/connectors/me/readiness"
+        base = {"credentials_configured": True, "credential_state": "unknown", "capabilities": ["ip"]}
+
+        blocked = await client.post(readiness_url, headers=headers, json={**base, "provider_error": "ip_restricted"})
+        assert blocked.status_code == 200
+        await db_session.refresh(conn)
+        invalid = await client.post(readiness_url, headers=headers, json={**base, "provider_error": "token=secret"})
+        assert invalid.status_code == 422
+        assert conn.readiness["provider_error"] == "ip_restricted"
+
+        # An ordinary heartbeat must not erase a failure; a success state does.
+        await client.post(readiness_url, headers=headers, json=base)
+        await db_session.refresh(conn)
+        assert conn.readiness["provider_error"] == "ip_restricted"
+        await client.post(readiness_url, headers=headers, json={**base, "credential_state": "valid"})
+        await db_session.refresh(conn)
+        assert conn.readiness["provider_error"] is None
+
     async def test_work_without_any_credential_401(self, client):
         assert (await client.get("/api/v1/connectors/me/work")).status_code == 401
 
@@ -435,14 +461,22 @@ class TestWork:
         work = await client.get("/api/v1/connectors/me/work", headers=await _auth(db_session, "dnstwist", "phishing"))
         assert work.status_code == 204
 
-        # Re-enable: the pending job becomes claimable again.
+        # Re-enabling never resurrects cancelled work.
         await client.patch(
             f"/api/v1/connectors/{conn.id}/status",
             headers=auth_headers_admin,
             json={"status": "enabled"},
         )
         work2 = await client.get("/api/v1/connectors/me/work", headers=await _auth(db_session, "dnstwist", "phishing"))
-        assert work2.status_code == 200
+        assert work2.status_code == 204
+        from sqlalchemy import select
+        from app.models import Job
+        cancelled = (await db_session.execute(select(Job).where(Job.job_type == "phishing.dnstwist"))).scalar_one()
+        assert cancelled.status == "cancelled" and cancelled.finished_at is not None
+        await svc.enqueue_module_scan(connector_type="phishing", created_by=None, title="New scan")
+        fresh = await client.get("/api/v1/connectors/me/work", headers=await _auth(db_session, "dnstwist", "phishing"))
+        assert fresh.status_code == 200
+        assert fresh.json()["job_id"] != str(cancelled.id)
 
 
 # ---------------------------------------------------------------------------
@@ -509,10 +543,7 @@ class TestFindings:
 
         domain = f"evil-{uuid.uuid4().hex[:8]}.com"
         with patch(
-            "app.services.ingestion_service.AlertDeliveryService.enqueue",
-            new_callable=AsyncMock,
-        ), patch(
-            "app.services.phishing.whois_service.WhoisService.enrich",
+            "app.services.ingestion_events.AlertDeliveryService.enqueue",
             new_callable=AsyncMock,
         ):
             resp = await client.post(
@@ -530,7 +561,7 @@ class TestFindings:
                 ],
             )
         assert resp.status_code == 200
-        assert resp.json() == {"accepted": 1, "rejected": 0}
+        assert resp.json() == {"received": 1, "created": 1, "updated": 0, "unchanged": 0, "accepted": 1, "rejected": 0, "errors": []}
 
         row = (
             await db_session.execute(
@@ -540,12 +571,9 @@ class TestFindings:
         assert row is not None
         assert row.detection_source == "dnstwist"
 
-        # Duplicate domain is silently rejected through the same endpoint.
+        # Changed evidence refreshes the existing candidate without rejection.
         with patch(
-            "app.services.ingestion_service.AlertDeliveryService.enqueue",
-            new_callable=AsyncMock,
-        ), patch(
-            "app.services.phishing.whois_service.WhoisService.enrich",
+            "app.services.ingestion_events.AlertDeliveryService.enqueue",
             new_callable=AsyncMock,
         ):
             resp2 = await client.post(
@@ -556,7 +584,7 @@ class TestFindings:
                 },
                 json=[{"phishing_domain": domain, "matched_asset": "example.com"}],
             )
-        assert resp2.json() == {"accepted": 0, "rejected": 1}
+        assert resp2.json() == {"received": 1, "created": 0, "updated": 1, "unchanged": 0, "accepted": 1, "rejected": 0, "errors": []}
 
     @pytest.mark.asyncio
     async def test_findings_ingest_breach_batch(self, client, db_session):
@@ -570,7 +598,7 @@ class TestFindings:
 
         suffix = uuid.uuid4().hex[:6]
         with patch(
-            "app.services.ingestion_service.AlertDeliveryService.enqueue",
+            "app.services.ingestion_events.AlertDeliveryService.enqueue",
             new_callable=AsyncMock,
         ):
             resp = await client.post(
@@ -583,6 +611,11 @@ class TestFindings:
                     {
                         "breach_name": f"TestBreach-{suffix}",
                         "matched_email": f"user-{suffix}@example.com",
+                        # A date is part of the contract now: a finding with none is
+                        # refused rather than stored with a made-up one, and the only
+                        # row without a date is one whose reporter says its metadata
+                        # did not arrive (F-02).
+                        "breach_date": "2020-01-02",
                         "pwn_count": 5,
                         "data_classes": ["Emails"],
                     },
@@ -590,7 +623,7 @@ class TestFindings:
                 ],
             )
         assert resp.status_code == 200
-        assert resp.json() == {"accepted": 1, "rejected": 1}
+        assert resp.json() == {"received": 2, "created": 1, "updated": 0, "unchanged": 0, "accepted": 1, "rejected": 1, "errors": [{"index": 1, "code": "invalid_observation", "retryable": False}]}
 
         row = (
             await db_session.execute(
@@ -599,6 +632,7 @@ class TestFindings:
         ).scalar_one_or_none()
         assert row is not None
         assert row.matched_email == f"user-{suffix}@example.com"
+        assert row.breach_date == date(2020, 1, 2)
 
     @pytest.mark.asyncio
     async def test_findings_unclaimed_job_403(self, client, db_session):
@@ -917,3 +951,391 @@ class TestAdminEndpoints:
         # Non-admin is forbidden.
         resp2 = await client.get("/api/v1/connectors/jobs", headers=auth_headers_viewer)
         assert resp2.status_code == 403
+
+
+class TestScanAudit:
+    """The audit rows a scan writes: who, how much, and bounded by the core."""
+
+    @pytest.mark.asyncio
+    async def test_completion_carries_the_connector_address(self, client, db_session):
+        """`internal:connector` made the last row of a scan uncorrelatable.
+
+        The batch rows always wrote the real address; the completion row wrote a
+        placeholder, so the one event that says a scan ended could not be joined
+        to the deliveries that belong to it by anything but the job id.
+        """
+        from app.models import AuditLog
+
+        _, job = await _register_and_enqueue(
+            db_session, name="hibp", connector_type="breaches", job_type="breaches.hibp"
+        )
+        work = await client.get(
+            "/api/v1/connectors/me/work", headers=await _auth(db_session, "hibp", "breaches")
+        )
+
+        resp = await client.post(
+            f"/api/v1/connectors/me/complete/{job.id}",
+            headers=await _auth(db_session, "hibp", "breaches"),
+            json={"ok": True, "summary": {"new_breach_rows": 3}, "lease_token": work.json()["lease_token"]},
+        )
+        assert resp.status_code == 200
+
+        row = (
+            await db_session.execute(
+                select(AuditLog)
+                .where(AuditLog.action == "connector.scan.completed")
+                .order_by(AuditLog.timestamp.desc())
+            )
+        ).scalars().first()
+        assert row is not None
+        assert row.ip_address not in {None, "internal:connector"}
+        assert row.details["summary"]["new_breach_rows"] == 3
+
+    @pytest.mark.asyncio
+    async def test_a_connector_summary_is_bounded_before_it_is_stored(
+        self, client, db_session
+    ):
+        """Strings, lists and nesting are the core's to bound, not the worker's.
+
+        The wire schema capped how many keys a summary may carry and nothing else,
+        so a connector could put an arbitrarily long string into the job record and
+        the immutable audit chain behind it.
+        """
+        from app.models import AuditLog
+
+        _, job = await _register_and_enqueue(
+            db_session, name="hibp", connector_type="breaches", job_type="breaches.hibp"
+        )
+        work = await client.get(
+            "/api/v1/connectors/me/work", headers=await _auth(db_session, "hibp", "breaches")
+        )
+
+        resp = await client.post(
+            f"/api/v1/connectors/me/complete/{job.id}",
+            headers=await _auth(db_session, "hibp", "breaches"),
+            json={
+                "ok": True,
+                "summary": {
+                    "note": "x" * 1000,
+                    "items": list(range(30)),
+                    "nested": {"a": {"b": {"c": {"d": {"e": "deep"}}}}},
+                },
+                "lease_token": work.json()["lease_token"],
+            },
+        )
+        assert resp.status_code == 200
+
+        fresh = await db_session.get(Job, job.id)
+        await db_session.refresh(fresh)
+        assert len(fresh.result_summary["note"]) == 200
+        assert len(fresh.result_summary["items"]) == 20
+        assert fresh.result_summary["nested"] == "…" or "e" not in str(
+            fresh.result_summary["nested"]
+        )
+
+        row = (
+            await db_session.execute(
+                select(AuditLog)
+                .where(AuditLog.action == "connector.scan.completed")
+                .order_by(AuditLog.timestamp.desc())
+            )
+        ).scalars().first()
+        assert row is not None
+        assert len(row.details["summary"]["note"]) == 200
+        assert len(row.details["summary"]["items"]) == 20
+
+    @pytest.mark.asyncio
+    async def test_a_findings_batch_row_names_its_size(self, client, db_session):
+        """Without a size, a row cannot say how much of the scan it accounts for."""
+        from app.models import AuditLog
+
+        _, job = await _register_and_enqueue(
+            db_session, name="dnstwist", connector_type="phishing", job_type="phishing.dnstwist"
+        )
+        work = await client.get(
+            "/api/v1/connectors/me/work", headers=await _auth(db_session, "dnstwist", "phishing")
+        )
+        domain = f"batch-{uuid.uuid4().hex[:8]}.com"
+
+        with patch(
+            "app.services.ingestion_events.AlertDeliveryService.enqueue",
+            new_callable=AsyncMock,
+        ):
+            resp = await client.post(
+                f"/api/v1/connectors/me/findings/{job.id}",
+                headers={
+                    **(await _auth(db_session, "dnstwist", "phishing")),
+                    "X-Connector-Lease": work.json()["lease_token"],
+                    "X-Connector-Batch-Index": "2",
+                    "X-Connector-Batch-Total": "3",
+                },
+                json=[{"phishing_domain": domain, "matched_asset": "example.com"}],
+            )
+        assert resp.status_code == 200
+
+        row = (
+            await db_session.execute(
+                select(AuditLog)
+                .where(AuditLog.action == "connector.findings.ingested")
+                .order_by(AuditLog.timestamp.desc())
+            )
+        ).scalars().first()
+        assert row is not None
+        assert row.details["job_id"] == str(job.id)
+        assert row.details["batch_size"] == 1
+        # The batch's place in the scan, so deliveries have an order and a
+        # denominator instead of being indistinguishable rows.
+        assert row.details["batch_index"] == 2
+        assert row.details["batch_total"] == 3
+
+
+# ---------------------------------------------------------------------------
+# Per-address bound on the connector protocol
+# ---------------------------------------------------------------------------
+
+
+class _CountingPipeline:
+    def __init__(self, owner: "_CountingRedis") -> None:
+        self._owner = owner
+        self._ops: list[tuple[str, str]] = []
+
+    def incr(self, key: str) -> "_CountingPipeline":
+        self._ops.append(("incr", key))
+        return self
+
+    def expire(self, key: str, ttl: int) -> "_CountingPipeline":
+        self._ops.append(("expire", key))
+        return self
+
+    async def execute(self) -> list:
+        out: list = []
+        for op, key in self._ops:
+            if op == "incr":
+                self._owner.counts[key] = self._owner.counts.get(key, 0) + 1
+                out.append(self._owner.counts[key])
+            else:
+                out.append(True)
+        return out
+
+    async def __aenter__(self) -> "_CountingPipeline":
+        return self
+
+    async def __aexit__(self, *_exc) -> bool:
+        return False
+
+
+class _CountingRedis:
+    """Just enough Redis for the fixed-window limiter and the day counter."""
+
+    def __init__(self) -> None:
+        self.counts: dict[str, int | str] = {}
+        self.used_today = 0
+
+    def pipeline(self, transaction: bool = True) -> _CountingPipeline:
+        return _CountingPipeline(self)
+
+    async def set(self, key: str, value, nx: bool = False, ex: int | None = None):
+        if nx and key in self.counts:
+            return None
+        self.counts[key] = value
+        return True
+
+    async def zcount(self, key: str, minimum: float, maximum: float) -> int:
+        return self.used_today
+
+
+@pytest.fixture
+def fake_redis(monkeypatch):
+    client = _CountingRedis()
+    monkeypatch.setattr(RateLimiter, "_get_client", classmethod(lambda cls: client))
+    return client
+
+
+class TestConnectorProtocolRateLimit:
+    @pytest.mark.asyncio
+    async def test_one_address_exceeding_the_bound_gets_429(
+        self, client, db_session, fake_redis, monkeypatch
+    ):
+        """A leaked or invented token must not buy unlimited work polls."""
+        monkeypatch.setattr(api_deps, "CONNECTOR_PROTOCOL_RATE_LIMIT_PER_MINUTE", 2)
+        await ConnectorService(db_session).register(
+            name="hibp", connector_type="breaches", default_job_type="breaches.hibp"
+        )
+        headers = await _auth(db_session, "hibp", "breaches")
+
+        for _ in range(2):
+            assert (
+                await client.get("/api/v1/connectors/me/control", headers=headers)
+            ).status_code == 200
+
+        blocked = await client.get("/api/v1/connectors/me/control", headers=headers)
+        assert blocked.status_code == 429
+        assert blocked.headers["Retry-After"]
+
+    @pytest.mark.asyncio
+    async def test_an_invented_token_is_bounded_before_the_credential_lookup(
+        self, client, fake_redis, monkeypatch
+    ):
+        """The cheapest flood to mount still costs a database query without this."""
+        monkeypatch.setattr(api_deps, "CONNECTOR_PROTOCOL_RATE_LIMIT_PER_MINUTE", 1)
+        assert (
+            await client.get("/api/v1/connectors/me/work", headers=_bogus_token())
+        ).status_code == 401
+        blocked = await client.get("/api/v1/connectors/me/work", headers=_bogus_token())
+        assert blocked.status_code == 429
+
+    @pytest.mark.asyncio
+    async def test_normal_polling_is_not_throttled(self, client, db_session, fake_redis):
+        """Twelve connectors polling every five seconds must fit comfortably."""
+        # 12 workers / 5 s = 144 requests a minute; the bound leaves >4x that.
+        assert api_deps.CONNECTOR_PROTOCOL_RATE_LIMIT_PER_MINUTE >= 144 * 4
+        await ConnectorService(db_session).register(
+            name="hibp", connector_type="breaches", default_job_type="breaches.hibp"
+        )
+        headers = await _auth(db_session, "hibp", "breaches")
+        for _ in range(20):
+            resp = await client.get("/api/v1/connectors/me/control", headers=headers)
+            assert resp.status_code == 200, resp.text
+
+
+# ---------------------------------------------------------------------------
+# Remaining provider budget on the health page
+# ---------------------------------------------------------------------------
+
+
+class TestConnectorHealthQuota:
+    async def _bound_connector(self, db_session, *, daily_budget: int = 50) -> Connector:
+        # The binding is a real row, not a fabricated id: the column is a foreign
+        # key, so a made-up uuid is a test that only passes where FK checks are off.
+        account = SourceAccount(
+            source_id="hibp",
+            name="default",
+            policy={"approved": True, "requests_per_minute": 10, "daily_budget": daily_budget},
+        )
+        db_session.add(account)
+        await db_session.flush()
+        conn = await ConnectorService(db_session).register(
+            name="hibp", connector_type="breaches", default_job_type="breaches.hibp"
+        )
+        conn.provider = "hibp"
+        conn.source_account_id = account.id
+        conn.config = {"daily_budget": daily_budget}
+        await db_session.commit()
+        return conn
+
+    @pytest.mark.asyncio
+    async def test_health_reports_the_days_remainder_from_the_counter(
+        self, client, db_session, auth_headers_admin, fake_redis
+    ):
+        conn = await self._bound_connector(db_session, daily_budget=50)
+        fake_redis.used_today = 7
+
+        resp = await client.get("/api/v1/connectors/health", headers=auth_headers_admin)
+        assert resp.status_code == 200
+        item = next(i for i in resp.json()["items"] if i["name"] == conn.name)
+        assert item["quota_remaining"] == 43
+        assert item["quota_budget"] == 50
+        assert item["quota_reason"] is None
+
+    @pytest.mark.asyncio
+    async def test_an_unreadable_counter_is_null_with_a_reason(
+        self, client, db_session, auth_headers_admin, monkeypatch
+    ):
+        """A missing number must not look like an exhausted budget."""
+        await self._bound_connector(db_session)
+        monkeypatch.setattr(RateLimiter, "_get_client", classmethod(lambda cls: None))
+
+        resp = await client.get("/api/v1/connectors/health", headers=auth_headers_admin)
+        assert resp.status_code == 200
+        item = next(i for i in resp.json()["items"] if i["name"] == "hibp")
+        assert item["quota_remaining"] is None
+        assert item["quota_reason"] == "quota_backend_unavailable"
+
+    @pytest.mark.asyncio
+    async def test_a_connector_without_a_provider_account_says_so(
+        self, client, db_session, auth_headers_admin, fake_redis
+    ):
+        await ConnectorService(db_session).register(
+            name="dnstwist", connector_type="phishing", default_job_type="phishing.dnstwist"
+        )
+
+        resp = await client.get("/api/v1/connectors/health", headers=auth_headers_admin)
+        item = next(i for i in resp.json()["items"] if i["name"] == "dnstwist")
+        assert item["quota_remaining"] is None
+        assert item["quota_reason"] == "provider_account_missing"
+        # A worker that needs no provider key is not "blocked" by the core.
+        assert item["blocked_reason"] is None
+
+
+class TestConnectorHealthBlockedReason:
+    """The core's own answer to "why can this source not scan?".
+
+    ``readiness`` is the worker's report about its credential; when no account
+    exists the worker cannot know that work will be refused, so the health page
+    needs the core's decision beside it (WI-02).
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_provider_without_a_bound_account_names_the_reason(
+        self, client, db_session, auth_headers_admin
+    ):
+        conn = await ConnectorService(db_session).register(
+            name="hibp", connector_type="breaches", default_job_type="breaches.hibp"
+        )
+        conn.provider = "hibp"
+        await db_session.commit()
+
+        resp = await client.get("/api/v1/connectors/health", headers=auth_headers_admin)
+        item = next(i for i in resp.json()["items"] if i["name"] == "hibp")
+        assert item["blocked_reason"] == "provider_account_missing"
+
+    @pytest.mark.asyncio
+    async def test_an_account_found_by_provider_and_quota_group_counts(
+        self, client, db_session, auth_headers_admin
+    ):
+        """Admission may bind an unbound connector to a group's account.
+
+        The health answer must follow the same rule; otherwise it would report a
+        block that the next scan does not meet.
+        """
+        account = SourceAccount(
+            source_id="hibp", name="default", policy={"approved": True}
+        )
+        db_session.add(account)
+        await db_session.flush()
+        conn = await ConnectorService(db_session).register(
+            name="hibp", connector_type="breaches", default_job_type="breaches.hibp"
+        )
+        conn.provider = "hibp"
+        conn.quota_group = "default"
+        await db_session.commit()
+
+        resp = await client.get("/api/v1/connectors/health", headers=auth_headers_admin)
+        item = next(i for i in resp.json()["items"] if i["name"] == "hibp")
+        assert item["blocked_reason"] is None
+
+    @pytest.mark.asyncio
+    async def test_an_unapproved_account_and_an_approved_one(
+        self, client, db_session, auth_headers_admin
+    ):
+        account = SourceAccount(
+            source_id="hibp", name="default", policy={"approved": False}
+        )
+        db_session.add(account)
+        await db_session.flush()
+        conn = await ConnectorService(db_session).register(
+            name="hibp", connector_type="breaches", default_job_type="breaches.hibp"
+        )
+        conn.provider = "hibp"
+        conn.source_account_id = account.id
+        await db_session.commit()
+
+        resp = await client.get("/api/v1/connectors/health", headers=auth_headers_admin)
+        item = next(i for i in resp.json()["items"] if i["name"] == "hibp")
+        assert item["blocked_reason"] == "account_policy_unapproved"
+
+        account.policy = {"approved": True, "daily_budget": 50}
+        await db_session.commit()
+        resp = await client.get("/api/v1/connectors/health", headers=auth_headers_admin)
+        item = next(i for i in resp.json()["items"] if i["name"] == "hibp")
+        assert item["blocked_reason"] is None

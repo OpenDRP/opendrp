@@ -10,13 +10,13 @@ SHA-256 digest, so a lost token is rotated, never recovered.
 Run INSIDE the backend container (so DB env and venv are wired correctly):
 
     # Bootstrap a connector for the first time (creates its registry row):
-    docker compose exec backend python -m scripts.manage_connector_tokens issue connector-hibp --type breaches --env CONNECTOR_TOKEN_HIBP
+    docker compose exec backend python -m scripts.manage_connector_tokens issue breaches-hibp --type breaches --env CONNECTOR_TOKEN_HIBP
 
     # Rotate a leaked credential (the previous token stops working immediately):
-    docker compose exec backend python -m scripts.manage_connector_tokens rotate connector-hibp --env CONNECTOR_TOKEN_HIBP
+    docker compose exec backend python -m scripts.manage_connector_tokens rotate breaches-hibp --env CONNECTOR_TOKEN_HIBP
 
     # Cut a connector off without deleting its history:
-    docker compose exec backend python -m scripts.manage_connector_tokens revoke connector-hibp
+    docker compose exec backend python -m scripts.manage_connector_tokens revoke breaches-hibp
 
     # See which connectors have credentials (prefixes only, never the secret):
     docker compose exec backend python -m scripts.manage_connector_tokens list
@@ -149,17 +149,22 @@ async def cmd_list() -> None:
             )
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
+    """The command line this script accepts, as an object a caller can inspect.
+
+    Separate from `main` so the documentation gate can compare the commands an
+    operator is told to run with the subcommands and flags that exist.
+    """
     parser = argparse.ArgumentParser(
         prog="manage_connector_tokens",
         description="Issue, rotate and revoke per-connector credentials.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
-            "  python -m scripts.manage_connector_tokens issue connector-hibp "
+            "  python -m scripts.manage_connector_tokens issue breaches-hibp "
             "--type breaches --env CONNECTOR_TOKEN_HIBP\n"
-            "  python -m scripts.manage_connector_tokens rotate connector-hibp\n"
-            "  python -m scripts.manage_connector_tokens revoke connector-hibp\n"
+            "  python -m scripts.manage_connector_tokens rotate breaches-hibp\n"
+            "  python -m scripts.manage_connector_tokens revoke breaches-hibp\n"
             "  python -m scripts.manage_connector_tokens list\n"
         ),
     )
@@ -189,6 +194,11 @@ def main() -> None:
 
     sub.add_parser("list", help="List connectors and their credential state")
 
+    return parser
+
+
+def main() -> None:
+    parser = build_parser()
     args = parser.parse_args()
 
     if args.command == "issue":

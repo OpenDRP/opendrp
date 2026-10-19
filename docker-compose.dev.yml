@@ -69,11 +69,56 @@ services:
       # like one. Read-only: nothing here writes to it.
       - ./docker:/docker:ro
       - ./frontend/Dockerfile:/frontend/Dockerfile:ro
+      # `tests/test_version_consistency_gate.py` runs `scripts/check_version_consistency.py`
+      # against the shipped tree, which reads the SPA package version as one of
+      # the statements the release must agree with. Without this mount the gate
+      # answers "cannot read" for a file that exists in the checkout.
+      - ./frontend/package.json:/frontend/package.json:ro
       # The installation shape is asserted rather than described:
       # tests/test_single_installation_shape.py reads the Makefile's targets and the
       # operator documentation, so both are mounted read-only as well.
       - ./Makefile:/Makefile:ro
       - ./CONTRIBUTING.md:/CONTRIBUTING.md:ro
+      # The four repository-level gates that read the rest of the checkout's inputs
+      # resolve them from `parents[2]` of tests/ — `/` here:
+      #
+      #   * tests/test_release_image_matrix.py validates the release workflow's
+      #     matrix against the Dockerfiles Compose builds from, so it needs the
+      #     workflow and every `build:` dockerfile a matrix entry covers;
+      #   * tests/test_docs_consistency_gate.py scans the root documents and
+      #     `.github` as well as docs/, and a document that is simply absent here
+      #     reads as a link the reader cannot follow;
+      #   * tests/test_dependency_sources_gate.py reads the requirement files and
+      #     pyproject at the path its root resolves, so an absent one reads as a
+      #     dependency table that escaped the rule;
+      #   * tests/test_pagination_contract.py compares the bound the API publishes
+      #     with the option list in the shared table's source.
+      #
+      # Read-only, and only these files: mounting a path here is what the gate needs
+      # to answer, and each one missing showed up as that gate's own failure — a
+      # red suite whose message says the repository is broken when the mount is.
+      - ./.github/workflows/release.yml:/.github/workflows/release.yml:ro
+      # `tests/test_postgres_only_suites_gate.py` asserts that the workflow runs
+      # the PostgreSQL-only suites, so CI is an input here too. Without this mount
+      # the gate skipped itself in this container — a check that passes by not
+      # running, which is the failure mode it exists to prevent one level down.
+      - ./.github/workflows/ci.yml:/.github/workflows/ci.yml:ro
+      - ./backend/Dockerfile:/backend/Dockerfile:ro
+      # `setup.py` reads the release this checkout declares from
+      # `backend/app/__init__.py` (its `checkout_version()`), which is where the
+      # running process reads `__version__` too. Without it the setup wizard's
+      # version prompt has no valid default and `tests/test_setup_env.py` fails.
+      - ./backend/app/__init__.py:/backend/app/__init__.py:ro
+      - ./backend/pyproject.toml:/backend/pyproject.toml:ro
+      - ./backend/requirements.txt:/backend/requirements.txt:ro
+      - ./backend/requirements-dev.txt:/backend/requirements-dev.txt:ro
+      - ./CHANGELOG.md:/CHANGELOG.md:ro
+      - ./SECURITY.md:/SECURITY.md:ro
+      - ./CODE_OF_CONDUCT.md:/CODE_OF_CONDUCT.md:ro
+      - ./LICENSE:/LICENSE:ro
+      - ./AGENTS.md:/AGENTS.md:ro
+      - ./backend/alembic/versions:/backend/alembic/versions:ro
+      - ./frontend/src:/frontend/src:ro
       # The repository-level environment gate resolves its checkout root as `/`
       # inside this test container. Mount the Compose inputs there as read-only
       # so the shipped-configuration test checks the real files, not an empty

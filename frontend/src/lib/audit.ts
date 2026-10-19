@@ -179,6 +179,95 @@ function cleanedUp(details: Details, noun: string): string {
   return `${plural(deleted, noun)} whose asset was removed were cleaned up`;
 }
 
+/** `Viewed the asset inventory (12 assets), filtered`. */
+function describeAssetList(details: Details): string {
+  const total = asCount(details.results);
+  const filtered =
+    details.search_used === true ||
+    typeof details.asset_type === "string" ||
+    typeof details.criticality === "string" ||
+    typeof details.is_active === "boolean";
+  const what =
+    total === null ? "the asset inventory" : `the asset inventory (${plural(total, "asset")})`;
+  return `Viewed ${what}${filtered ? ", filtered" : ""}`;
+}
+
+/**
+ * `Updated asset example.com — criticality: medium → high`.
+ *
+ * The change list is the row's own before/after values, so the sentence says what
+ * the update did rather than what the request carried: canonicalization can
+ * rewrite the stored value on a patch that never mentioned it, and a line that
+ * named only the requested fields would report the change that did not happen
+ * and stay silent about the one that did.
+ */
+function describeAssetUpdate(details: Details): string {
+  const base = named("Updated asset", details.asset_value, details.asset_id);
+  const changes = details.changes;
+  if (!changes || typeof changes !== "object" || Array.isArray(changes)) return base;
+  const parts = Object.entries(changes as Record<string, unknown>)
+    .map(([field, delta]) => {
+      const move = (delta ?? {}) as { from?: unknown; to?: unknown };
+      const from = asText(move.from);
+      const to = asText(move.to);
+      // The raw field name, as `fallbackDescription` uses for the values of an
+      // action it has no sentence for: `asset_type: domain → keyword_domain` is
+      // the same vocabulary as the record it describes, and a humanized label
+      // would read as a title in the middle of a sentence.
+      return from !== null && to !== null ? `${field}: ${from} → ${to}` : null;
+    })
+    .filter((part): part is string => part !== null);
+  return parts.length > 0 ? `${base} — ${parts.join(", ")}` : base;
+}
+
+/** The promotion routes name the asset by id and type, never by value. */
+/**
+ * The asset → findings view (WI-12). The reader needs which module was opened and
+ * how much the asset is involved in overall; the page they scrolled to is not a
+ * fact about the asset.
+ */
+function describeAssetFindingsView(details: Details): string {
+  const opened = named("Viewed the findings of asset", details.asset_value, details.asset_id);
+  const module = typeof details.module === "string" ? details.module.replace(/_/g, " ") : "";
+  const counts = details.counts as Details | undefined;
+  // ``asCount`` reads a missing value as 0, so ask whether the counter was sent
+  // at all: "0 findings" and "the caller did not say" are different sentences.
+  const total =
+    counts && counts.total !== undefined && counts.total !== null
+      ? asCount(counts.total)
+      : null;
+  const parts = [
+    module ? `${module} tab` : "",
+    total === null ? "" : `involved in ${plural(total, "finding")}`,
+  ].filter(Boolean);
+  return parts.length ? `${opened} — ${parts.join(", ")}` : opened;
+}
+
+function promotedAsset(details: Details, source: string): string {
+  const kind = asText(details.asset_type);
+  return `Added the ${kind ? `${kind} asset` : "asset"} observed by ${source}`;
+}
+
+function alreadyMonitored(details: Details, source: string): string {
+  const kind = asText(details.asset_type);
+  return `No change — the ${kind ? `${kind} asset` : "asset"} from ${source} was already monitored`;
+}
+
+/**
+ * `Confirmed that this certificate of ours is served by 198.51.100.7:443`.
+ *
+ * The address is the actionable half of a foreign deployment, so it is rendered
+ * as `ip:port`; a sighting a provider indexed without an address falls back to
+ * the hostname it was about, and then to the sighting itself so the sentence is
+ * never left without a subject.
+ */
+function certificateSighting(prefix: string, details: Details): string {
+  const ip = asText(details.ip);
+  const port = asText(details.port);
+  const address = ip ? `${ip}${port ? `:${port}` : ""}` : asText(details.subject);
+  return `${prefix} ${address ?? asText(details.sighting_id) ?? "an address a provider did not record"}`;
+}
+
 /**
  * One sentence per action, for entries whose details refine it no further.
  *
@@ -250,13 +339,66 @@ const AUDIT_DESCRIPTIONS: Record<string, (details: Details) => string> = {
     d.was_enabled === true
       ? `${named("Cleared the second factor of", d.target_email, d.target_user_id)} — enrolment is required at the next sign-in`
       : named("Cleared the second factor of", d.target_email, d.target_user_id),
+  // Backlog U-1/U-2/U-5: the operator surfaces added after the audit.
+  "users.export": (d) =>
+    `Exported ${typeof d.rows === "number" ? `${d.rows} ` : ""}user accounts`,
+  "users.bulk": (d) =>
+    `${d.operation === "activate" ? "Activated" : "Deactivated"} ${
+      typeof d.changed === "number" ? d.changed : "selected"
+    } accounts in one action`,
+  "user.sessions.revoked": (d) =>
+    named(
+      `Ended ${typeof d.revoked_count === "number" ? d.revoked_count : "all"} sessions of`,
+      d.target_email,
+      d.target_user_id,
+    ),
   "user.locked": (d) => named("Deactivated user", d.target_email, d.target_user_id),
-  "user.unlocked": (d) => named("Activated user", d.target_email, d.target_user_id),
+  // One action name covers two different operations: the API's activation
+  // change and the release of a brute-force lockout. `method` is what tells
+  // them apart, and reading "Activated user" for a lockout release would be a
+  // false statement about what happened (RWI-13).
+  "user.unlocked": (d) =>
+    d.method === "brute_force_unlock"
+      ? named("Unlocked user (failed sign-ins)", d.target_email, d.target_user_id)
+      : named("Activated user", d.target_email, d.target_user_id),
 
   // --- assets ---
   "asset.create": (d) => named("Added asset", d.asset_value, d.asset_id),
-  "asset.update": (d) => named("Updated asset", d.asset_value, d.asset_id),
+  "asset.update": describeAssetUpdate,
   "asset.delete": (d) => named("Deleted asset", d.asset_value, d.asset_id),
+  "asset.list": describeAssetList,
+  "asset.view": (d) => named("Viewed asset", d.asset_value, d.asset_id),
+  "asset.findings.list": describeAssetFindingsView,
+  // An inventory that changed because a module observed something. Both the
+  // promotion and the "already there" cases exist for each module, and the
+  // reader cares which module asked.
+  "dns_security.asset.promoted": (d) =>
+    d.already_exists === true
+      ? alreadyMonitored(d, "DNS Security")
+      : promotedAsset(d, "DNS Security"),
+  "dns_security.asset.already_exists": (d) => alreadyMonitored(d, "DNS Security"),
+  // A decision about a certificate of ours seen somewhere else. These are the
+  // reviewer's judgements rather than sightings, so each reads as an act, and the
+  // address it was made about comes from the row's own details.
+  "tls.sighting.candidate": (d) =>
+    certificateSighting("Reopened the review of the certificate served at", d),
+  "tls.sighting.expected": (d) =>
+    certificateSighting("Marked as expected the certificate served at", d),
+  "tls.sighting.shared_infrastructure": (d) =>
+    certificateSighting("Marked as shared infrastructure the certificate served at", d),
+  "tls.sighting.confirmed_foreign": (d) =>
+    certificateSighting("Confirmed that this certificate of ours is served by", d),
+  "tls.sighting.rejected": (d) =>
+    certificateSighting("Rejected the evidence that we serve a certificate at", d),
+  "tls.exception.added": (d) =>
+    named("Allowed a certificate out of the scope rules:", d.match_value, d.match_kind),
+  "tls.exception.removed": (d) =>
+    named("Removed a certificate scope exception:", d.match_value, d.match_kind),
+  "exposure.asset.promoted": (d) =>
+    d.already_exists === true
+      ? alreadyMonitored(d, "Exposure")
+      : promotedAsset(d, "Exposure"),
+  "exposure.asset.already_exists": (d) => alreadyMonitored(d, "Exposure"),
 
   // --- phishing ---
   "phishing.threat.update": (d) =>

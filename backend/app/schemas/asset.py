@@ -18,6 +18,17 @@ from app.schemas.email import EmailAddress
 from app.schemas.user import AssetType
 
 AssetCriticality = Literal["low", "medium", "high", "critical"]
+
+#: The fields ``GET /assets`` may be sorted by (WI-16). An allowlist rather than
+#: a free string, because the value reaches ``ORDER BY`` and caller input must
+#: never be concatenated into a statement: FastAPI rejects anything outside this
+#: set with 422 before the service sees it, and
+#: ``AssetService.ASSET_SORT_COLUMNS`` maps each member to a real column —
+#: ``tests/test_assets_integration.py`` fails if the two sets drift apart.
+AssetSortField = Literal[
+    "created_at", "updated_at", "asset_value", "asset_type", "criticality", "is_active"
+]
+SortDirection = Literal["asc", "desc"]
 _AssetTypeLiteralValues = {"domain", "ip_address", "email_account", "keyword_domain", "keyword_title"}
 
 _HOSTNAME_RE = re.compile(
@@ -26,6 +37,17 @@ _HOSTNAME_RE = re.compile(
 
 _IP_ADAPTER: TypeAdapter = TypeAdapter(IPvAnyAddress)
 _EMAIL_ADAPTER: TypeAdapter = TypeAdapter(EmailAddress)
+
+#: Longest keyword the platform accepts. A phrase this long is already far past
+#: what any provider query budget can use, and the column is wider than it.
+KEYWORD_MAX_LENGTH = 200
+#: Characters a keyword may not contain (AST-10). A quote or backslash is the
+#: escape and phrase delimiter of the provider search grammars, so such a value
+#: could close the phrase and add filters of its own; control characters are
+#: never part of a brand or page title. The connectors that build queries from
+#: keywords apply the same set (``connectors/shodan/main.py``), so a value the
+#: API accepts is a value a scan can safely quote.
+_KEYWORD_FORBIDDEN_RE = re.compile(r'["\\\x00-\x1f]')
 
 
 def normalize_asset_value(asset_type: str, value: str) -> str:
@@ -63,9 +85,99 @@ def validate_and_normalize_asset_value(asset_type: str, value: str) -> str:
             _EMAIL_ADAPTER.validate_python(normalized)
         except Exception as exc:
             raise ValueError("Invalid email format") from exc
-    if asset_type in ("keyword_domain", "keyword_title") and not normalized:
-        raise ValueError("Keyword cannot be empty")
+    if asset_type in ("keyword_domain", "keyword_title"):
+        if not normalized:
+            raise ValueError("Keyword cannot be empty")
+        if len(normalized) > KEYWORD_MAX_LENGTH:
+            raise ValueError(f"A keyword must be at most {KEYWORD_MAX_LENGTH} characters")
+        if _KEYWORD_FORBIDDEN_RE.search(normalized):
+            raise ValueError(
+                "A keyword cannot contain quotes, backslashes or control characters"
+            )
     return normalized
+
+
+#: Import and bulk limits (WI-18/AST-24).
+#:
+#: One call must not become an unbounded transaction: a bounded number of rows, a
+#: bounded decoded body, and a bounded number of ids per bulk action. They are
+#: named here rather than inline so the UI and the API cannot disagree about what
+#: "too many" means — the reconciliation gate (`frontend/src/lib/api.ts` reads
+#: them through the API's own refusals) starts from one number.
+IMPORT_MAX_ITEMS = 1000
+IMPORT_MAX_BYTES = 1_048_576
+BULK_MAX_IDS = 500
+
+#: The largest inventory an export will render in one file. Exporting is a read,
+#: but a single response carrying a million rows is a memory incident, so past
+#: this the export is refused with the filter that would narrow it.
+EXPORT_MAX_ROWS = 10_000
+
+
+class AssetImportItem(BaseModel):
+    """One row of an import, as the file states it — *not* validated per row yet.
+
+    ``asset_type`` is a plain string rather than the ``AssetType`` literal on
+    purpose: a wrong type on line 3 of a 200-line file must come back as a row
+    error next to the other rows, not as a 422 that rejects the whole request and
+    names no line (WI-18/AST-24). The row reaches the same validator every other
+    write uses when it is turned into an ``AssetCreate``.
+    """
+
+    asset_type: str = Field(..., max_length=32)
+    asset_value: str = Field(..., max_length=512)
+    criticality: AssetCriticality = "medium"
+
+    model_config = ConfigDict(use_enum_values=True)
+
+
+class AssetImportRequest(BaseModel):
+    items: list[AssetImportItem] = Field(..., max_length=IMPORT_MAX_ITEMS)
+    #: Report what the import would do without creating anything. The rows go
+    #: through the same validation and duplicate check, then the transaction is
+    #: rolled back — a dry run that took a different code path would answer a
+    #: different question from the one the operator then commits to.
+    dry_run: bool = False
+
+    model_config = ConfigDict(use_enum_values=True)
+
+
+class AssetImportRow(BaseModel):
+    """One line of the import report, so a failure names its own row."""
+
+    line: int
+    outcome: Literal["created", "duplicate", "invalid"]
+    asset_type: str | None = None
+    asset_value: str | None = None
+    detail: str | None = None
+
+
+class AssetImportResponse(BaseModel):
+    dry_run: bool
+    created: int
+    duplicate: int
+    invalid: int
+    rows: list[AssetImportRow]
+
+
+class AssetBulkRequest(BaseModel):
+    operation: Literal["activate", "deactivate", "criticality", "delete"]
+    ids: list[uuid.UUID] = Field(..., min_length=1, max_length=BULK_MAX_IDS)
+    #: Required by ``criticality``, ignored otherwise.
+    criticality: AssetCriticality | None = None
+    #: Only meaningful for ``delete``; the same flag as the single-asset route.
+    cascade_findings: bool = False
+
+    model_config = ConfigDict(use_enum_values=True)
+
+
+class AssetBulkResponse(BaseModel):
+    operation: str
+    requested: int
+    applied: int
+    missing: list[str]
+    cascade_findings: bool = False
+    findings_deleted: dict[str, int] = Field(default_factory=dict)
 
 
 class AssetBase(BaseModel):
@@ -128,11 +240,34 @@ class AssetUpdate(BaseModel):
         return v
 
 
+class AssetFindingSummary(BaseModel):
+    """How much of the platform's data names one asset, per module (WI-20).
+
+    Declared once and filled from one place (:func:`asset_matching.related_finding_summary_columns`),
+    so the counter in a list row and the tab counters on the asset page are the
+    same number, computed by the same predicates.
+    """
+
+    total: int = 0
+    phishing: int = 0
+    breaches: int = 0
+    dns: int = 0
+    exposure: int = 0
+    findings: int = 0
+    #: When each module last saw a finding about this asset, as ISO text. A
+    #: breach reports a disclosure *date* while a scan reports a timestamp, so
+    #: the two are published as text instead of being compared as datetimes.
+    last_seen: dict[str, str | None] = Field(default_factory=dict)
+
+
 class AssetResponse(AssetBase):
     id: uuid.UUID
     normalized_value: str | None = None
     created_at: datetime
     updated_at: datetime
+    #: Present on list rows: the asset's involvement, so "present in the table"
+    #: and "actually monitored" are distinguishable without opening each asset.
+    findings: AssetFindingSummary | None = None
 
     model_config = ConfigDict(from_attributes=True)
 

@@ -1,14 +1,21 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import SettingsPage from "@/pages/SettingsPage";
 
 const {
   getSettingsMock,
+  getAlertPolicyMock,
   updateSettingsMock,
   listUsersBriefMock,
   listConnectorsMock,
+  listSourceAccountsMock,
+  createSourceAccountMock,
+  approveSourceAccountMock,
+  setSourceAccountApiKeyMock,
+  clearSourceAccountApiKeyMock,
+  bindConnectorAccountMock,
   setConnectorStatusMock,
   setConnectorConfigMock,
   sendTestEmailMock,
@@ -17,9 +24,16 @@ const {
   toastMock,
 } = vi.hoisted(() => ({
   getSettingsMock: vi.fn(),
+  getAlertPolicyMock: vi.fn(),
   updateSettingsMock: vi.fn(),
   listUsersBriefMock: vi.fn(),
   listConnectorsMock: vi.fn(),
+  listSourceAccountsMock: vi.fn(),
+  createSourceAccountMock: vi.fn(),
+  approveSourceAccountMock: vi.fn(),
+  setSourceAccountApiKeyMock: vi.fn(),
+  clearSourceAccountApiKeyMock: vi.fn(),
+  bindConnectorAccountMock: vi.fn(),
   setConnectorStatusMock: vi.fn(),
   setConnectorConfigMock: vi.fn(),
   sendTestEmailMock: vi.fn(),
@@ -31,9 +45,17 @@ const {
 vi.mock("@/lib/api", () => ({
   endpoints: {
     getSettings: getSettingsMock,
+    getAlertPolicy: getAlertPolicyMock,
+    alertQueue: vi.fn().mockResolvedValue({ counts: {}, items: [] }),
     updateSettings: updateSettingsMock,
     listUsersBrief: listUsersBriefMock,
     listConnectors: listConnectorsMock,
+    listSourceAccounts: listSourceAccountsMock,
+    createSourceAccount: createSourceAccountMock,
+    approveSourceAccount: approveSourceAccountMock,
+    setSourceAccountApiKey: setSourceAccountApiKeyMock,
+    clearSourceAccountApiKey: clearSourceAccountApiKeyMock,
+    bindConnectorAccount: bindConnectorAccountMock,
     setConnectorStatus: setConnectorStatusMock,
     setConnectorConfig: setConnectorConfigMock,
     sendTestEmail: sendTestEmailMock,
@@ -69,6 +91,7 @@ vi.mock("@/components/ui/use-toast", () => ({ toast: toastMock }));
 
 const settings = {
   id: "settings-1",
+  version: 7,
   smtp_host: "smtp.example.com",
   smtp_port: 587,
   smtp_user: "smtp-user",
@@ -80,6 +103,8 @@ const settings = {
   telegram_chat_ids: [],
   schedule_phishing: { days: [1, 2, 3, 4, 5], hour: 2, minute: 30 },
   schedule_breaches: { days: [1, 2, 3, 4, 5], hour: 3, minute: 30 },
+  schedule_dns_security: { days: [1, 2, 3, 4, 5], hour: 4, minute: 0 },
+  schedules: { code_leak: { days: [2, 4], hour: 7, minute: 15 } },
   created_at: "2026-01-01T00:00:00Z",
   updated_at: "2026-01-01T00:00:00Z",
 };
@@ -98,10 +123,26 @@ function renderPage() {
 describe("SettingsPage", () => {
   beforeEach(() => {
     getSettingsMock.mockReset().mockResolvedValue(settings);
+    // The alert budget in force (WI-13): what the page shows next to the six
+    // stored values, since a value nobody saved is the deployment's.
+    getAlertPolicyMock.mockReset().mockResolvedValue({
+      confidence_direct: 60,
+      confidence_digest: 30,
+      digest_enabled: true,
+      digest_hour_utc: 6,
+      no_channel_retry_hours: 24,
+      candidate_change_notifications: true,
+      source: "environment",
+      invalid: [],
+    });
     updateSettingsMock.mockReset().mockResolvedValue(settings);
     listUsersBriefMock.mockReset().mockResolvedValue([
       { id: "user-1", email: "admin@example.com", role: "admin" },
     ]);
+    listSourceAccountsMock.mockReset().mockResolvedValue([]);
+    createSourceAccountMock.mockReset().mockResolvedValue({ id: "new-account" });
+    approveSourceAccountMock.mockReset().mockResolvedValue({ id: "account-1", policy: { approved: true, requests_per_minute: 10, daily_budget: 100 } });
+    bindConnectorAccountMock.mockReset().mockResolvedValue({});
     listConnectorsMock.mockReset().mockResolvedValue([
       {
         id: "connector-1",
@@ -159,11 +200,133 @@ describe("SettingsPage", () => {
     expect(await screen.findByRole("heading", { name: "Settings" })).toBeInTheDocument();
     expect(await screen.findByDisplayValue("smtp.example.com")).toBeInTheDocument();
     expect(screen.getByText("shodan")).toBeInTheDocument();
+    expect(screen.getByText(/SDK v1/)).toBeInTheDocument();
     expect(screen.getByText("Connectors")).toBeInTheDocument();
+    expect(screen.getByText("DNS Security rescan")).toBeInTheDocument();
+    expect(screen.getByText("Code leaks schedule")).toBeInTheDocument();
+    expect(screen.getByText("Code leaks schedule")).toBeInTheDocument();
     expect(getSettingsMock).toHaveBeenCalledTimes(1);
     // A connector without a credential cannot authenticate: say so, and offer
     // the action that fixes it instead of pretending it is simply offline.
     expect(screen.getByText(/No credential/)).toBeInTheDocument();
+  });
+
+  it("labels connector SDK versions and handles missing registration versions explicitly", async () => {
+    listConnectorsMock.mockResolvedValue([
+      {
+        id: "netlas-dns-security",
+        name: "netlas-dns-security-default",
+        connector_type: "dns",
+        status: "disabled",
+        api_version: null,
+        provider: "netlas",
+        readiness: { credentials_configured: false, credential_state: "unknown", capabilities: [] },
+      },
+    ]);
+    renderPage();
+    await screen.findByDisplayValue("smtp.example.com");
+    expect(screen.getByText("SDK version not reported · last seen: never")).toBeInTheDocument();
+    expect(screen.queryByText("v? · last seen: never")).not.toBeInTheDocument();
+  });
+
+  it("stores a provider API key write-only and shows only its hint", async () => {
+    setSourceAccountApiKeyMock.mockReset().mockResolvedValue({ id: "account-1", has_api_key: true, api_key_hint: "****9999" });
+    clearSourceAccountApiKeyMock.mockReset().mockResolvedValue({ id: "account-1", has_api_key: false, api_key_hint: null });
+    listConnectorsMock.mockResolvedValue([{ id: "netlas-one", name: "netlas-exposure", connector_type: "exposure", status: "disabled", provider: "netlas", has_token: true }]);
+    listSourceAccountsMock.mockResolvedValue([{ id: "account-1", source_id: "netlas", name: "default", credential_ref: "NETLAS_API_TOKEN", policy: { approved: false }, access_state: "unknown", has_api_key: true, api_key_hint: "****1234" }]);
+    renderPage();
+    expect(await screen.findByText("API key stored (****1234)")).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText("default API key"), { target: { value: "new-secret-9999" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save key" }));
+    await waitFor(() => expect(setSourceAccountApiKeyMock).toHaveBeenCalledWith("account-1", "new-secret-9999"));
+    expect(screen.getByLabelText("default API key")).toHaveValue("");
+    expect(document.body.textContent).not.toContain("new-secret-9999");
+    fireEvent.click(screen.getByRole("button", { name: "Remove key" }));
+    await waitFor(() => expect(clearSourceAccountApiKeyMock).toHaveBeenCalledWith("account-1"));
+  });
+
+  it("creates and approves a provider account quota explicitly", async () => {
+    listConnectorsMock.mockResolvedValue([{ id: "netlas-one", name: "netlas-exposure", connector_type: "exposure", status: "disabled", provider: "netlas", has_token: true }]);
+    listSourceAccountsMock.mockResolvedValue([{ id: "account-1", source_id: "netlas", name: "default", credential_ref: "NETLAS_API_KEY", policy: { approved: false }, access_state: "unknown" }]);
+    renderPage();
+    fireEvent.change(await screen.findByLabelText("New account provider"), { target: { value: "netlas" } });
+    fireEvent.change(screen.getByLabelText("New account name"), { target: { value: "account-2" } });
+    fireEvent.change(screen.getByLabelText("Credential reference"), { target: { value: "NETLAS_API_KEY_SECOND" } });
+    fireEvent.click(screen.getByRole("button", { name: "Create account" }));
+    await waitFor(() => expect(createSourceAccountMock).toHaveBeenCalledWith({ source_id: "netlas", name: "account-2", credential_ref: "NETLAS_API_KEY_SECOND" }));
+    expect(screen.getByText(/secret ref: NETLAS_API_KEY/)).toBeInTheDocument();
+    expect(screen.getByLabelText("Credential reference")).toBeInTheDocument();
+    fireEvent.click(screen.getAllByRole("button", { name: "Approve quota" })[0]);
+    await waitFor(() => expect(approveSourceAccountMock).toHaveBeenCalledWith("account-1", { approved: true, requests_per_minute: 10, daily_budget: 100 }));
+    fireEvent.change(screen.getByLabelText("Account for netlas-exposure"), { target: { value: "account-1" } });
+    await waitFor(() => expect(bindConnectorAccountMock).toHaveBeenCalledWith("netlas-one", "account-1"));
+  }, 15000);
+
+  it("allows explicit first validation for configured online providers without validating during setup", async () => {
+    const user = userEvent.setup();
+    listConnectorsMock.mockResolvedValue([{
+      id: "netlas-exposure-id", name: "netlas-exposure", connector_type: "exposure", status: "disabled", provider: "netlas", quota_group: "default", has_token: true,
+      last_seen_at: new Date().toISOString(), readiness: { credentials_configured: true, credential_state: "unknown", capabilities: ["hostname", "ip"] },
+    }]);
+    renderPage();
+    await screen.findByRole("heading", { name: "Opt-in intelligence setup" });
+    expect(screen.getByText(/Provider key: unknown/)).toBeInTheDocument();
+    expect(screen.getByText(/configured but not yet validated/)).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Enable for first validation" }));
+    await waitFor(() => expect(setConnectorStatusMock).toHaveBeenCalledWith("netlas-exposure-id", "enabled"));
+  });
+
+  it.each([
+    ["invalid", true],
+    ["unsupported", true],
+    ["unknown", false],
+  ])("does not offer provider opt-in for %s credentials or an offline worker", async (credentialState, online) => {
+    listConnectorsMock.mockResolvedValue([{
+      id: "netlas-exposure-id", name: "netlas-exposure", connector_type: "exposure", status: "disabled", provider: "netlas", quota_group: "default", has_token: true,
+      last_seen_at: online ? new Date().toISOString() : "2020-01-01T00:00:00Z",
+      readiness: { credentials_configured: true, credential_state: credentialState, capabilities: ["hostname", "ip"] },
+    }]);
+    renderPage();
+    await screen.findByRole("heading", { name: "Opt-in intelligence setup" });
+    expect(screen.queryByRole("button", { name: /Enable/ })).not.toBeInTheDocument();
+    expect(setConnectorStatusMock).not.toHaveBeenCalled();
+  });
+
+  it("does not offer opt-in when a worker advertises no capabilities", async () => {
+    listConnectorsMock.mockResolvedValue([{
+      id: "netlas-phishing-id", name: "netlas-phishing", connector_type: "phishing", status: "disabled", provider: "netlas", quota_group: "default", has_token: true,
+      last_seen_at: new Date().toISOString(), readiness: { credentials_configured: true, credential_state: "unknown", capabilities: [] },
+    }]);
+    renderPage();
+    await screen.findByRole("heading", { name: "Opt-in intelligence setup" });
+    expect(screen.getByText(/advertises no supported capabilities/)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Enable/ })).not.toBeInTheDocument();
+    expect(setConnectorStatusMock).not.toHaveBeenCalled();
+  });
+
+  it("shows normalized provider access failures and blocks enabling until fixed", async () => {
+    listConnectorsMock.mockResolvedValue([{
+      id: "netlas-exposure-id", name: "netlas-exposure", connector_type: "exposure", status: "disabled", provider: "netlas", quota_group: "default", has_token: true,
+      last_seen_at: new Date().toISOString(), readiness: { credentials_configured: true, credential_state: "unknown", provider_error: "credits_exhausted", capabilities: ["ip"] },
+    }]);
+    renderPage();
+    await screen.findByRole("heading", { name: "Opt-in intelligence setup" });
+    expect(screen.getByText("Provider API: credits exhausted")).toBeInTheDocument();
+    expect(screen.getByText(/correct the provider account, credits, network access, or API key/)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Enable/ })).not.toBeInTheDocument();
+    expect(setConnectorStatusMock).not.toHaveBeenCalled();
+  });
+
+  it("enables a provider immediately when credentials are already validated", async () => {
+    const user = userEvent.setup();
+    listConnectorsMock.mockResolvedValue([{
+      id: "netlas-exposure-id", name: "netlas-exposure", connector_type: "exposure", status: "disabled", provider: "netlas", quota_group: "default", has_token: true,
+      last_seen_at: new Date().toISOString(), readiness: { credentials_configured: true, credential_state: "valid", capabilities: ["hostname", "ip"] },
+    }]);
+    renderPage();
+    await screen.findByRole("heading", { name: "Opt-in intelligence setup" });
+    await user.click(screen.getByRole("button", { name: "Enable this source" }));
+    await waitFor(() => expect(setConnectorStatusMock).toHaveBeenCalledWith("netlas-exposure-id", "enabled"));
   });
 
   it("lists the module registry and toggles a declared module", async () => {
@@ -241,14 +404,33 @@ describe("SettingsPage", () => {
 
     await waitFor(() =>
       expect(updateSettingsMock).toHaveBeenCalledWith(
-        expect.objectContaining({ email_alerts_enabled: true }),
+        expect.objectContaining({
+          email_alerts_enabled: true,
+          expected_version: 7,
+        }),
       ),
     );
 
+    expect(updateSettingsMock.mock.calls[0][0]).not.toHaveProperty("schedule_dns_security");
+    expect(updateSettingsMock.mock.calls[0][0]).not.toHaveProperty("schedules");
     await user.click(screen.getByRole("switch", { name: "Toggle shodan" }));
     await waitFor(() =>
       expect(setConnectorStatusMock).toHaveBeenCalledWith("connector-1", "disabled"),
     );
+  });
+
+  it("preserves disabled schedules on unrelated saves and explicitly enables them", async () => {
+    getSettingsMock.mockResolvedValue({ ...settings, schedule_phishing: null, schedule_breaches: null, schedule_dns_security: null });
+    const user = userEvent.setup();
+    renderPage();
+    await screen.findByDisplayValue("smtp.example.com");
+    expect(screen.getByRole("switch", { name: "Enable phishing schedule" })).not.toBeChecked();
+    await user.click(screen.getByRole("switch", { name: "Enable email alerts" }));
+    await user.click(screen.getByRole("button", { name: "Save settings" }));
+    await waitFor(() => expect(updateSettingsMock).toHaveBeenCalledWith({ email_alerts_enabled: true, expected_version: 7 }));
+    await user.click(screen.getByRole("switch", { name: "Enable phishing schedule" }));
+    await user.click(screen.getByRole("button", { name: "Save settings" }));
+    await waitFor(() => expect(updateSettingsMock).toHaveBeenLastCalledWith(expect.objectContaining({ schedule_phishing: { days: [1, 2, 3, 4, 5], hour: 2, minute: 30 } })));
   });
 
   it("saves newly entered Telegram settings before sending a test message", async () => {
@@ -294,40 +476,48 @@ describe("SettingsPage", () => {
     expect(screen.getByText(/chat_not_found|Telegram cannot find this chat/)).toBeInTheDocument();
   });
 
-  it("saves newly entered SMTP settings before sending a test email", async () => {
-    const user = userEvent.setup();
-    renderPage();
+  // Seven fields typed through `userEvent`, each keystroke a re-render of this
+  // page: under the parallel suite run this is the heaviest interaction here, so
+  // it takes the same explicit budget as the quota test above instead of the
+  // suite's five-second default. No assertion is relaxed to fit in it.
+  it(
+    "saves newly entered SMTP settings before sending a test email",
+    async () => {
+      const user = userEvent.setup();
+      renderPage();
     await screen.findByDisplayValue("smtp.example.com");
 
-    await user.clear(screen.getByLabelText("Host"));
-    await user.type(screen.getByLabelText("Host"), "smtp.sandbox.mailtrap.io");
-    await user.clear(screen.getByLabelText("Port"));
-    await user.type(screen.getByLabelText("Port"), "2525");
-    await user.clear(screen.getByLabelText("Username"));
-    await user.type(screen.getByLabelText("Username"), "mailtrap-user");
-    await user.type(screen.getByLabelText("Password"), "mailtrap-password");
-    await user.clear(screen.getByLabelText("From address"));
-    await user.type(screen.getByLabelText("From address"), "from@example.com");
-    await user.type(screen.getByLabelText("Send test to"), "to@example.com");
-    await user.click(screen.getByRole("button", { name: "Send test email" }));
+      await user.clear(screen.getByLabelText("Host"));
+      await user.type(screen.getByLabelText("Host"), "smtp.sandbox.mailtrap.io");
+      await user.clear(screen.getByLabelText("Port"));
+      await user.type(screen.getByLabelText("Port"), "2525");
+      await user.clear(screen.getByLabelText("Username"));
+      await user.type(screen.getByLabelText("Username"), "mailtrap-user");
+      await user.type(screen.getByLabelText("Password"), "mailtrap-password");
+      await user.clear(screen.getByLabelText("From address"));
+      await user.type(screen.getByLabelText("From address"), "from@example.com");
+      await user.type(screen.getByLabelText("Send test to"), "to@example.com");
+      await user.click(screen.getByRole("button", { name: "Send test email" }));
 
-    await waitFor(() => expect(updateSettingsMock).toHaveBeenCalledWith(
-      expect.objectContaining({
-        smtp_host: "smtp.sandbox.mailtrap.io",
-        smtp_port: 2525,
-        smtp_user: "mailtrap-user",
-        smtp_password: "mailtrap-password",
-        smtp_from_email: "from@example.com",
-      }),
-    ));
-    await waitFor(() => expect(sendTestEmailMock).toHaveBeenCalledWith("to@example.com"));
-    expect(updateSettingsMock.mock.invocationCallOrder[0]).toBeLessThan(
-      sendTestEmailMock.mock.invocationCallOrder[0],
-    );
-    expect(toastMock).toHaveBeenCalledWith(
-      expect.objectContaining({ title: "Test email sent" }),
-    );
-  });
+      await waitFor(() => expect(updateSettingsMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          smtp_host: "smtp.sandbox.mailtrap.io",
+          smtp_port: 2525,
+          smtp_user: "mailtrap-user",
+          smtp_password: "mailtrap-password",
+          smtp_from_email: "from@example.com",
+        }),
+      ));
+      await waitFor(() => expect(sendTestEmailMock).toHaveBeenCalledWith("to@example.com"));
+      expect(updateSettingsMock.mock.invocationCallOrder[0]).toBeLessThan(
+        sendTestEmailMock.mock.invocationCallOrder[0],
+      );
+      expect(toastMock).toHaveBeenCalledWith(
+        expect.objectContaining({ title: "Test email sent" }),
+      );
+    },
+    15000,
+  );
 
   it("surfaces SMTP test-email errors", async () => {
     const user = userEvent.setup();

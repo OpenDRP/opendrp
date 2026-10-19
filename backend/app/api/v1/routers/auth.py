@@ -13,24 +13,27 @@ from qrcode.image.svg import SvgPathImage
 from sqlalchemy import desc, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import extract_ip, get_current_user, get_db
+from app.api.deps import extract_ip, get_db, require_self_service
 from app.core import totp
 from app.core.audit import AuditLogger
 from app.core.config import settings
 from app.core.crypto import decrypt_value, encrypt_value
 from app.core.exceptions import ConflictException, UnauthorizedException
 from app.core.rate_limit import RateLimiter
+from app.core import recovery_codes
 from app.core.security import (
+    DUMMY_PASSWORD_HASH,
     create_access_token,
     create_refresh_token,
     decode_token,
-    hash_password,
-    verify_password,
+    hash_password_async,
+    verify_password_async,
 )
 from app.models.audit import AuditLog
 from app.models.token import RefreshTokenFamily
 from app.models.user import User, role_name
 from app.schemas.user import (
+    AcceptInvitationRequest,
     LoginRequest,
     MfaCodeRequest,
     MfaSetupRequest,
@@ -45,6 +48,7 @@ from app.schemas.user import (
     TokenResponse,
     UserResponse,
 )
+from app.services import invitations
 from app.services.refresh_sessions import revoke_refresh_families
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
@@ -62,10 +66,8 @@ _CSRF_COOKIE = "opendrp_csrf"
 # ``Retry-After`` must stay identical on both branches.
 _LOCKOUT_DETAIL = "Too many failed login attempts. Please try again later."
 
-_DUMMY_HASH: str | None = None
 _MFA_MAX_FAILED_ATTEMPTS = 5
 _MFA_LOCK_WINDOW = timedelta(minutes=15)
-_RECOVERY_CODE_COUNT = 10
 
 
 def _mfa_is_locked(user: User, now: datetime) -> bool:
@@ -89,34 +91,32 @@ async def _clear_mfa_failures(user: User, db: AsyncSession) -> None:
     user.mfa_locked_until = None
 
 
-def _new_recovery_codes() -> tuple[list[str], list[str]]:
-    """Return fixed-length plaintext codes and their one-way bcrypt hashes."""
-    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
-    plain = ["".join(secrets.choice(alphabet) for _ in range(12)) for _ in range(_RECOVERY_CODE_COUNT)]
-    return plain, [hash_password(code) for code in plain]
-
-
 async def _consume_recovery_code(user: User, supplied: str) -> bool:
+    """Consume one recovery code, accepting the previous release's hashes.
+
+    A digest written before this release is bcrypt; one written since is an
+    HMAC. Both have to keep working, because a printed list that stops working
+    after an upgrade is the one failure a recovery path cannot have. The bcrypt
+    comparison runs on a worker thread — ten of them on the loop was a second of
+    frozen service — while the HMAC comparison is microseconds.
+
+    The matched entry is removed in either case. A bcrypt digest cannot be
+    rewritten without its plaintext, and the only plaintext here is the code being
+    spent, so "migrate the list" means "the list becomes HMAC as it is used or
+    rotated" rather than "rehash the code that just stopped being valid".
+    """
+    code = supplied.strip().upper()
     hashes = list(user.mfa_recovery_codes or [])
     for index, stored_hash in enumerate(hashes):
-        if verify_password(supplied.strip().upper(), stored_hash):
+        if recovery_codes.is_bcrypt_hash(stored_hash):
+            matched = await verify_password_async(code, stored_hash)
+        else:
+            matched = recovery_codes.verify(code, stored_hash)
+        if matched:
             hashes.pop(index)
             user.mfa_recovery_codes = hashes
             return True
     return False
-
-
-def _dummy_password_hash() -> str:
-    """A real bcrypt hash used only to keep failed-login timing uniform.
-
-    Computed once per process. Nothing authenticates against it; it exists so
-    that a login attempt for an unknown address still pays the cost of a bcrypt
-    comparison, which would otherwise reveal whether the account exists.
-    """
-    global _DUMMY_HASH
-    if _DUMMY_HASH is None:
-        _DUMMY_HASH = hash_password(secrets.token_urlsafe(32))
-    return _DUMMY_HASH
 
 
 async def _record_failed_login(email_key: str, ip: str) -> None:
@@ -169,15 +169,6 @@ async def _issue_session(
         {**data, "family_id": refresh_fid},
         expires_delta=timedelta(minutes=settings.JWT_ACCESS_TOKEN_EXPIRE_MINUTES),
     )
-    response.set_cookie(
-        _REFRESH_COOKIE, refresh_token, httponly=True, secure=settings.AUTH_COOKIE_SECURE,
-        samesite="lax", max_age=settings.JWT_REFRESH_TOKEN_EXPIRE_DAYS * 24 * 60 * 60,
-        path="/api/v1/auth",
-    )
-    response.set_cookie(
-        _CSRF_COOKIE, secrets.token_urlsafe(32), httponly=False, secure=settings.AUTH_COOKIE_SECURE,
-        samesite="lax", max_age=settings.JWT_REFRESH_TOKEN_EXPIRE_DAYS * 24 * 60 * 60, path="/",
-    )
     db.add(
         RefreshTokenFamily(
             id=_uuid_mod.uuid4(),
@@ -190,8 +181,23 @@ async def _issue_session(
     )
     try:
         await db.commit()
-    except Exception:
+    except Exception as exc:
         await db.rollback()
+        raise HTTPException(
+            status_code=503,
+            detail="Session could not be persisted; sign-in was not completed",
+            headers={"Retry-After": "5"},
+        ) from exc
+
+    response.set_cookie(
+        _REFRESH_COOKIE, refresh_token, httponly=True, secure=settings.AUTH_COOKIE_SECURE,
+        samesite="lax", max_age=settings.JWT_REFRESH_TOKEN_EXPIRE_DAYS * 24 * 60 * 60,
+        path="/api/v1/auth",
+    )
+    response.set_cookie(
+        _CSRF_COOKIE, secrets.token_urlsafe(32), httponly=False, secure=settings.AUTH_COOKIE_SECURE,
+        samesite="lax", max_age=settings.JWT_REFRESH_TOKEN_EXPIRE_DAYS * 24 * 60 * 60, path="/",
+    )
 
     return (
         TokenResponse(
@@ -269,11 +275,12 @@ async def login(
     if user is None:
         # Verify against a dummy hash and discard the result: skipping bcrypt
         # for unknown addresses would make them answer far faster than a wrong
-        # password and expose which accounts exist.
-        verify_password(password, _dummy_password_hash())
+        # password and expose which accounts exist. The hash is built once at
+        # import, so this costs a comparison and no construction.
+        await verify_password_async(password, DUMMY_PASSWORD_HASH)
         password_ok = False
     else:
-        password_ok = verify_password(password, user.password_hash)
+        password_ok = await verify_password_async(password, user.password_hash)
     user_active = bool(user and user.is_active)
     user_db_locked = bool(user and _user_is_db_locked(user, now))
 
@@ -408,8 +415,55 @@ async def login(
     return session
 
 
+@router.post("/accept-invitation", status_code=200)
+async def accept_invitation(
+    request: Request,
+    payload: AcceptInvitationRequest,
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, str]:
+    """Spend an invitation: the owner chooses the password nobody else knows (U-7).
+
+    Unknown and expired links get the same answer: a difference between the two
+    would turn this public endpoint into a way to test whether an address was
+    invited. The token itself is 256 bits, so guessing is not the attack this
+    guards against — asking is.
+
+    Acceptance is a credential change, so it clears the sign-in lockout, revokes
+    any session that existed before (there should be none, but an account can be
+    re-invited) and writes `auth.invitation.accepted` in the same transaction as
+    the new hash.
+    """
+    user = await invitations.find_by_token(db, payload.token.get_secret_value())
+    if user is None or invitations.is_expired(user):
+        raise UnauthorizedException("This invitation is invalid or has expired")
+
+    user.password_hash = await hash_password_async(
+        payload.new_password.get_secret_value()
+    )
+    user.must_change_password = False
+    user.failed_login_attempts = 0
+    user.locked_until = None
+    invitations.clear_invitation(user)
+    await revoke_refresh_families(db, user.id, reason="invitation_accepted")
+    await AuditLogger.emit(
+        db,
+        action="auth.invitation.accepted",
+        ip_address=extract_ip(request),
+        user_id=user.id,
+        details={"email": user.email},
+        require_persistence=True,
+        commit=False,
+    )
+    try:
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        raise
+    return {"status": "accepted"}
+
+
 @router.get("/me", response_model=UserResponse)
-async def get_me(current_user: User = Depends(get_current_user)) -> UserResponse:
+async def get_me(current_user: User = Depends(require_self_service)) -> UserResponse:
     return UserResponse.model_validate(current_user)
 
 
@@ -419,7 +473,7 @@ async def change_password(
     response: Response,
     payload: PasswordChangeRequest,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_self_service),
 ) -> TokenResponse:
     """Replace the signed-in account's own password.
 
@@ -439,7 +493,7 @@ async def change_password(
     ip = extract_ip(request)
     now = datetime.now(timezone.utc)
 
-    if not verify_password(
+    if not await verify_password_async(
         payload.current_password.get_secret_value(), current_user.password_hash
     ):
         await AuditLogger.emit(
@@ -450,7 +504,7 @@ async def change_password(
         raise UnauthorizedException("Current password is incorrect")
 
     new_password = payload.new_password.get_secret_value()
-    if verify_password(new_password, current_user.password_hash):
+    if await verify_password_async(new_password, current_user.password_hash):
         # Rotating onto the same value is not a rotation; refusing it keeps the
         # promise the account was given ("a password only you know") honest
         # instead of proceeding and clearing the flag regardless.
@@ -459,7 +513,7 @@ async def change_password(
         )
 
     was_required = current_user.must_change_password
-    current_user.password_hash = hash_password(new_password)
+    current_user.password_hash = await hash_password_async(new_password)
     current_user.must_change_password = False
     # A password change is also the moment to clear a stale lockout: the account
     # just proved it knows the current credential, so the counters that exist to
@@ -468,13 +522,9 @@ async def change_password(
     current_user.locked_until = None
 
     revoked = await revoke_refresh_families(db, current_user.id, reason="password_change")
-    try:
-        await db.commit()
-    except Exception:
-        await db.rollback()
-        raise
-
-    session, _refresh_fid = await _issue_session(response, current_user, db, now)
+    # The new credential, the sessions it signs out and the event that records
+    # both become durable in one commit: a password change nobody can find in the
+    # trail is not a change this platform is willing to make.
     await AuditLogger.emit(
         db, action="auth.password.changed", ip_address=ip, user_id=current_user.id,
         details={
@@ -482,7 +532,16 @@ async def change_password(
             "refresh_families_revoked": revoked,
             "was_required": was_required,
         },
+        require_persistence=True,
+        commit=False,
     )
+    try:
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        raise
+
+    session, _refresh_fid = await _issue_session(response, current_user, db, now)
     return session
 
 
@@ -517,7 +576,7 @@ async def list_sessions(
     request: Request,
     refresh_cookie: str | None = Cookie(default=None, alias=_REFRESH_COOKIE),
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_self_service),
 ) -> list[SessionResponse]:
     """List the sessions this account can still be used through, and nothing else.
 
@@ -561,7 +620,7 @@ async def list_sessions(
 async def revoke_session(
     family_id: _uuid_mod.UUID,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_self_service),
 ) -> None:
     """Revoke one of the caller's sessions; tokens are never returned."""
     family = (
@@ -576,14 +635,16 @@ async def revoke_session(
         family.revoked = True
         family.revoked_at = datetime.now(timezone.utc)
         family.revoked_reason = "user_revoked"
-        await db.commit()
         await AuditLogger.emit(
             db,
             action="auth.session.revoked",
             ip_address="authenticated-session",
             user_id=current_user.id,
             details={"family_id": str(family_id), "scope": "single"},
+            require_persistence=True,
+            commit=False,
         )
+        await db.commit()
     return None
 
 
@@ -592,7 +653,7 @@ async def revoke_other_sessions(
     request: Request,
     refresh_cookie: str | None = Cookie(default=None, alias=_REFRESH_COOKIE),
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_self_service),
 ) -> dict[str, int]:
     """Revoke every session except the browser currently presenting the cookie."""
     current_family = _current_family_id(refresh_cookie, request)
@@ -611,21 +672,23 @@ async def revoke_other_sessions(
         family.revoked = True
         family.revoked_at = now
         family.revoked_reason = "user_revoked_others"
-    await db.commit()
     await AuditLogger.emit(
         db,
         action="auth.sessions.revoked_others",
         ip_address=extract_ip(request),
         user_id=current_user.id,
         details={"revoked_count": len(rows)},
+        require_persistence=True,
+        commit=False,
     )
+    await db.commit()
     return {"revoked": len(rows)}
 
 
 @router.get("/security-activity", response_model=list[SecurityActivityResponse])
 async def security_activity(
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_self_service),
 ) -> list[SecurityActivityResponse]:
     """Show recent security events for this account, with secrets excluded."""
     security_actions = (
@@ -663,12 +726,12 @@ async def rotate_recovery_codes(
     request: Request,
     payload: MfaCodeRequest,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_self_service),
 ) -> MfaRecoveryCodesResponse:
     """Replace recovery codes after re-authentication with password and TOTP."""
     if current_user.totp_enabled_at is None:
         raise ConflictException("Enable a second factor before creating recovery codes")
-    if not verify_password(payload.password.get_secret_value(), current_user.password_hash):
+    if not await verify_password_async(payload.password.get_secret_value(), current_user.password_hash):
         await AuditLogger.emit(db, action="auth.mfa.failure", ip_address=extract_ip(request), user_id=current_user.id, details={"reason": "invalid_password_on_recovery_codes"})
         raise UnauthorizedException("Invalid password")
     secret = _decrypted_totp_secret(current_user)
@@ -676,10 +739,12 @@ async def rotate_recovery_codes(
     if step is None or (current_user.totp_last_used_step is not None and step <= current_user.totp_last_used_step):
         raise UnauthorizedException("Invalid MFA code")
     current_user.totp_last_used_step = step
-    plain, hashed = _new_recovery_codes()
+    plain, hashed = recovery_codes.generate()
     current_user.mfa_recovery_codes = hashed
+    # The codes and the event that says they were replaced land together: the
+    # audit row is the only record that the previous set stopped working.
+    await AuditLogger.emit(db, action="auth.mfa.recovery_codes.rotated", ip_address=extract_ip(request), user_id=current_user.id, details={"count": len(plain)}, require_persistence=True, commit=False)
     await db.commit()
-    await AuditLogger.emit(db, action="auth.mfa.recovery_codes.rotated", ip_address=extract_ip(request), user_id=current_user.id, details={"count": len(plain)})
     return MfaRecoveryCodesResponse(codes=plain)
 
 
@@ -760,10 +825,18 @@ async def refresh_token(
     except (ValueError, TypeError):
         refuse("Invalid refresh token payload")
 
+    # Lock and refresh the family row before making any decision. Two replicas
+    # handling the same refresh token must not both observe the old last_jti and
+    # mint different successor tokens. PostgreSQL blocks the loser here until
+    # the winner commits, then populate_existing refreshes its in-memory identity
+    # map from the newly committed (revoked) row.
+    family_query = select(RefreshTokenFamily).where(
+        RefreshTokenFamily.family_id == family_uuid
+    )
+    if db.get_bind().dialect.name == "postgresql":
+        family_query = family_query.with_for_update()
     fam = (
-        await db.execute(
-            select(RefreshTokenFamily).where(RefreshTokenFamily.family_id == family_uuid)
-        )
+        await db.execute(family_query.execution_options(populate_existing=True))
     ).scalar_one_or_none()
 
     if fam is None:
@@ -789,18 +862,20 @@ async def refresh_token(
         refuse("Refresh token does not match user")
 
     if fam.last_jti and fam.last_jti != jti:
+        old_jti = fam.last_jti
         fam.revoked = True
         fam.revoked_at = now
         fam.revoked_reason = "reuse_detected"
-        try:
-            await db.commit()
-        except Exception:
-            await db.rollback()
+        # Revoking a family because it replayed an old token is itself a security
+        # decision; it is not allowed to persist unrecorded.
         await AuditLogger.emit(
             db, action="auth.refresh.failure", ip_address=ip, user_id=user_id,
             details={"reason": "reuse_detected", "family_id": family_id_str,
-                     "old_jti": fam.last_jti, "presented_jti": jti},
+                     "old_jti": old_jti, "presented_jti": jti},
+            require_persistence=True,
+            commit=False,
         )
+        await db.commit()
         refuse("Refresh token reuse detected; family revoked")
 
     data = {"sub": str(user.id), "role": str(user.role)}
@@ -808,6 +883,7 @@ async def refresh_token(
         {**data, "family_id": family_id_str},
         expires_delta=timedelta(minutes=settings.JWT_ACCESS_TOKEN_EXPIRE_MINUTES))
     new_refresh, new_refresh_expires, new_jti, _ = create_refresh_token(data, family_id=family_id_str)
+    user_response = UserResponse.model_validate(user)
     response.set_cookie(
         _REFRESH_COOKIE, new_refresh, httponly=True, secure=settings.AUTH_COOKIE_SECURE,
         samesite="lax", max_age=new_refresh_expires, path="/api/v1/auth",
@@ -818,21 +894,26 @@ async def refresh_token(
     )
     fam.last_jti = new_jti
     fam.last_issued_at = now
+    # The rotation and its event share one commit: a successor token that cannot
+    # be found in the trail must not be handed to the browser.
+    await AuditLogger.emit(
+        db, action="auth.refresh.success", ip_address=ip, user_id=user_id,
+        details={"family_id": family_id_str, "new_jti": new_jti},
+        require_persistence=True,
+        commit=False,
+    )
     try:
         await db.commit()
     except Exception:
         await db.rollback()
-
-    await AuditLogger.emit(
-        db, action="auth.refresh.success", ip_address=ip, user_id=user_id,
-        details={"family_id": family_id_str, "new_jti": new_jti},
-    )
+        # Never return a token that was not made current in durable storage.
+        raise HTTPException(status_code=503, detail="Refresh rotation could not be committed")
 
     return TokenResponse(
         access_token=access_token,
         token_type="bearer",
         expires_in=expires_in,
-        user=UserResponse.model_validate(user),
+        user=user_response,
     )
 
 
@@ -924,7 +1005,7 @@ def _decrypted_totp_secret(user: User) -> str | None:
 
 @router.get("/mfa", response_model=MfaStatusResponse)
 async def mfa_status(
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_self_service),
 ) -> MfaStatusResponse:
     """Whether this account has a second factor, and since when.
 
@@ -943,7 +1024,7 @@ async def setup_mfa(
     request: Request,
     payload: MfaSetupRequest,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_self_service),
 ) -> MfaSetupResponse:
     """Generate a candidate secret for this account. Nothing is enabled yet.
 
@@ -964,7 +1045,7 @@ async def setup_mfa(
 
     if _mfa_is_locked(current_user, datetime.now(timezone.utc)):
         raise HTTPException(status_code=429, detail="Too many MFA attempts. Please try again later.")
-    if not verify_password(payload.password.get_secret_value(), current_user.password_hash):
+    if not await verify_password_async(payload.password.get_secret_value(), current_user.password_hash):
         await _record_mfa_failure(current_user, db)
         await AuditLogger.emit(
             db, action="auth.mfa.setup_failed", ip_address=ip, user_id=current_user.id,
@@ -978,16 +1059,20 @@ async def setup_mfa(
     # real once a code generated from this secret has been verified.
     current_user.totp_enabled_at = None
     current_user.totp_last_used_step = None
+    # A pending enrolment secret is credential material; it becomes durable only
+    # together with the event that says enrolment was started.
+    await AuditLogger.emit(
+        db, action="auth.mfa.setup_started", ip_address=ip, user_id=current_user.id,
+        details={"email": current_user.email},
+        require_persistence=True,
+        commit=False,
+    )
     try:
         await db.commit()
     except Exception:
         await db.rollback()
         raise
 
-    await AuditLogger.emit(
-        db, action="auth.mfa.setup_started", ip_address=ip, user_id=current_user.id,
-        details={"email": current_user.email},
-    )
     return MfaSetupResponse(
         secret=secret,
         otpauth_uri=totp.provisioning_uri(
@@ -998,7 +1083,7 @@ async def setup_mfa(
 
 @router.get("/mfa/qr")
 async def mfa_qr(
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_self_service),
 ) -> FastAPIResponse:
     """Render the pending otpauth URI as an SVG QR code without exposing it in JSON."""
     if current_user.totp_enabled_at is not None or not current_user.totp_secret:
@@ -1019,7 +1104,7 @@ async def enable_mfa(
     request: Request,
     payload: MfaCodeRequest,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_self_service),
 ) -> MfaStatusResponse:
     """Enable the second factor once a code from the pending secret verifies."""
     ip = extract_ip(request)
@@ -1036,7 +1121,7 @@ async def enable_mfa(
     # that no longer belongs to someone who knows the password.
     if _mfa_is_locked(current_user, datetime.now(timezone.utc)):
         raise HTTPException(status_code=429, detail="Too many MFA attempts. Please try again later.")
-    if not verify_password(payload.password.get_secret_value(), current_user.password_hash):
+    if not await verify_password_async(payload.password.get_secret_value(), current_user.password_hash):
         await _record_mfa_failure(current_user, db)
         await AuditLogger.emit(
             db, action="auth.mfa.setup_failed", ip_address=ip, user_id=current_user.id,
@@ -1069,19 +1154,16 @@ async def enable_mfa(
     # of the enrolment screen would otherwise be able to do.
     current_user.totp_last_used_step = step
     await _clear_mfa_failures(current_user, db)
-    plain_recovery_codes, hashed_recovery_codes = _new_recovery_codes()
+    plain_recovery_codes, hashed_recovery_codes = recovery_codes.generate()
     current_user.mfa_recovery_codes = hashed_recovery_codes
     # A factor was proven, so whatever recovery put this account here is finished.
     # The flag is cleared by evidence, not by intent: an enrolment that was
     # started and abandoned leaves it set, and the next sign-in asks again.
     was_required = current_user.must_enrol_mfa
     current_user.must_enrol_mfa = False
-    try:
-        await db.commit()
-    except Exception:
-        await db.rollback()
-        raise
-
+    # Enabling the factor and the recovery codes handed back are one change; the
+    # account must never be able to sign in with a factor the trail does not know
+    # about.
     await AuditLogger.emit(
         db, action="auth.mfa.enrolled", ip_address=ip, user_id=current_user.id,
         details={
@@ -1089,7 +1171,15 @@ async def enable_mfa(
             "enabled_at": enabled_at.isoformat(),
             "was_required": was_required,
         },
+        require_persistence=True,
+        commit=False,
     )
+    try:
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        raise
+
     return MfaEnableResponse(
         enabled=True,
         enabled_at=enabled_at,
@@ -1102,7 +1192,7 @@ async def disable_mfa(
     request: Request,
     payload: MfaCodeRequest,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_self_service),
 ) -> MfaStatusResponse:
     """Remove the second factor. Requires the password *and* a live code.
 
@@ -1118,7 +1208,7 @@ async def disable_mfa(
 
     if _mfa_is_locked(current_user, datetime.now(timezone.utc)):
         raise HTTPException(status_code=429, detail="Too many MFA attempts. Please try again later.")
-    if not verify_password(payload.password.get_secret_value(), current_user.password_hash):
+    if not await verify_password_async(payload.password.get_secret_value(), current_user.password_hash):
         await _record_mfa_failure(current_user, db)
         await AuditLogger.emit(
             db, action="auth.mfa.failure", ip_address=ip, user_id=current_user.id,
@@ -1153,14 +1243,18 @@ async def disable_mfa(
     current_user.totp_last_used_step = None
     current_user.mfa_recovery_codes = None
     await _clear_mfa_failures(current_user, db)
+    # Removing a second factor is exactly the kind of change that must leave a
+    # trail; it is refused rather than applied unrecorded.
+    await AuditLogger.emit(
+        db, action="auth.mfa.disabled", ip_address=ip, user_id=current_user.id,
+        details={"email": current_user.email},
+        require_persistence=True,
+        commit=False,
+    )
     try:
         await db.commit()
     except Exception:
         await db.rollback()
         raise
 
-    await AuditLogger.emit(
-        db, action="auth.mfa.disabled", ip_address=ip, user_id=current_user.id,
-        details={"email": current_user.email},
-    )
     return MfaStatusResponse(enabled=False, enabled_at=None)

@@ -27,6 +27,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from app.core.config import settings
 from app.core.database import Base
 from app.models import Connector, Job
+from app.services.module_registry import ensure_builtin_modules
 
 
 _DATABASE_URL = os.environ.get("INTEGRATION_DATABASE_URL")
@@ -66,6 +67,13 @@ async def postgres_engine():
     )
     async with engine.begin() as connection:
         await connection.run_sync(Base.metadata.create_all)
+    # A connector can only claim work for a module that exists and is enabled, so
+    # the platform's own module rows have to be there before a claim is exercised.
+    # The running system gets them from its migrations and from
+    # `ensure_builtin_modules`; this fixture builds the schema from the models, so
+    # it seeds them the same way the app does rather than asserting around it.
+    async with async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)() as seed:
+        await ensure_builtin_modules(seed)
     try:
         yield engine
     finally:
@@ -345,7 +353,12 @@ class TestRedisProductionBoundary:
             )
             assert sorted(results) == [False, True]
             assert client.get(key)
-            assert 0 < (client.ttl(key) or 0) <= 90
+            # The guard lives for 15 minutes (``scheduler_tasks`` sets it with
+            # ``ex=900``): it has to outlive the minute it names, because the
+            # release is a compare-and-delete and a stale replica must not delete
+            # a newer one's lock. The property that matters here is that it is
+            # finite, not the exact number.
+            assert 0 < (client.ttl(key) or 0) <= 900
         finally:
             client.delete(key)
             client.close()

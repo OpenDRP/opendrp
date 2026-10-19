@@ -43,7 +43,7 @@ Notes:
 
 - [ ] Not applicable.
 - [ ] `docs/` (and `README.md` where relevant) describe the new behaviour in this PR.
-- [ ] `CHANGELOG.md` has an entry under `Unreleased`.
+- [ ] `CHANGELOG.md` has an entry under the topmost version heading — the version this checkout declares.
 
 ## Compatibility
 

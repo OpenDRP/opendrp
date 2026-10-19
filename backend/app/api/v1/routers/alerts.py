@@ -1,9 +1,11 @@
 """Operational health checks for configured alert channels."""
 
 import asyncio
+import concurrent.futures
 import smtplib
 import ssl
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import NamedTuple
 
@@ -11,8 +13,9 @@ import httpx
 from fastapi import APIRouter, Depends, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import extract_ip, get_db, require_viewer_plus
+from app.api.deps import extract_ip, get_db, require_admin, require_active_account
 from app.core.audit import AuditLogger
+from app.core.exceptions import ConflictException, NotFoundException
 from app.core.outbound import (
     TELEGRAM_API_HOST,
     OutboundBlocked,
@@ -21,9 +24,20 @@ from app.core.outbound import (
 )
 from app.core.config import settings as core_settings
 from app.models.settings import SystemSettings
+from app.services import alert_health_cache
 from app.services.settings_service import SettingsService
 
 router = APIRouter(prefix="/alerts", tags=["Alerts"])
+
+# Bound SMTP probe work even when clients time out: cancelling an asyncio
+# waiter cannot stop an in-progress synchronous socket operation. A slot is
+# released only when the worker thread actually exits.
+_SMTP_PROBE_MAX_WORKERS = 4
+_SMTP_PROBE_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=_SMTP_PROBE_MAX_WORKERS,
+    thread_name_prefix="smtp-health-probe",
+)
+_SMTP_PROBE_SLOTS = asyncio.Semaphore(_SMTP_PROBE_MAX_WORKERS)
 
 
 class ProbeResult(NamedTuple):
@@ -42,6 +56,10 @@ class ProbeResult(NamedTuple):
     message: str
     latency_ms: int | None
     blocked_reason: str | None = None
+    # How the probe itself fared, separate from what it found (D8). ``saturated``
+    # means the pool had no free slot, so no observation of the channel was made;
+    # reporting that as ``degraded`` blamed the channel for the probe's queue.
+    probe_state: str = "ok"
 
 
 def _now() -> str:
@@ -70,7 +88,7 @@ def _smtp_probe(s: SystemSettings) -> ProbeResult:
         # host" that is really the API's own address, PostgreSQL, or the cloud
         # metadata endpoint turns this probe into a way to map the deployment
         # from a settings page.
-        ensure_allowed(smtp_host, port=smtp_port)
+        addresses = ensure_allowed(smtp_host, port=smtp_port)
     except OutboundBlocked as blocked:
         return ProbeResult(
             "failed",
@@ -82,8 +100,11 @@ def _smtp_probe(s: SystemSettings) -> ProbeResult:
         mode = (getattr(s, "smtp_security_mode", None) or "starttls").lower()
         if mode not in {"starttls", "ssl", "plain"}:
             return ProbeResult("failed", "SMTP security mode is invalid", 0)
+        if mode == "plain" and s.smtp_user and s.smtp_password_decrypted:
+            return ProbeResult("failed", "SMTP credentials require TLS", 0)
+        from app.core.outbound import pinned_smtp_class
         if mode == "ssl":
-            with smtplib.SMTP_SSL(
+            with pinned_smtp_class(smtplib.SMTP_SSL, addresses, implicit_tls=True)(
                 smtp_host,
                 smtp_port,
                 timeout=core_settings.ALERT_HEALTH_CHECK_TIMEOUT_SECONDS,
@@ -95,7 +116,7 @@ def _smtp_probe(s: SystemSettings) -> ProbeResult:
                 "healthy", "SMTP connection is available", int((time.perf_counter() - started) * 1000)
             )
 
-        with smtplib.SMTP(
+        with pinned_smtp_class(smtplib.SMTP, addresses)(
             smtp_host,
             smtp_port,
             timeout=core_settings.ALERT_HEALTH_CHECK_TIMEOUT_SECONDS,
@@ -120,19 +141,6 @@ def _smtp_probe(s: SystemSettings) -> ProbeResult:
 def _telegram_configured(s: SystemSettings) -> bool:
     chats = list(s.telegram_chat_ids or [])
     return bool(s.telegram_bot_token_decrypted and chats)
-
-
-async def _skip_probe() -> ProbeResult:
-    """Result for a channel an operator switched off.
-
-    A disabled channel is not dialled at all. Probing it anyway is not merely
-    wasted work: the SMTP probe blocks for up to
-    ``ALERT_HEALTH_CHECK_TIMEOUT_SECONDS`` against an unreachable server, and the
-    endpoint reports "disabled" regardless — so a switched-off channel could
-    make the health response hang for the full timeout and say nothing useful at
-    the end of it.
-    """
-    return ProbeResult("disabled", "", None)
 
 
 async def _telegram_probe(s: SystemSettings) -> ProbeResult:
@@ -168,57 +176,357 @@ async def _telegram_probe(s: SystemSettings) -> ProbeResult:
         )
 
 
-@router.get("/health")
-async def alert_channels_health(
-    request: Request,
-    db: AsyncSession = Depends(get_db),
-    user=Depends(require_viewer_plus),
-):
-    s = await SettingsService(db).get_singleton()
-    async def bounded_smtp_probe() -> ProbeResult:
-        if not s.email_alerts_enabled:
-            return await _skip_probe()
-        try:
-            return await asyncio.wait_for(
-                asyncio.to_thread(_smtp_probe, s),
-                timeout=(
-                    core_settings.ALERT_HEALTH_CHECK_TIMEOUT_SECONDS
-                    + float(core_settings.OUTBOUND_DNS_TIMEOUT_SECONDS)
-                ),
-            )
-        except asyncio.TimeoutError:
-            return ProbeResult(
-                "failed",
-                "SMTP health check timed out",
-                int((core_settings.ALERT_HEALTH_CHECK_TIMEOUT_SECONDS + float(core_settings.OUTBOUND_DNS_TIMEOUT_SECONDS)) * 1000),
-            )
+async def _bounded_smtp_probe(s: SystemSettings, timeout: float) -> ProbeResult:
+    """Run synchronous SMTP work with a hard queue and caller wait budget."""
+    loop = asyncio.get_running_loop()
+    try:
+        await asyncio.wait_for(_SMTP_PROBE_SLOTS.acquire(), timeout=timeout)
+    except asyncio.TimeoutError:
+        return ProbeResult(
+            "unknown",
+            "SMTP health check is busy; retry shortly",
+            int(timeout * 1000),
+            probe_state="saturated",
+        )
 
-    smtp_result, telegram_result = await asyncio.gather(
-        bounded_smtp_probe(),
-        _telegram_probe(s) if s.telegram_alerts_enabled else _skip_probe(),
+    try:
+        worker = _SMTP_PROBE_EXECUTOR.submit(_smtp_probe, s)
+    except Exception:
+        _SMTP_PROBE_SLOTS.release()
+        raise
+
+    worker.add_done_callback(lambda _future: loop.call_soon_threadsafe(_SMTP_PROBE_SLOTS.release))
+    wrapped = asyncio.wrap_future(worker)
+    done, _pending = await asyncio.wait({wrapped}, timeout=timeout)
+    if not done:
+        # Keep the slot occupied until the blocking socket work really finishes.
+        # The bounded executor plus semaphore prevents timed-out calls from
+        # generating an unbounded backlog of worker threads or queued probes.
+        return ProbeResult(
+            "failed", "SMTP health check timed out", int(timeout * 1000), probe_state="timeout"
+        )
+    try:
+        return wrapped.result()
+    except Exception as exc:
+        return ProbeResult("failed", f"SMTP check failed: {type(exc).__name__}", int(timeout * 1000))
+
+
+@router.get("/queue")
+async def alert_queue_status(db: AsyncSession = Depends(get_db), user=Depends(require_admin)):
+    from sqlalchemy import func, select
+    from app.models.alert_delivery import AlertDelivery
+    counts = (await db.execute(select(AlertDelivery.status, func.count(AlertDelivery.id)).group_by(AlertDelivery.status))).all()
+    recent = (await db.execute(select(AlertDelivery).order_by(AlertDelivery.created_at.desc()).limit(50))).scalars().all()
+    return {"counts": {status: count for status, count in counts}, "items": [{"id": str(row.id), "batch_id": row.batch_id, "job_id": str(row.job_id) if row.job_id else None, "channel": row.channel, "status": row.status, "attempts": row.attempts, "acknowledged_parts": row.acknowledged_parts, "parts": len(row.parts or []), "last_error": row.last_error, "next_attempt_at": row.next_attempt_at} for row in recent]}
+
+
+@router.get("/recipients")
+async def alert_recipient_holds(
+    db: AsyncSession = Depends(get_db), user=Depends(require_admin)
+):
+    """Recipients the queue is holding back, and why each one is held.
+
+    A delivery whose outcome is unknown — a worker died mid-send, or an SMTP
+    thread timed out after the provider may already have accepted the message —
+    holds its recipient for `ALERT_RECIPIENT_HOLD_SECONDS`, because retrying
+    immediately could duplicate the notification. That hold used to have no end
+    and no way out: the recipient stayed silent and the only remedy was SQL. This
+    listing is what makes the hold visible, and `release` is what makes it
+    something an operator can end early.
+    """
+    from app.services.alert_delivery_service import AlertDeliveryService
+
+    return {"items": await AlertDeliveryService(db).held_recipients()}
+
+
+@router.post("/recipients/{key}/release")
+async def release_alert_recipient(
+    request: Request,
+    key: str,
+    db: AsyncSession = Depends(get_db),
+    user=Depends(require_admin),
+):
+    """End a recipient's hold, and record who decided that.
+
+    Requeuing an ambiguous delivery is the operator asserting they have
+    reconciled it — usually by confirming with the recipient whether the message
+    arrived. The other possible outcome of that assertion is a duplicate
+    notification, which is why the decision is audited rather than merely
+    applied.
+    """
+    from app.services.alert_delivery_service import AlertDeliveryService
+
+    result = await AlertDeliveryService(db).release_recipient(key=key)
+    if not result["found"]:
+        raise NotFoundException("Unknown alert recipient")
+    if not result["released"]:
+        if result["reason"] == "not_held":
+            raise NotFoundException("This recipient is not currently held")
+        raise ConflictException(
+            "A delivery worker is sending to this recipient right now; the lease "
+            "ends within the delivery timeout"
+        )
+    await AuditLogger.emit_background(
+        db,
+        action="alerts.recipient.released",
+        ip_address=extract_ip(request),
+        user_id=user.id,
+        details={
+            "recipient_key": key,
+            "reason": result["reason"],
+            "requeued_deliveries": result["requeued_deliveries"],
+        },
     )
+    return result
+
+
+def _empty_delivery() -> dict:
+    """The delivery aggregate of a channel with no queue rows.
+
+    Always present with the same shape, so a card can print "queue empty"
+    instead of guessing from a missing key, and the response keeps one shape
+    for every channel and role.
+    """
+    return {
+        "counts": {
+            "pending": 0,
+            "delivering": 0,
+            "sent": 0,
+            "failed": 0,
+            "cancelled": 0,
+            "ambiguous": 0,
+        },
+        "oldest_unresolved_at": None,
+        "oldest_unresolved_age_seconds": None,
+        "retrying": 0,
+        "stuck": 0,
+        "degraded_reason": None,
+    }
+
+
+def _health_with_delivery(health: str, delivery: dict) -> str:
+    """A queue that cannot resolve itself degrades the channel.
+
+    Only a probe that is otherwise ``healthy``/``degraded`` is overridden: a
+    ``failed`` probe is already the more severe answer, and a disabled channel
+    has no delivery obligation to degrade.
+    """
+    if delivery.get("degraded_reason") and health in {"healthy", "degraded"}:
+        return "degraded"
+    return health
+
+
+@dataclass(frozen=True)
+class ChannelState:
+    """One channel's answer, including why its probe could not be made."""
+
+    enabled: bool
+    configured: bool
+    health: str
+    message: str
+    latency_ms: int | None
+    probe_state: str
+    checked_at: str | None
+    from_cache: bool
+    blocked_reason: str | None = None
+
+
+def _smtp_fingerprint(s: SystemSettings) -> str:
+    """The SMTP settings an answer depends on, hashed.
+
+    A changed host, port, mode, login or sender is a different question, so it
+    must not be answered from the previous probe's cache entry.
+    """
+    return alert_health_cache.fingerprint(
+        "email",
+        s.smtp_host,
+        s.smtp_port,
+        getattr(s, "smtp_security_mode", None),
+        s.smtp_user,
+        s.smtp_password_decrypted,
+        s.smtp_from_email_decrypted,
+    )
+
+
+def _telegram_fingerprint(s: SystemSettings) -> str:
+    return alert_health_cache.fingerprint(
+        "telegram", s.telegram_bot_token_decrypted, tuple(s.telegram_chat_ids or [])
+    )
+
+
+async def _email_state(
+    s: SystemSettings, *, ttl_seconds: int, probe_timeout: float
+) -> ChannelState:
+    enabled = bool(s.email_alerts_enabled)
+    configured = _configured_smtp(s)
+    if not enabled:
+        # Never dial a switched-off channel: the SMTP probe could block for its
+        # whole budget, and the answer would be "disabled" either way.
+        return ChannelState(
+            enabled=False,
+            configured=configured,
+            health="disabled",
+            message="Email alerts are disabled",
+            latency_ms=None,
+            probe_state="skipped",
+            checked_at=None,
+            from_cache=False,
+        )
+    outcome = await alert_health_cache.probe_with_cache(
+        channel="email",
+        fingerprint=_smtp_fingerprint(s),
+        ttl_seconds=ttl_seconds,
+        wait_budget_seconds=probe_timeout,
+        probe=lambda: _bounded_smtp_probe(s, probe_timeout),
+    )
+    return ChannelState(
+        enabled=True,
+        configured=configured,
+        health=outcome.health,
+        message=outcome.message,
+        latency_ms=outcome.latency_ms,
+        probe_state=outcome.probe_state,
+        checked_at=outcome.checked_at,
+        from_cache=outcome.from_cache,
+        blocked_reason=outcome.blocked_reason,
+    )
+
+
+async def _telegram_state(s: SystemSettings, *, ttl_seconds: int) -> ChannelState:
+    enabled = bool(s.telegram_alerts_enabled)
+    configured = _telegram_configured(s)
+    if not enabled:
+        # Same reason as email: no probe for a channel nobody switched on.
+        return ChannelState(
+            enabled=False,
+            configured=configured,
+            health="disabled",
+            message="Telegram alerts are disabled",
+            latency_ms=None,
+            probe_state="skipped",
+            checked_at=None,
+            from_cache=False,
+        )
+    # Telegram has no admission pool, so the probe's own HTTP timeout is the
+    # whole budget; the caller still gets the SMTP-shaped budget for the wait
+    # after a concurrent probe, which can only be longer than this one.
+    wait_budget = (
+        float(core_settings.ALERT_HEALTH_CHECK_TIMEOUT_SECONDS)
+        + float(core_settings.OUTBOUND_DNS_TIMEOUT_SECONDS)
+    )
+    outcome = await alert_health_cache.probe_with_cache(
+        channel="telegram",
+        fingerprint=_telegram_fingerprint(s),
+        ttl_seconds=ttl_seconds,
+        wait_budget_seconds=wait_budget,
+        probe=lambda: _telegram_probe(s),
+    )
+    return ChannelState(
+        enabled=True,
+        configured=configured,
+        health=outcome.health,
+        message=outcome.message,
+        latency_ms=outcome.latency_ms,
+        probe_state=outcome.probe_state,
+        checked_at=outcome.checked_at,
+        from_cache=outcome.from_cache,
+        blocked_reason=outcome.blocked_reason,
+    )
+
+
+async def channel_health_payload(
+    db: AsyncSession,
+) -> tuple[list[dict], dict, dict[str, str]]:
+    """Probe both channels once and return what every reader needs.
+
+    Shared by ``GET /alerts/health`` and the dashboard overview (DHP-10): the two
+    must answer with the same probes, cache and delivery rules, and a page that
+    asked the endpoint over HTTP would pay a second request and write a second
+    audit row for the same observation.
+
+    Returns ``(items, delivery_queue, blocked)``. Nothing here writes an audit
+    row: a reading is not an event, so the caller decides what the trail records
+    — the endpoint keeps its ``alerts.health.view`` entry, the overview records
+    one ``dashboard.view`` for the whole page.
+    """
+    from app.services.alert_delivery_service import AlertDeliveryService
+    from app.services.alert_service import AlertService
+
+    s = await AlertService(db).detach_settings(await SettingsService(db).get_singleton())
+    delivery_by_channel, waiting_recipients = await AlertDeliveryService(
+        db
+    ).channel_delivery_summary(stuck_after_seconds=int(core_settings.ALERT_RECIPIENT_HOLD_SECONDS))
+    # The delivery read is over, so the transaction ends here, before any network
+    # work (D9). `detach_settings` had already committed the settings snapshot;
+    # this commit releases the connection the aggregate query used. An SMTP probe
+    # may hold its worker for the whole budget, and a pooled connection must not
+    # be held with it, or a slow mail server would look like database pressure.
+    # The caller's audit rows open a new transaction.
+    await db.commit()
+    probe_timeout = (
+        float(core_settings.ALERT_HEALTH_CHECK_TIMEOUT_SECONDS)
+        + float(core_settings.OUTBOUND_DNS_TIMEOUT_SECONDS)
+    )
+    ttl_seconds = int(core_settings.ALERT_HEALTH_CACHE_SECONDS)
+    email, telegram = await asyncio.gather(
+        _email_state(s, ttl_seconds=ttl_seconds, probe_timeout=probe_timeout),
+        _telegram_state(s, ttl_seconds=ttl_seconds),
+    )
+    email_delivery = delivery_by_channel.get("email", _empty_delivery())
+    telegram_delivery = delivery_by_channel.get("telegram", _empty_delivery())
     items = [
         {
             "channel": "email",
             "label": "Email / SMTP",
-            "enabled": bool(s.email_alerts_enabled),
-            "configured": _configured_smtp(s),
-            "health": "disabled" if not s.email_alerts_enabled else smtp_result.health,
-            "message": "Email alerts are disabled" if not s.email_alerts_enabled else smtp_result.message,
-            "latency_ms": smtp_result.latency_ms,
-            "last_checked_at": _now(),
+            "enabled": email.enabled,
+            "configured": email.configured,
+            "health": _health_with_delivery(email.health, email_delivery),
+            "message": email.message,
+            "latency_ms": email.latency_ms,
+            "probe_state": email.probe_state,
+            "checked_at": email.checked_at,
+            "from_cache": email.from_cache,
+            "delivery": email_delivery,
         },
         {
             "channel": "telegram",
             "label": "Telegram",
-            "enabled": bool(s.telegram_alerts_enabled),
-            "configured": _telegram_configured(s),
-            "health": "disabled" if not s.telegram_alerts_enabled else telegram_result.health,
-            "message": "Telegram alerts are disabled" if not s.telegram_alerts_enabled else telegram_result.message,
-            "latency_ms": telegram_result.latency_ms,
-            "last_checked_at": _now(),
+            "enabled": telegram.enabled,
+            "configured": telegram.configured,
+            "health": _health_with_delivery(telegram.health, telegram_delivery),
+            "message": telegram.message,
+            "latency_ms": telegram.latency_ms,
+            "probe_state": telegram.probe_state,
+            "checked_at": telegram.checked_at,
+            "from_cache": telegram.from_cache,
+            "delivery": telegram_delivery,
         },
     ]
+    # A refused destination is a security event, not a configuration typo: it
+    # means an operator-supplied host resolved into loopback, the cloud metadata
+    # range, or one of this deployment's own networks.
+    blocked = {
+        channel: reason
+        for channel, reason in (
+            ("email", email.blocked_reason),
+            ("telegram", telegram.blocked_reason),
+        )
+        if reason
+    }
+    # A hold or a retry window is per recipient key, and the key is a digest of
+    # channel+target, which is deliberately not reversible. So this count is
+    # stated once for the installation rather than split across channels by
+    # guesswork.
+    return items, {"waiting_recipients": waiting_recipients}, blocked
+
+
+@router.get("/health")
+async def alert_channels_health(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    user=Depends(require_active_account),
+):
+    items, delivery_queue, blocked = await channel_health_payload(db)
     await AuditLogger.emit_background(
         db,
         action="alerts.health.view",
@@ -226,17 +534,6 @@ async def alert_channels_health(
         user_id=user.id,
         details={"channels": {item["channel"]: item["health"] for item in items}},
     )
-    # A refused destination is a security event, not a configuration typo: it
-    # means an operator-supplied host resolved into loopback, the cloud metadata
-    # range, or one of this deployment's own networks.
-    blocked = {
-        channel: reason
-        for channel, reason in (
-            ("email", smtp_result.blocked_reason),
-            ("telegram", telegram_result.blocked_reason),
-        )
-        if reason
-    }
     if blocked:
         await AuditLogger.emit_background(
             db,
@@ -245,4 +542,4 @@ async def alert_channels_health(
             user_id=user.id,
             details={"operation": "alert_channel_probe", "channels": blocked},
         )
-    return {"items": items, "generated_at": _now()}
+    return {"items": items, "delivery_queue": delivery_queue, "generated_at": _now()}

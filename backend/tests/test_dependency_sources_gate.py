@@ -26,7 +26,7 @@ def test_clean_pyproject_passes():
     source = (
         "[tool.poetry]\n"
         'name = "opendrp-backend"\n'
-        'version = "0.1.1"\n'
+        'version = "0.2.0"\n'
         "\n"
         "[tool.mypy]\n"
         'python_version = "3.12"\n'
@@ -57,7 +57,7 @@ def test_pep621_project_table_is_rejected():
 def test_poetry_version_table_is_allowed():
     # The version gate reads [tool.poetry].version; keeping the table must not
     # trip the dependency gate.
-    source = '[tool.poetry]\nname = "x"\nversion = "0.1.1"\n'
+    source = '[tool.poetry]\nname = "x"\nversion = "0.2.0"\n'
     assert _gate.check_pyproject(source) == []
 
 

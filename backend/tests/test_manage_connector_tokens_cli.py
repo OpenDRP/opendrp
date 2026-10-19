@@ -97,6 +97,19 @@ class TestRotateAndRevoke:
         assert await credentials.resolve(second) is not None
 
     @pytest.mark.asyncio
+    async def test_rotate_is_visible_in_the_public_prefix(self, cli_db):
+        """The CLI is how a rotation happens, so its effect has to be readable."""
+        await cli.cmd_issue("dnstwist", "phishing", None)
+        service = ConnectorService(cli_db)
+        before = (await service.get_by_name("dnstwist")).token_prefix
+
+        await cli.cmd_rotate("dnstwist", None)
+        after = (await service.get_by_name("dnstwist")).token_prefix
+
+        assert before and after and before != after
+        assert before.startswith("dnstwi_") and after.startswith("dnstwi_")
+
+    @pytest.mark.asyncio
     async def test_rotate_requires_the_connector_to_exist(self, cli_db):
         with pytest.raises(SystemExit) as exit_info:
             await cli.cmd_rotate("ghost", None)

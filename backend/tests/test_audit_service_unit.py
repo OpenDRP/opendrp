@@ -10,7 +10,12 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.audit import AUDIT_ALLOWED_ACTIONS, AuditLogger, _safe_jsonable
+from app.core.audit import (
+    AUDIT_ALLOWED_ACTIONS,
+    AuditLogger,
+    AuditPersistenceError,
+    _safe_jsonable,
+)
 from app.models.audit import AuditLog
 
 
@@ -22,7 +27,8 @@ class TestAuditActionWhitelist:
             "asset.create", "asset.update", "asset.delete", "asset.list", "asset.view",
             "settings.update", "settings.view", "settings.test_email_sent",
             "settings.test_email_failed",
-            "report.generate", "report.generate.failed", "report.list",
+            "report.generate", "report.generate.failed", "report.generate.completed",
+            "report.generate.retry", "report.retention.expired", "report.list",
             "report.download", "report.delete",
             "phishing.scan.dnstwist.start", "phishing.scan.shodan.start",
             "phishing.threat.list", "phishing.threat.view",
@@ -176,6 +182,62 @@ class TestAuditLoggerEmit:
         assert row.ip_address == "unknown"
 
     @pytest.mark.asyncio
+    async def test_required_emit_fails_closed_on_a_database_error(self, monkeypatch):
+        bad_db = MagicMock()
+        bad_db.add = MagicMock()
+        bad_db.commit = AsyncMock(side_effect=RuntimeError("audit store unavailable"))
+        bad_db.rollback = AsyncMock()
+        monkeypatch.setattr("app.core.audit.prepare_entry", AsyncMock(side_effect=RuntimeError("chain unavailable")))
+        monkeypatch.setattr("app.core.audit.log.error", lambda *args, **kwargs: None)
+
+        with pytest.raises(AuditPersistenceError):
+            await AuditLogger.emit(
+                bad_db,
+                action="user.created",
+                ip_address="127.0.0.1",
+                details={},
+                require_persistence=True,
+                commit=False,
+            )
+
+        bad_db.rollback.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_transactional_audit_is_exported_only_after_commit(
+        self, db_session: AsyncSession, monkeypatch
+    ):
+        stdout_calls = []
+        monkeypatch.setattr(
+            "app.core.audit.log.info",
+            lambda event_name, **kwargs: stdout_calls.append(kwargs),
+        )
+        await AuditLogger.emit(
+            db_session,
+            action="user.created",
+            ip_address="127.0.0.1",
+            details={"target_user_id": "target"},
+            require_persistence=True,
+            commit=False,
+        )
+        assert stdout_calls == []
+        await db_session.rollback()
+        assert stdout_calls == []
+
+        await AuditLogger.emit(
+            db_session,
+            action="user.created",
+            ip_address="127.0.0.1",
+            details={"target_user_id": "target"},
+            require_persistence=True,
+            commit=False,
+        )
+        assert stdout_calls == []
+        await db_session.commit()
+        assert len(stdout_calls) == 1
+        rows = (await db_session.execute(select(AuditLog))).scalars().all()
+        assert len(rows) == 1
+
+    @pytest.mark.asyncio
     async def test_emit_catches_db_write_failure_via_rollback(self, db_session: AsyncSession, monkeypatch):
         bad_db = MagicMock()
         bad_db.add = MagicMock()
@@ -224,6 +286,36 @@ class TestAuditLoggerEmit:
         assert ev["details"]["email"] == "a@b.com"
         assert ev["timestamp"].startswith("2026-09-05T12:00:00")
 
+    @pytest.mark.asyncio
+    async def test_failed_database_write_is_exported_as_not_persisted(
+        self, monkeypatch
+    ):
+        bad_db = MagicMock()
+        bad_db.add = MagicMock()
+        bad_db.commit = AsyncMock(side_effect=RuntimeError("db unavailable"))
+        bad_db.rollback = AsyncMock()
+        exported = []
+        from app.core import audit as audit_mod
+
+        monkeypatch.setattr(
+            audit_mod.log,
+            "info",
+            lambda event_name, **fields: exported.append(fields),
+        )
+        monkeypatch.setattr(audit_mod.log, "error", lambda *args, **kwargs: None)
+
+        await AuditLogger.emit(
+            bad_db, action="auth.login.failure", ip_address="203.0.113.7",
+            details={"audit_persisted": True, "audit_hash": "caller-forgery"},
+        )
+
+        assert len(exported) == 1
+        details = exported[0]["details"]
+        assert details["audit_persisted"] is False
+        assert "audit_hash" not in details
+        assert "audit_prev_hash" not in details
+        assert "audit_key_id" not in details
+
 
 class TestAuditLoggerBackground:
     @pytest.mark.asyncio
@@ -240,7 +332,12 @@ class TestAuditLoggerBackground:
         # The row carries the chain link in its own columns, and the same values
         # ride along in `details` so the exported stdout line and the row can be
         # compared without guessing.
-        assert set(row.details) == {"asset_id", "audit_hash", "audit_prev_hash", "audit_key_id"}
+        assert set(row.details) == {
+            "asset_id",
+            "audit_hash",
+            "audit_prev_hash",
+            "audit_key_id",
+        }
         assert row.entry_hash == row.details["audit_hash"]
         assert row.prev_hash == row.details["audit_prev_hash"]
         assert row.key_id == row.details["audit_key_id"]

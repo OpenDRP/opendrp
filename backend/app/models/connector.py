@@ -1,5 +1,6 @@
 from datetime import datetime
-from sqlalchemy import JSON, DateTime, String
+import uuid
+from sqlalchemy import JSON, DateTime, String, ForeignKey
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import Base, TimestampMixin, UUIDMixin
@@ -25,6 +26,7 @@ class Connector(Base, UUIDMixin, TimestampMixin):
 
     __tablename__ = "drp_connectors"
 
+    aliases: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
     name: Mapped[str] = mapped_column(String(100), unique=True, nullable=False, index=True)
     # Module the connector feeds. The module set is data (see
     # app/services/module_registry.py), so this is any registered module id —
@@ -52,6 +54,13 @@ class Connector(Base, UUIDMixin, TimestampMixin):
     # Per-connector configuration delivered to the connector with every scan.
     # Validated against the connector's own manifest config_schema.
     config: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    # Non-secret provider/account identity is operator-controlled, not supplied
+    # in findings. Account grouping shares quotas across module workers.
+    provider: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    source_account_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("source_accounts.id", ondelete="SET NULL"), nullable=True)
+    quota_group: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    readiness: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    last_success_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_error: Mapped[str | None] = mapped_column(String(2000), nullable=True)
     # Info block reported at registration (python version, hostname, etc.).
