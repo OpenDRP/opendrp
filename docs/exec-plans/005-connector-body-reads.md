@@ -19,10 +19,11 @@ this plan: a **source-level gate** over the connector tree, so a new worker that
 reaches for `response.json()` fails on CI instead of passing review.
 
 Both halves are written: the defect is fixed in this plan's first commit and the
-gate is in the second, wired into CI. What remains open is the one decision the
-gate's evidence was meant to settle — whether the SDK should also read the
-*platform's* own answers under a bound — and that is recorded in Progress rather
-than left to a reader.
+gate is in the second, wired into CI. The one decision the gate's evidence was
+meant to settle — whether the SDK should also read the *platform's* own answers
+under a bound — came out against a rewrite, and the reasoning is in Progress so
+that a reader does not have to reopen it. The plan is closed; what it deliberately
+left to other work is listed under "Deliberately not in this plan".
 
 ## Inventory — every remaining body read in the connector tree
 
