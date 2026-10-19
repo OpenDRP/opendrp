@@ -5,7 +5,7 @@
 # ------------------------------------------------------------------------------
 
 # ---- Stage 1: Builder — install system packages + Python wheels --------------
-FROM python:3.12-slim AS builder
+FROM python:3.14-slim AS builder
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -58,7 +58,7 @@ RUN python -m venv /opt/venv && \
     fi
 
 # ---- Stage 2: Runtime — small final image with only necessary deps -----------
-FROM python:3.12-slim AS runtime
+FROM python:3.14-slim AS runtime
 
 # Runtime identity. Overridable because a Linux host bind-mounts its own uid into
 # the container: with `./backend:/app` mounted, a container user whose uid does
