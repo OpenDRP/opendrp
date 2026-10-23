@@ -10,18 +10,18 @@ permissions:
 jobs:
   backend:
     runs-on: ubuntu-latest
-    # The suite runs four times over (tests, connectors, the coverage floor, the
-    # per-module gate) and takes about a quarter of an hour. The bound is for the
-    # step that stops returning: a hung job is otherwise indistinguishable from a
-    # slow one until the six-hour default expires.
+    # The tree runs the suite three times over (tests, the coverage floor, the
+    # per-module gate) plus the connector suites, and each full pass is about 19.5
+    # minutes at 3,577 tests. The bound is for the step that stops returning: a hung
+    # job is otherwise indistinguishable from a slow one until the six-hour default
+    # expires.
     #
-    # The bound has to clear the slowest healthy run, not the typical one: a green
-    # run takes about 35 minutes, and two runs on a contended runner were cut off
-    # inside the last full-suite pass at 40 -- cancelled, which reads as red while
-    # nothing is wrong with the code. 60 minutes keeps the hung step detectable
-    # (it still fires well before the six-hour default) and stops the runner's speed
-    # from deciding whether the branch is green.
-    timeout-minutes: 60
+    # The bound has to clear the slowest healthy run, not the typical one. The
+    # measurement that set it: a green run reached the last two gates at 60 minutes
+    # and was cancelled there, which reads as red while nothing is wrong with the
+    # code. 90 minutes leaves room for three full passes on a contended runner and
+    # still fires long before the six-hour default.
+    timeout-minutes: 90
     services:
       redis:
         image: redis:7-alpine
