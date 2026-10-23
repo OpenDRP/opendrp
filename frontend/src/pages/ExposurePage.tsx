@@ -12,9 +12,9 @@ import { TIME_ZONE_HINT, formatDateTime } from "@/lib/datetime";
 import { useIsAnalystPlus } from "@/store/auth";
 
 type Observation = {
-  id: string; subject: string; matched_asset: string; source: string; status: string;
+  id: string; subject: string; matched_asset?: string | null; source: string; status: string;
   observed_at: string | null; first_seen_at: string; last_seen_at: string;
-  payload: { port?: number; transport?: string; protocol?: string; metadata?: Record<string, unknown> };
+  payload?: { port?: number; transport?: string; protocol?: string; metadata?: Record<string, unknown> } | null;
 };
 
 type ScanSource = { connector?: unknown; status?: unknown; reason?: unknown };
@@ -89,7 +89,7 @@ export default function ExposurePage() {
   });
   const columns: DataTableColumn<Observation>[] = [
     { key: "subject", title: "Observed host", minWidth: 200, render: r => <span className="font-mono">{r.subject}</span> },
-    { key: "service", title: "Service", minWidth: 150, render: r => `${r.payload.port ?? "—"}/${r.payload.transport ?? "—"} · ${r.payload.protocol ?? "unknown"}` },
+    { key: "service", title: "Service", minWidth: 150, render: r => `${r.payload?.port ?? "—"}/${r.payload?.transport ?? "—"} · ${r.payload?.protocol ?? "unknown"}` },
     { key: "matched_asset", title: "Matched asset", minWidth: 180, render: r => r.matched_asset },
     { key: "source", title: "Source", minWidth: 110, render: r => r.source },
     { key: "observed_at", title: "Provider observation (UTC)", minWidth: 180, render: r => r.observed_at ? formatDateTime(r.observed_at) : "Unknown" },
@@ -101,7 +101,9 @@ export default function ExposurePage() {
   const scan = useMutation({
     mutationFn: () => endpoints.scanModule("exposure"),
     onSuccess: result => {
-      toast({ title: "Exposure scan queued", description: result.sources.map(s => `${s.connector}: ${s.status}`).join(" · ") });
+      // `sources` is optional on `ScanStartResult`; a module scan sends it, and the
+      // fallback keeps the toast working for a route that does not.
+      toast({ title: "Exposure scan queued", description: (result.sources ?? []).map(s => `${s.connector}: ${s.status}`).join(" · ") });
       qc.invalidateQueries({ queryKey: ["jobs"] });
     },
     onError: error => toast({ variant: "destructive", title: "Scan not started", description: describeExposureScanError(error) }),

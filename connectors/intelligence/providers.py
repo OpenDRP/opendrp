@@ -1249,5 +1249,7 @@ def endpoint(row):
             or row.get("scan_time")
             or row.get("@timestamp")
         ),
-        "title": str(row.get("title") or "")[:1000],
+        # The core refuses a NUL, CR or LF in finding metadata and then rejects the
+        # whole batch, so a run of them becomes one space before the bound applies.
+        "title": re.sub(r"\s*[\x00\r\n]+\s*", " ", str(row.get("title") or "")).strip()[:1000],
     }

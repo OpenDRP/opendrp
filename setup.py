@@ -58,6 +58,7 @@ import argparse
 import ast
 import base64
 import binascii
+import difflib
 import hashlib
 import ipaddress
 import os
@@ -70,7 +71,7 @@ import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Mapping, Optional, Sequence, Set, Tuple
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 REPO_ROOT = Path(__file__).resolve().parent
 DEFAULT_TEMPLATE = REPO_ROOT / ".env.example"
@@ -1682,6 +1683,34 @@ def describe_changes(
 # ==============================================================================
 # Modes
 # ==============================================================================
+def typo_candidate(key: str, documented: Iterable[str]) -> Optional[str]:
+    """The documented setting `key` is a misspelling of, or None.
+
+    Sequence similarity alone is not enough to answer this: `TOKEN_ACME_DNS` and
+    `TOKEN_OTHER_DNS` score over 0.9 while naming two different services, and a
+    "did you mean" that points at another connector's credential sends the
+    operator to issue a token that connector cannot use. A typo is a *short*
+    edit — a dropped letter, a doubled one, two swapped — in a name that is
+    otherwise exactly a documented setting's, so only one or two edited
+    characters qualify. Anything longer is reported as a setting this release
+    does not read, without guessing at a replacement.
+    """
+    best: Optional[Tuple[int, str]] = None
+    # Sorted, so two candidates at the same distance always resolve the same
+    # way: a suggestion that changes between runs is not reproducible.
+    for candidate in sorted(documented):
+        edited = 0
+        opcodes = difflib.SequenceMatcher(None, key, candidate).get_opcodes()
+        for tag, start_a, end_a, start_b, end_b in opcodes:
+            if tag != "equal":
+                edited += max(end_a - start_a, end_b - start_b)
+        if edited == 0 or edited > 2:
+            continue
+        if best is None or edited < best[0]:
+            best = (edited, candidate)
+    return best[1] if best is not None else None
+
+
 def run_check(
     target: Path, template: EnvFile, quiet: bool = False
 ) -> int:
@@ -1722,13 +1751,36 @@ def run_check(
         if key not in documented and not key.startswith("COMPOSE_")
     )
     for key in unknown:
-        findings.append(
-            Finding(
-                "error",
-                f"{key} is not documented in {DEFAULT_TEMPLATE.name}: if that is a "
-                "typo, the intended setting is silently at its default.",
+        # A name one or two characters away from a documented one is almost
+        # always a typo, and naming the intended setting is the whole fix. A
+        # name with no such near miss is what an `.env` keeps from an older
+        # release, after a setting was renamed or withdrawn; the application
+        # starts and ignores the line, so the consequence is that nothing is
+        # configured by it — which is why it is still an error, and why it does
+        # not claim the stack refuses to start.
+        nearest = typo_candidate(key, documented)
+        if nearest:
+            findings.append(
+                Finding(
+                    "error",
+                    f"{key} is not documented in {DEFAULT_TEMPLATE.name}: did you "
+                    f"mean {nearest}? The application reads only the "
+                    "documented name, so the setting you meant stays at its "
+                    "default.",
+                )
             )
-        )
+        else:
+            findings.append(
+                Finding(
+                    "error",
+                    f"{key} is not documented in {DEFAULT_TEMPLATE.name} and no "
+                    "setting of that name exists in this release: an `.env` from "
+                    "an older release keeps it after the setting was renamed or "
+                    "withdrawn. The application starts and ignores this line, so "
+                    "it configures nothing. Delete it, and use the documented "
+                    "name if its replacement is there.",
+                )
+            )
 
     findings.extend(validate_values(env.values))
 
@@ -1751,7 +1803,10 @@ def run_check(
             print(f"  {finding}")
     errors = [f for f in findings if f.level == "error"]
     if errors:
-        print(f"{len(errors)} error(s): the application would refuse to start.")
+        print(
+            f"{len(errors)} error(s): the application would reject or silently "
+            "ignore these; fix them before starting the stack."
+        )
         return 1
     return 0
 

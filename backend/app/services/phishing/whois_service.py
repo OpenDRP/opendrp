@@ -34,13 +34,14 @@ registry as a burst and arriving as a trickle.
 import asyncio
 import datetime as _dt
 import re
+import socket
 from typing import Protocol
 
 import structlog
-import whois
 from dateutil import parser as _dp
 from sqlalchemy.ext.asyncio import AsyncSession
-from whois.parser import PywhoisError
+from whois.parser import PywhoisError, WhoisEntry
+from whois.whois import NICClient
 
 from app.core.outbound import OutboundBlocked, ensure_allowed, validate_domain_target
 
@@ -82,6 +83,76 @@ _SERVER_LABEL = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
 
 #: The thread's answer when python-whois raises "no match for ...".
 _NO_RECORD = object()
+
+#: The most one registry's answer may cost this worker. A record is a few
+#: kilobytes and a referral doubles it; the bound is what stops a hostile or broken
+#: server from deciding how much of this worker's memory one lookup holds.
+_MAX_RESPONSE_BYTES = 256 * 1024
+#: The connect and read timeout. The library's own client uses ten seconds; the
+#: lookup already runs under the outbound budget, so this is the inner bound.
+_SOCKET_TIMEOUT_SECONDS = 10.0
+
+
+class GuardedNICClient(NICClient):
+    """The library's server selection, with every hop passing the egress guard.
+
+    ``NICClient.whois`` dials the server the library chose for the name's suffix,
+    and then — when that answer carries a ``Whois Server:`` line — the host *that
+    answer* names, recursively. Neither hop was guarded: the check named the
+    candidate and port 43, while the connection went to the registry and then to
+    whatever the registry's record pointed at (AUD-032). WHOIS is plaintext TCP, so
+    a record — or anyone on the path of one — could aim this worker at an internal
+    address on port 43.
+
+    Both hops go through :func:`ensure_allowed` here, before a socket exists. A
+    referral the policy refuses raises :class:`OutboundBlocked`, which
+    :meth:`WhoisService.enrich` answers with ``refused`` and an ``outbound.blocked``
+    line. The read is bounded for the same reason the destination is checked: the
+    answer is text a third party chose.
+    """
+
+    def whois(self, query, hostname, flags, many_results=False, quiet=False):
+        host = str(hostname)
+        ensure_allowed(host, port=43)
+        if isinstance(query, bytes):
+            query = query.decode("idna")
+        with socket.create_connection(
+            (host, 43), timeout=_SOCKET_TIMEOUT_SECONDS
+        ) as connection:
+            connection.sendall(f"{query}\r\n".encode("utf-8"))
+            chunks: list[bytes] = []
+            received = 0
+            while received < _MAX_RESPONSE_BYTES:
+                data = connection.recv(min(4096, _MAX_RESPONSE_BYTES - received))
+                if not data:
+                    break
+                chunks.append(data)
+                received += len(data)
+        response = b"".join(chunks).decode("utf-8", "replace")
+        if 'with "=xxx"' in response:
+            return self.whois(query, host, flags, True)
+        referral = (
+            self.findwhois_server(response, host, query)
+            if flags & NICClient.WHOIS_RECURSE
+            else None
+        )
+        if referral:
+            response += self.whois(query, referral, 0, quiet=True)
+        return response
+
+
+def lookup(target: str):
+    """The parsed WHOIS record for ``target``, from servers that pass the guard.
+
+    One function so the seam is a single name: the enrichment calls it, the pacing
+    pass knows nothing else, and a test that replaces it is stubbing the network
+    rather than the policy.
+    """
+    client = GuardedNICClient()
+    text = client.whois_lookup(
+        None, target.encode("idna"), NICClient.WHOIS_RECURSE
+    )
+    return WhoisEntry.load(target, text)
 
 
 class SessionLike(Protocol):
@@ -217,7 +288,7 @@ class WhoisService:
                 # Resolution and lookup both belong off the event loop, so the
                 # guard runs in here with them.
                 ensure_allowed(target, port=43)
-                return whois.whois(target)
+                return lookup(target)
             except OutboundBlocked:
                 raise
             except PywhoisError:

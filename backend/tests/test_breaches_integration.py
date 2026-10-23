@@ -124,6 +124,55 @@ class TestOrphanBreachCleanup:
         assert await db_session.get(Breach, linked_email_id) is not None
         assert await db_session.get(Breach, orphan_id) is None
 
+    @pytest.mark.asyncio
+    async def test_the_cleanup_row_names_the_findings_it_deleted(
+        self, client, db_session, auth_headers_admin
+    ):
+        """AUD-030: a count cannot answer "why did this finding disappear?".
+
+        The rows commit inside the service, so by the time the audit row is
+        written their identity exists nowhere but the deleted rows. The row
+        therefore carries a bounded sample of what it removed.
+        """
+        from sqlalchemy import select
+
+        from app.models.audit import AuditLog
+
+        orphans = [
+            Breach(
+                breach_name=f"Orphan{index}",
+                title=f"Orphan{index}",
+                domain="example.com",
+                breach_date=date(2024, 1, 1),
+                matched_email=f"nobody-{uuid.uuid4().hex[:6]}@missing.example",
+                matched_domain=None,
+            )
+            for index in range(2)
+        ]
+        db_session.add_all(orphans)
+        await db_session.commit()
+        orphan_ids = {str(row.id) for row in orphans}
+
+        response = await client.post(
+            "/api/v1/breaches/cleanup-orphans", headers=auth_headers_admin
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["deleted"] == 2
+
+        rows = list(
+            (
+                await db_session.execute(
+                    select(AuditLog)
+                    .where(AuditLog.action == "breach.orphans.cleaned")
+                    .order_by(AuditLog.seq.desc())
+                )
+            ).scalars()
+        )
+        assert rows, "the cleanup wrote no audit row"
+        details = rows[0].details
+        assert details["deleted"] == 2
+        assert set(details["sample_finding_ids"]) == orphan_ids
+
 
 class TestListBreaches:
     @pytest.mark.asyncio

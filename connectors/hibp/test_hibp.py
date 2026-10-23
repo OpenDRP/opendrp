@@ -2138,3 +2138,53 @@ async def test_a_verification_job_without_a_usable_request_asks_nothing(monkeypa
     assert asked == []
     assert summary["domain_verification"]["reason"] == "invalid_request"
     assert summary["domain_verification"]["status"] == "failed"
+
+
+async def test_a_provider_record_outside_the_cores_bounds_is_trimmed_not_forwarded(
+    monkeypatch,
+):
+    """One oversized field must not cost the scan every finding after it.
+
+    The core validates a whole submission before it stores any of it, and it
+    declares the bounds for these two fields (``BreachFinding``: a description of
+    at most 100,000 characters, at most 100 data classes of at most 255
+    characters). The worker truncated the name, the title and the domain but
+    forwarded these two untouched, so a record past either bound was refused as a
+    batch — and the scan raised rather than reporting a partial one.
+    """
+    from app.schemas.connector import BreachFinding
+
+    connector = make_connector(monkeypatch)
+    payload = connector._normalize_breach(
+        {
+            "Name": "ExampleBreach",
+            "Title": "Example",
+            "Domain": "example.com",
+            "BreachDate": "2020-01-01",
+            "PwnCount": 10,
+            "Description": "x" * 200_000,
+            "DataClasses": [f"class-{index}" for index in range(250)] + [None, ""],
+        }
+    )
+    accepted = BreachFinding.model_validate(payload)
+    assert len(accepted.description or "") == 100_000
+    assert len(accepted.data_classes) == 100
+    assert accepted.data_classes[0] == "class-0"
+
+    # The catalogue entry schema declares the same list bound, so the sweep that
+    # hands the core its incidents has to hold it too.
+    from app.schemas.connector import BreachCatalogueEntry
+
+    entry = BreachCatalogueEntry.model_validate(
+        _main._catalogue_entry(
+            {
+                "Name": "ExampleBreach",
+                "Title": "Example",
+                "Domain": "example.com",
+                "BreachDate": "2020-01-01",
+                "PwnCount": 10,
+                "DataClasses": [f"class-{index}" for index in range(250)],
+            }
+        )
+    )
+    assert len(entry.data_classes) == 100

@@ -70,6 +70,9 @@ class TestAuditActionsCatalog:
         assert r.status_code == 200, r.text
         body = r.json()
 
+        # The four keys the filter menu reads, all of them always sent: the client
+        # marks them optional, but the route builds every one.
+        assert set(body) == {"groups", "total", "actions", "labels"}
         assert body["total"] == len(AUDIT_ALLOWED_ACTIONS)
         assert body["actions"] == sorted(AUDIT_ALLOWED_ACTIONS)
         assert isinstance(body["labels"], dict)
@@ -77,10 +80,22 @@ class TestAuditActionsCatalog:
         # Grouped by first prefix segment, alphabetically sorted inside.
         categories = {g["category"] for g in body["groups"]}
         assert "auth" in categories and "asset" in categories
+        grouped: list[str] = []
         for group in body["groups"]:
+            assert set(group) == {"category", "actions"}
             assert group["actions"] == sorted(group["actions"])
             for a in group["actions"]:
                 assert a in AUDIT_ALLOWED_ACTIONS
+            grouped.extend(group["actions"])
+
+        # The groups partition the flat list: every action appears in exactly one
+        # group, and nothing is listed twice or left out. The response model declares
+        # the shape; this is the invariant the model cannot express.
+        assert sorted(grouped) == body["actions"]
+        assert len(grouped) == len(set(grouped)) == body["total"]
+        # A label exists for the actions the page can print one for, and every label
+        # key is an action the catalogue publishes.
+        assert set(body["labels"]) <= set(body["actions"])
 
     @pytest.mark.asyncio
     async def test_actions_requires_admin(self, client, auth_headers_viewer):
@@ -115,6 +130,45 @@ class TestAuditLogsFilters:
         assert set(row["details"]) == {"asset", "actor_email", "audit_hash", "audit_prev_hash", "audit_key_id"}
         assert row["actor_identity_source"] == "snapshot"
         assert row["seq"] > 0
+
+    @pytest.mark.asyncio
+    async def test_a_row_answers_the_eleven_fields_the_page_declares(
+        self, client, auth_headers_admin, audit_rows
+    ):
+        """Plan 035: the audit page's row was `PaginatedResponse[Any]` until now.
+
+        The key sets are asserted whole, so a field dropped from
+        `AuditLogRowResponse` fails here instead of rendering as a blank cell in the
+        page an operator opens during an incident.
+        """
+        r = await client.get(ENDPOINT, headers=auth_headers_admin)
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert set(body) == {"items", "total", "page", "size", "pages"}
+        row = next(i for i in body["items"] if i["action"] == "asset.create")
+        assert set(row) == {
+            "id",
+            "timestamp",
+            "user_id",
+            "user_email",
+            "actor_identity_source",
+            "seq",
+            "entry_hash",
+            "key_id",
+            "action",
+            "ip_address",
+            "details",
+        }
+        # `key_id` is declared although the page does not read it: the payload sends
+        # it, the column is not nullable, and a model may not narrow a row.
+        assert row["key_id"] >= 0
+        assert row["entry_hash"]
+        assert isinstance(row["seq"], int)
+        # A row written without an actor sends `null` rather than omitting the key,
+        # and says which resolution the email went through.
+        anonymous = next(i for i in body["items"] if i["action"] == "asset.delete")
+        assert anonymous["user_id"] is None and anonymous["user_email"] is None
+        assert anonymous["actor_identity_source"] == "current_user_lookup"
 
     @pytest.mark.asyncio
     async def test_action_filter_case_insensitive_and_literal_fallback(

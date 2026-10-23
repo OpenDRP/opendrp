@@ -14,6 +14,24 @@ from app.services.dns_expiry_service import due_threshold, queue_expiry_alerts
 NOW = datetime(2026, 1, 1, tzinfo=timezone.utc)
 
 
+def tls_probe(port: int, days: float, certificate: str, *, host: str = "example.com") -> dict:
+    """The active probe's control row, for one host and one port."""
+    return {
+        "observation_type": "tls_probe",
+        "subject": host,
+        "record_type": "TLS" if port == 443 else f"TLS:{port}",
+        "expires_at": (NOW + timedelta(days=days)).isoformat(),
+        "metadata": {
+            "check_state": "verified",
+            "checked_at": NOW.isoformat(),
+            "certificate_id": certificate,
+            "not_before": (NOW - timedelta(days=30)).isoformat(),
+            "probe_ip": "203.0.113.10",
+            "port": port,
+        },
+    }
+
+
 async def control(db, days=10, kind="registration"):
     db.add(Asset(asset_type=AssetType.domain, asset_value="example.com", normalized_value="example.com", is_active=True))
     await db.commit()
@@ -23,6 +41,53 @@ async def control(db, days=10, kind="registration"):
     row.checked_at = row.successful_at = NOW
     await db.commit()
     return row
+
+
+@pytest.mark.asyncio
+async def test_two_ports_keep_two_controls_with_their_own_reminder_history(db_session):
+    """AUD-036: the control is keyed by asset *and port*.
+
+    Every probe row became `kind="tls"`, and the unique key is (asset, kind), so
+    the second port overwrote the first control and reset the thresholds it had
+    already sent. Two verified ports are two controls, each with its own history.
+    """
+    db_session.add(Asset(asset_type=AssetType.domain, asset_value="example.com", normalized_value="example.com", is_active=True))
+    await db_session.commit()
+    await ingest_dns_observations(db_session, source="tlsprobe", findings=[tls_probe(443, 10, "cert-a")])
+    first = (await db_session.execute(select(DNSExpiryMonitor).where(DNSExpiryMonitor.kind == "tls:443"))).scalar_one()
+    first.checked_at = first.successful_at = NOW
+    first.alerted_thresholds = [14]
+    await db_session.commit()
+
+    await ingest_dns_observations(db_session, source="tlsprobe", findings=[tls_probe(8443, 3, "cert-b")])
+
+    rows = list((await db_session.execute(select(DNSExpiryMonitor).order_by(DNSExpiryMonitor.kind))).scalars())
+    assert [row.kind for row in rows] == ["tls:443", "tls:8443"]
+    assert [row.certificate_id for row in rows] == ["cert-a", "cert-b"]
+    # The first port's reminder was not re-queued by the second port's control.
+    assert rows[0].alerted_thresholds == [14]
+    assert rows[1].alerted_thresholds == []
+
+
+@pytest.mark.asyncio
+async def test_a_control_from_before_the_port_dimension_is_adopted_once(db_session):
+    """AUD-036's backfill: the legacy row is renamed, not duplicated or discarded."""
+    db_session.add(Asset(asset_type=AssetType.domain, asset_value="example.com", normalized_value="example.com", is_active=True))
+    await db_session.commit()
+    await ingest_dns_observations(db_session, source="tlsprobe", findings=[tls_probe(8443, 10, "cert-a")])
+    row = (await db_session.execute(select(DNSExpiryMonitor))).scalar_one()
+    # The shape an installation built before this change holds.
+    row.kind = "tls"
+    row.alerted_thresholds = [30]
+    await db_session.commit()
+
+    for _ in range(2):
+        await ingest_dns_observations(db_session, source="tlsprobe", findings=[tls_probe(8443, 10, "cert-a")])
+
+    rows = list((await db_session.execute(select(DNSExpiryMonitor))).scalars())
+    assert [(item.kind, item.certificate_id, item.alerted_thresholds) for item in rows] == [
+        ("tls:8443", "cert-a", [30])
+    ]
 
 
 @pytest.mark.parametrize("days,threshold", [(31,None),(30,30),(14.01,30),(14,14),(7,7),(3,3),(1,1),(0,0),(-1,0)])
@@ -104,6 +169,56 @@ async def test_certificate_replacement_failed_check_and_future_rejection(db_sess
     observation.metadata_json = {**observation.metadata_json,"not_before":(NOW+timedelta(days=1)).isoformat()}
     with pytest.raises(ValueError,match="invalid selected"):
         await update_monitor(db_session,observation,now=NOW)
+
+
+@pytest.mark.asyncio
+async def test_one_refused_control_row_does_not_cost_the_batch(db_session):
+    """A control the monitor refuses must not take the scan's evidence with it.
+
+    The refusal itself is right: a `verified` handshake whose certificate is not valid
+    yet is a row the platform cannot trust, and the worker has its own `future_only`
+    state for that fact. What was wrong was where the refusal landed — the ValueError
+    escaped `update_monitor` into `ingest_dns_observations`, which is the one call that
+    stores the whole scan, so a single row whose `not_before` sits minutes ahead of the
+    core's clock (a worker that runs ahead of the platform) cost every observation of
+    that scan and failed the connector's job.
+    """
+    real_now = datetime.now(timezone.utc)
+    db_session.add(Asset(asset_type=AssetType.domain, asset_value="example.com", normalized_value="example.com", is_active=True))
+    await db_session.commit()
+    good = {
+        "observation_type": "tls_probe",
+        "subject": "example.com",
+        "record_type": "TLS",
+        "expires_at": (real_now + timedelta(days=10)).isoformat(),
+        "metadata": {
+            "check_state": "verified",
+            "certificate_id": "cert-a",
+            "not_before": (real_now - timedelta(days=5)).isoformat(),
+            "checked_at": real_now.isoformat(),
+            "port": 443,
+        },
+    }
+    ahead = {
+        "observation_type": "tls_probe",
+        "subject": "example.com",
+        "record_type": "TLS:8443",
+        "expires_at": (real_now + timedelta(days=400)).isoformat(),
+        "metadata": {
+            **good["metadata"],
+            "certificate_id": "cert-b",
+            "not_before": (real_now + timedelta(hours=1)).isoformat(),
+            "port": 8443,
+        },
+    }
+
+    await ingest_dns_observations(db_session, source="tlsprobe", findings=[good, ahead])
+
+    stored = list((await db_session.execute(select(DNSObservation))).scalars())
+    assert {row.record_type for row in stored} == {"TLS", "TLS:8443"}
+    monitor = (await db_session.execute(select(DNSExpiryMonitor))).scalar_one()
+    assert monitor.state == "verified"
+    assert monitor.expires_at is not None
 
 
 @pytest.mark.asyncio

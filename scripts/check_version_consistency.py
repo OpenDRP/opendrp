@@ -14,7 +14,20 @@ One release version, stated in several places, and nothing joined them:
   connector row and an operator reads as the connector's version;
 * ``connectors/base/pyproject.toml`` — the connector SDK package metadata;
 * ``frontend/package.json`` — the SPA package metadata, which is the same
-  release the build injects as ``VITE_APP_VERSION`` and the UI displays.
+  release the build injects as ``VITE_APP_VERSION`` and the UI displays;
+* ``.env.example`` — the value a new installation copies as
+  ``OPENDRP_VERSION``: the image tag every service is built or pulled as, and the
+  value Settings reports;
+* ``docker-compose.yml`` — the ``VITE_APP_VERSION`` build argument's fallback,
+  which is the version the built SPA displays when ``.env`` names none;
+* ``frontend/Dockerfile`` — that argument's own default, which is what a direct
+  ``docker build frontend/`` bakes into the bundle.
+
+Those last three were the ones an upgrade leaves behind, because a release bump
+edited the seven statements then gated and none of them: the template and the two build
+defaults then name the *previous* release, and an installation built from the new
+tree displays two versions at once — Settings reads ``OPENDRP_VERSION`` from
+``.env.example``, the health endpoint reads this module's ``__version__``.
 
 A mismatch is not cosmetic. It means an instance reports a version no release
 note describes, an upgrade guide applies to a tag the code does not contain, and
@@ -51,6 +64,9 @@ _SDK_INIT = Path("connectors") / "base" / "opendrp_connector" / "__init__.py"
 _SDK_BASE = Path("connectors") / "base" / "opendrp_connector" / "base.py"
 _SDK_PYPROJECT = Path("connectors") / "base" / "pyproject.toml"
 _FRONTEND_PACKAGE = Path("frontend") / "package.json"
+_ENV_EXAMPLE = Path(".env.example")
+_COMPOSE = Path("docker-compose.yml")
+_FRONTEND_DOCKERFILE = Path("frontend") / "Dockerfile"
 
 _HEADING = re.compile(r"^##\s+\[([^\]]+)\]", re.MULTILINE)
 _UNRELEASED = "unreleased"
@@ -124,6 +140,32 @@ def _changelog_version(source: str) -> str | None:
     return None
 
 
+def _env_value(source: str, key: str) -> str | None:
+    """A ``KEY=value`` line from a dotenv template, quotes removed."""
+    match = re.search(rf"^{re.escape(key)}\s*=\s*(\S+)\s*$", source, re.MULTILINE)
+    return match.group(1).strip("\"'") if match else None
+
+
+def _compose_display_version(source: str) -> str | None:
+    """The fallback Compose substitutes into the SPA's build argument.
+
+    Only the *display* version is read. The image tag falls back to ``latest``
+    and the API's own ``OPENDRP_VERSION`` to ``dev``; neither is a release, and
+    both are deliberate (an installation must pin one, and an unpinned
+    development process reports the code it is running). ``VITE_APP_VERSION`` is
+    different: it is the string the UI prints, so a stale default is a wrong
+    answer rather than a missing pin.
+    """
+    match = re.search(r"VITE_APP_VERSION:\s*\$\{OPENDRP_VERSION:-([^}]+)\}", source)
+    return match.group(1).strip() if match else None
+
+
+def _dockerfile_arg(source: str, name: str) -> str | None:
+    """A ``ARG NAME=value`` default from a Dockerfile."""
+    match = re.search(rf"^ARG\s+{re.escape(name)}=(\S+)\s*$", source, re.MULTILINE)
+    return match.group(1).strip("\"'") if match else None
+
+
 #: Every place the release version is stated, with the reader that extracts it.
 #: Order is the order failures are reported in.
 READINGS = (
@@ -142,6 +184,17 @@ READINGS = (
     ),
     ("connectors/base/pyproject.toml", _SDK_PYPROJECT, lambda source: _toml_version(source, "project")),
     ("frontend/package.json", _FRONTEND_PACKAGE, _json_version),
+    (
+        ".env.example",
+        _ENV_EXAMPLE,
+        lambda source: _env_value(source, "OPENDRP_VERSION"),
+    ),
+    ("docker-compose.yml", _COMPOSE, _compose_display_version),
+    (
+        "frontend/Dockerfile",
+        _FRONTEND_DOCKERFILE,
+        lambda source: _dockerfile_arg(source, "VITE_APP_VERSION"),
+    ),
 )
 
 #: How each reading is named in the failure detail, in the same order.
@@ -153,7 +206,24 @@ LABELS = (
     "connector api_version",
     "connector pyproject.toml",
     "frontend package.json",
+    "env template OPENDRP_VERSION",
+    "compose VITE_APP_VERSION",
+    "frontend Dockerfile VITE_APP_VERSION",
 )
+
+#: What to say when a new statement is absent, keyed by its path. The suffix-based
+#: hints below fit a Python module, a package manifest or a TOML table; these
+#: three files state the version in a line of their own.
+_HINTS = {
+    ".env.example": "no OPENDRP_VERSION line — expected `OPENDRP_VERSION=x.y.z`",
+    "docker-compose.yml": (
+        "no SPA display version — expected `VITE_APP_VERSION: ${OPENDRP_VERSION:-x.y.z}` "
+        "in the frontend build args"
+    ),
+    "frontend/Dockerfile": (
+        "no ARG default — expected `ARG VITE_APP_VERSION=x.y.z`"
+    ),
+}
 
 
 def check(root: Path) -> list[str]:
@@ -171,22 +241,25 @@ def check(root: Path) -> list[str]:
         value = reader(source)
         readings[label] = value
         if value is None:
-            expected_hint = (
-                f'`{relative}` declares no version — expected a version value'
-            )
-            if relative.endswith(".py"):
-                name = "SDK_VERSION" if "base.py" in relative else "__version__"
-                expected_hint = (
-                    f"no version found — expected `{name} = \"x.y.z\"` in {relative}"
-                )
-            elif relative.endswith(".json"):
-                expected_hint = (
-                    f'no version found — expected a `"version"` key in {relative}'
-                )
-            elif relative.endswith(".toml"):
-                expected_hint = (
-                    f"no version found — expected a version in {relative}"
-                )
+            expected_hint = _HINTS.get(relative)
+            if expected_hint is None:
+                if relative.endswith(".py"):
+                    name = "SDK_VERSION" if "base.py" in relative else "__version__"
+                    expected_hint = (
+                        f"no version found — expected `{name} = \"x.y.z\"` in {relative}"
+                    )
+                elif relative.endswith(".json"):
+                    expected_hint = (
+                        f'no version found — expected a `"version"` key in {relative}'
+                    )
+                elif relative.endswith(".toml"):
+                    expected_hint = (
+                        f"no version found — expected a version in {relative}"
+                    )
+                else:
+                    expected_hint = (
+                        f"`{relative}` declares no version — expected a version value"
+                    )
             failures.append(f"{relative}: {expected_hint}")
 
     if failures:
@@ -227,8 +300,7 @@ def main(argv: list[str]) -> int:
     version = _assigned_constant(source, "__version__")
     print(
         f"version gate: OK — {len(READINGS)} statements agree on {version} "
-        "(app, pyproject, CHANGELOG, connector SDK, connector api_version, "
-        "connector pyproject, frontend package.json)"
+        f"({', '.join(LABELS)})"
     )
     return 0
 

@@ -264,11 +264,23 @@ def test_no_secret_value_reaches_stdout_or_stderr(tmp_path: Path, capsys) -> Non
 
 def test_the_printed_output_is_ascii(tmp_path: Path, capsys) -> None:
     """Windows consoles are not UTF-8; a typographic dash arrives as garbage."""
-    assert _run(_fresh_copy(tmp_path), *_production_args()) == 0
+    target = _fresh_copy(tmp_path)
+    assert _run(target, *_production_args()) == 0
     captured = capsys.readouterr()
 
     captured.out.encode("ascii")
     captured.err.encode("ascii")
+
+    # `--check` renders finding text the write path never prints, so it is the
+    # other half of "the output is ASCII": a dash that arrives as a replacement
+    # character here is what an operator on cmd.exe reads instead of the error.
+    with target.open("a", encoding="utf-8") as stream:
+        stream.write("\nJWT_SECRETKEY=leftover\nA_SETTING_THIS_RELEASE_DOES_NOT_READ=30\n")
+    assert setup_wizard.main(["--check", "--target", str(target)]) == 1
+    audited = capsys.readouterr()
+
+    audited.out.encode("ascii")
+    audited.err.encode("ascii")
 
 
 # ==============================================================================
@@ -643,6 +655,58 @@ def test_check_reports_a_typo_as_unknown(tmp_path: Path, capsys) -> None:
     assert code == 1
     assert "JWT_SECRETKEY" in output
     assert "not documented" in output
+    # The point of the error: the operator wrote a plausible name, and the
+    # setting they meant is now at its default. Naming the near miss is what
+    # makes the finding actionable — the pre-fix message only said "not
+    # documented", which reads as a leftover rather than a typo.
+    assert "did you mean JWT_SECRET_KEY" in output
+
+
+def test_a_suggestion_is_a_typo_and_not_a_different_service() -> None:
+    """Two connectors' tokens share a suffix; that is not a misspelling.
+
+    `--check` suggests the setting a typo meant to name, and the suggestion has
+    to be right: pointing at another service's credential sends the operator to
+    issue a token that no connector can use. The distinguishing part of the
+    name is where the edit is, so a whole different word there disqualifies the
+    candidate however similar the rest of the name looks.
+    """
+    documented = {"CONNECTOR_TOKEN_SHODAN", "JWT_SECRET_KEY"}
+
+    assert (
+        setup_wizard.typo_candidate("JWT_SECRETKEY", documented) == "JWT_SECRET_KEY"
+    )
+    # A swapped pair is still a typo: two characters, one name.
+    assert (
+        setup_wizard.typo_candidate("JWT_SECRET_EKY", documented) == "JWT_SECRET_KEY"
+    )
+    assert setup_wizard.typo_candidate("CONNECTOR_TOKEN_DNSTWIST", documented) is None
+    assert setup_wizard.typo_candidate("METRICS_TOKEN_OLD", documented) is None
+
+
+def test_check_names_a_setting_this_release_no_longer_reads(tmp_path: Path, capsys) -> None:
+    """An `.env` from an older release keeps settings this one does not read.
+
+    `--check` used to report each one as "the application would refuse to start",
+    which is false: unknown keys are ignored, and the stack starts. What is true,
+    and worth failing on, is that the line configures nothing — so the message
+    has to say that and tell the operator to delete the line, rather than send
+    them looking for a startup error that never appears.
+    """
+    target = _fresh_copy(tmp_path)
+    assert _run(target, *_production_args()) == 0
+    with target.open("a", encoding="utf-8") as stream:
+        stream.write("\nA_SETTING_THIS_RELEASE_DOES_NOT_READ=30\n")
+
+    code = setup_wizard.main(["--check", "--target", str(target)])
+    output = capsys.readouterr().out
+
+    assert code == 1
+    assert "A_SETTING_THIS_RELEASE_DOES_NOT_READ" in output
+    assert "Delete it" in output
+    # The summary must not promise a startup failure for a line the application
+    # starts fine with; it reports what the two classes of error have in common.
+    assert "would refuse to start" not in output
 
 
 def test_check_reports_the_settings_a_newer_template_added(tmp_path: Path, capsys) -> None:

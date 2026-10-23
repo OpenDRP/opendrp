@@ -635,7 +635,6 @@ class TestAssetAuditDetails:
             last_seen_at=now,
             status="current",
             metadata_json={},
-            alerted_thresholds=[],
         )
         db_session.add(observation)
         await db_session.commit()
@@ -745,7 +744,6 @@ class TestAssetFindings:
                     last_seen_at=now,
                     status="current",
                     metadata_json={},
-                    alerted_thresholds=[],
                 ),
                 SourceObservation(
                     module="exposure",

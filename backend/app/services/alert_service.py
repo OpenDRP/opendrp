@@ -560,8 +560,15 @@ class AlertService:
         link: str | None,
         total_count: int | None = None,
         stored_facts: dict[str, dict] | None = None,
+        counted_noun: str = "new finding",
+        counted_tail: str = "",
     ) -> Notification:
-        """Turn one queued batch into the neutral shape every channel renders."""
+        """Turn one queued batch into the neutral shape every channel renders.
+
+        `counted_noun` and `counted_tail` say what this batch counts; they default
+        to an alert's "new findings" and a digest passes its own, so the counted
+        line a channel prints is decided here rather than spelled in each renderer.
+        """
         rows: list[dict[str, str]] = []
         grouped: dict[str, list[str]] = {}
         known = stored_facts or {}
@@ -591,6 +598,8 @@ class AlertService:
             rows=rows,
             groups=[(name, counted(values)) for name, values in grouped.items()],
             link=link,
+            counted_noun=counted_noun,
+            counted_tail=counted_tail,
         )
 
     async def send_aggregated_alert_notification(
@@ -694,8 +703,8 @@ class AlertService:
                 failures.append(exc)
         for chat in telegram_chats:
             try:
-                for telegram_text in telegram_parts(notification, settings.ALERT_MAX_TELEGRAM_MESSAGE_LENGTH):
-                    delivered = await self._send_telegram(telegram_text, chat_id=chat)
+                for part in telegram_parts(notification, settings.ALERT_MAX_TELEGRAM_MESSAGE_LENGTH):
+                    delivered = await self._send_telegram(part, chat_id=chat)
                     if not delivered:
                         raise AlertDeliveryPermanentError("Telegram provider did not accept the message")
                 sent += 1

@@ -146,6 +146,25 @@ def test_the_verdict_comes_from_curls_own_exit_code(exit_code, verify_result, le
     ) == expected
 
 
+def test_a_subdomain_of_a_listed_name_is_a_name_mismatch_not_an_untrusted_chain():
+    # A certificate for example.com does not cover evil.example.com, and a wildcard
+    # covers one label only. curl refused both; the label must say why.
+    now = datetime.now(timezone.utc)
+    valid = now + timedelta(days=30)
+    assert tls_probe.classify(
+        exit_code=60, verify_result=0, facts=facts(valid, ["example.com"]),
+        host="evil.example.com", now=now,
+    ) == ("failed", "name_mismatch")
+    assert tls_probe.classify(
+        exit_code=60, verify_result=0, facts=facts(valid, ["*.example.com"]),
+        host="a.b.example.com", now=now,
+    ) == ("failed", "name_mismatch")
+    assert tls_probe.classify(
+        exit_code=60, verify_result=0, facts=facts(valid, ["*.example.com"]),
+        host="a.example.com", now=now,
+    ) == ("failed", "untrusted_or_self_signed")
+
+
 def test_curl_output_splits_its_verdict_from_the_chain():
     certificate = make_certificate()
     parsed = tls_probe.parse_output(marker_output(0, 0, 1, pem_of(certificate)))

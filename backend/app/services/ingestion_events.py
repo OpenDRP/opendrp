@@ -101,7 +101,7 @@ async def dispatch_notification_events(db, limit=100):
             route = phishing_alert_route(
                 await db.get(PhishingDomain, row.entity_id), policy=policy
             )
-            if route in {"digest", "list", "suppressed"}:
+            if route in {"digest", "list", "suppressed", "closed"}:
                 # The budget, not the channel, is what stops this message: the
                 # candidate is not worth interrupting someone for. The event is
                 # consumed rather than held, because the daily digest reads the
@@ -119,6 +119,10 @@ async def dispatch_notification_events(db, limit=100):
                     "digest": "phishing_digest_pending",
                     "list": "phishing_below_threshold",
                     "suppressed": "phishing_verdict_rejected",
+                    # An investigation status, not a verdict: the reason names the
+                    # resolution so the alert history cannot report one decision as
+                    # the other (the digest skips these rows for the same reason).
+                    "closed": "phishing_status_resolved",
                 }[route]
                 continue
         if row.module == "breach":
@@ -418,7 +422,27 @@ async def queue_breach_digest(
         queued += 1
 
     await db.commit()
-    return {"queued": queued, "incidents": len(rows), "remaining": len(rows) - queued}
+    # Counted after the commit, so the rows this pass queued are no longer in the
+    # figure: `remaining` is the backlog a later pass will carry, not the rest of
+    # the window this one fetched. Subtracting from the window reported zero for a
+    # pass that used its whole limit while a backlog waited behind it (AUD-088).
+    outstanding = (
+        await db.execute(
+            select(func.count())
+            .select_from(IngestionEvent)
+            .where(
+                IngestionEvent.kind == "notification",
+                IngestionEvent.module == "breach",
+                IngestionEvent.processed_at.is_(None),
+                IngestionEvent.last_error == BREACH_DIGEST_REASON,
+            )
+        )
+    ).scalar_one()
+    return {
+        "queued": queued,
+        "incidents": len(rows),
+        "remaining": int(outstanding or 0),
+    }
 
 
 async def run_breach_digest(db, *, now: datetime | None = None) -> dict:

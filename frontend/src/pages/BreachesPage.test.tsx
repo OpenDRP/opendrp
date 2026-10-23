@@ -56,10 +56,13 @@ vi.mock("@/components/DataTable", () => ({
   ),
 }));
 vi.mock("@/components/ui/confirm-dialog", () => ({
-  ConfirmDialog: ({ open, title, onConfirm, onCancel }: any) =>
+  // Children are rendered because a dialog that keeps its failure open shows the
+  // reason there (S24), and a mock that drops them would hide exactly that.
+  ConfirmDialog: ({ open, title, onConfirm, onCancel, children }: any) =>
     open ? (
       <div role="dialog">
         <h2>{title}</h2>
+        {children}
         <button onClick={onCancel}>Cancel confirmation</button>
         <button onClick={onConfirm}>Confirm action</button>
       </div>
@@ -243,5 +246,26 @@ describe("BreachesPage", () => {
     await user.click(screen.getByRole("button", { name: "Clean orphans" }));
     await user.click(screen.getByRole("button", { name: "Confirm action" }));
     await waitFor(() => expect(cleanOrphansMock).toHaveBeenCalledTimes(1));
+  });
+
+  /**
+   * The dialog is where the decision was made, so it is where a refusal has to be
+   * read and retried. Closing it on the click (as this page and the phishing page
+   * did) left the operator with a toast fading over a list that still showed the
+   * row, no pending state for a slow delete, and no dialog to try again from — the
+   * defect WI-21 fixed on the assets and DNS pages, still present here.
+   */
+  it("keeps a refused delete in front of the operator, with the API's reason", async () => {
+    deleteBreachMock.mockRejectedValue(new Error("This breach match is referenced by a report"));
+    const user = userEvent.setup();
+    renderPage();
+    expect((await screen.findAllByText("Acme Leak")).length).toBeGreaterThan(0);
+
+    await user.click(screen.getByRole("button", { name: "Delete breach match" }));
+    await user.click(screen.getByRole("button", { name: "Confirm action" }));
+
+    await waitFor(() => expect(deleteBreachMock).toHaveBeenCalledWith("breach-1"));
+    expect(await screen.findByRole("dialog")).toBeInTheDocument();
+    expect(await screen.findByText(/referenced by a report/)).toBeInTheDocument();
   });
 });

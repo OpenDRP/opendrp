@@ -111,9 +111,26 @@ _DEFAULT_MAX_CANDIDATES = 250
 # hardcoding public resolvers made the previous default hang when UDP/53 egress
 # was filtered.
 _DEFAULT_NAMESERVERS: list[str] = []
+def _env_number(value: str | None, default: float, low: float, high: float) -> float:
+    """A bounded numeric setting; an unusable value falls back to the default.
+
+    The same rule the other workers' settings follow. Without it a typo killed the
+    process at import (``abc`` raised before the worker could register) and a
+    negative value was accepted, which made every scan time out at once.
+    """
+    try:
+        number = float(str(value).strip())
+    except (TypeError, ValueError):
+        return default
+    return number if low <= number <= high else default
+
+
 # Upper bound for a single dnstwist subprocess run; a hang must not pin the
-# connector forever.
-_DNSTWIST_SUBPROCESS_TIMEOUT = float(os.environ.get("DNSTWIST_TIMEOUT_SECONDS", "120"))
+# connector forever. One second is the floor: a shorter bound is a scan that can
+# never finish, which is a misconfiguration rather than a preference.
+_DNSTWIST_SUBPROCESS_TIMEOUT = _env_number(
+    os.environ.get("DNSTWIST_TIMEOUT_SECONDS"), 120.0, 1.0, 3600.0
+)
 
 #: The DNSTwist CLI release this connector is written against. The images pin it
 #: (`dnstwist=0~20250130-1`, whose CLI answers ``dnstwist 20250130``), so the pin
@@ -244,14 +261,19 @@ class DNSTwistConnector(ConnectorBase):
         ]
         self.tld_dictionary = self.env.get("DNSTWIST_TLD_DICTIONARY", "").strip()
         self.dictionary = self.env.get("DNSTWIST_DICTIONARY", "").strip()
-        self.max_candidates = max(
-            1, min(int(self.env.get("DNSTWIST_MAX_CANDIDATES", str(_DEFAULT_MAX_CANDIDATES))), 5000)
+        self.max_candidates = int(
+            _env_number(
+                self.env.get("DNSTWIST_MAX_CANDIDATES"),
+                _DEFAULT_MAX_CANDIDATES,
+                1,
+                5000,
+            )
         )
         self.mx_check = _env_flag(self.env.get("DNSTWIST_MX_CHECK"), False)
         self.content_inspection = _env_flag(
             self.env.get("DNSTWIST_CONTENT_INSPECTION"), False
         )
-        self.threads = max(1, min(int(self.env.get("DNSTWIST_THREADS", "8")), 32))
+        self.threads = int(_env_number(self.env.get("DNSTWIST_THREADS"), 8, 1, 32))
         #: The resolver is built on first use, not here: a connector that has no
         #: candidates to resolve never needs one, and on a platform where ``aiodns``
         #: cannot run at all (a Windows host, a Proactor event loop) constructing it

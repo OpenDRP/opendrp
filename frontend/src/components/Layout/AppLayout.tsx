@@ -236,7 +236,10 @@ export function AppLayout() {
               <DropdownMenuTrigger asChild>
                 <Button variant="ghost" className="gap-3 h-9 pl-1 pr-3 hover:bg-accent">
                   <Avatar className="w-8 h-8 border border-border">
-                    <AvatarFallback className="bg-primary/15 text-primary text-xs font-semibold">
+                    {/* Initials on a 15% tint of the accent: the tint keeps the
+                        accent light, so accent-coloured text on it measures
+                        3.7:1. The ink is the readable choice on that ground. */}
+                    <AvatarFallback className="bg-primary/15 text-foreground text-xs font-semibold">
                       {initials}
                     </AvatarFallback>
                   </Avatar>

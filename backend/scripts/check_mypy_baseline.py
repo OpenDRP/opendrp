@@ -100,11 +100,23 @@ _SUCCESS_RE = re.compile(
 
 
 def _run_mypy(extra_args: list[str]) -> tuple[int | None, str]:
-    proc = subprocess.run(
-        ["mypy", "app", *extra_args],
-        capture_output=True,
-        text=True,
-    )
+    try:
+        proc = subprocess.run(
+            ["mypy", "app", *extra_args],
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError:
+        # A checkout whose dev requirements are not installed has no `mypy` on
+        # PATH. That is the gate's own "no summary" failure (exit 2), not a
+        # traceback: the caller learns which tool is missing and what to do about
+        # it instead of reading a stack out of a CI log. `shutil.which` would
+        # answer the same question, but it would still have to be repeated before
+        # the call that can race with a PATH change mid-run.
+        return None, (
+            "mypy is not installed or not on PATH; install the development "
+            "requirements (backend/requirements-dev.txt) and retry.\n"
+        )
     output = proc.stdout + proc.stderr
     match = _SUMMARY_RE.search(output)
     if match is None:

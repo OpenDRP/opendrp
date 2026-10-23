@@ -5,6 +5,7 @@ import uuid
 from typing import Any, Awaitable, cast
 
 from fastapi import HTTPException
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.rate_limit import RateLimiter
@@ -23,6 +24,22 @@ LIMITS = {
     "scan_timeout_seconds": (10, 3600, 300),
     "cooldown_seconds": (0, 86400, 60),
 }
+
+#: Ceilings a connector may declare about itself, and the range each is checked
+#: against. They belong to the connector's config rather than to the core: a
+#: provider's hard limit is a fact about that provider's account, and the core
+#: naming one provider to apply it to left the next provider with no way to say
+#: its own (AUD-021). A declaration only ever lowers the account's window, never
+#: raises it.
+CAPS = {
+    "requests_per_minute_ceiling": (1, 600),
+    "certificate_requests_per_minute": (1, 60),
+}
+
+#: The certificate operation's ceiling when a connector declares none. The
+#: operation itself is declared in readiness like every other bucket; this is
+#: only the rate it is charged at.
+DEFAULT_CERTIFICATE_REQUESTS_PER_MINUTE = 3
 SCRIPT = """
 local now = tonumber(ARGV[1])
 
@@ -71,7 +88,9 @@ return {1,0, math.max(0, tonumber(ARGV[day_index+1]) - used_today)}
 
 
 def validate_policy(config: dict) -> None:
-    for key, (low, high, _) in LIMITS.items():
+    ranges = {key: (low, high) for key, (low, high, _) in LIMITS.items()}
+    ranges.update(CAPS)
+    for key, (low, high) in ranges.items():
         value = config.get(key)
         if value is not None and (
             isinstance(value, bool)
@@ -141,15 +160,14 @@ async def reserve(
     # into each queued job so edits affect future scans only.
     rpm = int(policy.get("requests_per_minute", 10))
     daily = int(policy.get("daily_budget", 100))
-    if caller.provider == "netlas":
-        rpm = min(rpm, 60)
+    # A ceiling the connector declares about its provider's API lowers the
+    # account's window; it never raises it, because the account is the approval.
+    ceiling = policy.get("requests_per_minute_ceiling")
+    if ceiling is not None:
+        rpm = min(rpm, int(ceiling))
     operations = set((caller.readiness or {}).get("operations") or [])
     if bucket not in operations:
         raise HTTPException(400, "Unsupported operation bucket")
-    if bucket == "certificate" and caller.provider != "netlas":
-        raise HTTPException(400, "Unsupported provider operation bucket")
-    if bucket == "certificate" and caller.provider == "netlas" and "certificate" not in operations:
-        raise HTTPException(400, "Unsupported provider operation bucket")
     client = RateLimiter._get_client()
     if client is None:
         raise HTTPException(503, "Provider quota backend unavailable")
@@ -159,9 +177,15 @@ async def reserve(
     # presentation only and adding a window cannot redefine another one.
     keys = [prefix + ":minute", prefix + ":day"]
     limits = [rpm, daily]
-    if bucket == "certificate" and caller.provider == "netlas":
+    if bucket == "certificate":
+        # The bucket's own rate is configuration too: a provider that allows only a
+        # few certificate reads a minute declares that, and one that declares
+        # nothing gets the documented default rather than an unbounded bucket.
+        certificate_cap = policy.get(
+            "certificate_requests_per_minute", DEFAULT_CERTIFICATE_REQUESTS_PER_MINUTE
+        )
         keys.append(prefix + ":cert-minute")
-        limits.append(min(rpm, 3))
+        limits.append(min(rpm, int(certificate_cap)))
     keys.append(prefix + ":job:" + str(job.id))
     limits.append(policy.get("max_requests", 20))
     try:
@@ -206,7 +230,7 @@ async def reserve(
 _DAY_WINDOW_MS = 86400000
 
 
-async def remaining_today(caller: Connector) -> dict:
+async def remaining_today(db: AsyncSession, caller: Connector) -> dict:
     """The day bucket's headroom for the account this connector is bound to.
 
     Derived from the counter ``reserve`` already charges, so the answer costs one
@@ -214,6 +238,11 @@ async def remaining_today(caller: Connector) -> dict:
     about the provider's own idea of what is left. Nothing is written and no
     audit row is produced — the health page asks this on every refresh, and an
     audit line per read would turn observability into volume.
+
+    The budget is read the way ``reserve`` reads it: the account's approved policy
+    layered over the connector's config. Reading the connector's config alone
+    answered with a budget the reservation never enforces, so the page could print
+    "none left" beside a scan that was still admitted (AUD-020).
 
     ``remaining_today`` is ``None`` when there is nothing to measure: a connector
     with no provider account, or a Redis that cannot answer. ``reason`` then says
@@ -225,7 +254,19 @@ async def remaining_today(caller: Connector) -> dict:
             "request_budget": None,
             "reason": "provider_account_missing",
         }
-    policy = caller.config if isinstance(caller.config, dict) else {}
+    policy = dict(caller.config) if isinstance(caller.config, dict) else {}
+    account = await db.get(SourceAccount, caller.source_account_id)
+    if account is None and caller.provider:
+        account = (
+            await db.execute(
+                select(SourceAccount).where(
+                    SourceAccount.source_id == caller.provider,
+                    SourceAccount.name == (caller.quota_group or "default"),
+                )
+            )
+        ).scalar_one_or_none()
+    if account is not None and isinstance(account.policy, dict):
+        policy = {**policy, **account.policy}
     try:
         budget = int(policy.get("daily_budget", LIMITS["daily_budget"][2]))
     except (TypeError, ValueError):

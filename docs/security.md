@@ -100,6 +100,10 @@ name, because a token sent in clear on a shared network is already disclosed.
 required in production, the refresh cookie is not sent over plain HTTP, and
 `REQUIRE_MFA_FOR_ADMINS` turns the second factor from a feature into a gate
 (`MFA_ISSUER` names the enrolment key so two installations are distinguishable).
+Enrolling a factor ends every other session in the same transaction, because a
+refresh token minted before the enrolment would otherwise keep signing in without
+a code; an access token already minted stays valid for its remaining minutes, which
+is bounded by `JWT_ACCESS_TOKEN_EXPIRE_MINUTES` rather than by the factor.
 
 **Every important event is auditable, and the audit trail is tamper-evident.** Audit
 rows are written as JSON with the five fields the SIEM contract names (`timestamp`,
@@ -121,7 +125,10 @@ requests a minute — so it never throttles a healthy installation. All four are
 by their own design, on the grounds that locking every operator out is worse than
 losing the throttle for the duration; that is why the nginx edge limits in
 `docker/nginx/` exist as the bound that does not depend on Redis. The values are
-recorded in [configuration.md](configuration.md).
+recorded in [configuration.md](configuration.md), and the Redis keys, subjects
+and windows in
+[observability.md](observability.md#rate-limit-keys) — a lockout is investigated
+by reading the key, not by reading the module.
 
 **HSTS is off until an operator turns it on.** Both the API and the UI's nginx read the
 same `HSTS_ENABLED` / `HSTS_MAX_AGE` / `HSTS_INCLUDE_SUBDOMAINS`, so the header cannot
@@ -239,6 +246,7 @@ host around it. Check these before considering an installation production-ready.
 | The audit chain is detect-only. | Verification (`make verify-audit-chain`) plus the SIEM's copy of the stdout stream in a different account. It makes an insider with database access pay for tampering; it does not stop one. |
 | One Redis holds the broker, the counters and the scan leases, and persistence is deliberately disabled. | A restart loses in-flight tasks and counters rather than restoring a half-written queue; findings are durable in PostgreSQL *before* delivery, and the scheduler re-creates the periodic work, so the backlog is delivered once Redis, `celery-beat` and `celery-worker-alerts` are back. |
 | `dnstwist` is a distribution package whose CLI the connector parses (JSON fields, fuzzer vocabulary, resolved-address dictionary). | The package is pinned to an exact Debian version in `connectors/dnstwist/Dockerfile`, and to the same one in `backend/Dockerfile`, so a base image whose archive serves another release fails the build. The connector also checks `dnstwist --version` at startup and exits non-zero — with both versions and the fix in the line — if it is not the release it was written against (`_EXPECTED_DNSTWIST_VERSION`; `backend/tests/test_dnstwist_cli_version.py`). A version change is therefore a deliberate edit in this repository rather than something that arrives silently and shows up as fewer findings. |
+| A send whose acceptance is unknown (a timeout or a lost response after the provider may have accepted it) is sent again when its recipient hold ends. The provider offers no idempotency key that would stop it. | The hold is `ALERT_RECIPIENT_HOLD_SECONDS` (default 900 s), so the second send comes no sooner than the window. Each ambiguous row shows in `/api/v1/alerts/health` and `opendrp_alert_deliveries{status="ambiguous"}`, and an administrator can end the hold early after reconciling it with the recipient's log (`POST /api/v1/alerts/recipients/{key}/release`). |
 | No WAF, no external load balancer, no HA: single PostgreSQL, single Redis, one scheduler, a local report store. | Documented as limitations with dates in [production-readiness.md](production-readiness.md), and the exposed surface is bounded by the terminator, the loopback bindings and the edge limits. An installation that needs HA replaces those components rather than scaling containers. |
 
 ## Where the numbers live

@@ -65,6 +65,8 @@ export type TLSSightingVerdict =
 export interface TLSCertificateSighting {
   id: string;
   subject: string | null;
+  /** Every hostname this certificate was reported for at this endpoint. */
+  subjects?: string[];
   ip: string | null;
   port: number | null;
   source: string;
@@ -123,10 +125,31 @@ export interface CertificateScopeException {
   created_at: string;
 }
 
+/**
+ * What `POST /dns/certificate-exceptions` answers.
+ *
+ * A named type rather than `Omit<CertificateScopeException, ...>`, because the
+ * create route sends five fields and never sent `created_by`. The list row keeps
+ * it: the column is filled by the rows this route writes and by older ones that
+ * may not carry an account, and `created_by` says which.
+ */
+export interface CertificateScopeExceptionCreated {
+  id: string;
+  match_kind: CertificateExceptionKind;
+  match_value: string;
+  reason: string | null;
+  expires_at: string | null;
+}
+
 export interface User {
   id: string;
   email: string;
-  full_name?: string;
+  /**
+   * The API serializes the column, so an unset name arrives as `null` — not as an
+   * absent key. Both are falsy, but only one type-checks against `String.length`,
+   * which is how a nullable field becomes a crash at the first `.trim()`.
+   */
+  full_name?: string | null;
   role: UserRole;
   is_active: boolean;
   /** Minutes between two manual actions of the same scope (0 = unlimited). */
@@ -245,7 +268,8 @@ export interface Asset {
   id: string;
   asset_type: AssetType;
   asset_value: string;
-  normalized_value?: string;
+  /** `null` when normalization leaves the value unchanged — the API always sends the key. */
+  normalized_value?: string | null;
   criticality: AssetCriticality;
   is_active: boolean;
   created_at: string;
@@ -333,13 +357,13 @@ export interface PhishingThreat {
   id: string;
   phishing_domain: string;
   matched_asset: string;
-  ip_address?: string;
-  web_ports?: string;
+  ip_address?: string | null;
+  web_ports?: string | null;
   detection_source: DetectionSource;
-  original_domain?: string;
-  whois_registrar?: string;
-  whois_abuse_email?: string;
-  domain_created_at?: string;
+  original_domain?: string | null;
+  whois_registrar?: string | null;
+  whois_abuse_email?: string | null;
+  domain_created_at?: string | null;
   /**
    * Whole days since the registration, computed by the server from
    * `domain_created_at` when the row is read. `null` means no source has answered
@@ -458,12 +482,12 @@ export interface Breach {
   domain: string;
   breach_date: string;
   pwn_count: number;
-  description?: string;
+  description?: string | null;
   data_classes: string[];
-  matched_email?: string;
-  matched_domain?: string;
-  matched_asset?: string;
-  matched_asset_type?: "domain" | "email_account";
+  matched_email?: string | null;
+  matched_domain?: string | null;
+  matched_asset?: string | null;
+  matched_asset_type?: "domain" | "email_account" | null;
   status: ThreatStatus;
   /**
    * Which class of exposure this row records. Absent on a row stored before the
@@ -582,8 +606,8 @@ export interface ReportTruncation {
 export interface Report {
   id: string;
   report_name: string;
-  created_by?: string;
-  created_by_email?: string;
+  created_by?: string | null;
+  created_by_email?: string | null;
   file_path: string;
   /** False when the artifact is gone from the store; the download must be hidden. */
   file_available?: boolean | null;
@@ -614,8 +638,9 @@ export interface SystemSettings {
   alert_recipient_email?: string;
   email_alerts_enabled?: boolean;
   telegram_alerts_enabled?: boolean;
-  alert_email_user_ids?: string[];
-  telegram_chat_ids?: string[];
+  /** A JSON column: absent means "no explicit recipients", and the API serializes that as `null`. */
+  alert_email_user_ids?: string[] | null;
+  telegram_chat_ids?: string[] | null;
   schedule_phishing?: { days: number[]; hour: number; minute: number } | null;
   schedule_breaches?: { days: number[]; hour: number; minute: number } | null;
   schedule_dns_security?: { days: number[]; hour: number; minute: number } | null;
@@ -631,6 +656,14 @@ export interface SystemSettings {
   alert_phishing_digest_hour_utc?: number | null;
   alert_no_channel_retry_hours?: number | null;
   alert_candidate_change_notifications?: boolean | null;
+  /**
+   * The breach half of the same budget. These two were missing from this type
+   * after the alert-budget work landed: the API has serialized them since, and
+   * the settings page reads them through an untyped helper, so nothing failed —
+   * the interface simply described a response the API no longer sent.
+   */
+  alert_breach_noise_policy?: BreachNoiseChoice | null;
+  alert_breach_digest_threshold?: number | null;
   created_at: string;
   updated_at: string;
 }
@@ -741,6 +774,36 @@ export interface SourceAccount {
   access_state: string;
   has_api_key?: boolean;
   api_key_hint?: string | null;
+}
+
+/**
+ * What `POST /connectors/accounts` answers: the id of the account it provisioned.
+ *
+ * The row itself comes from the list; this route answers an id because that is what
+ * the page needs to bind the account or set its key, and the client used to spell
+ * it as `{ id: string }` with nothing to compare.
+ */
+export interface SourceAccountCreated {
+  id: string;
+}
+
+/** What approving a policy answers: the account, and the document it stored. */
+export interface SourceAccountPolicyUpdated {
+  id: string;
+  policy: SourceAccount["policy"];
+}
+
+/**
+ * What setting or clearing a provider key answers — both routes, one shape.
+ *
+ * `api_key_hint` is `null` after a clear rather than absent: the page has to be
+ * able to say "no key" and not merely "nothing to show", which is why this face of
+ * the account keeps its nulls while the list drops them.
+ */
+export interface SourceAccountApiKey {
+  id: string;
+  has_api_key: boolean;
+  api_key_hint: string | null;
 }
 
 export interface Connector {
@@ -1052,17 +1115,20 @@ export interface Job {
   id: string;
   job_type: JobType;
   status: JobStatus;
-  created_by?: string;
-  created_by_email?: string;
-  task_id?: string;
-  title?: string;
-  error_message?: string;
-  params?: Record<string, unknown> | unknown[];
-  result_summary?: Record<string, unknown> | unknown[];
+  created_by?: string | null;
+  created_by_email?: string | null;
+  task_id?: string | null;
+  title?: string | null;
+  error_message?: string | null;
+  params?: Record<string, unknown> | unknown[] | null;
+  result_summary?: Record<string, unknown> | unknown[] | null;
   created_at: string;
-  started_at?: string;
-  finished_at?: string;
-  updated_at: string;
+  /** `null` until a worker claims the job; the key is always present. */
+  started_at?: string | null;
+  finished_at?: string | null;
+  // No `updated_at`: `JobResponse` does not serialize it, and the SPA never read
+  // it. It was declared here as an always-present field until the response-shape
+  // gate compared this interface with the model (AUD-060).
 }
 
 export interface Paginated<T> {
@@ -1071,4 +1137,280 @@ export interface Paginated<T> {
   page: number;
   size: number;
   pages: number;
+}
+
+/** Query values a list route accepts; the API validates and bounds them (AUD-060). */
+export type QueryParams = Record<string, string | number | boolean | null | undefined>;
+
+/** One audit-trail row as `GET /audit/logs` serializes it (AUD-060). */
+export interface AuditLogRow {
+  id: string;
+  timestamp: string;
+  action: string;
+  user_email?: string;
+  user_id?: string;
+  seq?: number;
+  entry_hash?: string;
+  actor_identity_source?: string;
+  ip_address?: string;
+  details?: Record<string, unknown>;
+}
+
+/** The filter catalogue `GET /audit/actions` publishes (AUD-060). */
+export interface AuditActionsCatalog {
+  groups?: Array<{ category: string; actions: string[] }>;
+  total?: number;
+  actions?: string[];
+  labels?: Record<string, string>;
+}
+
+/**
+ * Where the audit chain stands, from `GET /audit/integrity`.
+ *
+ * Every number an operator acts on — the verified cursor, the retained range, the
+ * archive's state — is read from here rather than guessed, which is why the whole
+ * payload is typed instead of the four fields the page happens to render.
+ */
+export interface AuditIntegrity {
+  full_verification: {
+    upper_seq: number;
+    cursor: number;
+    in_progress: boolean;
+    at: string | null;
+    failure_seq: number | null;
+    failure_reason: string | null;
+  };
+  committed: { through_seq: number; tip_hash: string | null };
+  archive: { configured: boolean; hold: boolean; last_seq: number | null; retired: boolean };
+  retained: { rows: number; first_seq: number; last_seq: number };
+  retired: { through_seq: number; tip_hash: string | null };
+  last_verification: { through_seq: number; at: string | null };
+  keys: { configured: number };
+}
+
+/** One queued alert delivery, as `GET /alerts/queue` lists it. */
+export interface AlertQueueItem {
+  id: string;
+  batch_id: string;
+  job_id: string | null;
+  channel: string;
+  status: string;
+  attempts: number;
+  acknowledged_parts: number;
+  parts: number;
+  last_error: string | null;
+  next_attempt_at: string | null;
+}
+
+export interface AlertQueueSummary {
+  counts: Record<string, number>;
+  items: AlertQueueItem[];
+}
+
+/** The active accounts the alert-recipient checkboxes offer. */
+export interface UserBrief {
+  id: string;
+  email: string;
+  role: UserRole;
+  is_active: boolean;
+}
+
+/** One passive exposure observation (the source-inventory list payload). */
+export interface ExposureObservation {
+  id: string;
+  source: string;
+  subject: string;
+  matched_asset?: string | null;
+  first_seen_at: string;
+  last_seen_at: string;
+  observed_at: string | null;
+  status: "observed" | "investigating" | "resolved";
+  payload?: {
+    port?: number;
+    transport?: string;
+    protocol?: string;
+    metadata?: Record<string, unknown>;
+    [key: string]: unknown;
+  } | null;
+  provenance?: Record<string, unknown> | null;
+  connector_id?: string | null;
+  source_account_id?: string | null;
+}
+
+export interface ExposurePage extends Paginated<ExposureObservation> {}
+
+export interface ExposureTriageResult {
+  id: string;
+  status: ExposureObservation["status"];
+}
+
+/** `GET /phishing/threats/{id}/evidence` answers one array, not a page. */
+export interface PhishingEvidenceResponse {
+  items: PhishingEvidence[];
+}
+
+/** The two bulk cleanups answer the same shape: a status and a count. */
+export interface CleanupResult {
+  status: string;
+  deleted: number;
+}
+
+/**
+ * How many refresh families a revocation ended.
+ *
+ * Two routes answer it — ending every session but this browser, and an
+ * administrator ending another account's — and they sent the one key as two inline
+ * literals until plan 038. A count rather than a list: what an operator needs is
+ * that the action happened, and the sessions page shows what is left.
+ */
+export interface RevokedSessions {
+  revoked: number;
+}
+
+/**
+ * What a scan route answers once its jobs are queued.
+ *
+ * `sources` and `offline_connectors` are per-route extras rather than a second
+ * shape: a caller that only reads `job_ids` works everywhere.
+ */
+export interface ScanStartResult {
+  status: string;
+  job_ids: string[];
+  sources?: Array<{ connector: string; status: string; reason?: string }>;
+  offline_connectors?: string[];
+  error?: string;
+}
+
+/** What promoting an observation or a finding into an asset answers. */
+export interface PromotedAsset {
+  already_exists: boolean;
+  asset: {
+    id?: string;
+    asset_value: string;
+    asset_type?: AssetType;
+    is_active?: boolean;
+  };
+  source?: string | null;
+}
+
+/** The delivery-test and Telegram-validation routes answer service payloads. */
+/**
+ * What `POST /settings/test-email` answers.
+ *
+ * One interface used to cover both test-send routes with every field optional,
+ * which made the mail answer and the Telegram answer indistinguishable to the
+ * compiler — the union was eight optional fields for two payloads whose fields
+ * are six and five. They are separate now, because the server sends different
+ * shapes and only a separate type can be compared with each response model.
+ */
+export interface TestEmailResult {
+  status: string;
+  /** The recipient the mail was sent to, as the API reports it. */
+  to: string;
+}
+
+/**
+ * What an invitation answers: the account, and the one-time token.
+ *
+ * Two routes send this payload — `POST /users/invite` and
+ * `POST /users/{id}/invitation` — and the client wrote it twice as an inline
+ * literal, so each spelling was the other's only check. The token appears here and
+ * in no other response: the server keeps a digest, which is why reading it again is
+ * a reissue rather than a lookup.
+ */
+export interface UserInvite {
+  user: User;
+  invitation_token: string;
+  expires_at: string;
+  email_scheduled: boolean;
+}
+
+/**
+ * What `POST /users/bulk` changed, and what it left alone.
+ *
+ * Three numbers rather than one because a batch of already-active accounts is not
+ * a failure: `changed` can be zero with `skipped` above it. `revoked_sessions`
+ * counts the families a deactivation ended.
+ */
+export interface UserBulkResult {
+  operation: "activate" | "deactivate";
+  changed: number;
+  skipped: number;
+  revoked_sessions: number;
+}
+
+/**
+ * Fresh recovery codes, returned once by `POST /auth/mfa/recovery-codes/rotate`.
+ *
+ * The previous set stops working in the same transaction, so a page that loses
+ * this answer has to rotate again — there is no route that reads the codes back.
+ */
+export interface MfaRecoveryCodes {
+  codes: string[];
+}
+
+/** What `POST /settings/test-telegram` answers, chat by chat. */
+export interface TestTelegramResult {
+  /** How many chats accepted the test message. */
+  sent: number;
+  /** How many chats were attempted. */
+  total: number;
+  /** How many chats the bot could reach before sending. */
+  validated: number;
+  /** `total` minus `validated`: the chats that failed the reachability check. */
+  validation_failed: number;
+  results: TelegramChatValidationResult[];
+}
+
+/**
+ * What `POST /reports/generate` answers once the worker has the job (202).
+ *
+ * Both words are literal rather than free strings, because the two halves of the
+ * answer are always the same pair: the report row is `scheduled` and the broker has
+ * it `queued`. A report that could not be scheduled answers 503 with the job marked
+ * failed, so there is no third combination to type.
+ */
+export interface ReportQueued {
+  status: "scheduled";
+  queue_state: "queued";
+  report_id: string;
+  job_id: string;
+}
+
+/**
+ * What `POST /auth/accept-invitation` answers.
+ *
+ * No session and no user: spending the link sets the password and nothing else, so
+ * the page sends the person to the sign-in form afterwards. One success word, and
+ * 401 for an invalid and an expired link alike.
+ */
+export interface InvitationAccepted {
+  status: "accepted";
+}
+
+/**
+ * What `POST /breaches/domain-verification` answers (202).
+ *
+ * `no_connector` is a success with a reason rather than an error: the attempt was
+ * audited and the page has to say "nobody could ask" instead of showing nothing.
+ * `error` is sent only in that case, so it is optional here and absent there.
+ */
+export interface BreachDomainVerificationStarted {
+  status: "scheduled" | "no_connector";
+  domain: string;
+  action: "generate" | "verify";
+  job_ids: string[];
+  error?: string;
+}
+
+/**
+ * What recording a verdict on one certificate sighting answers.
+ *
+ * The decision, as stored: `verdict` is what the next sweep will see, and
+ * `reviewed_at` is null when the change cleared a verdict rather than setting one.
+ */
+export interface TLSSightingReview {
+  id: string;
+  verdict: TLSSightingVerdict;
+  reviewed_at: string | null;
 }

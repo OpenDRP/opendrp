@@ -277,3 +277,147 @@ class TestSecondFactorPolicy:
 
         for member in UserRole:
             assert Settings(REQUIRE_MFA_ROLES=member.value).REQUIRE_MFA_ROLES == member.value  # type: ignore[call-arg]
+
+
+class TestCorsOriginShapes:
+    """`CORS_ORIGINS` arrives as a JSON array, a JSON string or a comma list.
+
+    All three are documented in `.env.example`, and the failure mode of guessing
+    wrong is an API that answers every browser with a CORS error — a deployment
+    that looks up and serves nothing.
+    """
+
+    def test_a_json_string_of_origins_is_split_like_a_comma_list(self):
+        import json
+
+        assert _parse_cors_origins(json.dumps("http://a.local,http://b.local")) == [
+            "http://a.local",
+            "http://b.local",
+        ]
+
+    def test_a_value_that_is_not_a_list_or_a_string_falls_back_to_localhost(self):
+        assert _parse_cors_origins({"origin": "http://a.local"}) == ["http://localhost:3000"]
+        assert _parse_cors_origins(42) == ["http://localhost:3000"]
+
+
+class TestProxyAllowlistShapes:
+    """Every spelling a forwarded-for allowlist can arrive in is checked.
+
+    A wildcard or an unparsable entry does not fail at request time — it makes
+    `extract_ip` trust the wrong thing and every audit row record an address that
+    is not the client's, which is discovered only by someone reading the trail.
+    """
+
+    def test_a_star_forwarded_allowlist_is_refused(self):
+        with pytest.raises(ValidationError, match="must not be"):
+            Settings(UVICORN_FORWARDED_ALLOW_IPS="*")  # type: ignore[call-arg]
+
+    def test_an_empty_entry_is_refused(self):
+        with pytest.raises(ValidationError, match="empty entry"):
+            Settings(TRUSTED_PROXY_IPS="127.0.0.1,,::1")  # type: ignore[call-arg]
+
+    def test_a_wildcard_beside_addresses_is_refused(self):
+        with pytest.raises(ValidationError, match="only IPs or CIDRs"):
+            Settings(TRUSTED_PROXY_IPS="127.0.0.1,*")  # type: ignore[call-arg]
+
+    def test_an_unparsable_entry_is_refused(self):
+        with pytest.raises(ValidationError, match="invalid IP/CIDR"):
+            Settings(TRUSTED_PROXY_IPS="127.0.0.1,not-an-address")  # type: ignore[call-arg]
+
+
+class TestBreachNoisePolicy:
+    """A typo in the noise policy must not silently mean "report everything"."""
+
+    def test_an_unknown_policy_is_refused_with_the_accepted_values(self):
+        with pytest.raises(ValidationError, match="ALERT_BREACH_NOISE_POLICY must be one of"):
+            Settings(ALERT_BREACH_NOISE_POLICY="store-only-spam")  # type: ignore[call-arg]
+
+    def test_each_documented_policy_is_accepted(self):
+        for policy in ("store_only_spam", "verified_only", "all"):
+            assert Settings(ALERT_BREACH_NOISE_POLICY=policy).ALERT_BREACH_NOISE_POLICY == policy  # type: ignore[call-arg]
+
+
+class TestProductionStartupRefusals:
+    """The remaining production checks, each naming the variable it refused."""
+
+    def test_a_parent_subnet_that_is_not_a_network_is_named(self):
+        with pytest.raises(ValidationError, match="OPENDRP_NETWORK_SUBNET is not an IP network"):
+            Settings(OPENDRP_NETWORK_SUBNET="not-a-network")  # type: ignore[call-arg]
+
+    def test_an_unparsable_database_url_is_named(self):
+        with pytest.raises(ValidationError, match="DATABASE_URL is invalid"):
+            _production(DATABASE_URL="postgresql://[::1/db")
+
+    def test_an_unparsable_broker_url_is_named(self):
+        with pytest.raises(ValidationError, match="REDIS_URL is invalid"):
+            _production(REDIS_URL="redis://[::1/0")
+
+    def test_an_insecure_session_cookie_is_refused(self):
+        with pytest.raises(ValidationError, match="AUTH_COOKIE_SECURE"):
+            _production(AUTH_COOKIE_SECURE=False)
+
+    def test_a_short_jwt_secret_is_refused(self):
+        with pytest.raises(ValidationError, match="at least 32 characters"):
+            Settings(JWT_SECRET_KEY="too-short")  # type: ignore[call-arg]
+
+
+class TestTokenLifetimes:
+    """A lifetime of zero is a login that cannot succeed, not a policy.
+
+    Both values are read straight into the token claims, so `0` mints a token
+    that is already expired and a negative value mints one that expired before it
+    was signed. Nothing else in the stack validates them: the failure appears as
+    every login answering 200 with a token the API then rejects, which is the
+    shape of an incident rather than of a misconfiguration.
+    """
+
+    @pytest.mark.parametrize("value", [0, -1, -60])
+    def test_an_access_lifetime_must_be_at_least_a_minute(self, value):
+        with pytest.raises(ValidationError, match="JWT_ACCESS_TOKEN_EXPIRE_MINUTES"):
+            Settings(JWT_ACCESS_TOKEN_EXPIRE_MINUTES=value)
+
+    @pytest.mark.parametrize("value", [0, -1])
+    def test_a_refresh_lifetime_must_be_at_least_a_day(self, value):
+        with pytest.raises(ValidationError, match="JWT_REFRESH_TOKEN_EXPIRE_DAYS"):
+            Settings(JWT_REFRESH_TOKEN_EXPIRE_DAYS=value)
+
+    def test_the_documented_defaults_still_load(self):
+        settings = Settings()
+        assert settings.JWT_ACCESS_TOKEN_EXPIRE_MINUTES == 15
+        assert settings.JWT_REFRESH_TOKEN_EXPIRE_DAYS == 3
+
+
+class TestAppEnvVocabulary:
+    """`APP_ENV` is a switch, so a typo must fail instead of switching nothing on.
+
+    Everything it gates — the secret refusals, the cookie-Secure check, the
+    pinned version, the shutdown of `/api/docs` — is keyed on the *exact* value
+    `production`. Before the allowlist, `APP_ENV=prod` was accepted and answered
+    "not production": a deployment that serves API documentation publicly and
+    skips every production check, with nothing in the log to say so.
+    """
+
+    @pytest.mark.parametrize("value", ["prod", "staging", "pre-production", "produktion"])
+    def test_an_unknown_environment_is_refused(self, value):
+        with pytest.raises(ValidationError, match="APP_ENV must be one of"):
+            Settings(APP_ENV=value)  # type: ignore[call-arg]
+
+    def test_the_non_production_environments_are_accepted(self):
+        for value in ("development", "test", "integration"):
+            assert Settings(APP_ENV=value).APP_ENV == value  # type: ignore[call-arg]
+
+    def test_a_spelled_environment_is_normalised(self):
+        """Case and surrounding whitespace: the two ways a right value arrives wrong.
+
+        `APP_ENV=" Production "` used to compare unequal to `production` and skip
+        every production check; it now normalises and runs them — which is why it is
+        asserted through `_production`, whose other values are already deployment
+        shaped.
+        """
+        assert Settings(APP_ENV=" Test ").APP_ENV == "test"  # type: ignore[call-arg]
+        assert Settings(APP_ENV="INTEGRATION").APP_ENV == "integration"  # type: ignore[call-arg]
+        assert _production(APP_ENV=" Production ").APP_ENV == "production"
+
+    def test_the_default_is_the_documented_development(self, monkeypatch):
+        monkeypatch.delenv("APP_ENV", raising=False)
+        assert Settings().APP_ENV == "development"

@@ -64,7 +64,8 @@ async def ingest_probe(db, row: dict, *, source: str = "tlsprobe") -> DNSObserva
 @pytest.mark.asyncio
 async def test_a_verified_probe_drives_its_own_monitor_kind(db_session):
     monitor = await ingest_probe(db_session, probe_row(days=10))
-    assert monitor.kind == "tls"
+    # The port is part of the control's identity (AUD-036).
+    assert monitor.kind == "tls:443"
     assert monitor.state == "verified"
     assert monitor.certificate_id == "fp-a"
     assert utc(monitor.expires_at) == NOW + timedelta(days=10)

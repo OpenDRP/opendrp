@@ -40,7 +40,14 @@ AUDIT_CHAIN_STATE_ID = 1
 
 class AuditLog(Base, UUIDMixin):
     __tablename__ = "drp_audit_logs"
-    __table_args__ = (Index("ix_audit_timestamp_id", "timestamp", "id"),)
+    __table_args__ = (
+        Index("ix_audit_timestamp_id", "timestamp", "id"),
+        # The per-account view of the trail (`GET /audit` filtered by user, in
+        # time order). It is declared here as well as in the baseline because the
+        # test schema is built from these models: an index only the revision
+        # knows about is an access path no test can see.
+        Index("ix_drp_audit_logs_user_timestamp", "user_id", "timestamp"),
+    )
 
     timestamp: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

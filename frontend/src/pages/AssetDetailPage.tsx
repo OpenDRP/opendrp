@@ -66,14 +66,19 @@ export default function AssetDetailPage() {
   // The asset's own record, read once when the page opens (AST-44). It is what
   // writes `asset.view` and what carries criticality and both dates; the
   // findings endpoint only ever returned a four-field summary of the asset.
-  // A stable key with no remount refetch keeps the read count at one per open,
-  // rather than one per tab that re-renders the page.
+  //
+  // One read per *open*, not per render: re-renders and tab switches reuse the
+  // cached record, while coming back to the page asks again. That distinction is
+  // the fix for a page that answered its own second question from the first
+  // answer: `staleTime: Infinity` with `refetchOnMount: false` and no
+  // invalidation kept an edited criticality — or an edited value — invisible here
+  // for the life of the tab, while the inventory page showed the new one.
   const assetQuery = useQuery({
     queryKey: ["asset", id],
     queryFn: () => endpoints.getAsset(id),
     enabled: Boolean(id),
     staleTime: Infinity,
-    refetchOnMount: false,
+    refetchOnMount: "always",
     refetchOnWindowFocus: false,
     refetchOnReconnect: false,
   });
@@ -172,6 +177,24 @@ export default function AssetDetailPage() {
           {record && (
             <p className="text-xs text-muted-foreground mt-1">
               Created {formatDateTime(record.created_at)} · Updated {formatDateTime(record.updated_at)}
+            </p>
+          )}
+          {assetQuery.isError && (
+            // The findings are a second read and may well have answered, so this
+            // is a partial failure: the page is usable, and it says which part is
+            // missing and why instead of rendering an asset with no criticality,
+            // no dates and no monitoring that looks like an empty record.
+            <p role="alert" className="text-sm text-destructive mt-2">
+              The asset record could not be read, so its criticality, dates and monitoring are
+              not shown: {describeApiError(assetQuery.error)}
+              <Button
+                variant="link"
+                size="sm"
+                className="h-auto px-1"
+                onClick={() => assetQuery.refetch()}
+              >
+                Try again
+              </Button>
             </p>
           )}
         </div>

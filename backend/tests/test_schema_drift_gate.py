@@ -22,8 +22,9 @@ import subprocess
 import sys
 from pathlib import Path
 
-from sqlalchemy import Column, Integer, MetaData, Table
+from sqlalchemy import Column, DateTime, Index, Integer, MetaData, String, Table, func
 
+from scripts import check_schema_drift as gate
 from scripts.check_schema_drift import build_schema, check_schema_drift
 
 #: The versions directory and the models the platform actually ships.
@@ -338,3 +339,289 @@ def test_a_broken_revision_graph_is_reported_rather_than_guessed(tmp_path: Path)
 
     assert len(failures) == 1
     assert "expected exactly one head revision" in failures[0]
+
+
+# ==============================================================================
+# Server defaults: what the models say the database supplies
+# ==============================================================================
+def test_a_server_default_no_revision_sets_is_reported(tmp_path: Path) -> None:
+    """The `jobs` shape: ``nullable=False``, a model default, no revision default.
+
+    ``TimestampMixin`` declares ``server_default=func.now()`` for every timestamp
+    it mints, so an INSERT that omits the column is expected to work. On a
+    migrated PostgreSQL it does not: the column is ``NOT NULL`` with no default,
+    while the SQLite test schema — built from the same models — has one. Nothing
+    exercised the difference, because the ORM always supplies a Python-side
+    value.
+    """
+    versions = _write_versions(
+        tmp_path,
+        (
+            "0001_baseline",
+            None,
+            'op.create_table("jobs", sa.Column("id", sa.Integer()), '
+            'sa.Column("created_at", sa.DateTime(timezone=True), nullable=False))',
+            _NOOP,
+        ),
+    )
+    metadata = MetaData()
+    Table(
+        "jobs",
+        metadata,
+        Column("id", Integer, primary_key=True),
+        Column(
+            "created_at",
+            DateTime(timezone=True),
+            server_default=func.now(),
+            nullable=False,
+        ),
+    )
+
+    failures = check_schema_drift(metadata, versions)
+
+    assert len(failures) == 1
+    assert "jobs.created_at" in failures[0]
+    assert "server default" in failures[0]
+
+
+def test_a_revision_default_the_models_leave_to_the_writer_is_not_a_finding(
+    tmp_path: Path,
+) -> None:
+    """One direction only: the schema may supply more than the models promise.
+
+    The baseline defaults ``status``, ``id`` and the JSON columns so a row can be
+    written by hand; no model has to declare those. The reverse — a model that
+    promises a default the schema does not supply — is the failure, because the
+    ORM's statement then disagrees with the database it runs against.
+    """
+    versions = _write_versions(
+        tmp_path,
+        (
+            "0001_baseline",
+            None,
+            'op.create_table("jobs", sa.Column("id", sa.Integer()), '
+            'sa.Column("status", sa.String(32), nullable=False, server_default="pending"))',
+            _NOOP,
+        ),
+    )
+    metadata = MetaData()
+    Table(
+        "jobs",
+        metadata,
+        Column("id", Integer, primary_key=True),
+        Column("status", String(32), nullable=False),
+    )
+
+    assert check_schema_drift(metadata, versions) == []
+
+
+def test_a_default_cleared_by_a_later_revision_is_not_required(tmp_path: Path) -> None:
+    versions = _write_versions(
+        tmp_path,
+        (
+            "0001_baseline",
+            None,
+            'op.create_table("jobs", sa.Column("id", sa.Integer()), '
+            'sa.Column("created_at", sa.DateTime(), server_default=sa.text("now()")))',
+            _NOOP,
+        ),
+        (
+            "0002_drop_default",
+            "0001_baseline",
+            'op.alter_column("jobs", "created_at", server_default=None)',
+            _NOOP,
+        ),
+    )
+    metadata = MetaData()
+    Table("jobs", metadata, Column("id", Integer, primary_key=True), Column("created_at", DateTime))
+
+    assert check_schema_drift(metadata, versions) == []
+
+
+# ==============================================================================
+# Index coverage: what the models say is fast
+# ==============================================================================
+def test_an_index_the_models_declare_and_no_revision_creates_is_reported(
+    tmp_path: Path,
+) -> None:
+    versions = _write_versions(
+        tmp_path,
+        (
+            "0001_baseline",
+            None,
+            'op.create_table("assets", sa.Column("id", sa.Integer()), '
+            'sa.Column("asset_value", sa.String(255)))',
+            _NOOP,
+        ),
+    )
+    metadata = MetaData()
+    Table(
+        "assets",
+        metadata,
+        Column("id", Integer, primary_key=True),
+        Column("asset_value", String(255)),
+        Index("ix_assets_asset_value", "asset_value"),
+    )
+
+    failures = check_schema_drift(metadata, versions)
+
+    assert len(failures) == 1
+    assert "assets" in failures[0]
+    assert "ix_assets_asset_value" in failures[0]
+
+
+def test_a_unique_constraint_covers_the_unique_index_a_model_declares(
+    tmp_path: Path,
+) -> None:
+    """The same access path under two names must not read as a difference.
+
+    A model's ``unique=True, index=True`` column declares a unique index; the
+    revision spells the same thing ``UniqueConstraint``. Both create one unique
+    btree over ``email``, so the comparison is by table, ordered columns and
+    uniqueness — never by object name.
+    """
+    versions = _write_versions(
+        tmp_path,
+        (
+            "0001_baseline",
+            None,
+            'op.create_table("users", sa.Column("id", sa.Integer()), '
+            'sa.Column("email", sa.String(255), nullable=False), '
+            'sa.UniqueConstraint("email", name="uq_users_email"))',
+            _NOOP,
+        ),
+    )
+    metadata = MetaData()
+    Table(
+        "users",
+        metadata,
+        Column("id", Integer, primary_key=True),
+        Column("email", String(255), nullable=False, unique=True, index=True),
+    )
+
+    assert check_schema_drift(metadata, versions) == []
+
+
+def test_an_index_only_a_revision_creates_is_reported_unless_it_is_listed(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The reverse direction, with the documented escape hatch.
+
+    Some indexes exist for a read the ORM cannot declare — a PostgreSQL-only
+    operator class, an expression. Those are named in ``_REVISION_ONLY_INDEXES``
+    with the reason; anything else the revision creates and no model declares is
+    schema nobody describes, and a generated migration would drop it.
+    """
+    versions = _write_versions(
+        tmp_path,
+        (
+            "0001_baseline",
+            None,
+            'op.create_table("reports", sa.Column("id", sa.Integer()), '
+            'sa.Column("status", sa.String(32)))',
+            _NOOP,
+        ),
+    )
+    (versions / "0001_baseline.py").write_text(
+        (versions / "0001_baseline.py")
+        .read_text(encoding="utf-8")
+        .replace(
+            '    op.create_table("reports"',
+            '    op.create_index("ix_reports_status", "reports", ["status"])\n'
+            '    op.create_table("reports"',
+        ),
+        encoding="utf-8",
+    )
+    metadata = MetaData()
+    Table("reports", metadata, Column("id", Integer, primary_key=True), Column("status", String(32)))
+
+    failures = check_schema_drift(metadata, versions)
+
+    assert len(failures) == 1
+    assert "ix_reports_status" in failures[0]
+    assert "_REVISION_ONLY_INDEXES" in failures[0]
+
+    monkeypatch.setitem(
+        gate._REVISION_ONLY_INDEXES, "ix_reports_status", "a read this test owns"
+    )
+    assert check_schema_drift(metadata, versions) == []
+
+
+def test_an_expression_index_is_reported_unless_it_is_listed(tmp_path: Path, monkeypatch) -> None:
+    """An expression index cannot be compared with a model, so it must be named.
+
+    Skipping it silently is how the shipped tree collected eleven indexes that no
+    gate saw; reporting it is what makes the allowlist a decision instead of a
+    habit.
+    """
+    versions = _write_versions(
+        tmp_path,
+        (
+            "0001_baseline",
+            None,
+            'op.create_table("users", sa.Column("id", sa.Integer()))',
+            _NOOP,
+        ),
+    )
+    (versions / "0001_baseline.py").write_text(
+        (versions / "0001_baseline.py")
+        .read_text(encoding="utf-8")
+        .replace(
+            '    op.create_table("users"',
+            '    op.create_index("ix_users_lower_email", "users", '
+            '[sa.text("lower(email)")])\n'
+            '    op.create_table("users"',
+        ),
+        encoding="utf-8",
+    )
+
+    failures = check_schema_drift(_metadata(("users", ["id"])), versions)
+
+    assert len(failures) == 1
+    assert "ix_users_lower_email" in failures[0]
+    assert "expression" in failures[0]
+
+    monkeypatch.setitem(
+        gate._REVISION_ONLY_INDEXES, "ix_users_lower_email", "a read this test owns"
+    )
+    assert check_schema_drift(_metadata(("users", ["id"])), versions) == []
+
+
+def test_an_allowlist_entry_the_revision_no_longer_creates_is_reported(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A stale entry is how an allowlist stops describing the tree.
+
+    Checked against this repository's list, which is why it is a function of its
+    own: a temporary revision directory in the tests above describes another tree,
+    and none of its indexes are the ones the list names.
+    """
+    versions = _write_versions(
+        tmp_path,
+        ("0001_baseline", None, 'op.create_table("users", sa.Column("id", sa.Integer()))', _NOOP),
+    )
+    monkeypatch.setitem(gate._REVISION_ONLY_INDEXES, "ix_ghost", "a read nobody ships")
+    chain, failures = gate._read_chain(versions)
+
+    assert failures == []
+    stale = gate.check_revision_only_indexes(chain)
+
+    assert any("ix_ghost" in problem and "no revision creates" in problem for problem in stale)
+
+
+def test_the_shipped_tree_has_no_index_or_default_difference() -> None:
+    """The exit artifact of S22, as a test: the refreshed difference list is empty.
+
+    The PostgreSQL round trip asserts a hand-written subset of indexes and skips
+    without ``INTEGRATION_MIGRATION_DATABASE_URL``; this runs everywhere and sees
+    every index and every server default the revision chain creates.
+    """
+    result = subprocess.run(
+        [sys.executable, "-m", "scripts.check_schema_drift"],
+        cwd=_BACKEND_ROOT,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "index" in result.stdout

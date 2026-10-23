@@ -58,10 +58,24 @@ _spec.loader.exec_module(_lock)
 
 _LOCK_FILE = _BACKEND_ROOT / "requirements.txt"
 _DEV_FILE = _BACKEND_ROOT / "requirements-dev.txt"
+#: Every file `scripts/lock_requirements.py` generates. The connector images each
+#: install one with `--require-hashes`, so each is held to the same rule as the
+#: backend's runtime lock.
+_GENERATED_LOCKS = [_LOCK_FILE, *sorted((_ROOT / "connectors").glob("*/requirements.txt"))]
+
+_HASH_BLOCK = re.compile(
+    r"^(?P<name>[A-Za-z0-9._-]+)==[^\s\\]+ \\\n(?P<body>(?:\s+--hash=sha256:[0-9a-f]{64}[^\n]*\n)+)",
+    re.MULTILINE,
+)
 
 _SOURCE = """\
 # A direct dependency.
 fastapi==0.115.0
+
+# The package that declares greenlet through a `platform_machine` marker: a
+# manifest without it does not need the pinned wheel at all, which is the case
+# every connector lock is.
+sqlalchemy==2.0.36
 
 # SQLAlchemy's asyncio engine needs greenlet on linux/amd64, and SQLAlchemy
 # declares it with a `platform_machine` marker.
@@ -76,6 +90,29 @@ _PIN = re.compile(r"^(?P<name>[A-Za-z0-9._-]+)==(?P<version>[^\s;\\]+)", re.MULT
 
 def _declared(path: Path) -> dict[str, str]:
     return {match["name"]: match["version"] for match in _PIN.finditer(path.read_text(encoding="utf-8"))}
+
+
+def _stub_from_manifest(monkeypatch, manifest: Path) -> None:
+    """Answer the resolution with the file's own pins and its own hashes.
+
+    That is what a generator run against an unchanged tree must see, so the only
+    thing the comparison can then report is a difference the generator itself
+    would introduce — a dropped comment, a re-spelled name, a rewritten header.
+    """
+    text = manifest.read_text(encoding="utf-8")
+    declared = _declared(manifest)
+    digests = {
+        _normalise(match["name"]): re.findall(r"--hash=sha256:([0-9a-f]{64})", match["body"])
+        for match in _HASH_BLOCK.finditer(text)
+    }
+    monkeypatch.setattr(
+        _lock,
+        "_pip_download_requirements",
+        lambda *args, **kwargs: [f"{name}=={version}" for name, version in declared.items()],
+    )
+    monkeypatch.setattr(
+        _lock, "_hashes", lambda name, version: digests.get(_normalise(name), ["a" * 64])
+    )
 
 
 def _stub(monkeypatch, resolved: list[str], digests: dict[str, list[str]] | None = None):
@@ -100,7 +137,7 @@ def source(tmp_path: Path) -> Path:
 # ==============================================================================
 def test_a_dropped_marker_gated_dependency_is_kept(monkeypatch, source) -> None:
     """The resolution omits greenlet; the lock must not."""
-    _stub(monkeypatch, ["fastapi==0.115.0", "typing-extensions==4.16.0"])
+    _stub(monkeypatch, ["fastapi==0.115.0", "sqlalchemy==2.0.36", "typing-extensions==4.16.0"])
 
     generated = _lock.build_lock(source)
 
@@ -110,8 +147,8 @@ def test_a_dropped_marker_gated_dependency_is_kept(monkeypatch, source) -> None:
 def test_a_source_that_does_not_pin_it_is_refused(monkeypatch, tmp_path: Path) -> None:
     """Unpinned means the generator cannot invent a version, so it must stop."""
     path = tmp_path / "requirements.txt"
-    path.write_text("fastapi==0.115.0\n", encoding="utf-8")
-    _stub(monkeypatch, ["fastapi==0.115.0"])
+    path.write_text("sqlalchemy==2.0.36\n", encoding="utf-8")
+    _stub(monkeypatch, ["sqlalchemy==2.0.36"])
 
     with pytest.raises(_lock.Failed) as failure:
         _lock.build_lock(path)
@@ -145,6 +182,24 @@ def test_every_marked_dependency_states_why_resolution_misses_it() -> None:
     for name, reason in _lock.MARKER_GATED_RUNTIME.items():
         assert reason.strip(), f"{name} is listed without a reason"
         assert len(reason) > 40, f"the reason for {name} does not explain anything"
+        # Without this the entry applies to every manifest, including the seven
+        # connector locks that install nothing which declares it.
+        assert name in _lock.MARKER_GATED_BY, (
+            f"{name} does not name the package whose metadata declares it, so the "
+            "rule cannot tell a manifest that needs it from one that cannot"
+        )
+
+
+def test_a_source_that_installs_none_of_the_declaring_packages_is_locked(monkeypatch, tmp_path: Path) -> None:
+    """A connector lock: no SQLAlchemy, so no greenlet to keep."""
+    path = tmp_path / "requirements.txt"
+    path.write_text("httpx==0.27.2\n", encoding="utf-8")
+    _stub(monkeypatch, ["httpx==0.27.2", "anyio==4.6.0"])
+
+    generated = _lock.build_lock(path)
+
+    assert "httpx==0.27.2" in generated
+    assert "greenlet" not in generated
 
 
 # ==============================================================================
@@ -257,6 +312,73 @@ def _undeclared_closure(manifest: Path, also_provided: Path | None = None) -> li
             else:
                 undeclared.add(requirement)
     return sorted(undeclared)
+
+
+# ==============================================================================
+# The files the generator must reproduce
+# ==============================================================================
+def test_every_generated_lock_is_a_fixed_point_of_the_generator(monkeypatch) -> None:
+    """Regenerating a shipped lock must write the file that is already there.
+
+    The dev file had this test and the eight runtime locks — the files the images
+    actually install — did not, which is how `backend/requirements.txt` came to
+    carry a header its own generator would not write.
+    """
+    drifted: list[str] = []
+    for manifest in _GENERATED_LOCKS:
+        _stub_from_manifest(monkeypatch, manifest)
+        generated = _lock.build_lock(manifest)
+        current = manifest.read_text(encoding="utf-8").replace("\r\n", "\n")
+        if generated != current:
+            drifted.append(f"{manifest.relative_to(_ROOT).as_posix()}: {_first_difference(current, generated)}")
+
+    assert drifted == [], (
+        "these locks are not what the generator writes, so a regeneration would "
+        "change them and the file's own instructions do not describe it:\n  "
+        + "\n  ".join(drifted)
+    )
+
+
+def _first_difference(current: str, generated: str) -> str:
+    current_lines = current.splitlines()
+    generated_lines = generated.splitlines()
+    for index, (left, right) in enumerate(zip(current_lines, generated_lines, strict=False)):
+        if left != right:
+            return f"line {index + 1}: shipped {left.strip()!r}, generated {right.strip()!r}"
+    if len(current_lines) != len(generated_lines):
+        return f"{len(current_lines)} lines shipped, {len(generated_lines)} generated"
+    return "identical line by line"
+
+
+def test_every_lock_header_names_a_command_that_runs_from_the_root() -> None:
+    """The header is the only instruction in the file for maintaining it."""
+    broken: list[str] = []
+    command = re.compile(r"^#\s+python (?P<script>\S+) (?P<argument>\S+)$")
+    for manifest in _GENERATED_LOCKS:
+        name = manifest.relative_to(_ROOT).as_posix()
+        lines = manifest.read_text(encoding="utf-8").splitlines()
+        if not lines or "GENERATED FILE" not in "\n".join(lines[:4]):
+            broken.append(f"{name}: does not announce itself as generated")
+            continue
+        found = 0
+        for line in lines:
+            match = command.match(line.strip())
+            if match is None:
+                continue
+            found += 1
+            script = _ROOT / match["script"]
+            argument = _ROOT / match["argument"]
+            if not script.is_file():
+                broken.append(f"{name}: `{match['script']}` is not a file from the repository root")
+            if not argument.is_file():
+                broken.append(
+                    f"{name}: `{match['argument']}` is not a file from the repository root, "
+                    "so the command in its header cannot be run as written"
+                )
+        if found == 0:
+            broken.append(f"{name}: names no regeneration command")
+
+    assert broken == [], "\n  ".join(["", *broken])
 
 
 def test_the_runtime_lock_declares_its_whole_closure() -> None:

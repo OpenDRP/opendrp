@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import PhishingPage from "@/pages/PhishingPage";
@@ -10,13 +10,14 @@ const mocks = vi.hoisted(() => ({
   toast: vi.fn(),
   evidence: vi.fn(),
   promote: vi.fn(),
+  deleteThreat: vi.fn(),
 }));
 vi.mock("@/lib/api", () => ({
   endpoints: {
     listPhishing: mocks.list,
     phishingEvidence: mocks.evidence,
     updatePhishingThreat: vi.fn(),
-    deletePhishingThreat: vi.fn(),
+    deletePhishingThreat: mocks.deleteThreat,
     cleanOrphanPhishing: vi.fn(),
     scanModule: vi.fn(),
     promotePhishingAsset: mocks.promote,
@@ -193,5 +194,26 @@ describe("PhishingPage sources column (WI-30)", () => {
 
     expect(await screen.findByText("not recorded")).toBeInTheDocument();
     expect(screen.queryByText("1 (dnstwist)")).not.toBeInTheDocument();
+  });
+
+  /**
+   * Same reasoning as the breach page: a destructive decision stays on screen
+   * until the API answers. Closing on the click hid a slow delete behind nothing
+   * and turned a refusal into a toast, with no row change and no retry.
+   */
+  it("keeps a refused delete in front of the operator, with the API's reason", async () => {
+    mocks.list.mockResolvedValue({ items: [young], total: 1, page: 1, size: 20, pages: 1 });
+    mocks.deleteThreat.mockRejectedValue(new Error("This candidate is referenced by a report"));
+    const user = userEvent.setup();
+    renderPage("analyst");
+    await screen.findByText("paypa1-login.example");
+
+    await user.click(screen.getAllByRole("button", { name: "Delete threat" })[0]);
+    const dialog = await screen.findByRole("dialog");
+    await user.click(within(dialog).getByRole("button", { name: "Delete threat" }));
+
+    await waitFor(() => expect(mocks.deleteThreat).toHaveBeenCalledWith("threat-young"));
+    expect(await screen.findByRole("dialog")).toBeInTheDocument();
+    expect(await screen.findByText(/referenced by a report/)).toBeInTheDocument();
   });
 });

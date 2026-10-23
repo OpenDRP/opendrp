@@ -135,11 +135,17 @@ async def events(db) -> list[IngestionEvent]:
 
 
 class _StandIn:
-    """The two fields the routing reads, without a database row."""
+    """The fields the routing reads, without a database row."""
 
-    def __init__(self, confidence: int = 0, verdict: str | None = None) -> None:
+    def __init__(
+        self,
+        confidence: int = 0,
+        verdict: str | None = None,
+        status: str = "active",
+    ) -> None:
         self.confidence = confidence
         self.verdict = verdict
+        self.status = status
 
 
 class TestRouting:
@@ -181,6 +187,34 @@ class TestRouting:
         digest = await queue_phishing_digest(db_session)
         assert digest["queued"] == 0
         assert mailbox.messages == []
+
+    @pytest.mark.asyncio
+    async def test_a_resolved_candidate_is_silent_in_the_channel_too(
+        self, db_session, mailbox
+    ):
+        """Closing a finding silences the channel, not only tomorrow's digest.
+
+        An operator resolves a candidate to say they are done with it, and the digest
+        has always read that as silence. The routing read only the score, so the same
+        row at 95 was announced immediately — and at 40 was consumed for a digest that
+        then filtered it out, which means the arrival was reported nowhere at all.
+        """
+        await configured_email(db_session)
+        loud = await candidate(db_session, "closed-loud.example", 95, status="resolved")
+        quiet = await candidate(db_session, "closed-quiet.example", 40, status="resolved")
+        await arrival(db_session, loud, rule="phishing.candidate.changed", dedup="ip|1")
+        await arrival(db_session, quiet, rule="phishing.candidate.changed", dedup="ip|2")
+
+        assert await dispatch_notification_events(db_session) == 0
+        assert await drain(db_session) == []
+        assert mailbox.messages == []
+        assert await queue_phishing_digest(db_session) == {"queued": 0, "candidates": 0}
+
+        rows = await events(db_session)
+        assert {row.last_error for row in rows} == {"phishing_status_resolved"}
+        assert all(row.processed_at is not None for row in rows)
+        # The candidates stay readable in the list: only the channel goes quiet.
+        assert loud.status == "resolved" and quiet.status == "resolved"
 
     @pytest.mark.asyncio
     async def test_a_confirmation_below_the_threshold_still_alerts(

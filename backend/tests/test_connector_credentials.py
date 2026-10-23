@@ -117,6 +117,29 @@ class TestTokenMaterial:
         # An empty label segment is not a name either.
         assert connector_name_from_token(f"{TOKEN_PREFIX}__{'z' * 43}") is None
 
+    def test_the_hint_is_a_bounded_printable_label_not_text_the_caller_chose(self):
+        """AUD-018: this value reaches the platform's log, so it is filtered.
+
+        The hint is read from a rejected credential, which means an unauthenticated
+        caller writes it: a 5000-character label, a bidirectional override and an
+        ANSI escape all arrived intact before this. The hint is for a human reading
+        a line, so it keeps the alphabet a connector name is made of and nothing
+        else.
+        """
+        allowed = set("abcdefghijklmnopqrstuvwxyz0123456789._-")
+
+        long_hint = connector_name_from_token(f"{TOKEN_PREFIX}_{'A' * 5000}_x")
+        assert long_hint is not None
+        assert len(long_hint) == 40
+
+        hostile = connector_name_from_token(f"{TOKEN_PREFIX}_evil\u202e\x1b[31mconn_{'z' * 43}")
+        assert hostile is not None
+        assert not ({"\u202e", "\x1b"} & set(hostile))
+        assert set(hostile) <= allowed
+
+        # A label that is nothing but unprintable characters is not a hint at all.
+        assert connector_name_from_token(f"{TOKEN_PREFIX}_\x1b\u202e\x00_{'z' * 43}") is None
+
 
 # ---------------------------------------------------------------------------
 # Service layer

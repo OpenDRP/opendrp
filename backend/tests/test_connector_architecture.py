@@ -14,7 +14,9 @@ _APP_ROOT = Path("app")
 
 def test_celery_discovers_only_core_owned_tasks():
     source = Path("app/core/celery_app.py").read_text(encoding="utf-8")
-    assert '"app.tasks.phishing_tasks"' not in source
+    # `phishing_tasks` is core-owned since AUD-033: the nightly rescore of stored
+    # confidence is this platform's own maintenance, not a provider's scan.
+    assert '"app.tasks.phishing_tasks"' in source
     assert '"app.tasks.hibp_tasks"' not in source
     assert '"app.tasks.scheduler_tasks"' in source
     assert '"app.tasks.report_tasks"' in source
@@ -35,7 +37,7 @@ def test_provider_execution_is_not_imported_by_core_runtime():
         path
         for path in _APP_ROOT.rglob("*.py")
         if "tests" not in path.parts
-        and path.name not in {"hibp_service.py", "shodan_service.py", "dnstwist_service.py", "hibp_tasks.py", "phishing_tasks.py"}
+        and path.name not in {"hibp_service.py", "shodan_service.py", "dnstwist_service.py", "hibp_tasks.py"}
     ]
     forbidden = (
         "from app.services.hibp_service",

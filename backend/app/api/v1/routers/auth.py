@@ -32,8 +32,10 @@ from app.core.security import (
 from app.models.audit import AuditLog
 from app.models.token import RefreshTokenFamily
 from app.models.user import User, role_name
+from app.schemas.common import RevokedSessionsResponse
 from app.schemas.user import (
     AcceptInvitationRequest,
+    InvitationAccepted,
     LoginRequest,
     MfaCodeRequest,
     MfaSetupRequest,
@@ -159,6 +161,11 @@ async def _issue_session(
     whether this session came from signing in or from changing a credential, and
     the two belong in the trail under their own names.
 
+    The family row is added, not committed: sign-in commits it together with
+    `auth.login.success`, so a trail the platform cannot write means no session
+    either. A commit here made that impossible — the route would hand out a
+    usable session the trail did not know about.
+
     Returns the response and the new family id, which the sign-in handler has
     always recorded alongside the login: it is what ties a session on the wire to
     the row whose revocation ends it.
@@ -179,15 +186,6 @@ async def _issue_session(
             revoked=False,
         )
     )
-    try:
-        await db.commit()
-    except Exception as exc:
-        await db.rollback()
-        raise HTTPException(
-            status_code=503,
-            detail="Session could not be persisted; sign-in was not completed",
-            headers={"Retry-After": "5"},
-        ) from exc
 
     response.set_cookie(
         _REFRESH_COOKIE, refresh_token, httponly=True, secure=settings.AUTH_COOKIE_SECURE,
@@ -399,28 +397,38 @@ async def login(
     user.failed_login_attempts = 0
     user.locked_until = None
     user.last_login_at = now
-    try:
-        await db.commit()
-    except Exception:
-        await db.rollback()
-
-    await _clear_login_rate_limit(email_key, ip)
 
     session, refresh_fid = await _issue_session(response, user, db, now)
+    # The session and the event that says it exists become durable together: a
+    # refresh family the trail cannot explain is a signed-in account nobody can
+    # account for, which is the one row a SIEM needs after an incident.
     await AuditLogger.emit(
         db, action="auth.login.success", ip_address=ip, user_id=user.id,
         details={"email": email_key, "role": role_name(user.role),
                  "refresh_family_id": refresh_fid},
+        require_persistence=True,
+        commit=False,
     )
+    try:
+        await db.commit()
+    except Exception as exc:
+        await db.rollback()
+        raise HTTPException(
+            status_code=503,
+            detail="Session could not be persisted; sign-in was not completed",
+            headers={"Retry-After": "5"},
+        ) from exc
+
+    await _clear_login_rate_limit(email_key, ip)
     return session
 
 
-@router.post("/accept-invitation", status_code=200)
+@router.post("/accept-invitation", status_code=200, response_model=InvitationAccepted)
 async def accept_invitation(
     request: Request,
     payload: AcceptInvitationRequest,
     db: AsyncSession = Depends(get_db),
-) -> dict[str, str]:
+) -> InvitationAccepted:
     """Spend an invitation: the owner chooses the password nobody else knows (U-7).
 
     Unknown and expired links get the same answer: a difference between the two
@@ -459,7 +467,7 @@ async def accept_invitation(
     except Exception:
         await db.rollback()
         raise
-    return {"status": "accepted"}
+    return InvitationAccepted(status="accepted")
 
 
 @router.get("/me", response_model=UserResponse)
@@ -542,6 +550,21 @@ async def change_password(
         raise
 
     session, _refresh_fid = await _issue_session(response, current_user, db, now)
+    try:
+        await db.commit()
+    except Exception as exc:
+        await db.rollback()
+        # The change itself is already durable and every other session is gone;
+        # what failed is the replacement session. Say that, rather than the
+        # sign-in wording this block used to share.
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "The password was changed, but a new session could not be issued; "
+                "sign in again with the new password."
+            ),
+            headers={"Retry-After": "5"},
+        ) from exc
     return session
 
 
@@ -648,13 +671,17 @@ async def revoke_session(
     return None
 
 
-@router.post("/sessions/revoke-others", status_code=200)
+@router.post(
+    "/sessions/revoke-others",
+    status_code=200,
+    response_model=RevokedSessionsResponse,
+)
 async def revoke_other_sessions(
     request: Request,
     refresh_cookie: str | None = Cookie(default=None, alias=_REFRESH_COOKIE),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_self_service),
-) -> dict[str, int]:
+) -> RevokedSessionsResponse:
     """Revoke every session except the browser currently presenting the cookie."""
     current_family = _current_family_id(refresh_cookie, request)
     if current_family is None:
@@ -682,7 +709,7 @@ async def revoke_other_sessions(
         commit=False,
     )
     await db.commit()
-    return {"revoked": len(rows)}
+    return RevokedSessionsResponse(revoked=len(rows))
 
 
 @router.get("/security-activity", response_model=list[SecurityActivityResponse])
@@ -728,17 +755,29 @@ async def rotate_recovery_codes(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_self_service),
 ) -> MfaRecoveryCodesResponse:
-    """Replace recovery codes after re-authentication with password and TOTP."""
+    """Replace recovery codes after re-authentication with password and TOTP.
+
+    Throttled like every other code check: this endpoint can replace the last way
+    into a lost account, so a correct password must not turn it into an unthrottled
+    oracle for a six-digit value.
+    """
+    ip = extract_ip(request)
     if current_user.totp_enabled_at is None:
         raise ConflictException("Enable a second factor before creating recovery codes")
+    if _mfa_is_locked(current_user, datetime.now(timezone.utc)):
+        raise HTTPException(status_code=429, detail="Too many MFA attempts. Please try again later.")
     if not await verify_password_async(payload.password.get_secret_value(), current_user.password_hash):
-        await AuditLogger.emit(db, action="auth.mfa.failure", ip_address=extract_ip(request), user_id=current_user.id, details={"reason": "invalid_password_on_recovery_codes"})
+        await _record_mfa_failure(current_user, db)
+        await AuditLogger.emit(db, action="auth.mfa.failure", ip_address=ip, user_id=current_user.id, details={"reason": "invalid_password_on_recovery_codes"})
         raise UnauthorizedException("Invalid password")
     secret = _decrypted_totp_secret(current_user)
     step = totp.verify(secret, payload.code.get_secret_value()) if secret and payload.code else None
     if step is None or (current_user.totp_last_used_step is not None and step <= current_user.totp_last_used_step):
+        await _record_mfa_failure(current_user, db)
+        await AuditLogger.emit(db, action="auth.mfa.failure", ip_address=ip, user_id=current_user.id, details={"reason": "invalid_code_on_recovery_codes"})
         raise UnauthorizedException("Invalid MFA code")
     current_user.totp_last_used_step = step
+    await _clear_mfa_failures(current_user, db)
     plain, hashed = recovery_codes.generate()
     current_user.mfa_recovery_codes = hashed
     # The codes and the event that says they were replaced land together: the
@@ -1103,9 +1142,10 @@ async def mfa_qr(
 async def enable_mfa(
     request: Request,
     payload: MfaCodeRequest,
+    refresh_cookie: str | None = Cookie(default=None, alias=_REFRESH_COOKIE),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_self_service),
-) -> MfaStatusResponse:
+) -> MfaEnableResponse:
     """Enable the second factor once a code from the pending secret verifies."""
     ip = extract_ip(request)
 
@@ -1161,15 +1201,28 @@ async def enable_mfa(
     # started and abandoned leaves it set, and the next sign-in asks again.
     was_required = current_user.must_enrol_mfa
     current_user.must_enrol_mfa = False
-    # Enabling the factor and the recovery codes handed back are one change; the
-    # account must never be able to sign in with a factor the trail does not know
-    # about.
+    # A factor that leaves the sessions predating it alive can be ignored by
+    # whoever holds them: their refresh tokens keep minting access tokens without
+    # ever being asked for a code, which is exactly the credential the factor was
+    # turned on to stop. Every other session ends here; the browser that enrolled
+    # keeps its own, because it is the one the account holder is sitting in front
+    # of and signing it out would make enrolment look like a logout.
+    revoked = await revoke_refresh_families(
+        db,
+        current_user.id,
+        reason="mfa_enabled",
+        except_family_id=_current_family_id(refresh_cookie, request),
+    )
+    # Enabling the factor, ending the sessions that predate it, and the recovery
+    # codes handed back are one change; the account must never be able to sign in
+    # with a factor the trail does not know about.
     await AuditLogger.emit(
         db, action="auth.mfa.enrolled", ip_address=ip, user_id=current_user.id,
         details={
             "email": current_user.email,
             "enabled_at": enabled_at.isoformat(),
             "was_required": was_required,
+            "refresh_families_revoked": revoked,
         },
         require_persistence=True,
         commit=False,
@@ -1227,6 +1280,10 @@ async def disable_mfa(
         and step <= current_user.totp_last_used_step
     )
     if secret is None or step is None or replayed:
+        # A wrong code here is a guess at six digits like any other, and this
+        # endpoint is the one that removes the factor: counting it is what keeps
+        # the lockout a real bound rather than a check that never trips.
+        await _record_mfa_failure(current_user, db)
         await AuditLogger.emit(
             db, action="auth.mfa.failure", ip_address=ip, user_id=current_user.id,
             details={

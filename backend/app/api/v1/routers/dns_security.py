@@ -6,7 +6,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 from app.models.dns_expiry_monitor import DNSExpiryMonitor
-from app.services.dns_expiry_monitor_service import monitor_payload
+from app.services.dns_expiry_monitor_service import kind_is_tls, monitor_payload, tls_kind
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 from sqlalchemy import delete
@@ -21,8 +21,13 @@ from app.core.exceptions import ConflictException, NotFoundException
 from app.core.manual_rate_limit import SCOPE_ASSETS, enforce_manual_rate_limit
 from app.models.asset import Asset, AssetType
 from app.models.dns_observation import DNSObservation
-from app.schemas.asset import AssetCreate, validate_and_normalize_asset_value
-from app.schemas.common import MAX_PAGE_SIZE, PaginatedResponse
+from app.schemas.asset import (
+    AssetCreate,
+    PromotedAssetResponse,
+    validate_and_normalize_asset_value,
+)
+from app.schemas.common import CleanupResponse, MAX_PAGE_SIZE, PaginatedResponse
+from app.schemas.connector import ScanStartResponse
 from app.services.asset_matching import asset_sql_key, key_variants
 from app.services.asset_service import AssetService, asset_type_value
 from app.services.connector_service import ConnectorService
@@ -30,7 +35,83 @@ from app.services.connector_service import ConnectorService
 router = APIRouter(tags=["DNS Security"])
 
 
-@router.get("/observations", response_model=PaginatedResponse[dict])
+class DNSExpiryMonitorResponse(BaseModel):
+    """The expiry control an inventory row feeds, as the page shows it.
+
+    `kind` is the control's key — `tls:8443` when the port is part of it (AUD-036)
+    — while the row's `expiry_kind` is the label the column prints (`tls`). Both
+    are published because they answer different questions: which control sent the
+    reminder, and what kind of control it is.
+
+    `remaining_seconds` is a float because it is a timedelta divided by seconds;
+    the page renders it as days, and the type says what the arithmetic produces.
+    """
+
+    kind: str
+    state: str
+    checked_at: datetime
+    successful_at: datetime | None
+    expires_at: datetime | None
+    certificate_id: str | None
+    not_before: datetime | None
+    #: Day counts already notified for this cycle, in the order the sweep crossed
+    #: them. The control is their single writer (AUD-038).
+    alerted_thresholds: list[int]
+    remaining_seconds: float | None
+
+
+class DNSObservationResponse(BaseModel):
+    """One row of the DNS inventory, as the DNS Security page reads it.
+
+    `observation_type`, `source`, `status` and `expiry_kind` stay strings. The client
+    closes two of them with unions, but the columns are free text and the module's
+    vocabulary has grown twice — the `vt_*` family, then the active probe — so a row
+    written by a worker this build does not know must still render. A model that
+    refused it would replace the row an operator needs with a 500.
+
+    `expiry_monitor` is nullable because `monitor_kind` answers `None` for an
+    observation type no control tracks: the row feeds nothing, and the page shows no
+    expiry control rather than an empty one.
+
+    `metadata` is the connector's own record — the RRset under `record_values`, the
+    wildcard flag, a provider document — and the page reads three keys of it.
+    """
+
+    id: str
+    observation_type: str
+    subject: str
+    record_type: str | None
+    #: The RRset member this row stands for, which is what the inventory table shows
+    #: rather than the stored `value` a grouped certificate keeps.
+    value: str | None
+    source: str
+    first_seen_at: datetime
+    last_seen_at: datetime
+    expires_at: datetime | None
+    status: str
+    metadata: dict[str, Any]
+    #: The control's history beside its own payload: the same list in both places,
+    #: because the row's column and the nested control answer the same question.
+    alerted_thresholds: list[int]
+    #: How many observations one row stands for: an RRset member is one, a
+    #: certificate group is its sightings.
+    evidence_count: int
+    subject_in_assets: bool
+    #: The hostname or address this member resolves to, when the row is a DNS record
+    #: whose value can be promoted as an asset.
+    value_asset_target: str | None
+    value_in_assets: bool
+    expiry_kind: str
+    expiry_monitor: DNSExpiryMonitorResponse | None
+
+
+class DNSObservationPageResponse(PaginatedResponse[DNSObservationResponse]):
+    """A page of the inventory with the counters the table pages by."""
+
+    items: list[DNSObservationResponse]
+
+
+@router.get("/observations", response_model=DNSObservationPageResponse)
 async def list_observations(
     request: Request,
     subject: str | None = Query(None, max_length=253),
@@ -79,21 +160,55 @@ async def list_observations(
     monitors = (await db.execute(select(DNSExpiryMonitor).where(DNSExpiryMonitor.subject.in_(candidates)))).scalars().all()
     controls = {(m.subject, m.kind): monitor_payload(m, datetime.now(timezone.utc)) for m in monitors}
     await AuditLogger.emit_background(db, action="dns_security.observations.list", ip_address=extract_ip(request), user_id=user.id, details={"source": source, "observation_type": observation_type, "count": len(rows), "total": total})
-    return PaginatedResponse(items=[{
-        "id": str(row.id), "observation_type": row.observation_type, "subject": row.subject,
-        "record_type": row.record_type, "value": value, "source": row.source,
-        "first_seen_at": first_seen, "last_seen_at": row.last_seen_at,
-        "evidence_count": evidence_count, "subject_in_assets": in_assets(row.subject),
-        "value_asset_target": value_asset_target(row, value),
-        "value_in_assets": in_assets(value_asset_target(row, value)),
-        "expires_at": row.expires_at, "status": row.status, "metadata": row.metadata_json,
-        "alerted_thresholds": row.alerted_thresholds or [],
-        "expiry_kind": expiry_kind(row),
-        "expiry_monitor": _expiry_monitor(controls, row),
-    } for row, value, evidence_count, first_seen in rows], total=total, page=page, size=size, pages=math.ceil(total / size) if size else 0)
+    items: list[DNSObservationResponse] = []
+    for row, value, evidence_count, first_seen in rows:
+        # The control and the promotable target are asked once per row: both used to
+        # be computed twice in the comprehension, which is two lookups for one answer.
+        monitor = _expiry_monitor(controls, row)
+        target = value_asset_target(row, value)
+        items.append(
+            DNSObservationResponse(
+                id=str(row.id),
+                observation_type=row.observation_type,
+                subject=row.subject,
+                record_type=row.record_type,
+                value=value,
+                source=row.source,
+                first_seen_at=first_seen,
+                last_seen_at=row.last_seen_at,
+                expires_at=row.expires_at,
+                status=row.status,
+                metadata=row.metadata_json,
+                # The reminder history is the control's, and only the control's: the
+                # observation used to carry a second copy that nothing ever wrote, so
+                # a control that had been reminding for weeks showed "nothing sent"
+                # (AUD-038).
+                alerted_thresholds=(monitor or {}).get("alerted_thresholds") or [],
+                evidence_count=evidence_count,
+                subject_in_assets=in_assets(row.subject),
+                value_asset_target=target,
+                value_in_assets=in_assets(target),
+                expiry_kind=expiry_kind(row),
+                expiry_monitor=(
+                    DNSExpiryMonitorResponse.model_validate(monitor) if monitor else None
+                ),
+            )
+        )
+    return DNSObservationPageResponse(
+        items=items,
+        total=total,
+        page=page,
+        size=size,
+        pages=math.ceil(total / size) if size else 0,
+    )
 
 
-@router.post("/scan", status_code=202)
+@router.post(
+    "/scan",
+    status_code=202,
+    response_model=ScanStartResponse,
+    response_model_exclude_none=True,
+)
 async def scan_dns_security(request: Request, db: AsyncSession = Depends(get_db), user=Depends(require_analyse)):
     service = ConnectorService(db)
     offline = [conn.name for conn in await service.list_enabled_by_type("dns") if not service.is_online(conn)]
@@ -115,13 +230,15 @@ async def scan_dns_security(request: Request, db: AsyncSession = Depends(get_db)
     return result
 
 
-@router.post("/observations/cleanup-orphans")
+@router.post("/observations/cleanup-orphans", response_model=CleanupResponse)
 async def cleanup_orphans(request: Request, db: AsyncSession = Depends(get_db), user=Depends(require_admin)):
     from app.services.dns_security_service import clean_orphan_observations
 
     deleted = await clean_orphan_observations(db)
     await AuditLogger.emit(db, action="dns_security.observation.orphans.cleaned", ip_address=extract_ip(request), user_id=user.id, details={"deleted": deleted})
-    return {"status": "completed", "deleted": deleted}
+    # The same two keys the breaches and phishing cleanups answer: one shape for one
+    # operation, declared once (plan 017).
+    return CleanupResponse(status="completed", deleted=deleted)
 
 
 class PromoteObservation(BaseModel):
@@ -138,20 +255,22 @@ def value_asset_target(row: DNSObservation, value: str | None) -> str | None:
         return None
 
 
-def monitor_kind(observation_type: str) -> str | None:
+def monitor_kind(row) -> str | None:
     """The expiry control an observation feeds, or None when it feeds none.
 
     `tls_probe` is a kind of its own rather than part of `certificate`: the active
     handshake and the passive Certificate Transparency check answer different
     questions about the same hostname, and a reader has to be able to tell which
-    one a reminder came from.
+    one a reminder came from. Within `tls_probe` the port is part of the kind, so
+    two services on one asset are two controls (AUD-036).
     """
+    observation_type = row.observation_type
     if observation_type == "rdap":
         return "registration"
     if observation_type in {"certificate", "certificate_check"}:
         return "certificate"
     if observation_type == "tls_probe":
-        return "tls"
+        return tls_kind(row)
     return None
 
 
@@ -163,17 +282,24 @@ def _expiry_monitor(controls: dict[tuple[str, str], dict], row: Any) -> dict | N
     the question is asked, instead of leaving a reader to notice that the lookup it
     would build could only ever miss.
     """
-    kind = monitor_kind(row.observation_type)
+    kind = monitor_kind(row)
     if not kind:
         return None
-    return controls.get((row.subject, kind))
+    control = controls.get((row.subject, kind))
+    if control is None and kind_is_tls(kind):
+        # A control written before the port dimension is still the answer for
+        # this row until the next sweep adopts it (AUD-036).
+        control = controls.get((row.subject, "tls"))
+    return control
 
 
 def expiry_kind(row) -> str:
     """What the expiry column is about for one inventory row."""
-    kind = monitor_kind(row.observation_type)
+    kind = monitor_kind(row)
     if kind:
-        return kind
+        # The column labels the kind of control, not its key: the port is shown
+        # beside the certificate it belongs to, not in the label (AUD-036).
+        return "tls" if kind_is_tls(kind) else kind
     if row.observation_type == "tls_certificate":
         return "tls"
     if row.source == "resolver":
@@ -207,7 +333,7 @@ async def delete_observation(
     else:
         await db.delete(row)
         deleted = 1
-    deleted_kind = monitor_kind(row.observation_type)
+    deleted_kind = monitor_kind(row)
     if deleted_kind:
         from sqlalchemy import update
         await db.execute(update(DNSExpiryMonitor).where(DNSExpiryMonitor.subject == row.subject, DNSExpiryMonitor.kind == deleted_kind).values(state="unverified", observation_id=None))
@@ -217,7 +343,12 @@ async def delete_observation(
     return None
 
 
-@router.post("/observations/{observation_id}/asset", status_code=201)
+@router.post(
+    "/observations/{observation_id}/asset",
+    status_code=201,
+    response_model=PromotedAssetResponse,
+    response_model_exclude_none=True,
+)
 async def promote_observation_to_asset(
     observation_id: uuid.UUID,
     request: Request,
@@ -297,6 +428,21 @@ class CertificateVerdict(BaseModel):
     note: str | None = Field(default=None, max_length=2000)
 
 
+class TLSSightingReview(BaseModel):
+    """What `PATCH /dns/certificates/sightings/{id}` answers: the decision, as stored.
+
+    `id` is a string because the route has always sent `str(sighting.id)`, and the
+    page keys the row in its cache by it. `verdict` stays a free string rather than
+    the request's pattern: a row can hold a value written before a verdict was
+    retired, and reading it back is not the place to fail. `reviewed_at` is null for
+    a decision that cleared a verdict instead of setting one.
+    """
+
+    id: str
+    verdict: str
+    reviewed_at: datetime | None = None
+
+
 class CertificateExceptionCreate(BaseModel):
     match_kind: str = Field(pattern="^(fingerprint|spki|ip|asn|issuer)$")
     match_value: str = Field(min_length=1, max_length=255)
@@ -304,7 +450,105 @@ class CertificateExceptionCreate(BaseModel):
     expires_at: datetime | None = None
 
 
-@router.get("/certificates", response_model=PaginatedResponse[dict])
+class CertificateScopeExceptionResponse(BaseModel):
+    """One identity the scope rules must not alert on, as the list answers it.
+
+    `expired` is computed at read time rather than stored, so the rule it encodes —
+    an end date in the past, compared in UTC — belongs beside the field. `created_by`
+    is the account that added the exception, and it stays nullable because the CLI
+    and seeded rows may not carry one.
+    """
+
+    id: uuid.UUID
+    match_kind: str
+    match_value: str
+    reason: str | None
+    created_by: uuid.UUID | None
+    expires_at: datetime | None
+    expired: bool
+    created_at: datetime
+
+
+class CertificateScopeExceptionCreated(BaseModel):
+    """What `POST /dns/certificate-exceptions` answers: the row, without the
+    computed fields and without `created_by`, which the create path does not send.
+    """
+
+    id: uuid.UUID
+    match_kind: str
+    match_value: str
+    reason: str | None
+    expires_at: datetime | None
+
+
+class TLSCertificateSightingResponse(BaseModel):
+    """Where one certificate was observed, and what the review decided about it.
+
+    `subjects` is every hostname the certificate was reported for at this endpoint
+    (AUD-037); the row is keyed by (certificate, address, port, source), so the
+    names are evidence rather than identity and one sighting can carry several.
+
+    `signals` is what the provider said, kept whole so a new signal needs no column.
+    A model of its keys would be a second copy of the scoring rules.
+
+    `verdict` stays a string although the client closes it with a union: the sweep
+    writes five values and an older row has to keep listing.
+    """
+
+    id: uuid.UUID
+    subject: str | None
+    subjects: list[str]
+    ip: str | None
+    port: int | None
+    source: str
+    is_ours: bool
+    #: 0-100, from the rules that judged this sighting.
+    confidence: int
+    signals: dict[str, Any]
+    verdict: str
+    first_seen_at: datetime
+    last_seen_at: datetime
+    reviewed_at: datetime | None
+    review_note: str | None
+
+
+class TLSCertificateResponse(BaseModel):
+    """One certificate as an object that outlives any single hostname.
+
+    Design B's view: the same certificate is legitimately seen by the probe, by
+    Certificate Transparency and by a provider, so the interesting question — "is a
+    certificate of ours served somewhere that is not ours?" — is asked of the
+    certificate. `foreign_sightings` is the count the list sorts by eye, and
+    `sightings` is where the review workflow acts.
+    """
+
+    id: uuid.UUID
+    fingerprint_sha256: str
+    fingerprint_sha1: str | None
+    #: Subject Public Key Info digest: the identity that survives a re-issue.
+    spki_sha256: str | None
+    serial_hex: str | None
+    subject_dn: str | None
+    issuer_dn: str | None
+    not_before: datetime | None
+    not_after: datetime | None
+    san_dns: list[str]
+    key_algo: str | None
+    #: Which kind of evidence created the row first: `our_probe`, `ct` or `provider`.
+    origin: str
+    first_seen_at: datetime
+    last_seen_at: datetime
+    sightings: list[TLSCertificateSightingResponse]
+    foreign_sightings: int
+
+
+class TLSCertificatePageResponse(PaginatedResponse[TLSCertificateResponse]):
+    """A page of the review list with the counters the table pages by."""
+
+    items: list[TLSCertificateResponse]
+
+
+@router.get("/certificates", response_model=TLSCertificatePageResponse)
 async def list_certificates(
     request: Request,
     verdict: str | None = Query(None, pattern="^(candidate|expected|shared_infrastructure|confirmed_foreign|rejected)$"),
@@ -319,10 +563,18 @@ async def list_certificates(
 
     items, total = await identities_payload(db, verdict=verdict, foreign_only=foreign_only, page=page, size=size)
     await AuditLogger.emit_background(db, action="dns_security.certificates.list", ip_address=extract_ip(request), user_id=user.id, details={"verdict": verdict, "foreign_only": foreign_only, "count": len(items), "total": total})
-    return PaginatedResponse(items=items, total=total, page=page, size=size, pages=math.ceil(total / size) if size else 0)
+    # The projection stays the service's; what the boundary adds is the contract. A key
+    # the composer drops is a failure here instead of a blank cell in the triage view.
+    return TLSCertificatePageResponse(
+        items=[TLSCertificateResponse.model_validate(item) for item in items],
+        total=total,
+        page=page,
+        size=size,
+        pages=math.ceil(total / size) if size else 0,
+    )
 
 
-@router.patch("/certificates/sightings/{sighting_id}")
+@router.patch("/certificates/sightings/{sighting_id}", response_model=TLSSightingReview)
 async def review_certificate_sighting(
     sighting_id: uuid.UUID,
     payload: CertificateVerdict,
@@ -343,10 +595,14 @@ async def review_certificate_sighting(
         raise NotFoundException("Certificate sighting not found")
     await AuditLogger.emit(db, action=f"tls.sighting.{payload.verdict}", ip_address=extract_ip(request), user_id=user.id, details={"sighting_id": str(sighting.id), "identity_id": str(sighting.identity_id), "ip": sighting.ip, "port": sighting.port, "source": sighting.source, "subject": sighting.subject, "note": payload.note}, require_persistence=True, commit=False)
     await db.commit()
-    return {"id": str(sighting.id), "verdict": sighting.verdict, "reviewed_at": sighting.reviewed_at}
+    return TLSSightingReview(
+        id=str(sighting.id),
+        verdict=sighting.verdict,
+        reviewed_at=sighting.reviewed_at,
+    )
 
 
-@router.get("/certificate-exceptions", response_model=list[dict])
+@router.get("/certificate-exceptions", response_model=list[CertificateScopeExceptionResponse])
 async def list_certificate_exceptions(
     request: Request,
     db: AsyncSession = Depends(get_db),
@@ -360,7 +616,7 @@ async def list_certificate_exceptions(
     return items
 
 
-@router.post("/certificate-exceptions", status_code=201)
+@router.post("/certificate-exceptions", status_code=201, response_model=CertificateScopeExceptionCreated)
 async def create_certificate_exception(
     payload: CertificateExceptionCreate,
     request: Request,

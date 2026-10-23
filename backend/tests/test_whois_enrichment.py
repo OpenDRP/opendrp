@@ -69,7 +69,8 @@ def _db() -> AsyncMock:
 
 
 def _patch_whois(monkeypatch, payload) -> None:
-    monkeypatch.setattr(whois_module.whois, "whois", lambda _domain: payload)
+    """Replace the lookup, not the guard: every hop is the client's business."""
+    monkeypatch.setattr(whois_module, "lookup", lambda _domain: payload)
 
 
 @pytest.fixture(autouse=True)
@@ -136,7 +137,7 @@ async def test_a_name_nobody_registered_is_an_answer_rather_than_a_failure(monke
     def _no_match(_domain):
         raise PywhoisError('No match for "evil.example".')
 
-    monkeypatch.setattr(whois_module.whois, "whois", _no_match)
+    monkeypatch.setattr(whois_module, "lookup", _no_match)
     db = _db()
 
     assert await WhoisService(db).enrich(_Threat()) == whois_module.NO_RECORD
@@ -148,7 +149,7 @@ async def test_a_row_that_already_carries_the_facts_is_not_asked_about(monkeypat
     """The candidate row is the cache (WI-25): a complete row costs no query."""
     asked: list[str] = []
     monkeypatch.setattr(
-        whois_module.whois, "whois", lambda domain: asked.append(domain) or {}
+        whois_module, "lookup", lambda domain: asked.append(domain) or {}
     )
     threat = _Threat(
         registrar="Original Registrar",
@@ -276,7 +277,7 @@ async def test_a_registrar_lookup_failure_leaves_the_finding_untouched(monkeypat
     def _boom(_domain):
         raise RuntimeError("whois server unreachable")
 
-    monkeypatch.setattr(whois_module.whois, "whois", _boom)
+    monkeypatch.setattr(whois_module, "lookup", _boom)
     threat = _Threat()
     db = _db()
 

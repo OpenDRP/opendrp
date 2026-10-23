@@ -168,6 +168,19 @@ def _platform_version() -> str:
     return __version__
 
 
+def _public_routes() -> int:
+    """The routes the route-access gate lets through without a capability.
+
+    Read from the gate's own map, not from the routers: whether a route requires
+    a capability is decided by the dependency it attaches, and the gate is the
+    one place that enumerates the exceptions. A count in this file would agree
+    with itself while the surface it describes grew.
+    """
+    from tests.test_route_access_gate import _PUBLIC_REASONS
+
+    return len(_PUBLIC_REASONS)
+
+
 @dataclass(frozen=True)
 class Claim:
     #: Page a reader lands on, relative to the checkout root.
@@ -288,6 +301,16 @@ _CLAIMS: tuple[Claim, ...] = (
         pattern=r"alert worker (\d+) seconds",
         source=lambda: _compose_grace_seconds("celery-worker-alerts"),
         source_name="docker-compose.yml services.celery-worker-alerts.stop_grace_period",
+    ),
+    # ---- the public surface the route-access gate leaves open ---------------
+    # Not an appendix measurement: the page states a current guarantee about the
+    # endpoints that need no capability, so it is compared like any other bound.
+    Claim(
+        page="docs/production-readiness.md",
+        promise="this many routes are public without a capability",
+        pattern=r"one of the (\w+) named public routes",
+        source=_public_routes,
+        source_name="tests.test_route_access_gate._PUBLIC_REASONS",
     ),
     # ---- the version a page pins to this checkout ---------------------------
     Claim(

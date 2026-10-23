@@ -243,7 +243,12 @@ describe("SettingsPage", () => {
     expect(document.body.textContent).not.toContain("new-secret-9999");
     fireEvent.click(screen.getByRole("button", { name: "Remove key" }));
     await waitFor(() => expect(clearSourceAccountApiKeyMock).toHaveBeenCalledWith("account-1"));
-  });
+    // Four sequential render-and-wait steps over the whole settings page. It runs
+    // in about a second unwrapped and passed five under instrumentation, which is
+    // why the test above it already carries this budget: without it, a full
+    // `test:coverage` run intermittently timed out here while the same test passed
+    // in isolation.
+  }, 15000);
 
   it("creates and approves a provider account quota explicitly", async () => {
     listConnectorsMock.mockResolvedValue([{ id: "netlas-one", name: "netlas-exposure", connector_type: "exposure", status: "disabled", provider: "netlas", has_token: true }]);
@@ -369,7 +374,7 @@ describe("SettingsPage", () => {
     expect(screen.getByText(/Shown once/)).toBeInTheDocument();
   });
 
-  it("revokes a connector credential without dropping the connector", async () => {
+  it("asks before revoking a connector credential, then keeps the connector", async () => {
     const user = userEvent.setup();
     listConnectorsMock.mockResolvedValue([
       {
@@ -386,12 +391,48 @@ describe("SettingsPage", () => {
     renderPage();
     await screen.findByDisplayValue("smtp.example.com");
 
+    // The button sits beside "Rotate credential"; a misclick would stop the
+    // worker claiming work until a new token is issued and its container recreated.
     await user.click(screen.getByRole("button", { name: "Revoke" }));
+    expect(revokeConnectorTokenMock).not.toHaveBeenCalled();
+    const dialog = screen.getByRole("dialog");
+    expect(within(dialog).getByText(/can no longer claim work/)).toBeInTheDocument();
+
+    await user.click(within(dialog).getByRole("button", { name: "Revoke credential" }));
 
     await waitFor(() => expect(revokeConnectorTokenMock).toHaveBeenCalledWith("connector-1"));
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
     expect(toastMock).toHaveBeenCalledWith(
       expect.objectContaining({ title: "Credential revoked for shodan" }),
     );
+  });
+
+  it("reads and keeps a schedule minute the API allows off the five-minute grid", async () => {
+    // The API accepts 0..59; the control used to offer only a five-minute grid. A
+    // stored 17 was not drawable, so it rendered blank — and Radix answers a value
+    // it cannot resolve with `onValueChange("")`, which this form stores as 0 and
+    // marks dirty. That made the next save of an *unrelated* field move the scan.
+    getSettingsMock.mockResolvedValue({
+      ...settings,
+      schedule_phishing: { days: [1, 2, 3, 4, 5], hour: 2, minute: 17 },
+    });
+    const user = userEvent.setup();
+    renderPage();
+    await screen.findByDisplayValue("smtp.example.com");
+
+    // The phishing schedule is the first one rendered, so its minute control is
+    // the first "Minute" trigger on the page.
+    expect(screen.getAllByLabelText("Minute")[0]).toHaveTextContent("17");
+
+    await user.click(screen.getByRole("switch", { name: "Enable email alerts" }));
+    await user.click(screen.getByRole("button", { name: "Save settings" }));
+
+    await waitFor(() => expect(updateSettingsMock).toHaveBeenCalled());
+    const payload = updateSettingsMock.mock.calls[0][0];
+    // Nothing touched the schedule, so nothing about it may travel — least of all
+    // a minute the page invented while rendering it.
+    expect(payload).not.toHaveProperty("schedule_phishing");
+    expect(payload).not.toHaveProperty("schedule_phishing_minute");
   });
 
   it("saves notification settings and reports connector status changes", async () => {
@@ -519,6 +560,8 @@ describe("SettingsPage", () => {
     15000,
   );
 
+  // The render plus the typed fields run past the 5 s default on a loaded CI
+  // runner; the neighbour above carries the same bound for the same reason.
   it("surfaces SMTP test-email errors", async () => {
     const user = userEvent.setup();
     sendTestEmailMock.mockRejectedValueOnce({ response: { data: { detail: "SMTP unavailable" } } });
@@ -531,5 +574,5 @@ describe("SettingsPage", () => {
         expect.objectContaining({ variant: "destructive", title: "Test email failed" }),
       ),
     );
-  });
+  }, 15000);
 });

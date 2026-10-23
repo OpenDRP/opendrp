@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING
 from datetime import datetime
 import uuid
 
-from sqlalchemy import JSON, Uuid, ForeignKey, String, Boolean, DateTime, Integer, Text, func
+from sqlalchemy import JSON, Uuid, ForeignKey, Index, String, Boolean, DateTime, Integer, Text, func
 from sqlalchemy.ext.mutable import MutableDict
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -15,6 +15,13 @@ if TYPE_CHECKING:
 
 class Report(Base, UUIDMixin, TimestampMixin):
     __tablename__ = "reports"
+    __table_args__ = (
+        # The list's default order, and the count `POST /generate` takes before it
+        # admits another job (pending + generating). Both are declared here as in
+        # the baseline: the test schema is built from these models.
+        Index("ix_reports_created_at", "created_at"),
+        Index("ix_reports_status", "status"),
+    )
 
     report_name: Mapped[str] = mapped_column(String(255), nullable=False)
     created_by: Mapped[uuid.UUID | None] = mapped_column(

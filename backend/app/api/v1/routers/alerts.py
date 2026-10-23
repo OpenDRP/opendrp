@@ -7,10 +7,11 @@ import ssl
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import NamedTuple
+from typing import Literal, NamedTuple
 
 import httpx
 from fastapi import APIRouter, Depends, Request
+from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import extract_ip, get_db, require_admin, require_active_account
@@ -24,6 +25,7 @@ from app.core.outbound import (
 )
 from app.core.config import settings as core_settings
 from app.models.settings import SystemSettings
+from app.schemas.common import HealthState
 from app.services import alert_health_cache
 from app.services.settings_service import SettingsService
 
@@ -211,13 +213,68 @@ async def _bounded_smtp_probe(s: SystemSettings, timeout: float) -> ProbeResult:
         return ProbeResult("failed", f"SMTP check failed: {type(exc).__name__}", int(timeout * 1000))
 
 
-@router.get("/queue")
+class AlertQueueItem(BaseModel):
+    """One delivery in the operator's queue, newest last.
+
+    `batch_id` is nullable although the client types it as a string: the column is
+    nullable, the route copies it as-is, and a delivery created outside a batch sends
+    `null`. Declaring it `str` would turn one such row into a 500 for the whole
+    listing. `status` stays a string for the same reason a queue must not refuse to
+    render: the state machine is the service's, and an unrecognised value is something
+    an operator needs to see rather than a reason to hide the page.
+    """
+
+    id: str
+    batch_id: str | None
+    job_id: str | None
+    channel: str
+    status: str
+    attempts: int
+    acknowledged_parts: int
+    #: How many parts the delivery was split into; `acknowledged_parts` says how many
+    #: the provider accepted.
+    parts: int
+    last_error: str | None
+    next_attempt_at: datetime | None
+
+
+class AlertQueueSummary(BaseModel):
+    """The queue's counters and its most recent rows.
+
+    `counts` is keyed by the statuses the table actually holds — a map of what exists,
+    not a model of every state the machine allows — so a new status appears here
+    without a code change.
+    """
+
+    counts: dict[str, int]
+    items: list[AlertQueueItem]
+
+
+@router.get("/queue", response_model=AlertQueueSummary)
 async def alert_queue_status(db: AsyncSession = Depends(get_db), user=Depends(require_admin)):
+    """The queue's counters and its fifty newest deliveries, for an administrator."""
     from sqlalchemy import func, select
     from app.models.alert_delivery import AlertDelivery
     counts = (await db.execute(select(AlertDelivery.status, func.count(AlertDelivery.id)).group_by(AlertDelivery.status))).all()
     recent = (await db.execute(select(AlertDelivery).order_by(AlertDelivery.created_at.desc()).limit(50))).scalars().all()
-    return {"counts": {status: count for status, count in counts}, "items": [{"id": str(row.id), "batch_id": row.batch_id, "job_id": str(row.job_id) if row.job_id else None, "channel": row.channel, "status": row.status, "attempts": row.attempts, "acknowledged_parts": row.acknowledged_parts, "parts": len(row.parts or []), "last_error": row.last_error, "next_attempt_at": row.next_attempt_at} for row in recent]}
+    return AlertQueueSummary(
+        counts={status: int(count) for status, count in counts},
+        items=[
+            AlertQueueItem(
+                id=str(row.id),
+                batch_id=row.batch_id,
+                job_id=str(row.job_id) if row.job_id else None,
+                channel=row.channel,
+                status=row.status,
+                attempts=row.attempts,
+                acknowledged_parts=row.acknowledged_parts,
+                parts=len(row.parts or []),
+                last_error=row.last_error,
+                next_attempt_at=row.next_attempt_at,
+            )
+            for row in recent
+        ],
+    )
 
 
 @router.get("/recipients")
@@ -432,6 +489,72 @@ async def _telegram_state(s: SystemSettings, *, ttl_seconds: int) -> ChannelStat
         from_cache=outcome.from_cache,
         blocked_reason=outcome.blocked_reason,
     )
+
+
+class AlertDeliveryCounts(BaseModel):
+    """The queue's rows by status, one counter per state a delivery can be in."""
+
+    pending: int
+    delivering: int
+    sent: int
+    failed: int
+    cancelled: int
+    ambiguous: int
+
+
+class AlertDeliverySummary(BaseModel):
+    """One channel's delivery queue, beside its probe.
+
+    A probe answers "can this installation reach the provider?"; this answers "are
+    the messages leaving?". Both are published because a channel whose handshake
+    succeeds can still hold a queue, and `degraded_reason` is how the payload says
+    so without prose.
+    """
+
+    counts: AlertDeliveryCounts
+    #: ISO text: the aggregate converts the timestamp itself, so the offset the
+    #: database hands back does not reach the browser.
+    oldest_unresolved_at: str | None
+    oldest_unresolved_age_seconds: int | None
+    retrying: int
+    stuck: int
+    degraded_reason: str | None
+
+
+class AlertChannelHealth(BaseModel):
+    """One alert channel's probe and queue, in the shape both readers get.
+
+    `checked_at` is text because the probe and its cache write it as text, and
+    `from_cache` is what tells a reader that a recent `checked_at` describes an
+    earlier handshake rather than this request.
+    """
+
+    channel: str
+    label: str
+    enabled: bool
+    configured: bool
+    health: HealthState
+    message: str
+    latency_ms: int | None
+    probe_state: Literal["ok", "saturated", "timeout", "skipped"]
+    checked_at: str | None
+    from_cache: bool
+    delivery: AlertDeliverySummary
+
+
+class AlertDeliveryQueue(BaseModel):
+    """Holds and retry windows are keyed by a digest of channel+target, so the
+    count is stated once for the installation rather than guessed per channel."""
+
+    waiting_recipients: int
+
+
+class AlertChannelsHealthResponse(BaseModel):
+    """The alert-health envelope, shared by `/alerts/health` and the dashboard."""
+
+    items: list[AlertChannelHealth]
+    delivery_queue: AlertDeliveryQueue
+    generated_at: datetime
 
 
 async def channel_health_payload(

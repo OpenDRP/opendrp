@@ -30,6 +30,7 @@ from app.services.tls_identity_service import (
     project_observations,
     record_verdict,
     run_certificate_sweep,
+    sighting_subjects,
 )
 
 NOW = datetime(2026, 1, 1, tzinfo=timezone.utc)
@@ -406,6 +407,132 @@ async def test_key_reuse_and_unexpected_issuance_are_their_own_findings(db_sessi
     )
     await db_session.commit()
     assert (await evaluate_identities(db_session, now=NOW))["queued"]["R3"] == 0
+
+
+@pytest.mark.asyncio
+async def test_a_ct_record_as_the_worker_writes_it_becomes_an_identity(db_session):
+    """The historical CT shape is the worker's, not the test's.
+
+    `_ct_exact_check` and the subdomain sweep both name the certificate with
+    `metadata.id` alone — no `fingerprint_sha256` — because the storage identity is
+    keyed by that id. The projector read every spelling except that one, so the rows
+    the CT connector actually submits produced no identity and no sighting: R2/R3 and
+    the review list only ever saw the single selected certificate per domain. The
+    older test happened to feed both keys, which is why the gap was invisible.
+    """
+    ct = await source(db_session, name="dns-ctlogs", source="ctlogs")
+    historical = "c" * 64
+    await feed(
+        db_session,
+        ct,
+        [
+            {
+                "observation_type": "certificate",
+                "subject": "shop.example.com",
+                "value": "shop.example.com",
+                "status": "historical",
+                "expires_at": (NOW + timedelta(days=60)).isoformat(),
+                "metadata": {
+                    "id": historical,
+                    "not_before": (NOW - timedelta(days=10)).isoformat(),
+                    "source_domain": "shop.example.com",
+                    "wildcard": False,
+                    "certificate_match": "shop.example.com",
+                    "lookup": "exact",
+                    "issuer": "CN=Other CA",
+                    "evidence": "certificate_transparency_historical_not_dns_proof",
+                },
+            }
+        ],
+    )
+    await project(db_session)
+
+    identity = (
+        await db_session.execute(
+            select(TLSCertificateIdentity).where(
+                TLSCertificateIdentity.fingerprint_sha256 == historical
+            )
+        )
+    ).scalar_one()
+    assert identity.origin == "ct"
+    sightings = list((await db_session.execute(select(TLSCertificateSighting))).scalars())
+    assert [(item.subject, item.ip, item.source) for item in sightings] == [
+        ("shop.example.com", None, "ctlogs")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_one_certificate_served_for_two_names_keeps_both_subjects(db_session):
+    """AUD-037: the sighting key has no subject, so the second name disappeared.
+
+    One certificate on one address and port is one sighting — that is the point of
+    the key — but the hostnames it is served for are evidence, and the rule that
+    asks "was this issued for our name" must evaluate every one of them. The
+    subjects are recorded on the sighting and R3 reads the set rather than the
+    single name that happened to win the projection.
+    """
+    probe = await source(db_session, name="dns-tlsprobe", source="tlsprobe")
+    hosts = ("shop.example.com", "beta.example.com")
+    await feed(
+        db_session,
+        probe,
+        [row for host in hosts for row in (probe_observation(host), certificate_observation(host))],
+    )
+    ct = await source(db_session, name="dns-ctlogs", source="ctlogs")
+    counterfeit = "e" * 64
+    await feed(
+        db_session,
+        ct,
+        [
+            {
+                "observation_type": "certificate",
+                "subject": host,
+                "value": host,
+                "status": "historical",
+                "expires_at": (NOW + timedelta(days=60)).isoformat(),
+                "metadata": {
+                    "id": counterfeit,
+                    "fingerprint_sha256": counterfeit,
+                    "ip": "203.0.113.99",
+                    "port": 443,
+                    "issuer": "CN=Other CA",
+                    "not_before": (NOW + timedelta(days=1)).isoformat(),
+                    "source_domain": host,
+                    "lookup": "exact",
+                },
+            }
+            for host in hosts
+        ],
+    )
+    await project(db_session)
+
+    identity = (
+        await db_session.execute(
+            select(TLSCertificateIdentity).where(
+                TLSCertificateIdentity.fingerprint_sha256 == counterfeit
+            )
+        )
+    ).scalar_one()
+    sighting = (
+        await db_session.execute(
+            select(TLSCertificateSighting).where(
+                TLSCertificateSighting.identity_id == identity.id
+            )
+        )
+    ).scalar_one()
+    assert sorted(sighting_subjects(sighting)) == sorted(hosts)
+    payload, _total = await identities_payload(db_session, size=10)
+    assert sorted(payload[0]["sightings"][0]["subjects"]) == sorted(hosts)
+
+    result = await evaluate_identities(db_session, now=NOW)
+    await db_session.commit()
+    assert result["queued"]["R3"] == 2
+    issued = sorted(
+        event.payload["host"]
+        for event in await notifications(db_session)
+        if event.payload.get("rule") == "tls.certificate.unexpected"
+    )
+    assert issued == sorted(hosts)
 
 
 @pytest.mark.asyncio

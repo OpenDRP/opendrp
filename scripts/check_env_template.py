@@ -71,6 +71,7 @@ Exit codes: 0 clean, 1 findings, 2 unreadable input.
 from __future__ import annotations
 
 import argparse
+import ast
 import re
 import sys
 from pathlib import Path
@@ -156,9 +157,6 @@ COMPOSE_VAR_RE = re.compile(r"\$\$?\{([A-Za-z_][A-Za-z0-9_]*)")
 #: services, networks and volumes in these files are lowercase.
 COMPOSE_LITERAL_RE = re.compile(r"^\s+([A-Z][A-Z0-9_]*)\s*:\s*(.+)$")
 ASSIGNMENT_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
-SETTINGS_FIELD_RE = re.compile(
-    r"^\s{4}([A-Z][A-Z0-9_]*)\s*:.*?=\s*Field\(", re.MULTILINE
-)
 
 
 class Finding:
@@ -224,11 +222,36 @@ def template_entries(template: Path) -> tuple[Dict[str, str], Set[str]]:
 
 
 def settings_fields(settings_file: Path) -> Set[str]:
-    """Field names declared by the application's ``Settings`` model."""
+    """Field names declared by the application's ``Settings`` model.
+
+    Read with the parser, because the question rule 3 asks is "is this a field
+    of the model" and a declaration may carry ``Field(...)`` or a plain default.
+    The scanner used to key off the ``Field(`` spelling, which silently
+    exempted five fields of the shipped model — `AUDIT_ARCHIVE_DIR`,
+    `AUDIT_RETENTION_HOLD`, `ALERT_PHISHING_DIGEST_ENABLED`,
+    `ALERT_CANDIDATE_CHANGE_NOTIFICATIONS` and `ALERT_BREACH_NOISE_POLICY` —
+    from the rule that a documented setting has to reach a container.
+
+    Only the ``Settings`` class body counts: an annotated attribute of a helper
+    class in the same module is a constant, not an operator's knob.
+    """
     if not settings_file.is_file():
         return set()
-    text = _without_comment_lines(_read(settings_file))
-    return set(SETTINGS_FIELD_RE.findall(text))
+    try:
+        tree = ast.parse(_read(settings_file))
+    except SyntaxError:
+        return set()
+
+    names: Set[str] = set()
+    for node in tree.body:
+        if not isinstance(node, ast.ClassDef) or node.name != "Settings":
+            continue
+        for statement in node.body:
+            if isinstance(statement, ast.AnnAssign) and isinstance(
+                statement.target, ast.Name
+            ):
+                names.add(statement.target.id)
+    return names
 
 
 def connector_scope(roots: Iterable[Path]) -> tuple[Set[str], str]:

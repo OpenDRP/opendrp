@@ -881,6 +881,41 @@ async def test_exposure_finding_survives_a_non_canonical_stored_asset(db_session
     assert await _stored() == 2
 
 
+@pytest.mark.asyncio
+async def test_a_junk_value_in_the_scan_parameters_cannot_match(db_session):
+    """The membership test skips a value that is not a name or an address.
+
+    ``jobs.params`` is written by the core from the inventory, but an upgraded
+    installation can hold whatever an older build accepted. A value the
+    canonicalizer refuses contributes nothing to the comparison instead of
+    failing the whole finding — the operator loses a correct finding otherwise.
+    """
+    connector = Connector(
+        name=f"conn-exposure-{uuid.uuid4().hex[:8]}",
+        connector_type="exposure",
+        status="enabled",
+        default_job_type="exposure.netlas",
+    )
+    db_session.add(connector)
+    await db_session.flush()
+    job = Job(
+        job_type="exposure.netlas",
+        status="running",
+        title="exposure snapshot",
+        params={"domains": ["example.com", "!! not a name !!", ""], "ips": []},
+    )
+    db_session.add(job)
+    await db_session.commit()
+
+    assert await ingest_exposure(
+        db_session,
+        connector,
+        {"subject": "www.example.com", "matched_asset": "example.com", "port": 443},
+        connector_name=connector.name,
+        job_id=job.id,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Alert-mock helpers
 # ---------------------------------------------------------------------------

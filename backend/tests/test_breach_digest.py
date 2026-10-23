@@ -455,6 +455,34 @@ async def test_the_noise_policy_is_read_at_drain_time_not_at_ingest(
 
 
 @pytest.mark.asyncio
+async def test_the_pass_reports_the_backlog_it_did_not_reach(
+    db_session, breaches_connector, mailbox
+):
+    """AUD-088: `remaining` is the backlog, not the rest of the fetched window.
+
+    A pass reads at most one message's worth of incidents. Until this test, the
+    answer subtracted what it queued from what it *fetched*, so a pass that used
+    its whole window reported `remaining: 0` while twenty incidents were still
+    held — a digest several passes behind read as finished.
+    """
+    await configured_email(db_session)
+    await save_budget(db_session, alert_breach_digest_threshold=1)
+    job = await scan(db_session, breaches_connector, "window")
+    await scan_incidents(db_session, breaches_connector, job, 30)
+    await finish(db_session, job)
+    await dispatch_notification_events(db_session)
+
+    first = await queue_breach_digest(db_session, limit=10)
+    assert first == {"queued": 10, "incidents": 10, "remaining": 20}
+
+    second = await queue_breach_digest(db_session, limit=10)
+    assert second == {"queued": 10, "incidents": 10, "remaining": 10}
+
+    third = await queue_breach_digest(db_session, limit=10)
+    assert third == {"queued": 10, "incidents": 10, "remaining": 0}
+
+
+@pytest.mark.asyncio
 async def test_a_digest_that_cannot_be_delivered_keeps_its_backlog(
     db_session, breaches_connector, mailbox
 ):

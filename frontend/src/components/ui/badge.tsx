@@ -7,9 +7,11 @@ const badgeVariants = cva(
   {
     variants: {
       variant: {
-        default: "border-transparent bg-primary text-primary-foreground shadow hover:bg-primary/80",
+        // The hover fills are the darker tokens rather than `/80`, which blends
+        // toward the page and drops the label below AA while hovered.
+        default: "border-transparent bg-primary text-primary-foreground shadow hover:bg-primary-hover",
         secondary: "border-transparent bg-secondary text-secondary-foreground hover:bg-secondary/80",
-        destructive: "border-transparent bg-destructive text-destructive-foreground shadow hover:bg-destructive/80",
+        destructive: "border-transparent bg-destructive text-destructive-foreground shadow hover:bg-destructive-hover",
         outline: "text-foreground",
       },
     },

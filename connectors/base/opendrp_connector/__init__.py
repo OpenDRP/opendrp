@@ -9,4 +9,4 @@ the two disagree.
 from .base import ConnectorBase, ConnectorPreflightError
 
 __all__ = ["ConnectorBase", "ConnectorPreflightError"]
-__version__ = "0.2.0"
+__version__ = "0.2.1"

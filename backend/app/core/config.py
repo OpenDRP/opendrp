@@ -20,6 +20,11 @@ JWT_ALGORITHMS_ALLOWED = frozenset({"HS256", "HS384", "HS512"})
 #: imports this name the other way round.
 BREACH_NOISE_POLICIES: tuple[str, ...] = ("store_only_spam", "verified_only", "all")
 
+#: Every value ``APP_ENV`` accepts. `test` and `integration` are real values here
+#: because CI sets them (`.github/workflows/ci.yml`) and two seams key on `test`
+#: (the login limiter and scan admission, which have no Redis in that job).
+_APP_ENVIRONMENTS = frozenset({"development", "test", "integration", "production"})
+
 _INSECURE_SECRET_MARKERS = (
     "changethis",
     "change-me",
@@ -91,8 +96,16 @@ class Settings(BaseSettings):
     # the repository. Production still requires an explicit environment value.
     JWT_SECRET_KEY: str = Field(default_factory=_development_jwt_secret)
     JWT_ALGORITHM: str = Field(default="HS256")
-    JWT_ACCESS_TOKEN_EXPIRE_MINUTES: int = Field(default=15)
-    JWT_REFRESH_TOKEN_EXPIRE_DAYS: int = Field(default=3)
+    # Bounded, because these two are read straight into the token claims: a
+    # lifetime of `0` mints a token that is already expired and a negative one a
+    # token that expired before it was signed, so every login would answer 200
+    # with a credential the API then rejects. Nothing downstream re-checks them.
+    # The upper bounds are the point at which the value stops being a session
+    # lifetime: an access token that outlives a day defeats revocation by expiry,
+    # and a refresh token longer than the audit retention is history, not a
+    # session.
+    JWT_ACCESS_TOKEN_EXPIRE_MINUTES: int = Field(default=15, ge=1, le=1440)
+    JWT_REFRESH_TOKEN_EXPIRE_DAYS: int = Field(default=3, ge=1, le=3650)
     # Always true for an installation. A browser only sends a Secure cookie over
     # HTTPS, and the one exception - `localhost`, which every browser treats as a
     # trustworthy origin - is what keeps http://localhost:3000 usable for checking
@@ -120,6 +133,12 @@ class Settings(BaseSettings):
     # the audit pipeline from amplifying one credential. 0 disables the check.
     # See app/core/request_rate_limit.py.
     AUTHENTICATED_RATE_LIMIT_PER_MINUTE: int = Field(default=600, ge=0)
+    #: Validated against a closed vocabulary rather than left as a free string: the
+    #: only thing this value does is decide whether the production checks run, so a
+    #: typo does not fail — it *silently* answers "not production" and switches off
+    #: the secret refusals, the cookie-Secure check and the API-documentation
+    #: shutdown at once. `prod`, `Production ` (with a space) and `staging` all read
+    #: like a deployment and are not one.
     APP_ENV: str = Field(default="development")
     # Pinned image/release identifier. Production deployments must provide a
     # semantic version rather than the moving `latest` tag.
@@ -822,6 +841,28 @@ class Settings(BaseSettings):
         if normalized not in allowed:
             raise ValueError(
                 f"LOG_LEVEL must be one of {sorted(allowed)}, got {v!r}"
+            )
+        return normalized
+
+    @field_validator("APP_ENV")
+    @classmethod
+    def _validate_app_env(cls, v: str) -> str:
+        """Refuse an environment name the platform does not recognise.
+
+        The value is a switch, not a label: `production` turns on the secret
+        refusals, the cookie-Secure check, the pinned-version check and the
+        shutdown of `/api/docs`, and nothing else reads it except two test-only
+        seams. A value that is not in the vocabulary used to be accepted as "not
+        production" — so `APP_ENV=prod`, `APP_ENV=Production ` (trailing space) or
+        `APP_ENV=staging` produced a deployment that served API documentation in
+        public and skipped every production check, with no message saying so. A
+        typo has to be a startup failure for the same reason a malformed secret
+        is.
+        """
+        normalized = str(v or "").strip().lower()
+        if normalized not in _APP_ENVIRONMENTS:
+            raise ValueError(
+                f"APP_ENV must be one of {sorted(_APP_ENVIRONMENTS)}, got {v!r}"
             )
         return normalized
 

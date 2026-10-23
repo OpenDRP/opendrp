@@ -666,7 +666,13 @@ class AlertDeliveryService:
                 # The facts are read from the module's own rows as they stand now,
                 # not from the payload captured when the finding arrived: a delivery
                 # that was retried sends the state of the world it is sent in.
-                # A digest batch says what it is. `digest` is set by the pass that
+                # A digest batch says what it is — and counts only itself: the
+                # group total counts every delivery queued for this channel and
+                # target, including the alerts already sent, so a summary of four
+                # candidates would otherwise report seven in a chat while its own
+                # subject said four. An ordinary alert keeps the group total: its
+                # count is the batch the reader is being told about.
+                # `digest` is set by the pass that
                 # built the band (WI-10), and the group it lands in is the ordinary
                 # one — same queue, same retry policy, same recipient rotation — so
                 # only the words change: a summary of eighty look-alikes is not "80
@@ -676,8 +682,12 @@ class AlertDeliveryService:
                 # A batch that is not entirely a digest is an alert — calling it a
                 # summary of candidates below the threshold would be a lie about its
                 # own contents.
-                if all(row.payload.get("digest") for row in rows):
-                    label, subject = digest_heading(len(rows), rows[0].threat_type)
+                counted_noun, counted_tail = "new finding", ""
+                is_digest = all(row.payload.get("digest") for row in rows)
+                if is_digest:
+                    label, subject, counted_noun, counted_tail = digest_heading(
+                        len(rows), rows[0].threat_type
+                    )
                 else:
                     label, subject = (
                         rows[0].threat_type.removeprefix("module:"),
@@ -690,7 +700,7 @@ class AlertDeliveryService:
                         change = _breach_subject_class([row.payload for row in rows])
                         if change is not None:
                             subject = f"{subject} ({change})"
-                notification = service._build_notification(total_count=group_total, threat_type=rows[0].threat_type, label=label, subject=subject, findings=[row.payload for row in rows], bounded=[row.payload for row in rows], job_id=rows[0].job_id, link=service._platform_link(rows[0].threat_type), stored_facts=await service._stored_message_facts(rows[0].threat_type, [row.payload for row in rows]))
+                notification = service._build_notification(threat_type=rows[0].threat_type, label=label, subject=subject, findings=[row.payload for row in rows], bounded=[row.payload for row in rows], job_id=rows[0].job_id, link=service._platform_link(rows[0].threat_type), stored_facts=await service._stored_message_facts(rows[0].threat_type, [row.payload for row in rows]), counted_noun=counted_noun, counted_tail=counted_tail, total_count=len(rows) if is_digest else group_total)
                 if channel == "telegram":
                     parts = [{"text": text} for text in telegram_parts(notification, settings.ALERT_MAX_TELEGRAM_MESSAGE_LENGTH, rows[0].batch_id)]
                 else:

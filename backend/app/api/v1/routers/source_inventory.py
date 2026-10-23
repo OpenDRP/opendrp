@@ -1,7 +1,8 @@
 import ipaddress
 import math
 import uuid
-from typing import Literal
+from datetime import datetime
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict
 
@@ -13,8 +14,13 @@ from app.api.deps import extract_ip, get_db, require_analyse, require_active_acc
 from app.core.audit import AuditLogger
 from app.models.source_observation import SourceObservation
 from app.models import Asset, AssetType, PhishingDomain
-from app.schemas.asset import AssetCreate, validate_and_normalize_asset_value
-from app.schemas.common import MAX_PAGE_SIZE
+from app.schemas.asset import (
+    AssetCreate,
+    PromotedAssetResponse,
+    validate_and_normalize_asset_value,
+)
+from app.schemas.common import MAX_PAGE_SIZE, PaginatedResponse
+from app.schemas.connector import ScanStartResponse
 from app.services.asset_service import AssetService, asset_type_value
 from app.core.exceptions import ConflictException
 from app.core.manual_rate_limit import SCOPE_ASSETS, enforce_manual_rate_limit
@@ -81,7 +87,86 @@ class ExposureTriageRequest(BaseModel):
     status: Literal["observed", "investigating", "resolved"]
 
 
-@router.post("/modules/{module_id}/scan", status_code=202)
+class ExposureObservationResponse(BaseModel):
+    """One passive exposure observation, as the inventory page reads it.
+
+    `status` is a string rather than the triage route's three values: the column
+    is free text, a row written before the vocabulary was fixed still has to
+    render, and a page that refuses to list an observation because it cannot name
+    its triage state is worse than one that shows the state it found.
+
+    `payload` is whatever the connector sent — the page reads its own service
+    fields out of it (`port`, `transport`, `protocol`) and ignores the rest — and
+    `provenance` is what the core recorded about where the row came from. Neither
+    is a shape the platform promises, which is why the phishing evidence list
+    republishes an allowlisted half beside its payload.
+    """
+
+    id: str
+    source: str
+    subject: str
+    #: Non-nullable in the column and in the answer; the SPA types it nullable only
+    #: because it renders the cell defensively.
+    matched_asset: str
+    first_seen_at: datetime
+    last_seen_at: datetime
+    #: When the provider itself observed the host, which is absent for a source that
+    #: reports only that the row exists.
+    observed_at: datetime | None
+    status: str
+    payload: dict[str, Any]
+    provenance: dict[str, Any]
+    connector_id: str | None
+    source_account_id: str | None
+
+
+class ExposureObservationListResponse(PaginatedResponse[ExposureObservationResponse]):
+    """A page of exposure observations with the counters the table pages by."""
+
+    items: list[ExposureObservationResponse]
+
+
+class ExposureTriageResponse(BaseModel):
+    """What a triage update answers: the row it changed and its new state."""
+
+    id: str
+    status: str
+
+
+class PhishingEvidenceItem(BaseModel):
+    """One sighting of a phishing candidate, from one source.
+
+    `fields` is `evidence_fields`' answer — the allowlisted half of the payload the
+    module's rules and alerts read — so its names come from `EVIDENCE_FIELDS` and a
+    value is a scalar or a list of them. It stays a map rather than sixteen
+    optional properties: the allowlist is the rule, and a second copy of it here
+    would drift from the one the list is built with.
+    """
+
+    source: str
+    matched_asset: str
+    observed_at: datetime | None
+    first_seen_at: datetime
+    last_seen_at: datetime
+    fields: dict[str, Any]
+    payload: dict[str, Any]
+    provenance: dict[str, Any]
+    connector_id: str | None
+    source_account_id: str | None
+
+
+class PhishingEvidenceResponse(BaseModel):
+    """Every sighting of one candidate: an array, not a page."""
+
+    items: list[PhishingEvidenceItem]
+
+
+@router.post(
+    "/modules/{module_id}/scan",
+    status_code=202,
+    response_model=ScanStartResponse,
+    response_model_exclude_none=True,
+)
 async def scan(module_id: str, request: Request, db: AsyncSession = Depends(get_db), user=Depends(require_analyse)):
     # The queued Job rows and the event that says the scan was requested are one
     # commit: a scan nobody asked for in the trail must not exist.
@@ -95,7 +180,7 @@ async def scan(module_id: str, request: Request, db: AsyncSession = Depends(get_
     return result
 
 
-@router.get("/exposure/observations")
+@router.get("/exposure/observations", response_model=ExposureObservationListResponse)
 async def exposure(request: Request, source: str | None = Query(None, pattern="^[a-z][a-z0-9_-]{0,99}$"), page: int = Query(1, ge=1), size: int = Query(20, ge=1, le=MAX_PAGE_SIZE), db: AsyncSession = Depends(get_db), user=Depends(require_active_account)):
     conditions = [SourceObservation.module == "exposure"]
     if source:
@@ -103,10 +188,36 @@ async def exposure(request: Request, source: str | None = Query(None, pattern="^
     total = (await db.execute(select(func.count(SourceObservation.id)).where(*conditions))).scalar_one()
     rows = list((await db.execute(select(SourceObservation).where(*conditions).order_by(SourceObservation.last_seen_at.desc()).offset((page-1)*size).limit(size))).scalars())
     await AuditLogger.emit_background(db, action="source.observations.list", user_id=user.id, ip_address=extract_ip(request), details={"module": "exposure", "total": total})
-    return {"items": [{"id": str(row.id), "source": row.source, "subject": row.subject, "matched_asset": row.matched_asset, "first_seen_at": row.first_seen_at, "last_seen_at": row.last_seen_at, "observed_at": row.observed_at, "status": row.status, "payload": row.payload, "provenance": row.provenance, "connector_id": row.connector_id, "source_account_id": row.source_account_id} for row in rows], "total": total, "page": page, "size": size, "pages": math.ceil(total/size)}
+    return ExposureObservationListResponse(
+        items=[
+            ExposureObservationResponse(
+                id=str(row.id),
+                source=row.source,
+                subject=row.subject,
+                matched_asset=row.matched_asset,
+                first_seen_at=row.first_seen_at,
+                last_seen_at=row.last_seen_at,
+                observed_at=row.observed_at,
+                status=row.status,
+                payload=row.payload,
+                provenance=row.provenance,
+                connector_id=str(row.connector_id) if row.connector_id else None,
+                source_account_id=(
+                    str(row.source_account_id) if row.source_account_id else None
+                ),
+            )
+            for row in rows
+        ],
+        total=total,
+        page=page,
+        size=size,
+        pages=math.ceil(total/size),
+    )
 
 
-@router.patch("/exposure/observations/{observation_id}")
+@router.patch(
+    "/exposure/observations/{observation_id}", response_model=ExposureTriageResponse
+)
 async def update_exposure_observation(observation_id: uuid.UUID, payload: ExposureTriageRequest, request: Request, db: AsyncSession = Depends(get_db), user=Depends(require_analyse)):
     row = await db.get(SourceObservation, observation_id)
     if row is None or row.module != "exposure":
@@ -116,10 +227,15 @@ async def update_exposure_observation(observation_id: uuid.UUID, payload: Exposu
     if previous != row.status:
         await AuditLogger.emit(db, action="exposure.observation.status_update", user_id=user.id, ip_address=extract_ip(request), details={"observation_id": str(row.id), "source": row.source, "from": previous, "to": row.status}, require_persistence=True, commit=False)
     await db.commit()
-    return {"id": str(row.id), "status": row.status}
+    return ExposureTriageResponse(id=str(row.id), status=row.status)
 
 
-@router.post("/exposure/observations/{observation_id}/asset", status_code=201)
+@router.post(
+    "/exposure/observations/{observation_id}/asset",
+    status_code=201,
+    response_model=PromotedAssetResponse,
+    response_model_exclude_none=True,
+)
 async def promote_exposure_observation(observation_id: uuid.UUID, request: Request, db: AsyncSession = Depends(get_db), user=Depends(require_analyse)):
     row = await db.get(SourceObservation, observation_id)
     if row is None or row.module != "exposure":
@@ -168,10 +284,30 @@ async def promote_exposure_observation(observation_id: uuid.UUID, request: Reque
     return {"already_exists": already_exists, "asset": asset, "source": row.source}
 
 
-@router.get("/phishing/threats/{candidate_id}/evidence")
+@router.get(
+    "/phishing/threats/{candidate_id}/evidence", response_model=PhishingEvidenceResponse
+)
 async def phishing_evidence(candidate_id: uuid.UUID, request: Request, db: AsyncSession = Depends(get_db), user=Depends(require_active_account)):
     if await db.get(PhishingDomain, candidate_id) is None:
         raise HTTPException(404, "Candidate not found")
     await AuditLogger.emit_background(db, action="source.observations.list", user_id=user.id, ip_address=extract_ip(request), details={"module": "phishing", "candidate_id": str(candidate_id)})
     rows = list((await db.execute(select(SourceObservation).where(SourceObservation.candidate_id == candidate_id).order_by(SourceObservation.last_seen_at.desc()).limit(200))).scalars())
-    return {"items": [{"source": r.source, "matched_asset": r.matched_asset, "observed_at": r.observed_at, "first_seen_at": r.first_seen_at, "last_seen_at": r.last_seen_at, "fields": evidence_fields(r.payload), "payload": r.payload, "provenance": r.provenance, "connector_id": r.connector_id, "source_account_id": r.source_account_id} for r in rows]}
+    return PhishingEvidenceResponse(
+        items=[
+            PhishingEvidenceItem(
+                source=row.source,
+                matched_asset=row.matched_asset,
+                observed_at=row.observed_at,
+                first_seen_at=row.first_seen_at,
+                last_seen_at=row.last_seen_at,
+                fields=evidence_fields(row.payload),
+                payload=row.payload,
+                provenance=row.provenance,
+                connector_id=str(row.connector_id) if row.connector_id else None,
+                source_account_id=(
+                    str(row.source_account_id) if row.source_account_id else None
+                ),
+            )
+            for row in rows
+        ]
+    )

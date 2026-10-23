@@ -16,10 +16,19 @@ Two route groups:
 import re
 import uuid
 from datetime import datetime, timedelta, timezone
+from typing import Any, Literal
 
 import structlog
 from fastapi import APIRouter, Body, Depends, Header, HTTPException, Query, Request, Response
-from pydantic import BaseModel, Field, StrictBool, StrictInt, ValidationError, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    StrictInt,
+    ValidationError,
+    field_validator,
+)
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -38,7 +47,7 @@ from app.core.exceptions import (
     UnauthorizedException,
 )
 from app.models import Connector
-from app.schemas.common import MAX_PAGE_SIZE, PaginatedResponse
+from app.schemas.common import MAX_PAGE_SIZE, HealthState, PaginatedResponse
 from app.schemas.connector import (
     MAX_CATALOGUE_ENTRIES_PER_BATCH,
     MAX_FINDINGS_PER_BATCH,
@@ -278,6 +287,171 @@ class ConnectorOut(BaseModel):
     token_last_used_at: datetime | None = None
 
     model_config = {"from_attributes": True}
+
+
+class SourceAccountPolicy(BaseModel):
+    """The quota policy an operator approves for one provider account.
+
+    The three fields are the ones the settings page renders and the approve route
+    writes; anything else the JSON column holds is forwarded rather than dropped,
+    because this is a stored document, not a table: a policy written before a field
+    was removed, or restored from a backup, is still what the operator approved.
+    `approved` defaults to `False` because the column's own default is `{}`, and an
+    empty policy means "not approved" everywhere it is read.
+    """
+
+    approved: bool = False
+    requests_per_minute: int | None = None
+    daily_budget: int | None = None
+
+    model_config = ConfigDict(extra="allow")
+
+
+class SourceAccountOut(BaseModel):
+    """One bindable provider account, as the settings page lists it.
+
+    The stored ciphertext is never part of this shape: `has_api_key` says whether
+    there is one and `api_key_hint` names the tail, which is enough to tell *which*
+    key is in use without handing an operator material they could authenticate with.
+    """
+
+    id: uuid.UUID
+    source_id: str
+    name: str
+    credential_ref: str | None = None
+    policy: SourceAccountPolicy
+    access_state: str
+    has_api_key: bool
+    api_key_hint: str | None = None
+
+
+class SourceAccountCreated(BaseModel):
+    """What `POST /connectors/accounts` answers: the id, and nothing else.
+
+    The settings page needs the id of the account it just created — to bind it or to
+    set its key — and the list is where the rest of the row comes from. Answering
+    `SourceAccountOut` here would be a second description of the same resource with
+    every other field made optional.
+    """
+
+    id: uuid.UUID
+
+
+class SourceAccountPolicyUpdated(BaseModel):
+    """What approving a policy answers: the account, and the document it stored.
+
+    `policy` is the same `SourceAccountPolicy` the list sends, because it is the same
+    stored document; the route excludes nulls so an approval that set none keeps
+    `{"approved": true}` instead of gaining two keys the operator never wrote.
+    """
+
+    id: uuid.UUID
+    policy: SourceAccountPolicy
+
+
+class SourceAccountApiKeyState(BaseModel):
+    """What setting or clearing a provider key answers — both routes, one shape.
+
+    `api_key_hint` is null rather than absent after a clear: the page has to be able
+    to tell "no key" from "the answer did not say", which is the opposite of the
+    list route's `exclude_none`. The ciphertext is never part of this shape.
+    """
+
+    id: uuid.UUID
+    has_api_key: bool
+    api_key_hint: str | None = None
+
+
+class ConnectorHealth(BaseModel):
+    """One connector's health, in the one shape every role receives.
+
+    The administrator's fields — `last_error`, the `quota_*` triple,
+    `blocked_reason` and `readiness` — are `null` for a viewer rather than absent,
+    so the page can read the shape without branching on the role. That is why the
+    route declares no `exclude_none`: here the nulls *are* the contract.
+
+    `checked_at` is text because the worker wrote it: it is copied out of the
+    readiness document, where a timestamp is whatever the worker chose to send, and
+    a `datetime` field would either refuse it or rewrite it. `readiness` and `info`
+    stay free-form because the guards that keep secrets and provider prose out of
+    them live in the composer, not in a schema.
+    """
+
+    name: str
+    connector_type: str
+    status: Literal["enabled", "disabled"]
+    health: HealthState
+    #: Liveness, not an overall verdict: a worker whose last scan failed is still
+    #: online, and the DNS page refuses to queue work against a missing heartbeat.
+    online: bool
+    last_seen_at: datetime | None
+    last_error: str | None
+    blocked_reason: str | None
+    quota_remaining: int | None
+    quota_budget: int | None
+    quota_reason: str | None
+    credentials_configured: bool
+    credential_state: Literal["valid", "invalid", "unsupported", "unknown"]
+    provider_error: str | None
+    checked_at: str | None
+    last_success_at: datetime | None
+    last_success_age_seconds: int | None
+    readiness: dict[str, Any] | None
+    info: dict[str, Any]
+
+
+class ConnectorHealthResponse(BaseModel):
+    """The health page: every connector, and when the reading was taken."""
+
+    items: list[ConnectorHealth]
+    generated_at: datetime
+
+
+class ConnectorModuleJob(BaseModel):
+    """One connector registered under a module, as the job history filters it.
+
+    `config_schema` is the connector's own manifest — per-vendor field specs the UI
+    renders — so it stays a free-form document: it describes a provider, not a shape
+    the core enforces.
+    """
+
+    name: str
+    status: Literal["enabled", "disabled"]
+    job_type: str
+    asset_types: list[str]
+    config_schema: dict[str, Any]
+
+
+class ConnectorModuleEntry(BaseModel):
+    """One module: what it declares, and the connectors that claim its work.
+
+    `label` and `description` are never null: a connector whose type no registry row
+    declares still appears here, and the composer names it after its type with an
+    empty description. `storage` is a plain string on purpose — it is the `kind`
+    field of the module's own JSON, so a module may name an adapter this build has
+    never seen, and failing the page over data that is merely newer than the code
+    would hide every other module.
+    """
+
+    label: str
+    description: str
+    job_types: list[str]
+    connectors: list[ConnectorModuleJob]
+    finding_kind: str
+    asset_types: list[str]
+    storage: str
+    builtin: bool
+    enabled: bool
+
+
+class ConnectorModulesResponse(BaseModel):
+    """The module inventory, keyed by module id.
+
+    A map rather than a model with named modules, because module ids are data: a
+    module declared after this build appears here without a code change.
+    """
+
+    modules: dict[str, ConnectorModuleEntry]
 
 
 #: What a source may report as its last provider error. The write endpoint
@@ -724,7 +898,7 @@ async def heartbeat(
 
 async def connector_health_items(
     db: AsyncSession, *, user, now: datetime | None = None
-) -> tuple[list[dict], datetime]:
+) -> tuple[list[ConnectorHealth], datetime]:
     """Generic, secret-free health rows for every registered connector.
 
     Shared by ``GET /connectors/health`` and the dashboard overview (DHP-10).
@@ -793,7 +967,7 @@ async def connector_health_items(
             else:
                 last_seen = last_seen.astimezone(timezone.utc)
             health = "degraded" if now - last_seen > stale_after else "healthy"
-        quota = await remaining_today(conn) if is_admin else None
+        quota = await remaining_today(db, conn) if is_admin else None
         blocked_reason = await _blocked_reason(conn) if is_admin else None
         # The source's own readiness report, reduced to the closed vocabulary
         # every role may see (D5). It answers the question `health` does not:
@@ -817,7 +991,7 @@ async def connector_health_items(
                 last_success = last_success.replace(tzinfo=timezone.utc)
             else:
                 last_success = last_success.astimezone(timezone.utc)
-        items.append({
+        items.append(ConnectorHealth.model_validate({
             "name": conn.name,
             "connector_type": conn.connector_type,
             "status": conn.status,
@@ -862,11 +1036,15 @@ async def connector_health_items(
                 if key in {"api_version", "version", "hostname", "python_version", "capabilities"}
                 and isinstance(value, (str, int, float, bool, list, dict, type(None)))
             },
-        })
+        }))
     return items, now
 
 
-@router.get("/health", response_model=dict, dependencies=[Depends(require_active_account)])
+@router.get(
+    "/health",
+    response_model=ConnectorHealthResponse,
+    dependencies=[Depends(require_active_account)],
+)
 async def connector_health(
     request: Request,
     db: AsyncSession = Depends(get_db),
@@ -885,7 +1063,7 @@ async def connector_health(
         db, action="connectors.health.view", ip_address=extract_ip(request),
         user_id=user.id, details={"count": len(items)},
     )
-    return {"items": items, "generated_at": now}
+    return ConnectorHealthResponse(items=items, generated_at=now)
 
 
 @router.get("", response_model=list[ConnectorOut], dependencies=[Depends(require_admin)])
@@ -905,7 +1083,11 @@ async def list_connectors(
     return [_connector_out(conn, specs) for conn in items]
 
 
-@router.get("/modules", response_model=dict, dependencies=[Depends(require_active_account)])
+@router.get(
+    "/modules",
+    response_model=ConnectorModulesResponse,
+    dependencies=[Depends(require_active_account)],
+)
 async def list_modules(
     request: Request,
     db: AsyncSession = Depends(get_db),
@@ -924,7 +1106,12 @@ async def list_modules(
         user_id=user.id,
         details={"modules": sorted(modules)},
     )
-    return {"modules": modules}
+    return ConnectorModulesResponse(
+        modules={
+            name: ConnectorModuleEntry.model_validate(entry)
+            for name, entry in modules.items()
+        }
+    )
 
 
 @router.get("/jobs", response_model=PaginatedResponse[JobResponse], dependencies=[Depends(require_admin)])
@@ -1029,15 +1216,39 @@ class SourceAccountPolicyRequest(BaseModel):
     requests_per_minute: StrictInt = Field(ge=1, le=600)
     daily_budget: StrictInt = Field(ge=1, le=100000)
 
-@router.get("/accounts", dependencies=[Depends(require_admin)])
+@router.get(
+    "/accounts",
+    response_model=list[SourceAccountOut],
+    response_model_exclude_none=True,
+    dependencies=[Depends(require_admin)],
+)
 async def list_source_accounts(db: AsyncSession = Depends(get_db)):
+    """Every source account, ordered by provider then name.
+
+    `exclude_none` keeps the policy byte-identical: `{"approved": false}` stays one
+    key instead of gaining two nulls the page would read as "no budget approved".
+    The price is that `credential_ref` and `api_key_hint` disappear on a row that
+    has neither — which is the shape the client already types them for.
+    """
     from sqlalchemy import select
     from app.models.source_account import SourceAccount
     rows = list((await db.execute(select(SourceAccount).order_by(SourceAccount.source_id, SourceAccount.name))).scalars())
-    return [{"id": row.id, "source_id": row.source_id, "name": row.name, "credential_ref": row.credential_ref, "policy": row.policy, "access_state": row.access_state, "has_api_key": bool(row.api_key_encrypted), "api_key_hint": row.api_key_hint} for row in rows]
+    return [
+        SourceAccountOut(
+            id=row.id,
+            source_id=row.source_id,
+            name=row.name,
+            credential_ref=row.credential_ref,
+            policy=SourceAccountPolicy(**(row.policy or {})),
+            access_state=row.access_state,
+            has_api_key=bool(row.api_key_encrypted),
+            api_key_hint=row.api_key_hint,
+        )
+        for row in rows
+    ]
 
 
-@router.post("/accounts")
+@router.post("/accounts", response_model=SourceAccountCreated)
 async def create_source_account(payload: SourceAccountRequest, request: Request, db: AsyncSession = Depends(get_db), user=Depends(require_admin)):
     from app.services.source_accounts import provision_account
     account, created, credential_ref_updated = await provision_account(db, **payload.model_dump())
@@ -1047,7 +1258,7 @@ async def create_source_account(payload: SourceAccountRequest, request: Request,
     return {"id": account.id}
 
 
-@router.patch("/accounts/{account_id}/policy")
+@router.patch("/accounts/{account_id}/policy", response_model=SourceAccountPolicyUpdated, response_model_exclude_none=True)
 async def update_account_policy(account_id: uuid.UUID, payload: SourceAccountPolicyRequest, request: Request, db: AsyncSession = Depends(get_db), user=Depends(require_admin)):
     from app.services.source_accounts import approve_policy
     account = await approve_policy(
@@ -1063,11 +1274,15 @@ class SourceAccountApiKeyRequest(BaseModel):
     api_key: str = Field(min_length=1, max_length=512, pattern=r"^[\x21-\x7e]+$")
 
 
-def _api_key_state(account) -> dict:
-    return {"id": account.id, "has_api_key": bool(account.api_key_encrypted), "api_key_hint": account.api_key_hint}
+def _api_key_state(account) -> SourceAccountApiKeyState:
+    return SourceAccountApiKeyState(
+        id=account.id,
+        has_api_key=bool(account.api_key_encrypted),
+        api_key_hint=account.api_key_hint,
+    )
 
 
-@router.put("/accounts/{account_id}/api-key")
+@router.put("/accounts/{account_id}/api-key", response_model=SourceAccountApiKeyState)
 async def set_source_account_api_key(account_id: uuid.UUID, payload: SourceAccountApiKeyRequest, request: Request, db: AsyncSession = Depends(get_db), user=Depends(require_admin)):
     from app.services.source_accounts import set_api_key
     account = await set_api_key(db, account_id, payload.api_key)
@@ -1076,7 +1291,7 @@ async def set_source_account_api_key(account_id: uuid.UUID, payload: SourceAccou
     return _api_key_state(account)
 
 
-@router.delete("/accounts/{account_id}/api-key")
+@router.delete("/accounts/{account_id}/api-key", response_model=SourceAccountApiKeyState)
 async def clear_source_account_api_key(account_id: uuid.UUID, request: Request, db: AsyncSession = Depends(get_db), user=Depends(require_admin)):
     from app.services.source_accounts import clear_api_key
     account = await clear_api_key(db, account_id)
@@ -1085,7 +1300,7 @@ async def clear_source_account_api_key(account_id: uuid.UUID, request: Request, 
     return _api_key_state(account)
 
 
-@router.patch("/{connector_id}/account")
+@router.patch("/{connector_id}/account", response_model=ConnectorOut)
 async def bind_source_account(connector_id: uuid.UUID, account_id: uuid.UUID, request: Request, db: AsyncSession = Depends(get_db), user=Depends(require_admin)):
     from app.models.source_account import SourceAccount
     conn, account = await db.get(Connector, connector_id), await db.get(SourceAccount, account_id)

@@ -8,6 +8,7 @@ three callers that depend on it agreeing with itself.
 
 from __future__ import annotations
 
+import os
 import uuid
 from pathlib import Path
 
@@ -85,13 +86,40 @@ class TestClassification:
             "store_evil/report.pdf",
             "report.pdf/../../etc/passwd",
             "C:\\reports\\report.pdf",
+            # A drive-relative name has a colon but no separator, so it reaches the
+            # colon rule rather than the separator one. Nothing this platform writes
+            # starts with a drive, and on Windows the OS would treat it as `C:`.
+            "C:report.pdf",
             "report.pdf\x00.txt",
+            # A single dot is the current directory, not a file name. It is refused
+            # as a name rather than resolved to the store directory.
+            ".",
+            "..",
         ],
     )
     def test_anything_with_a_directory_component_is_refused(self, _store, value):
         resolved, reason = classify_artifact(value)
         assert resolved is None
         assert reason == REASON_NOT_A_NAME
+
+    def test_a_name_beyond_the_filesystem_limit_is_refused(self, _store):
+        """255 characters is the longest name a filesystem stores, not a name.
+
+        A longer value is either a path from somewhere else or a payload aimed at
+        the audit record, so it is refused before any stat call is made.
+        """
+        too_long = "a" * 252 + ".pdf"  # 256 characters
+        resolved, reason = classify_artifact(too_long)
+        assert resolved is None
+        assert reason == REASON_NOT_A_NAME
+
+        # One character shorter is still a name, so the bound is not off by one.
+        at_limit = "a" * 251 + ".pdf"
+        assert len(at_limit) == 255
+        (store_directory() / at_limit).write_bytes(b"%PDF-1.7")
+        resolved, reason = classify_artifact(at_limit)
+        assert reason == REASON_OK
+        assert resolved is not None
 
     @pytest.mark.parametrize("value", ["report.txt", "report", "report.pdf.exe", ".pdf"])
     def test_a_suffix_the_platform_does_not_produce_is_refused(self, _store, value):
@@ -112,6 +140,50 @@ class TestClassification:
         resolved, reason = classify_artifact("linked.pdf")
         assert resolved is None
         assert reason == REASON_OUTSIDE_STORE
+
+    def test_a_resolution_that_lands_outside_the_store_is_refused(self, _store, monkeypatch):
+        """The symlink branch, without needing symlink privileges.
+
+        `test_a_symlink_out_of_the_store_is_refused` reaches this with a real link
+        on Linux; the Windows runner cannot create one. What is simulated here is
+        the operating system's answer, not the module's logic: `realpath` returns a
+        path outside the store for the artifact name, exactly as it would for a
+        planted link, and the real answer for everything else.
+        """
+        outside = _store.parent / "elsewhere.pdf"
+        outside.write_bytes(b"secret")
+        real_realpath = os.path.realpath
+
+        # `Path.resolve()` passes `strict=` through to `realpath`, so the stand-in
+        # forwards every other argument untouched.
+        def _realpath(value, **kwargs):
+            if str(value).endswith("outside.pdf"):
+                return str(outside)
+            return real_realpath(value, **kwargs)
+
+        monkeypatch.setattr(os.path, "realpath", _realpath)
+        resolved, reason = classify_artifact("outside.pdf")
+        assert resolved is None
+        assert reason == REASON_OUTSIDE_STORE
+
+    def test_an_unreadable_path_is_missing_rather_than_a_server_error(self, _store, monkeypatch):
+        """A resolution failure is an operational incident, not a security event.
+
+        A link loop or a permission problem makes `realpath` raise. The caller asks
+        "can this be served?", and the answer is no for a reason the operator can
+        act on, rather than an exception on the download route.
+        """
+        real_realpath = os.path.realpath
+
+        def _realpath(value, **kwargs):
+            if str(value).endswith("looping.pdf"):
+                raise OSError("too many levels of symbolic links")
+            return real_realpath(value, **kwargs)
+
+        monkeypatch.setattr(os.path, "realpath", _realpath)
+        resolved, reason = classify_artifact("looping.pdf")
+        assert resolved is None
+        assert reason == REASON_MISSING
 
     def test_a_directory_named_like_an_artifact_is_not_a_file(self, _store):
         (store_directory() / "directory.pdf").mkdir()

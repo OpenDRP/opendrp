@@ -17,6 +17,7 @@ had zero coverage. This file pins:
 
 from __future__ import annotations
 
+import re
 from datetime import date
 
 import pytest
@@ -185,6 +186,92 @@ class TestSeedAll:
                 await db_session.execute(select(func.count(model.id)))
             ).scalar_one()
             assert after == before[key], key
+
+
+class TestForceGuard:
+    """``--force`` deletes rows, and the flag that was meant to gate it was dead.
+
+    The command declared ``--yes`` as "skip confirmation prompts" and never read
+    it, so ``--force`` truncated ``users``, ``assets``, ``drp_phishing_domains`` and
+    ``drp_breaches`` — cascading into jobs, reports and the TLS review rows — on
+    whichever database ``DATABASE_URL`` named, with no prompt and no environment
+    check. These tests pin the refusal before any work starts, because the guard
+    that runs after the first ``TRUNCATE`` is not a guard.
+    """
+
+    def _invoke(self, *arguments: str, input: str | None = None):
+        from typer.testing import CliRunner
+
+        # The documented spelling, which `make seed-demo` and CONTRIBUTING use:
+        # the subcommand name is part of the invocation, because a single-command
+        # app without a callback answers "Got unexpected extra argument (all)".
+        return CliRunner().invoke(seed_data.app, ["all", *arguments], input=input)
+
+    def test_force_without_confirmation_starts_nothing(self, monkeypatch):
+        started: list[bool] = []
+
+        async def fake_seed_all(*, force: bool) -> None:
+            started.append(force)
+
+        monkeypatch.setattr(seed_data, "_seed_all", fake_seed_all)
+
+        result = self._invoke("--force", input="n\n")
+
+        assert result.exit_code == 1
+        assert started == []
+        assert "Cancelled" in result.output
+
+    def test_force_is_refused_in_production(self, monkeypatch):
+        from app.core.config import settings
+
+        started: list[bool] = []
+
+        async def fake_seed_all(*, force: bool) -> None:
+            started.append(force)
+
+        monkeypatch.setattr(seed_data, "_seed_all", fake_seed_all)
+        monkeypatch.setattr(settings, "APP_ENV", "production")
+
+        result = self._invoke("--force", "--yes")
+
+        assert result.exit_code == 1
+        assert started == []
+        assert "production" in result.output
+
+    def test_an_operator_who_confirms_gets_the_reseed(self, monkeypatch):
+        started: list[bool] = []
+
+        async def fake_seed_all(*, force: bool) -> None:
+            started.append(force)
+
+        monkeypatch.setattr(seed_data, "_seed_all", fake_seed_all)
+
+        result = self._invoke("--force", "--yes")
+
+        assert result.exit_code == 0, result.output
+        assert started == [True]
+
+    def test_the_documented_help_is_usable(self):
+        """AUD-057: `--help` is what an operator runs before anything else.
+
+        With `typer==0.12.5` under `click==8.5.0` the option panel raised
+        `TypeError: Parameter.make_metavar() missing 1 required positional
+        argument: 'ctx'` and the command exited 1 over a traceback. The pins are a
+        compatible pair now (Click 8.1.8), and no per-option `flag_value`
+        workaround masks the version gap. This fails on the old pair because
+        `--help` never reaches its output.
+        """
+        result = self._invoke("--help")
+
+        assert result.exit_code == 0, result.output
+        # Rich styles the panel and wraps it to the terminal it sees, so the
+        # option names may carry escape codes or a line break at a column that
+        # differs between a Windows console and a CI runner. Strip both before
+        # asking whether the flag is documented at all.
+        plain = re.sub(r"\x1b\[[0-9;]*m", "", result.output)
+        compact = re.sub(r"\s+", "", plain)
+        assert "--force" in compact
+        assert "--yes" in compact
 
 
 class TestSeedDefaults:

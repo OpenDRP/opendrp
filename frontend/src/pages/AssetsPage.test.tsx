@@ -32,20 +32,26 @@ const {
   toastMock: vi.fn(),
 }));
 
-vi.mock("@/lib/api", () => ({
-  endpoints: {
-    listAssets: listMock,
-    createAsset: createMock,
-    updateAsset: updateMock,
-    deleteAsset: deleteMock,
-    assetFindings: findingsMock,
-    exportAssets: exportMock,
-    importAssets: importMock,
-    importAssetsCsv: importCsvMock,
-    bulkAssets: bulkMock,
-  },
-  describeApiError: (error: any) => String(error?.message ?? error ?? ""),
-}));
+vi.mock("@/lib/api", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/lib/api")>();
+  // Only the transport is replaced: `describeApiError` is the real one, because
+  // the sentence the operator reads for a refused query is the behaviour under
+  // test rather than a stand-in for it.
+  return {
+    ...actual,
+    endpoints: {
+      listAssets: listMock,
+      createAsset: createMock,
+      updateAsset: updateMock,
+      deleteAsset: deleteMock,
+      assetFindings: findingsMock,
+      exportAssets: exportMock,
+      importAssets: importMock,
+      importAssetsCsv: importCsvMock,
+      bulkAssets: bulkMock,
+    },
+  };
+});
 vi.mock("@/components/ui/use-toast", () => ({ toast: toastMock }));
 // The connector registry declares which modules consume which asset type (WI-20),
 // so the page reads it instead of guessing from a hardcoded table.
@@ -88,7 +94,17 @@ vi.mock("@/components/DataTable", () => ({
     getRowLabel,
     loading,
     emptyText,
-  }: any) => (
+    isError = false,
+    errorDescription,
+    onRetry,
+  }: any) => isError && rows.length === 0 ? (
+    // The real table replaces an empty error result with the failure itself
+    // rather than the "nothing monitored" line, so the stand-in does too.
+    <div role="alert">
+      <span>{errorDescription}</span>
+      {onRetry && <button onClick={onRetry}>Try again</button>}
+    </div>
+  ) : (
     <div>
       <div>
         {selectable && (
@@ -393,6 +409,52 @@ describe("AssetsPage", () => {
     expect(within(report).getByText("invalid")).toBeInTheDocument();
   });
 
+  it("explains a database_busy refusal and retries the same read", async () => {
+    // The API answers a query it stopped on purpose with a 503 and a code. The
+    // operator sees the sentence that tells them what to do, and the retry
+    // repeats the read rather than staying on a page that cannot succeed.
+    const user = userEvent.setup();
+    listMock.mockRejectedValueOnce({ response: { status: 503, data: { code: "database_busy" } } });
+
+    renderPage();
+
+    expect(
+      await screen.findByText(/The database stopped this query because it took too long/),
+    ).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Try again" }));
+
+    expect(await screen.findByText("example.com")).toBeInTheDocument();
+    expect(listMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("says when the import report is truncated, and where the rest lives", async () => {
+    const user = userEvent.setup();
+    const rows = Array.from({ length: 150 }, (_, index) => ({
+      line: index + 2,
+      outcome: "created" as const,
+      asset_type: "domain",
+      asset_value: `host-${index}.example`,
+      detail: null,
+    }));
+    importCsvMock
+      .mockResolvedValueOnce({ dry_run: true, created: 150, duplicate: 0, invalid: 0, rows: [] })
+      .mockResolvedValueOnce({ dry_run: false, created: 150, duplicate: 0, invalid: 0, rows });
+
+    renderPage();
+    await screen.findByText("example.com");
+    await user.click(screen.getByRole("button", { name: "Import" }));
+    const dialog = screen.getByRole("dialog");
+    await user.type(within(dialog).getByLabelText("Assets to import"), "asset_type,asset_value,{enter}domain,a.example,");
+    await user.click(within(dialog).getByRole("button", { name: "Preview" }));
+    await waitFor(() => expect(importCsvMock).toHaveBeenCalledWith(expect.any(String), true));
+    await user.click(within(dialog).getByRole("button", { name: "Import" }));
+
+    // The page renders a bounded list; the sentence is what tells the operator
+    // that they are not looking at the whole report.
+    expect(await within(dialog).findByText(/Showing the first 100 of 150 lines/)).toBeInTheDocument();
+    expect(within(dialog).getByText(/the audit trail holds the full report/)).toBeInTheDocument();
+  });
+
   it("reads pasted JSON as items rather than as CSV (WI-18)", async () => {
     const user = userEvent.setup();
     importMock.mockResolvedValue({ dry_run: true, created: 1, duplicate: 0, invalid: 0, rows: [] });
@@ -595,6 +657,27 @@ describe("AssetsPage", () => {
         cascade_findings: false,
       }),
     );
+  });
+
+  /**
+   * The batch route takes ids, so the ids may only be the rows the operator can
+   * see now (AST-42). A filter change is a different result set: keeping the ticks
+   * would let one click change an asset that is no longer on screen, chosen under
+   * a filter the operator was no longer looking at.
+   */
+  it("drops a selection when the result set changes", async () => {
+    const user = userEvent.setup();
+    renderPage();
+    await screen.findByText("example.com");
+    await user.click(screen.getByRole("checkbox", { name: "Select example.com" }));
+    expect(screen.getByRole("region", { name: "Batch actions" })).toBeInTheDocument();
+
+    await user.type(screen.getByPlaceholderText("Search value..."), "other");
+
+    await waitFor(() =>
+      expect(screen.queryByRole("region", { name: "Batch actions" })).not.toBeInTheDocument(),
+    );
+    expect(bulkMock).not.toHaveBeenCalled();
   });
 
   it("confirms activation and promises rescanning, not restored findings", async () => {

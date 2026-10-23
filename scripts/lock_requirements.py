@@ -40,8 +40,10 @@ resolves for the named platform without evaluating `platform_machine`, so a
 dependency a package declares with that marker never reaches the report —
 SQLAlchemy declares `greenlet` that way, and a lock without it builds an image
 that fails on its first async connection. `MARKER_GATED_RUNTIME` names those
-dependencies and states why resolution cannot find them; a source that does not
-pin one of them is refused instead of being locked without it.
+dependencies and states why resolution cannot find them; a source that installs
+the package declaring one of them but does not pin it is refused instead of being
+locked without it. A source that installs nothing of the sort — every connector
+lock, which carries no SQLAlchemy — is not a gap and is locked as it stands.
 
 `--extends` is for a file that installs *on top of* another one, which is what
 `requirements-dev.txt` does: it pins the test and lint toolchain and includes the
@@ -132,6 +134,20 @@ MARKER_GATED_RUNTIME: Dict[str, str] = {
         "`platform_machine` marker that a `--platform` resolution does not evaluate"
     ),
 }
+
+#: The package whose own metadata declares each entry above through a
+#: `platform_machine` marker — the only reason the entry can be missing from a
+#: resolution in the first place. A manifest that installs none of them cannot
+#: need the gated dependency at all: the seven connector locks carry no SQLAlchemy
+#: and so no greenlet, and requiring it from them made this script refuse to
+#: regenerate a connector lock at all (`does not pin greenlet`) — which is why
+#: those files were never regenerated, and why their headers could drift unseen.
+MARKER_GATED_BY: Dict[str, str] = {"greenlet": "sqlalchemy"}
+
+#: Where a generated file's own instructions are written from. Anchored to the
+#: repository rather than to the caller's working directory, because the header is
+#: the only place the file says how to maintain it.
+_REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 
 
 class Failed(Exception):
@@ -292,6 +308,12 @@ def _with_marker_gated_runtime(pins: List[str], source: Path) -> List[str]:
     for name in MARKER_GATED_RUNTIME:
         key = _normalise(name)
         if key in resolved:
+            continue
+        needed_by = MARKER_GATED_BY.get(name)
+        if needed_by is not None and _normalise(needed_by) not in resolved:
+            # This manifest installs nothing that declares it, so it is not a gap
+            # in this lock. Refusing here is what made every connector manifest
+            # unregenerable.
             continue
         version = declared.get(key)
         if version is None:
@@ -455,6 +477,22 @@ transitive dependencies included, while the runtime pins stay where they are.
     return "\n\n".join(blocks) + "\n"
 
 
+def _invocation_path(source: Path) -> str:
+    """The path written into the header, so the command works from the root.
+
+    It used to be whatever spelling the caller typed. `backend/requirements.txt`
+    therefore carried `python scripts/lock_requirements.py requirements.txt`,
+    which names the right script from no directory at all: from the repository root
+    the argument does not exist, and from `backend/` the script does not. Anchoring
+    the path to the repository root makes the line independent of where the
+    generator ran.
+    """
+    try:
+        return source.resolve().relative_to(_REPOSITORY_ROOT).as_posix()
+    except ValueError:
+        return source.as_posix()
+
+
 def build_lock(source: Path) -> str:
     """The generated content for one requirements file."""
     try:
@@ -490,7 +528,7 @@ def build_lock(source: Path) -> str:
     pins = _with_marker_gated_runtime(pins, source)
     comments = _comments(source)
     curated_spelling = _curated_spelling(source.read_text(encoding="utf-8"))
-    blocks: List[str] = [_HEADER.format(source=source.as_posix()).rstrip()]
+    blocks: List[str] = [_HEADER.format(source=_invocation_path(source)).rstrip()]
     for pin in pins:
         name, version = pin.split("==", 1)
         name = curated_spelling.get(_normalise(name), name)

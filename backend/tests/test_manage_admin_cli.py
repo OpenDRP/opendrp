@@ -363,6 +363,26 @@ class TestCliAudit:
         assert row.details["role"] == "admin"
         assert row.entry_hash and row.seq > 0
 
+    async def test_create_takes_the_active_admin_lock(self, db_session, monkeypatch):
+        """Entering the admin set takes the lock that leaving it takes.
+
+        ``admin_invariants`` states that every writer of the set holds it. The CLI
+        creates an administrator without an authenticated caller, so this is the
+        path where an insertion and a demotion can meet.
+        """
+        from scripts import manage_admin
+
+        calls = []
+
+        async def _lock(db):
+            calls.append(db)
+
+        monkeypatch.setattr(manage_admin, "lock_active_admin_set", _lock, raising=False)
+        _raising_exit(monkeypatch)
+        await manage_admin.cmd_create("locked-create@example.com", STRONG_PASSWORD)
+
+        assert calls, "creating an administrator must serialise against the set"
+
     async def test_reset_writes_role_change_state(self, db_session, monkeypatch):
         from scripts.manage_admin import cmd_reset
 
@@ -424,6 +444,45 @@ class TestCliAudit:
         assert rows[0].details["method"] == "cli_mfa_off"
         assert rows[0].details["was_enabled"] is True
         assert rows[0].details["refresh_families_revoked"] == 1
+
+    async def test_mfa_off_releases_the_factor_lockout_it_was_called_for(
+        self, db_session, monkeypatch
+    ):
+        """Recovery must leave the account able to enrol a new factor.
+
+        `/auth/mfa/setup` and `/auth/mfa/enable` refuse while
+        `mfa_locked_until` is in the future, so clearing the factor of somebody
+        who exhausted the five attempts handed back an account that still could
+        not enrol — for another fifteen minutes, with nothing saying why. The API
+        reset clears both counters; the CLI path is the same recovery.
+        """
+        import uuid
+        from datetime import datetime, timedelta, timezone
+
+        from app.models.token import RefreshTokenFamily
+        from scripts.manage_admin import cmd_mfa_off
+
+        user = await self._user(db_session, "mfa-locked@example.com")
+        db_session.add(
+            RefreshTokenFamily(family_id=uuid.uuid4(), user_id=user.id, revoked=False)
+        )
+        user.totp_secret = "encrypted"
+        user.totp_enabled_at = datetime.now(timezone.utc)
+        user.mfa_failed_attempts = 5
+        user.mfa_locked_until = datetime.now(timezone.utc) + timedelta(minutes=10)
+        await db_session.commit()
+
+        _raising_exit(monkeypatch)
+        await cmd_mfa_off("mfa-locked@example.com")
+
+        await db_session.refresh(user)
+        assert user.totp_enabled_at is None
+        assert user.mfa_locked_until is None
+        assert user.mfa_failed_attempts == 0
+
+        rows = await self._rows(db_session, "user.mfa.reset")
+        assert len(rows) == 1
+        assert rows[0].details["mfa_lockout_cleared"] is True
 
     async def test_list_records_the_read_it_performed(self, db_session, monkeypatch):
         from scripts.manage_admin import cmd_list

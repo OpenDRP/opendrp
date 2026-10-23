@@ -1,6 +1,6 @@
 from enum import Enum as PyEnum
 
-from sqlalchemy import Boolean, Enum, Index, String
+from sqlalchemy import Boolean, Enum, Index, String, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import Base, TimestampMixin, UUIDMixin
@@ -22,6 +22,18 @@ class Asset(Base, UUIDMixin, TimestampMixin):
         # AST-18). PostgreSQL scans the btree backwards, so one ascending index
         # serves both directions.
         Index("ix_assets_created_at_id", "created_at", "id"),
+        # The duplicate rule itself. Declared here as well as in migration 0001 so the
+        # ORM metadata that tests and drift checks build from enforces the same rule:
+        # without it an insert race between two writers was never a constraint error
+        # outside PostgreSQL.
+        Index(
+            "uq_assets_type_normalized_value",
+            "asset_type",
+            "normalized_value",
+            unique=True,
+            postgresql_where=text("(normalized_value IS NOT NULL)"),
+            sqlite_where=text("(normalized_value IS NOT NULL)"),
+        ),
     )
 
     asset_type: Mapped[str] = mapped_column(

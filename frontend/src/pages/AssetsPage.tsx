@@ -703,7 +703,7 @@ export default function AssetsPage() {
             : relatedCounts.isError
               ? "The related findings could not be counted, so they are not shown here."
               : (relatedCounts.data?.counts?.total ?? 0) > 0
-                ? `Involved in ${formatNumber(relatedCounts.data.counts.total)} findings: phishing ${relatedCounts.data.counts.phishing}, breaches ${relatedCounts.data.counts.breaches}, DNS Security ${relatedCounts.data.counts.dns}, exposure ${relatedCounts.data.counts.exposure}, other modules ${relatedCounts.data.counts.findings}. Deleting the asset alone leaves all of them in place.`
+                ? `Involved in ${formatNumber(relatedCounts.data?.counts?.total ?? 0)} findings: phishing ${relatedCounts.data?.counts?.phishing ?? 0}, breaches ${relatedCounts.data?.counts?.breaches ?? 0}, DNS Security ${relatedCounts.data?.counts?.dns ?? 0}, exposure ${relatedCounts.data?.counts?.exposure ?? 0}, other modules ${relatedCounts.data?.counts?.findings ?? 0}. Deleting the asset alone leaves all of them in place.`
                 : "No findings name this asset right now."}
         </p>
         <label className="flex items-start gap-3 rounded-md border border-border p-3 text-sm cursor-pointer">

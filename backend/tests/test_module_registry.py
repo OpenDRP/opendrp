@@ -20,7 +20,10 @@ from pathlib import Path
 
 import pytest
 
-from app.core.exceptions import BadRequestException
+from app.core.exceptions import BadRequestException, NotFoundException
+from app.models.job import Job, JobStatus
+from app.models.module import Module
+from app.models.connector import Connector
 from app.services.connector_manifest import (
     ModuleSpec,
     declared_dedup_key,
@@ -35,6 +38,7 @@ from app.services.module_registry import (
     ensure_builtin_modules,
     load_modules,
     set_module_enabled,
+    update_module_metadata,
 )
 
 _MODULES_DIR = Path(__file__).resolve().parents[1] / "alembic" / "versions"
@@ -268,6 +272,141 @@ class TestModuleDefinitionValidation:
         spec = await set_module_enabled(db_session, "code_leak", enabled=False)
         assert spec.enabled is False
         assert (await load_modules(db_session))["code_leak"].enabled is False
+
+    @pytest.mark.asyncio
+    async def test_disabling_a_module_cancels_the_work_it_had_queued(self, db_session):
+        """A switched-off module must not still have provider work waiting.
+
+        Disabling is a statement that this installation stops collecting the
+        module. A pending connector job left behind is that statement being false:
+        the next worker to poll picks it up, calls a metered provider, and stores
+        findings for a module an administrator switched off. Already-finished work
+        is history and stays as it is.
+        """
+        await create_module(
+            db_session,
+            module_id="code_leak",
+            label="Code leaks",
+            fields={"repository": {"type": "str"}},
+            dedup_fields=["repository"],
+        )
+        connector = Connector(
+            name="code-leak-default",
+            connector_type="code_leak",
+            default_job_type="code_leak.scan",
+            status="enabled",
+            api_version="0.2.1",
+        )
+        db_session.add(connector)
+        await db_session.flush()
+        queued = Job(
+            job_type="code_leak.scan",
+            status=JobStatus.pending,
+            params={"scan_admission_token": "token-1"},
+        )
+        finished = Job(job_type="code_leak.scan", status=JobStatus.success)
+        db_session.add_all([queued, finished])
+        await db_session.flush()
+
+        await set_module_enabled(db_session, "code_leak", enabled=False)
+
+        await db_session.refresh(queued)
+        await db_session.refresh(finished)
+        assert queued.status == JobStatus.cancelled
+        assert queued.finished_at is not None
+        assert queued.error_message == "Module disabled by administrator"
+        assert finished.status == JobStatus.success
+
+    @pytest.mark.asyncio
+    async def test_a_label_outside_the_bounds_is_refused_on_create_and_update(self, db_session):
+        for label in ("   ", "a" * 121):
+            with pytest.raises(BadRequestException, match="module label must be 1-120 characters"):
+                await create_module(
+                    db_session,
+                    module_id="labelled",
+                    label=label,
+                    fields={"repository": {"type": "str"}},
+                    dedup_fields=["repository"],
+                )
+
+        await create_module(
+            db_session,
+            module_id="labelled",
+            label="Labelled",
+            fields={"repository": {"type": "str"}},
+            dedup_fields=["repository"],
+        )
+        with pytest.raises(BadRequestException, match="module label must be 1-120 characters"):
+            await update_module_metadata(db_session, "labelled", label="  ")
+
+    @pytest.mark.asyncio
+    async def test_metadata_updates_are_bounded_and_committed(self, db_session):
+        """The description is prose for a page, so it is clipped rather than refused.
+
+        A label is a name and is refused outside its bound; a description that is
+        too long is truncated, and a blank one is stored as NULL so the page does
+        not render an empty paragraph. Both paths commit, which is what the
+        registry reads back.
+        """
+        await create_module(
+            db_session,
+            module_id="code_leak",
+            label="Code leaks",
+            description="short",
+            fields={"repository": {"type": "str"}},
+            dedup_fields=["repository"],
+        )
+
+        spec = await update_module_metadata(
+            db_session, "code_leak", label="  Code exposure  ", description="x" * 2500
+        )
+        assert spec.label == "Code exposure"
+        assert spec.description is not None and len(spec.description) == 2000
+
+        spec = await update_module_metadata(db_session, "code_leak", description="   ")
+        row = await db_session.get(Module, "code_leak")
+        await db_session.refresh(row)
+        assert row.description is None
+
+    @pytest.mark.asyncio
+    async def test_an_unknown_module_is_a_404_on_toggle_and_on_metadata(self, db_session):
+        with pytest.raises(NotFoundException, match="Module not found"):
+            await set_module_enabled(db_session, "never_declared", enabled=False)
+        with pytest.raises(NotFoundException, match="Module not found"):
+            await update_module_metadata(db_session, "never_declared", label="Nope")
+
+    @pytest.mark.asyncio
+    async def test_a_finding_kind_owned_by_another_row_is_refused(self, db_session):
+        """The kind is the wire contract; two modules answering it split findings.
+
+        A row whose id does not match its kind can exist (an adopted database, a
+        release that renamed a module), so the check is on the stored kind rather
+        than on the id. Without it, submissions for the older module would land in
+        whichever declaration was written last.
+        """
+        db_session.add(
+            Module(
+                id="legacy_kind",
+                label="Legacy",
+                finding_kind="code_leak",
+                asset_types=[],
+                fields={"repository": {"type": "str"}},
+                dedup_fields=["repository"],
+                storage={"kind": "generic", "adapter": "generic"},
+                enabled=True,
+                builtin=False,
+            )
+        )
+        await db_session.flush()
+
+        with pytest.raises(BadRequestException, match="is already used by module 'legacy_kind'"):
+            await create_module(
+                db_session,
+                module_id="code_leak",
+                label="Code leaks",
+                fields={"repository": {"type": "str"}},
+                dedup_fields=["repository"],
+            )
 
     def test_platform_fields_cannot_be_redeclared(self):
         with pytest.raises(BadRequestException, match="provided by the platform"):

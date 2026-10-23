@@ -215,11 +215,16 @@ profile. Each further line adds the set it names.
 
 | Set | `mem_limit` sum | `cpus` sum |
 |---|---:|---:|
-| Base (always on) | 7.0 GiB | 7.75 |
-| + `netlas` profile (3 workers) | 8.5 GiB | 10.0 |
-| + `netlas-endpoints` and `shodan-endpoints` profiles (1 worker each) | 9.5 GiB | 11.5 |
-| + `shodan`, `hibp`, `virustotal` profiles (1 worker each) | 11.0 GiB | 13.75 |
-| + `backup` profile | 11.5 GiB | 14.25 |
+| Base (always on) | 8.0 GiB | 9.0 |
+| + `netlas` profile (3 workers) | 9.5 GiB | 11.25 |
+| + `netlas-endpoints` and `shodan-endpoints` profiles (1 worker each) | 10.5 GiB | 12.75 |
+| + `shodan` (2 workers), `hibp`, `virustotal` profiles (1 worker each otherwise) | 12.5 GiB | 15.75 |
+| + `backup` profile | 13.0 GiB | 16.25 |
+
+Every number above is checked against `docker-compose.yml` by
+`scripts/check_compose_healthchecks.py`, together with the host requirements in
+[deployment.md](deployment.md#host-requirements): a `mem_limit` or `cpus` value
+changed in the file without the sums fails CI.
 
 These are floors for host sizing, not the memory the stack needs: the kernel, the
 Docker daemon and page cache sit on top of every line, and enabling an overlay
@@ -311,3 +316,118 @@ reads `.env`, so it cannot see API replicas: a two-replica deployment has to add
 Settings page **Applied runtime configuration** shows the pool size the running
 backend actually read, which is the other half of the answer — what it read, not
 what the file said.
+
+## Audit archive, and what retention refuses to do without it
+
+`AUDIT_ARCHIVE_DIR` is where retired audit rows are written as signed NDJSON
+before they leave the database. It is deliberately empty by default, and an empty
+value is not a fallback to the report store: `app/services/audit_archive.py`
+raises, the nightly run records `audit_archive_retention_blocked` and deletes
+nothing. That is the safe direction — a sweep that deleted a row it had not
+archived would destroy the one copy — but it has a consequence an operator has to
+know: **`AUDIT_RETENTION_DAYS` does nothing until the archive directory is set and
+writable.** The Settings page's integrity view reports `archive.configured` for
+exactly this reason, and the readiness page treats an unarchived history as a
+finding rather than a default.
+
+Point it at a volume that is backed up separately from the database; the archive is
+what makes the database copy of the trail disposable.
+
+## Settings reference
+
+Generated from `app/core/config.py` by
+`python -m scripts.settings_reference`, and enforced by
+`tests/test_settings_reference.py`: a setting added without its row makes that test
+fail, so the table below is always the model's own answer. The validator column
+says what refuses a bad value — `type only` means the field's type is the
+validation, which for a free-text value such as `MFA_ISSUER` is the honest answer.
+
+<!-- BEGIN GENERATED SETTINGS TABLE -->
+
+| Setting | Default | Validator |
+|---|---|---|
+| `DATABASE_URL` | `postgresql://opendrp:opendrp@localhost:5432/opendrp` | parsed in production: the password must not be a shipped value |
+| `REDIS_URL` | `redis://localhost:6379/0` | parsed in production: a non-loopback host must carry a password |
+| `JWT_SECRET_KEY` | *generated per process* | placeholder refused, `len >= 32`; production refuses a shipped or derived value |
+| `JWT_ALGORITHM` | `HS256` | allowlist HS256/HS384/HS512, upper-cased |
+| `JWT_ACCESS_TOKEN_EXPIRE_MINUTES` | `15` | `1 <= value <= 1440` |
+| `JWT_REFRESH_TOKEN_EXPIRE_DAYS` | `3` | `1 <= value <= 3650` |
+| `AUTH_COOKIE_SECURE` | `true` | production refuses `false` |
+| `HSTS_ENABLED` | `false` | type only |
+| `HSTS_MAX_AGE` | `31536000` | must be positive when `HSTS_ENABLED` |
+| `HSTS_INCLUDE_SUBDOMAINS` | `false` | type only |
+| `AUTHENTICATED_RATE_LIMIT_PER_MINUTE` | `600` | `value >= 0` |
+| `APP_ENV` | `development` | one of `development`/`test`/`integration`/`production` (case and whitespace normalised); an unknown value is refused. `production` switches the production-only checks on |
+| `OPENDRP_VERSION` | *(empty)* | production requires a pinned semantic version |
+| `DNS_EXPIRY_MAX_AGE_HOURS` | `48` | `1 <= value <= 720` |
+| `LOG_LEVEL` | `INFO` | one of CRITICAL/ERROR/WARNING/INFO/DEBUG, upper-cased |
+| `CORS_ORIGINS` | *generated per process* | JSON array or comma list, parsed to a list |
+| `ENCRYPTION_KEY` | *generated per process* | must be a valid Fernet key (import-time check); production refuses a shipped value |
+| `MFA_ISSUER` | `OpenDRP` | type only |
+| `REQUIRE_MFA_FOR_ADMINS` | `false` | type only |
+| `REQUIRE_MFA_ROLES` | *(empty)* | role names must exist (`admin`, `analyst`, `viewer`) |
+| `ENCRYPTION_PREVIOUS_KEYS` | *(empty)* | comma-separated, each must be a valid Fernet key |
+| `JWT_PREVIOUS_SECRET_KEYS` | *(empty)* | comma-separated; in production each needs `len >= 32` and no placeholder |
+| `REPORTS_STORE_DIR` | `/workspace/reports_store` | resolved with `realpath`; every artifact read is contained by it |
+| `CONNECTOR_HEALTH_STALE_AFTER_SECONDS` | `120` | `30 <= value <= 86400` |
+| `CONNECTOR_JOB_LEASE_SECONDS` | `180` | `30 <= value <= 86400` |
+| `CONNECTOR_JOB_MAX_ATTEMPTS` | `3` | `1 <= value <= 20` |
+| `ALERT_HEALTH_CHECK_TIMEOUT_SECONDS` | `15` | `1 <= value <= 60` |
+| `ALERT_HEALTH_CACHE_SECONDS` | `60` | `0 <= value <= 3600` |
+| `ALERT_DELIVERY_TIMEOUT_SECONDS` | `20` | `1 <= value <= 300` |
+| `ALERT_DELIVERY_MAX_ATTEMPTS` | `3` | `1 <= value <= 10` |
+| `ALERT_DELIVERY_RETRY_BASE_SECONDS` | `2` | `0.1 <= value <= 60` |
+| `ALERT_RECIPIENT_INTERVAL_SECONDS` | `1` | `0 <= value <= 3600` |
+| `ALERT_RECIPIENT_HOLD_SECONDS` | `900` | `60 <= value <= 86400` |
+| `AUDIT_ARCHIVE_DIR` | *(empty)* | empty blocks audit retirement instead of deleting unarchived rows |
+| `AUDIT_RETENTION_HOLD` | `false` | type only |
+| `ALERT_HISTORY_RETENTION_DAYS` | `90` | `0 <= value <= 3650` |
+| `TLS_CERTIFICATE_RETENTION_DAYS` | `365` | `0 <= value <= 3650` |
+| `ALERT_AGGREGATION_DELAY_SECONDS` | `10` | `0 <= value <= 300` |
+| `ALERT_CONFIDENCE_DIRECT` | `60` | must stay above `ALERT_CONFIDENCE_DIGEST` |
+| `ALERT_CONFIDENCE_DIGEST` | `30` | must stay below `ALERT_CONFIDENCE_DIRECT` |
+| `ALERT_PHISHING_DIGEST_ENABLED` | `true` | type only |
+| `ALERT_PHISHING_DIGEST_HOUR_UTC` | `6` | `0 <= value <= 23` |
+| `ALERT_NO_CHANNEL_RETRY_HOURS` | `24` | `0 <= value <= 8760` |
+| `ALERT_CANDIDATE_CHANGE_NOTIFICATIONS` | `true` | type only |
+| `ALERT_BREACH_NOISE_POLICY` | `store_only_spam` | one of `store_only_spam`, `verified_only`, `all` |
+| `ALERT_BREACH_DIGEST_THRESHOLD` | `20` | `0 <= value <= 500` |
+| `ALERT_BREACH_GROWTH_FLOOR` | `1` | `1 <= value <= 1000000000` |
+| `ALERT_MAX_FINDINGS_PER_MESSAGE` | `50` | `1 <= value <= 500` |
+| `ALERT_MAX_TELEGRAM_MESSAGE_LENGTH` | `3800` | `500 <= value <= 4096` |
+| `OUTBOUND_DNS_TIMEOUT_SECONDS` | `3.0` | `1 <= value <= 30` |
+| `REPORT_MAX_ROWS` | `5000` | `100 <= value <= 50000`; bounds each of the five sections, and the renderer refuses a document over 25,000 rows in total (five sections at the default) or 64 MiB, as `report_too_large` |
+| `REPORT_GENERATION_TIMEOUT_SECONDS` | `120` | `10 <= value <= 1800` |
+| `REPORT_QUEUE_MAX_PENDING` | `100` | `1 <= value <= 10000` |
+| `REPORT_ENQUEUE_MAX_RETRIES` | `2` | `0 <= value <= 10` |
+| `REPORT_WORKER_CONCURRENCY` | `2` | `1 <= value <= 32` |
+| `AUDIT_RETENTION_DAYS` | `365` | `0 <= value <= 3650` |
+| `REPORT_RETENTION_DAYS` | `365` | `0 <= value <= 3650` |
+| `RETENTION_BATCH_SIZE` | `5000` | `100 <= value <= 100000` |
+| `RETENTION_MAX_BATCHES_PER_RUN` | `200` | `1 <= value <= 100000` |
+| `DB_POOL_SIZE` | `20` | `1 <= value <= 200` |
+| `DB_MAX_OVERFLOW` | `10` | `0 <= value <= 100` |
+| `DB_POOL_RECYCLE_SECONDS` | `1800` | `60 <= value <= 86400` |
+| `DB_POOL_TIMEOUT_SECONDS` | `30` | `5 <= value <= 300` |
+| `DB_POOL_USE_LIFO` | `true` | type only |
+| `DB_STATEMENT_TIMEOUT_MS` | `30000` | `0 <= value <= 3600000` |
+| `DB_LOCK_TIMEOUT_MS` | `5000` | `0 <= value <= 3600000` |
+| `DB_IDLE_IN_TRANSACTION_TIMEOUT_MS` | `60000` | `0 <= value <= 86400000` |
+| `DB_COMMAND_TIMEOUT_SECONDS` | `45` | `0 <= value <= 3600` |
+| `DB_APPLICATION_NAME` | `opendrp` | type only |
+| `MIGRATION_LOCK_TIMEOUT_MS` | `30000` | `0 <= value <= 3600000` |
+| `MIGRATION_STATEMENT_TIMEOUT_MS` | `0` | `0 <= value <= 86400000` |
+| `METRICS_TOKEN` | *(empty)* | empty disables the endpoint; production needs `len >= 32` and no placeholder |
+| `UVICORN_WORKERS` | `1` | `1 <= value <= 32` |
+| `UVICORN_FORWARDED_ALLOW_IPS` | `127.0.0.1` | IPs/CIDRs only; `*` is refused everywhere |
+| `TRUSTED_PROXY_IPS` | `127.0.0.1,::1` | IPs/CIDRs only; refused when it covers the data or connector subnet |
+| `OPENDRP_NETWORK_SUBNET` | `172.18.0.0/16` | must parse as an IP network |
+| `OPENDRP_EDGE_SUBNET` | `172.18.10.0/24` | must parse and lie inside `OPENDRP_NETWORK_SUBNET` |
+| `OPENDRP_DATA_SUBNET` | `172.18.20.0/24` | must parse and lie inside `OPENDRP_NETWORK_SUBNET` |
+| `OPENDRP_CONNECTOR_SUBNET` | `172.18.30.0/24` | must parse and lie inside `OPENDRP_NETWORK_SUBNET` |
+| `OUTBOUND_ALLOWED_HOSTS` | *(empty)* | comma-separated; each entry widens the outbound policy |
+| `OUTBOUND_BLOCKED_CIDRS` | *(empty)* | comma-separated CIDRs; additive to the built-in block list |
+| `AUDIT_CHAIN_KEYS` | *(empty)* | comma-separated; production requires an explicit value (no derived fallback) |
+| `AUDIT_CHAIN_PREVIOUS_KEYS` | *(empty)* | comma-separated, verify-only |
+
+<!-- END GENERATED SETTINGS TABLE -->

@@ -21,9 +21,10 @@ Two kinds of number live here, and the difference is deliberate:
 Three rules keep the exposition safe to hand to a scraper:
 
 * **No value from a request ever becomes a label.** Labels come from the
-  platform's own enumerations (delivery status, job status, HTTP status class)
-  and from the *name* of a registered connector. An email address, a finding
-  title or a request path is data; putting one in a label is how a metrics
+  platform's own enumerations (delivery status, job status, HTTP status class,
+  :data:`KNOWN_METHODS`) and from the *name* of a registered connector. An email
+  address, a finding title or a request path is data; putting one in a label is
+  how a metrics
   endpoint becomes an unbounded memory leak and a copy of the very records the
   audit trail is supposed to hold. ``tests/test_metrics.py`` asserts this for the
   rows it can construct.
@@ -163,6 +164,16 @@ FAMILIES: dict[str, tuple[str, str]] = {
 #: Characters that may appear unescaped in a label *name*.
 _LABEL_NAME = re.compile(r"\A[A-Za-z_][A-Za-z0-9_]*\Z")
 
+#: Methods the exposition distinguishes. An HTTP method is a token the *client*
+#: chooses — a route that serves none of them answers 405, and that response
+#: still passes through the middleware — so "record what arrived" would let an
+#: unauthenticated caller invent a series per verb. This is the enumeration the
+#: label is allowed to take, and anything outside it is one bucket.
+KNOWN_METHODS = frozenset(
+    {"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"}
+)
+OTHER_METHOD = "OTHER"
+
 
 @dataclass(frozen=True, slots=True)
 class Sample:
@@ -264,15 +275,27 @@ class RequestMetrics:
         hundreds = max(1, min(5, status_code // 100))
         return f"{hundreds}xx"
 
+    @staticmethod
+    def method_label(method: str) -> str:
+        """The method as a label value, or :data:`OTHER_METHOD`.
+
+        The upper-cased original when the platform serves that verb, so a
+        dashboard reads ``GET`` rather than a bucket; every invented verb shares
+        one series instead of adding one per request.
+        """
+        normalized = str(method or "").strip().upper()
+        return normalized if normalized in KNOWN_METHODS else OTHER_METHOD
+
     def request_started(self) -> None:
         with self._lock:
             self._in_flight += 1
 
     def request_finished(self, method: str, status_code: int, seconds: float) -> None:
         status_class = self.status_class(status_code)
+        method = self.method_label(method)
         with self._lock:
             self._in_flight = max(0, self._in_flight - 1)
-            key = (method.upper(), status_class)
+            key = (method, status_class)
             self._requests[key] = self._requests.get(key, 0) + 1
             self._duration_sum[status_class] = (
                 self._duration_sum.get(status_class, 0.0) + seconds

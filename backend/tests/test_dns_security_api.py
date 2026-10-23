@@ -12,6 +12,136 @@ from app.models.dns_observation import DNSObservation
 from app.services.connector_service import ConnectorService
 
 
+def _tls_probe(port: int, certificate: str) -> dict:
+    now = datetime.now(timezone.utc)
+    return {
+        "observation_type": "tls_probe",
+        "subject": "example.com",
+        "record_type": "TLS" if port == 443 else f"TLS:{port}",
+        "expires_at": (now + timedelta(days=10)).isoformat(),
+        "metadata": {
+            "check_state": "verified",
+            "checked_at": now.isoformat(),
+            "certificate_id": certificate,
+            "not_before": (now - timedelta(days=30)).isoformat(),
+            "probe_ip": "203.0.113.10",
+            "port": port,
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_each_port_has_its_own_control_and_the_reminder_history_is_the_monitors(client, db_session, auth_headers_analyst):
+    """AUD-036 and AUD-038 at the payload: one control per port, one source of truth.
+
+    The inventory row's `alerted_thresholds` was a second, always-empty copy of a
+    history only the monitor writes. The payload now answers from the control that
+    sent the reminder, so the two cannot disagree.
+    """
+    from app.models.dns_expiry_monitor import DNSExpiryMonitor
+    from app.services.dns_security_service import ingest_dns_observations
+
+    db_session.add(Asset(asset_type=AssetType.domain, asset_value="example.com", normalized_value="example.com", is_active=True))
+    await db_session.commit()
+    await ingest_dns_observations(
+        db_session,
+        source="tlsprobe",
+        findings=[_tls_probe(443, "cert-a"), _tls_probe(8443, "cert-b")],
+    )
+    first = (await db_session.execute(select(DNSExpiryMonitor).where(DNSExpiryMonitor.kind == "tls:443"))).scalar_one()
+    first.alerted_thresholds = [14]
+    await db_session.commit()
+
+    listed = (await client.get("/api/v1/dns-security/observations", headers=auth_headers_analyst)).json()
+    probes = {item["record_type"]: item for item in listed["items"] if item["observation_type"] == "tls_probe"}
+    assert probes["TLS"]["expiry_monitor"]["kind"] == "tls:443"
+    assert probes["TLS:8443"]["expiry_monitor"]["kind"] == "tls:8443"
+    assert probes["TLS"]["alerted_thresholds"] == [14]
+    assert probes["TLS:8443"]["alerted_thresholds"] == []
+
+
+@pytest.mark.asyncio
+async def test_an_inventory_row_answers_the_eighteen_fields_the_page_declares(
+    client, db_session, auth_headers_analyst
+):
+    """Plan 036: the row was `PaginatedResponse[dict]` until now.
+
+    The key sets are asserted whole, so a field dropped from `DNSObservationResponse`
+    fails here instead of rendering as a blank cell on the DNS page. The nested
+    control is the second model: nine keys, and `remaining_seconds` is the float the
+    subtraction produces.
+    """
+    from app.services.dns_security_service import ingest_dns_observations
+
+    db_session.add(Asset(asset_type=AssetType.domain, asset_value="example.com", normalized_value="example.com", is_active=True))
+    await db_session.commit()
+    await ingest_dns_observations(
+        db_session,
+        source="resolver",
+        findings=[
+            {
+                "observation_type": "dns_record",
+                "subject": "www.example.com",
+                "record_type": "A",
+                "value": "203.0.113.5",
+            }
+        ],
+    )
+    await ingest_dns_observations(
+        db_session, source="tlsprobe", findings=[_tls_probe(443, "cert-a")]
+    )
+
+    body = (await client.get("/api/v1/dns-security/observations", headers=auth_headers_analyst)).json()
+
+    assert set(body) == {"items", "total", "page", "size", "pages"}
+    rows = {item["observation_type"]: item for item in body["items"]}
+    dns = rows["dns_record"]
+    assert set(dns) == {
+        "id",
+        "observation_type",
+        "subject",
+        "record_type",
+        "value",
+        "source",
+        "first_seen_at",
+        "last_seen_at",
+        "expires_at",
+        "status",
+        "metadata",
+        "alerted_thresholds",
+        "evidence_count",
+        "subject_in_assets",
+        "value_asset_target",
+        "value_in_assets",
+        "expiry_kind",
+        "expiry_monitor",
+    }
+    # A record no control tracks carries no control rather than an empty one, and its
+    # expiry column says the answer is the cache's, not a control's.
+    assert dns["expiry_monitor"] is None
+    assert dns["expiry_kind"] == "dns_cache"
+    assert dns["value_asset_target"] == "203.0.113.5"
+
+    probe = rows["tls_probe"]
+    assert probe["expiry_kind"] == "tls"
+    monitor = probe["expiry_monitor"]
+    assert set(monitor) == {
+        "kind",
+        "state",
+        "checked_at",
+        "successful_at",
+        "expires_at",
+        "certificate_id",
+        "not_before",
+        "alerted_thresholds",
+        "remaining_seconds",
+    }
+    # The control's key carries the port; the row's label does not (AUD-036).
+    assert monitor["kind"] == "tls:443"
+    assert isinstance(monitor["remaining_seconds"], float)
+    assert probe["alerted_thresholds"] == monitor["alerted_thresholds"]
+
+
 @pytest.mark.asyncio
 async def test_inventory_splits_rrsets_groups_ct_and_tracks_assets(client, db_session, auth_headers_analyst):
     from app.services.dns_security_service import ingest_dns_observations
@@ -123,7 +253,6 @@ async def test_observations_require_viewer_and_apply_canonical_subject_filter(cl
             last_seen_at=now,
             status="current",
             metadata_json={},
-            alerted_thresholds=[],
         )
         for index, source in enumerate(("resolver", "ctlogs"), 1)
     ])
@@ -251,7 +380,6 @@ async def test_promotion_normalizes_and_deduplicates_asset(client, db_session, a
         last_seen_at=datetime.now(timezone.utc),
         status="current",
         metadata_json={},
-        alerted_thresholds=[],
     )
     db_session.add(observation)
     await db_session.commit()
@@ -262,6 +390,9 @@ async def test_promotion_normalizes_and_deduplicates_asset(client, db_session, a
     )
     assert first.status_code == 201
     assert first.json()["already_exists"] is False
+    # The DNS answer names the observation's source beside the asset; the breach
+    # and phishing answers have no such field and leave the key out entirely.
+    assert first.json()["source"] == "resolver"
 
     second = await client.post(
         f"/api/v1/dns-security/observations/{observation.id}/asset",
@@ -321,5 +452,194 @@ async def test_dns_worker_protocol_claim_submit_complete_and_read(client, db_ses
     assert listed.status_code == 200
     assert listed.json()["total"] == 2
     assert {row["subject"] for row in listed.json()["items"]} == {"prod.egov.kz", "login.egov.kz"}
+
+
+@pytest.mark.asyncio
+async def test_an_unparseable_subject_filter_is_a_bad_request_and_the_type_filter_narrows(client, db_session, auth_headers_viewer):
+    """A filter the query cannot express is the caller's error, not an empty page.
+
+    ``subject`` is normalised before it reaches SQL, so a value that is neither an
+    address nor a DNS name must be refused rather than silently matched against
+    nothing; ``observation_type`` is the other filter the page offers and it has to
+    narrow the same way ``source`` does.
+    """
+    from app.services.dns_security_service import ingest_dns_observations
+
+    await ingest_dns_observations(
+        db_session,
+        source="resolver",
+        findings=[{"observation_type": "dns_record", "subject": "example.com", "record_type": "A", "value": "203.0.113.5"}],
+    )
+    await ingest_dns_observations(
+        db_session,
+        source="ctlogs",
+        findings=[{"observation_type": "certificate", "subject": "example.com", "value": "example.com", "metadata": {"id": "cert-a"}}],
+    )
+    url = "/api/v1/dns-security/observations"
+
+    refused = await client.get(url, headers=auth_headers_viewer, params={"subject": "not a host!"})
+    assert refused.status_code == 400
+    assert "valid hostname or IP address" in refused.json()["detail"]
+
+    narrowed = (await client.get(url, headers=auth_headers_viewer, params={"observation_type": "certificate"})).json()
+    assert narrowed["total"] == 1
+    assert narrowed["items"][0]["observation_type"] == "certificate"
+
+
+@pytest.mark.asyncio
+async def test_a_record_member_that_is_not_an_asset_and_the_last_member_of_an_rrset(client, db_session, auth_headers_analyst):
+    """Evidence stays evidence, and a record with no members left is not a record.
+
+    The inventory marks which value a record could promote to an asset, but a value
+    that is not a hostname or address marks nothing. Deleting the only member of an
+    RRset removes the row itself, because a set with no members is not a fact.
+    """
+    now = datetime.now(timezone.utc)
+    row = DNSObservation(
+        observation_key="b" * 64,
+        observation_type="dns_record",
+        subject="example.com",
+        record_type="A",
+        value=None,
+        source="resolver",
+        first_seen_at=now,
+        last_seen_at=now,
+        status="current",
+        metadata_json={"record_values": ["not a host!"]},
+    )
+    db_session.add(row)
+    await db_session.commit()
+
+    url = "/api/v1/dns-security/observations"
+    item = (await client.get(url, headers=auth_headers_analyst)).json()["items"][0]
+    assert item["value"] == "not a host!"
+    assert item["value_asset_target"] is None
+    assert item["value_in_assets"] is False
+
+    deleted = await client.delete(f"{url}/{row.id}", headers=auth_headers_analyst, params={"value": "not a host!"})
+    assert deleted.status_code == 204
+    assert await db_session.get(DNSObservation, row.id) is None
+
+
+@pytest.mark.asyncio
+async def test_promotion_refuses_a_missing_observation_and_a_value_it_cannot_normalise(client, db_session, auth_headers_analyst):
+    """A promotion that cannot become an asset says why instead of creating one.
+
+    The target has to be part of the observation (409 above this test), but passing
+    that test is not enough: the asset schema has the final word, so a subject the
+    platform accepted as evidence - a wildcard or a malformed name from a provider -
+    is refused as an asset.
+    """
+    now = datetime.now(timezone.utc)
+    row = DNSObservation(
+        observation_key="c" * 64,
+        observation_type="certificate",
+        subject="not a host!",
+        value="example.com",
+        source="ctlogs",
+        first_seen_at=now,
+        last_seen_at=now,
+        status="historical",
+        metadata_json={},
+    )
+    db_session.add(row)
+    await db_session.commit()
+
+    missing = await client.post(f"/api/v1/dns-security/observations/{uuid.uuid4()}/asset", headers=auth_headers_analyst)
+    assert missing.status_code == 404
+
+    refused = await client.post(f"/api/v1/dns-security/observations/{row.id}/asset", headers=auth_headers_analyst)
+    assert refused.status_code == 409
+    assert "cannot be promoted" in refused.json()["detail"]
+    assert list((await db_session.execute(select(Asset))).scalars()) == []
+
+
+@pytest.mark.asyncio
+async def test_a_concurrent_duplicate_promotion_returns_the_winning_asset(client, db_session, auth_headers_analyst, monkeypatch):
+    """The lookup before the insert is not the guard; the unique index is.
+
+    Two analysts promoting the same value at the same time both miss the lookup and
+    both insert, and the loser sees the winner's row. Answering with a 409 there would
+    make a repeat click look like an error, so the route adopts the existing asset and
+    records the same audit row a first-time promotion does.
+    """
+    from app.core.exceptions import ConflictException
+    from app.services import asset_service
+
+    now = datetime.now(timezone.utc)
+    row = DNSObservation(
+        observation_key="d" * 64,
+        observation_type="dns_record",
+        subject="www.example.com",
+        record_type="A",
+        value="203.0.113.10",
+        source="resolver",
+        first_seen_at=now,
+        last_seen_at=now,
+        status="current",
+        metadata_json={},
+    )
+    db_session.add(row)
+    await db_session.commit()
+
+    original = asset_service.AssetService.create_asset
+
+    async def create_then_lose_the_race(self, data, *, commit=True):
+        # The winner's row lands first, then this caller's INSERT hits the index.
+        await original(self, data, commit=False)
+        raise ConflictException("Asset with this value already exists")
+
+    monkeypatch.setattr(asset_service.AssetService, "create_asset", create_then_lose_the_race)
+    response = await client.post(f"/api/v1/dns-security/observations/{row.id}/asset", headers=auth_headers_analyst)
+
+    assert response.status_code == 201
+    assert response.json()["already_exists"] is True
+    assets = list((await db_session.execute(select(Asset))).scalars())
+    assert [asset.asset_value for asset in assets] == ["www.example.com"]
+    assert response.json()["asset"]["id"] == str(assets[0].id)
+    audit = (
+        await db_session.execute(select(AuditLog).where(AuditLog.action == "dns_security.asset.promoted"))
+    ).scalars().all()
+    assert len(audit) == 1 and audit[0].details["already_exists"] is True
+
+
+@pytest.mark.asyncio
+async def test_a_conflict_that_is_not_a_duplicate_still_fails_the_request(
+    client, db_session, auth_headers_analyst, monkeypatch
+):
+    """Adopting an existing asset must not swallow a real write failure.
+
+    The race branch re-reads the value and adopts the row it finds; when there is no
+    row, the conflict came from something other than a duplicate and reporting success
+    would claim an asset exists when nothing was written.
+    """
+    from app.core.exceptions import ConflictException
+    from app.services import asset_service
+
+    now = datetime.now(timezone.utc)
+    row = DNSObservation(
+        observation_key="e" * 64,
+        observation_type="dns_record",
+        subject="www.example.com",
+        record_type="A",
+        value="203.0.113.10",
+        source="resolver",
+        first_seen_at=now,
+        last_seen_at=now,
+        status="current",
+        metadata_json={},
+    )
+    db_session.add(row)
+    await db_session.commit()
+
+    async def always_conflicts(self, data, *, commit=True):
+        raise ConflictException("Asset with this value already exists")
+
+    monkeypatch.setattr(asset_service.AssetService, "create_asset", always_conflicts)
+    response = await client.post(f"/api/v1/dns-security/observations/{row.id}/asset", headers=auth_headers_analyst)
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "Asset with this value already exists"
+    assert list((await db_session.execute(select(Asset))).scalars()) == []
 
 

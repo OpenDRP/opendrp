@@ -29,7 +29,7 @@ from app.core.manual_rate_limit import SCOPE_REPORTS, enforce_manual_rate_limit
 from app.core.request_context import request_id_header
 from app.models import Report, ReportArtifactCleanup
 from app.schemas.common import MAX_PAGE_SIZE, PaginatedResponse
-from app.schemas.report import ReportCreate, ReportListResponse, ReportResponse
+from app.schemas.report import ReportCreate, ReportListResponse, ReportQueued, ReportResponse
 
 
 router = APIRouter(prefix="/reports", tags=["Reports"])
@@ -44,7 +44,7 @@ log = get_logger("opendrp.reports")
 _INTEGRITY_REASONS = frozenset({REASON_NOT_A_NAME, REASON_OUTSIDE_STORE})
 
 
-@router.post("/generate", status_code=202, response_model=dict)
+@router.post("/generate", status_code=202, response_model=ReportQueued)
 async def generate_report(
     request: Request,
     data_in: ReportCreate,
@@ -148,7 +148,12 @@ async def generate_report(
             status_code=503,
             detail="Report queue is temporarily unavailable; the report job was marked failed",
         )
-    return {"status": "scheduled", "queue_state": "queued", "report_id": str(r.id), "job_id": str(job_id)}
+    return ReportQueued(
+        status="scheduled",
+        queue_state="queued",
+        report_id=str(r.id),
+        job_id=str(job_id),
+    )
 
 
 @router.get("", response_model=ReportListResponse)

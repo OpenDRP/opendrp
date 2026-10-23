@@ -34,7 +34,11 @@ badly, and both are easy to lose in a later edit:
    `docs/configuration.md` told an operator that a limit was 1 GB while Compose
    said something else, and they listed eight services out of twenty-six:
    capacity planning from a page that disagrees with the deployment is worse than
-   no page. The table is parsed and compared here rather than trusted.
+   no page. The table is parsed and compared here rather than trusted — and so are
+   the *sums* the two host-sizing pages publish (`configuration.md`'s cumulative
+   rows and `deployment.md`'s host requirements), which are the same arithmetic
+   one step removed: both had drifted by 1.0 GiB and 1.25 CPU while the per-service
+   table beside them stayed green, because a sum nobody recomputes is a copy.
 6. **The network split and the broker password are still in place.** Connectors
    are third-party code by this platform's own design, and they are one Compose
    edit away from being re-attached to the network that holds PostgreSQL and an
@@ -147,6 +151,65 @@ _LIMITS_TABLE_ROW = re.compile(
     r"^\|\s*`(?P<service>[a-z0-9-]+)`\s*\|\s*`(?P<mem>[^`]+)`\s*\|\s*"
     r"`(?P<cpus>[^`]+)`\s*\|\s*`(?P<pids>[^`]+)`\s*\|$"
 )
+
+#: A published total: `| <label> | 8.0 GiB | 9.0 | ... |`. Only these rows match;
+#: the per-service table above writes `1.5g`, not `GiB`.
+_TOTALS_ROW = re.compile(
+    r"^\|\s*(?P<label>[^|]+?)\s*\|\s*(?P<mem>\d+(?:\.\d+)?)\s*GiB\s*\|\s*"
+    r"(?P<cpu>\d+(?:\.\d+)?)\s*\|"
+)
+
+#: The profile sets behind each published total, in the order the table lists
+#: them. Both tables are cumulative: a row adds the profiles it names to the row
+#: above it. A service under a profile no set here covers is a finding — the sums
+#: claim to account for every service in the file, so a new profile has to be
+#: given a row rather than silently left out of the arithmetic.
+_TOTAL_SETS: tuple[tuple[Path, tuple[frozenset[str], ...]], ...] = (
+    (
+        Path("docs") / "configuration.md",
+        (
+            frozenset(),
+            frozenset({"netlas"}),
+            frozenset({"netlas", "netlas-endpoints", "shodan-endpoints"}),
+            frozenset(
+                {
+                    "netlas",
+                    "netlas-endpoints",
+                    "shodan-endpoints",
+                    "shodan",
+                    "hibp",
+                    "virustotal",
+                }
+            ),
+            frozenset(
+                {
+                    "netlas",
+                    "netlas-endpoints",
+                    "shodan-endpoints",
+                    "shodan",
+                    "hibp",
+                    "virustotal",
+                    "backup",
+                }
+            ),
+        ),
+    ),
+    (
+        Path("docs") / "deployment.md",
+        (
+            frozenset(),
+            frozenset({"backup"}),
+            frozenset({"netlas", "shodan", "hibp", "virustotal"}),
+        ),
+    ),
+)
+
+#: The sentence that prices the two endpoint workers separately, because they
+#: belong to no row of the host-requirement table.
+_ENDPOINT_TOTAL = re.compile(
+    r"add\s+(?P<mem>\d+(?:\.\d+)?)\s*GiB\s+and\s+(?P<cpu>\d+(?:\.\d+)?)\s*CPU"
+)
+_ENDPOINT_PROFILES = frozenset({"netlas-endpoints", "shodan-endpoints"})
 
 
 class Service:
@@ -738,6 +801,160 @@ def _check_documented_limits(text: str, limits_doc: Path) -> list[str]:
     return failures
 
 
+def _profiles(service: Service) -> frozenset[str]:
+    """The profiles a service is gated on, as written inline in the file."""
+    value = service.inline.get("profiles", "")
+    return frozenset(
+        part.strip().strip('"').strip("'")
+        for part in value.strip().strip("[]").split(",")
+        if part.strip()
+    )
+
+
+def _memory_gib(value: str) -> float:
+    """A Compose `mem_limit` in GiB: `1.5g`, `512m` or a byte count."""
+    text = value.strip().strip('"').strip("'").lower()
+    if text.endswith("g"):
+        return float(text[:-1])
+    if text.endswith("m"):
+        return float(text[:-1]) / 1024
+    return float(text) / (1024**3)
+
+
+def _service_cpus(service: Service) -> float:
+    return float(service.inline.get("cpus", "0").strip().strip('"'))
+
+
+def _check_documented_totals(
+    text: str, root: Path, documents: tuple[tuple[Path, tuple[frozenset[str], ...]], ...] | None = None
+) -> list[str]:
+    """The sums an operator sizes a host from are the sums this file produces.
+
+    Two pages publish them — `configuration.md` per cumulative profile set and
+    `deployment.md` as host requirements — and both were hand-computed copies of
+    the Compose file's `mem_limit`/`cpus` values, neither gated while the
+    per-service table beside them was. They had drifted by the same 1.0 GiB and
+    1.25 CPU: the base row said 7.0 GiB / 7.75 CPU against a file that sums to
+    8.0 / 9.0, and every cumulative row inherited it. Sizing a host from the
+    page therefore chose a machine smaller than the caps need, which is the
+    failure the page exists to prevent.
+    """
+    services, _line = parse_services(text)
+    failures: list[str] = []
+    rows_by_document = documents or _TOTAL_SETS
+    covered: set[str] = set()
+    for spec in rows_by_document:
+        for profiles in spec[1]:
+            covered |= set(profiles)
+
+    for name, profiles_set in _profiles_by_service(services).items():
+        for profile in profiles_set - covered:
+            failures.append(
+                f"service `{name}` is gated on profile `{profile}`, which no "
+                f"published total accounts for: the sums in the two host-sizing "
+                f"pages claim to cover every service, so add the profile to a "
+                f"row (and to _TOTAL_SETS) or the page understates the host"
+            )
+
+    for relative, expected_sets in rows_by_document:
+        path = root / relative
+        try:
+            document = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            failures.append(
+                f"cannot read the published totals ({path}): {exc} — an operator "
+                f"sizes a host from those numbers"
+            )
+            continue
+
+        rows = [
+            match
+            for line in document.splitlines()
+            if (match := _TOTALS_ROW.match(line.strip())) is not None
+        ]
+        if len(rows) != len(expected_sets):
+            failures.append(
+                f"{relative}: the totals table has {len(rows)} row(s) where this "
+                f"gate knows {len(expected_sets)} set(s): a row added or removed "
+                f"without its arithmetic is a number nobody checks"
+            )
+
+        for index, (row, allowed) in enumerate(zip(rows, expected_sets), start=1):
+            members = [
+                service
+                for service in services
+                if _profiles(service) <= allowed
+            ]
+            expected_mem = sum(_memory_gib(service.inline.get("mem_limit", "0")) for service in members)
+            expected_cpu = sum(_service_cpus(service) for service in members)
+            documented_mem = float(row.group("mem"))
+            documented_cpu = float(row.group("cpu"))
+            if abs(documented_mem - expected_mem) >= 0.05:
+                failures.append(
+                    f"{relative}:{index}: the row `{row.group('label')}` says "
+                    f"{documented_mem:g} GiB while the services it covers sum to "
+                    f"{expected_mem:g} GiB in this file"
+                )
+            if abs(documented_cpu - expected_cpu) >= 0.005:
+                failures.append(
+                    f"{relative}:{index}: the row `{row.group('label')}` says "
+                    f"{documented_cpu:g} CPU while the services it covers sum to "
+                    f"{expected_cpu:g} CPU in this file"
+                )
+
+        if relative.name == "deployment.md":
+            failures.extend(
+                _check_endpoint_total(relative, document, services)
+            )
+
+    return failures
+
+
+def _check_endpoint_total(
+    relative: Path, document: str, services: list[Service]
+) -> list[str]:
+    """The two endpoint workers are priced in prose, outside the table.
+
+    They belong to no row (`netlas-endpoints` and `shodan-endpoints` are enabled
+    on their own), so the page states their cost in a sentence an operator adds
+    by hand. A sentence that disagrees with the file is the same defect as a row
+    that does.
+    """
+    match = _ENDPOINT_TOTAL.search(document)
+    if match is None:
+        return [
+            f"{relative}: the sentence that prices the endpoint workers is gone "
+            f"— those two services belong to no row of the table, so their cost "
+            f"has to be stated somewhere an operator reads"
+        ]
+
+    endpoints = [
+        service for service in services if _profiles(service) & _ENDPOINT_PROFILES
+    ]
+    expected_mem = sum(
+        _memory_gib(service.inline.get("mem_limit", "0")) for service in endpoints
+    )
+    expected_cpu = sum(_service_cpus(service) for service in endpoints)
+    failures: list[str] = []
+    if abs(float(match.group("mem")) - expected_mem) >= 0.05:
+        failures.append(
+            f"{relative}: the endpoint sentence says "
+            f"{float(match.group('mem')):g} GiB while the endpoint workers sum to "
+            f"{expected_mem:g} GiB in this file"
+        )
+    if abs(float(match.group("cpu")) - expected_cpu) >= 0.005:
+        failures.append(
+            f"{relative}: the endpoint sentence says "
+            f"{float(match.group('cpu')):g} CPU while the endpoint workers sum to "
+            f"{expected_cpu:g} CPU in this file"
+        )
+    return failures
+
+
+def _profiles_by_service(services: list[Service]) -> dict[str, frozenset[str]]:
+    return {service.name: _profiles(service) for service in services}
+
+
 def check(
     text: str, compose_dir: Path, limits_doc: Path | None = None
 ) -> list[str]:
@@ -756,6 +973,7 @@ def check(
     failures.extend(
         _check_documented_limits(text, limits_doc or (compose_dir / _LIMITS_DOC))
     )
+    failures.extend(_check_documented_totals(text, compose_dir))
 
     for service in services:
         missing_limits = [
@@ -842,10 +1060,11 @@ def main(argv: list[str]) -> int:
     services, _line = parse_services(text)
     print(
         f"compose gate: OK — {len(services)} services, each with a healthcheck, "
-        f"a bounded logging policy and container hardening; an authenticated "
-        f"broker; the edge/data/connector network split intact with only the edge "
-        f"trusted for forwarded addresses; and every documented resource limit "
-        f"equal to the one this file sets"
+        f"a bounded logging policy, container hardening and resource limits; an "
+        f"authenticated broker; the edge/data/connector network split intact with "
+        f"only the edge trusted for forwarded addresses; every documented limit "
+        f"equal to the one this file sets, and both host-sizing tables summing to "
+        f"the caps it applies"
     )
     return 0
 

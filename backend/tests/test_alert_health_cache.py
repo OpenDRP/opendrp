@@ -14,10 +14,12 @@ contributions — `checked_at`, `from_cache`, `probe_state` — are asserted in
 from __future__ import annotations
 
 import asyncio
+import time
 from types import SimpleNamespace
 
 import pytest
 
+from app.core.config import settings
 from app.services import alert_health_cache as cache
 
 
@@ -251,3 +253,90 @@ async def test_a_saturated_probe_keeps_its_marker_when_replayed(monkeypatch):
     assert cached.from_cache is True
     assert cached.health == "unknown"
     assert cached.probe_state == "saturated"
+
+
+class _RedisType:
+    """Stands in for ``redis.asyncio.Redis`` in the process-client tests."""
+
+    urls: list[str] = []
+    failure: Exception | None = None
+
+    @classmethod
+    def from_url(cls, url, **_kwargs):
+        cls.urls.append(url)
+        if cls.failure is not None:
+            raise cls.failure
+        return SimpleNamespace(url=url)
+
+
+def test_the_process_client_is_built_once_and_reused_inside_its_ttl(monkeypatch):
+    _RedisType.urls = []
+    _RedisType.failure = None
+    monkeypatch.setattr(cache, "_testing_mode", lambda: False)
+    monkeypatch.setattr(cache, "_redis_type", lambda: _RedisType)
+    monkeypatch.setattr(cache, "_CLIENT", None)
+    monkeypatch.setattr(cache, "_CLIENT_TS", 0.0)
+
+    first = cache._client()
+    second = cache._client()
+
+    assert first is not None
+    assert second is first
+    assert _RedisType.urls == [settings.REDIS_URL]
+
+    # Past the TTL the client is built again rather than reused forever.
+    monkeypatch.setattr(cache, "_CLIENT_TS", time.monotonic() - cache._CLIENT_TTL_SECONDS - 1)
+    third = cache._client()
+
+    assert third is not first
+    assert len(_RedisType.urls) == 2
+
+
+def test_a_client_that_cannot_be_built_degrades_to_probing(monkeypatch):
+    _RedisType.urls = []
+    _RedisType.failure = ConnectionError("redis is unreachable")
+    monkeypatch.setattr(cache, "_testing_mode", lambda: False)
+    monkeypatch.setattr(cache, "_redis_type", lambda: _RedisType)
+    monkeypatch.setattr(cache, "_CLIENT", None)
+
+    assert cache._client() is None
+    assert cache._CLIENT is None
+    _RedisType.failure = None
+
+
+def test_a_runtime_without_redis_answers_without_a_client(monkeypatch):
+    monkeypatch.setattr(cache, "_testing_mode", lambda: False)
+    monkeypatch.setattr(cache, "_redis_type", lambda: None)
+
+    assert cache._client() is None
+
+
+def test_reset_client_cache_forgets_the_process_client():
+    cache._CLIENT = object()
+    cache._CLIENT_TS = 123.0
+
+    cache.reset_client_cache()
+
+    assert cache._CLIENT is None
+    assert cache._CLIENT_TS == 0.0
+
+
+async def test_a_failed_write_is_logged_rather_than_raised():
+    outcome = cache.ProbeOutcome(
+        health="healthy",
+        message="ok",
+        latency_ms=1,
+        blocked_reason=None,
+        probe_state="ok",
+        checked_at=cache._now(),
+    )
+
+    # The broken client raises on every call; the cache must not turn that into a
+    # failed health page.
+    await cache._write(_BrokenRedis(), "key", outcome, 60)
+    await cache._release(_BrokenRedis(), "lock")
+
+
+def test_the_process_client_is_disabled_under_the_test_runner():
+    # This is the branch every other test relies on: no Redis in the test runner.
+    assert cache._client() is None

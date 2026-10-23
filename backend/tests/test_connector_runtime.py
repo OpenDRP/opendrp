@@ -891,6 +891,45 @@ class TestShodanConnector:
         connector._search.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_the_favicon_guard_does_not_depend_on_the_environment_name(
+        self, connector_env, monkeypatch
+    ):
+        """AUD-026: `APP_ENV=test` removed the destination check with no signal.
+
+        The seam that lets this suite answer a fake host is `TESTING` alone, so a
+        stack whose configuration says `APP_ENV=test` — a copied `.env`, a staging
+        box built from the test profile — still resolves the name and refuses a
+        private answer instead of dialling it.
+        """
+        monkeypatch.delenv("TESTING", raising=False)
+        monkeypatch.setenv("APP_ENV", "test")
+        connector = ShodanConnector()
+        resolved: list[str] = []
+        requested: list[str] = []
+
+        def fake_getaddrinfo(host, port, *args, **kwargs):
+            resolved.append(host)
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 0))]
+
+        class FakeClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return None
+
+            def stream(self, method, url, **kwargs):
+                requested.append(url)
+                raise AssertionError("dialled a destination the guard refused")
+
+        monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+        monkeypatch.setattr(_shodanmodule.httpx, "AsyncClient", lambda **kwargs: FakeClient())
+
+        assert await connector._fetch_favicon("brand.example", "https") is None
+        assert resolved == ["brand.example"]
+        assert requested == []
+
+    @pytest.mark.asyncio
     async def test_favicon_follows_a_same_host_redirect(self, connector_env, monkeypatch):
         monkeypatch.setenv("TESTING", "1")
         connector = ShodanConnector()
@@ -1661,6 +1700,37 @@ class TestDnstwistConnector:
         assert "--nameservers" not in command
         assert command[command.index("--threads") + 1] == "8"
 
+    def test_an_unusable_numeric_setting_falls_back_instead_of_killing_the_worker(
+        self, connector_env, monkeypatch
+    ):
+        """A typo in a documented setting is a misconfiguration, not a broken worker.
+
+        ``DNSTWIST_TIMEOUT_SECONDS`` was read with a bare ``float()`` at import, so
+        ``abc`` killed the process before it could register, and a negative value
+        was accepted and made every scan time out instantly. The other two numeric
+        settings raised in the constructor for the same reason. Every other worker
+        bounds a setting and falls back to the default when it cannot use it.
+        """
+        monkeypatch.setenv("DNSTWIST_TIMEOUT_SECONDS", "abc")
+        monkeypatch.setenv("DNSTWIST_THREADS", "-5")
+        monkeypatch.setenv("DNSTWIST_MAX_CANDIDATES", "many")
+        module = _load_module(
+            "opendrp_test_dnstwist_env", _CONNECTORS / "dnstwist" / "main.py"
+        )
+        assert module._DNSTWIST_SUBPROCESS_TIMEOUT == 120.0
+        connector = module.DNSTwistConnector()
+        assert connector.threads == 8
+        assert connector.max_candidates == module._DEFAULT_MAX_CANDIDATES
+
+        # A value inside the documented range is still the operator's.
+        monkeypatch.setenv("DNSTWIST_TIMEOUT_SECONDS", "45")
+        assert (
+            _load_module(
+                "opendrp_test_dnstwist_env_ok", _CONNECTORS / "dnstwist" / "main.py"
+            )._DNSTWIST_SUBPROCESS_TIMEOUT
+            == 45.0
+        )
+
     @pytest.mark.asyncio
     async def test_run_domain_filters_original_and_unresolved_entries(
         self, connector_env, monkeypatch
@@ -1834,3 +1904,30 @@ class TestDnstwistConnector:
         assert summary["resolved"] == 1
         assert summary["new_discovered"] == 0
         assert summary["domains_with_errors"] == 0
+
+
+class TestTheQuotaBudgetHasOneHome:
+    """AUD-022: the VirusTotal limits exist once, in the API that enforces them.
+
+    ``connectors/dns_security/quota.py`` was a Redis guard nothing imported,
+    carrying a second copy of the public tier's 4/minute and 500/day limits. A
+    reader could tune the copy and believe the budget had moved, while the API
+    still reserved against its own numbers. The fix is the deletion; these
+    assertions fail while a second copy is back, so a future reader cannot
+    reintroduce one by restoring a file.
+    """
+
+    def test_the_virustotal_budget_is_not_kept_in_the_connector_tree(self):
+        assert not (_CONNECTORS / "dns_security" / "quota.py").exists()
+
+        sources = [
+            path
+            for path in _CONNECTORS.rglob("*.py")
+            if path.name != "test_connector_runtime.py"
+        ]
+        offenders = [
+            str(path.relative_to(_ROOT))
+            for path in sources
+            if "quota:virustotal" in path.read_text(encoding="utf-8")
+        ]
+        assert offenders == []

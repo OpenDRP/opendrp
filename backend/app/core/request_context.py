@@ -14,6 +14,11 @@ stream to an audit table on timestamp and client address — two fields that wer
 never designed to identify a single request, in a platform that writes an audit
 row for the *authenticated* address behind a proxy.
 
+The response is also where an unhandled exception is turned into a 500, for the
+same reason: Starlette renders that response one layer above every middleware the
+application installs, so the id would be missing from exactly the report an
+operator is asked to quote. See the comment in ``__call__``.
+
 Why the value is validated
 --------------------------
 The header arrives from the client, so it is untrusted input being written into
@@ -28,12 +33,24 @@ rather than rejected — a client sending junk should still be traceable.
 from __future__ import annotations
 
 import re
+import traceback as _traceback
 import uuid
 from contextvars import ContextVar, Token
 from typing import Any
 
+import structlog
 from starlette.datastructures import Headers, MutableHeaders
+from starlette.responses import PlainTextResponse
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
+
+#: Same logger name as the API's own, so an unhandled exception is one filter
+#: away from the rest of the request-scoped lines rather than a fourth stream.
+log = structlog.get_logger("opendrp.api")
+
+#: The body of a crash. Deliberately the string Starlette's own error middleware
+#: sends, so a client that has been taught to expect an opaque 500 keeps reading
+#: the same one.
+_INTERNAL_ERROR_BODY = "Internal Server Error"
 
 #: The header the platform reads and returns.
 REQUEST_ID_HEADER = "X-Request-ID"
@@ -92,6 +109,21 @@ def reset_request_id(token: Token) -> None:
     _request_id_var.reset(token)
 
 
+def _raising_frame(exc: BaseException) -> str | None:
+    """``file:line`` of the innermost frame, without the exception's message.
+
+    The traceback object carries no text of its own — ``extract_tb`` returns the
+    code locations — so this is the part of a stack trace that can be logged
+    without deciding whether a third-party message is safe to ship to the SIEM.
+    """
+    frames = _traceback.extract_tb(exc.__traceback__)
+    if not frames:
+        return None
+    last = frames[-1]
+    name = last.filename.replace("\\", "/").rsplit("/", 1)[-1]
+    return f"{name}:{last.lineno}"
+
+
 def request_id_header() -> dict[str, str]:
     """Headers that carry this request's id to another process.
 
@@ -126,16 +158,40 @@ class RequestContextMiddleware:
         incoming = Headers(scope=scope).get(REQUEST_ID_HEADER)
         request_id = sanitize_request_id(incoming) or new_request_id()
         token = _request_id_var.set(request_id)
+        response_started = False
 
         async def send_with_request_id(message: Message) -> None:
+            nonlocal response_started
             if message["type"] == "http.response.start":
+                response_started = True
                 # Echoed even on a rejection: the id is what makes a 4xx in
                 # someone's bug report findable in the logs.
                 MutableHeaders(scope=message)[REQUEST_ID_HEADER] = request_id
             await send(message)
 
         try:
-            await self.app(scope, receive, send_with_request_id)
+            try:
+                await self.app(scope, receive, send_with_request_id)
+            except Exception as exc:
+                # A crash is answered here rather than by Starlette's
+                # ``ServerErrorMiddleware``, which sits above this layer: the
+                # response it renders carries no ``X-Request-ID`` and the sink it
+                # logs to never sees the correlation id, so the one response that
+                # *is* a bug report is the one nobody can look up. Answering one
+                # layer in fixes both, and the exception is re-raised afterwards
+                # so the server still writes the traceback to its error log.
+                if response_started:
+                    raise
+                log.error(
+                    "unhandled_exception",
+                    path=str(scope.get("path", "")),
+                    method=str(scope.get("method", "")),
+                    err=type(exc).__name__,
+                    frame=_raising_frame(exc),
+                )
+                response = PlainTextResponse(_INTERNAL_ERROR_BODY, status_code=500)
+                await response(scope, receive, send_with_request_id)
+                raise
         finally:
             # The context is per-request via the task, but resetting keeps the
             # variable's lifetime correct for reused contexts (tests, embedded

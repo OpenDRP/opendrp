@@ -271,6 +271,52 @@ def test_a_host_only_setting_may_be_allowlisted_with_a_reason(
     assert with_allowlist == []
 
 
+def test_a_setting_declared_with_a_plain_default_is_still_a_setting(
+    tmp_path: Path,
+) -> None:
+    """Rule 3's question is "is this a field of the model", not "was it Field(".
+
+    A field written `DIGEST_ENABLED: bool = True` is as much a setting as one
+    written `Field(default=True)`. The gate decided membership by pattern, so
+    five fields of the shipped model — `AUDIT_ARCHIVE_DIR`, `AUDIT_RETENTION_HOLD`,
+    `ALERT_PHISHING_DIGEST_ENABLED`, `ALERT_CANDIDATE_CHANGE_NOTIFICATIONS` and
+    `ALERT_BREACH_NOISE_POLICY` — were exempt from the rule that a documented
+    setting has to be passed into a container, and nothing said so.
+    """
+    findings = _analyse(
+        tmp_path,
+        "DIGEST_ENABLED=true\n",
+        "services:\n  api:\n    image: x\n",
+        settings_text="class Settings(BaseSettings):\n    DIGEST_ENABLED: bool = True\n",
+        # The model file is a consumer in its own right, so rule 2 is answered
+        # and the question left is rule 3's.
+        source_roots=[tmp_path],
+    )
+
+    assert _rules(findings) == [3]
+    assert "DIGEST_ENABLED" in str(findings[0])
+
+
+def test_an_attribute_of_another_class_is_not_a_settings_field(tmp_path: Path) -> None:
+    """Reading the model is what keeps a helper's constant out of rule 3."""
+    findings = _analyse(
+        tmp_path,
+        "TUNING_SECONDS=30\n",
+        "services:\n  api:\n    image: x\n",
+        settings_text=(
+            "class Helper:\n"
+            "    TUNING_SECONDS: int = 30\n"
+            "\n"
+            "\n"
+            "class Settings(BaseSettings):\n"
+            "    pass\n"
+        ),
+        source_roots=[tmp_path],
+    )
+
+    assert findings == []
+
+
 # ==============================================================================
 # Rule 4 — Compose sets it to a literal, shadowing the template
 # ==============================================================================

@@ -1,7 +1,7 @@
 import ipaddress
 import re
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 from typing import Literal
 
 from pydantic import (
@@ -270,6 +270,102 @@ class AssetResponse(AssetBase):
     findings: AssetFindingSummary | None = None
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class PromotedAssetResponse(BaseModel):
+    """What the four promotion routes answer: the asset, and whether it existed.
+
+    `asset` reuses :class:`AssetResponse` rather than restating its fields, because a
+    promotion and a read return the same resource and two declarations of it would
+    drift. Until this model existed the nested object was a SQLAlchemy row serialized
+    by `jsonable_encoder`, so the payload was whatever columns the table happened to
+    have; now it is the set of fields the rest of the API describes.
+
+    `source` is optional: the DNS and exposure promotions name the observation's
+    source, the breach and phishing ones have no such field, and the routes exclude
+    nulls so an absent key stays absent.
+    """
+
+    already_exists: bool
+    asset: AssetResponse
+    source: str | None = None
+
+
+#: The modules whose findings can name an asset, spelled as
+#: `services/asset_matching.RELATED_FINDING_MODULES` spells them. A `Literal` rather
+#: than a free string, because a row can only name a module the view can list.
+RelatedFindingModule = Literal["phishing", "breaches", "dns", "exposure", "findings"]
+
+
+class AssetFindingSubject(BaseModel):
+    """The asset a findings view is about — the header, not the whole row.
+
+    The page names the asset it is showing and nothing else from `assets`, so this
+    is the four fields it reads rather than an `AssetResponse`: a column added to
+    the table is not something this answer has to decide about.
+    """
+
+    id: uuid.UUID
+    asset_type: AssetType
+    asset_value: str
+    is_active: bool
+
+
+class AssetFindingCounts(BaseModel):
+    """One number per module that can name an asset, plus their sum.
+
+    The names are the contract: `RELATED_FINDING_MODULES` drives the counters and
+    the SPA reads them as a closed record, so a module added to that tuple has to
+    be added here and in the client type rather than arriving as an extra key the
+    interface does not describe.
+    """
+
+    phishing: int
+    breaches: int
+    dns: int
+    exposure: int
+    findings: int
+    total: int
+
+
+class AssetFindingItem(BaseModel):
+    """One related finding, in the one shape every module answers with.
+
+    `observed_at` is deliberately not a single type. A breach reports the *date* it
+    was disclosed while a scan reports the timestamp it recorded, and the matching
+    module publishes each in its own kind on purpose — declaring `datetime` would
+    turn `2024-01-01` into midnight, a moment the platform never observed.
+    """
+
+    id: uuid.UUID
+    module: RelatedFindingModule
+    title: str
+    matched_asset: str | None = None
+    source: str | None = None
+    status: str | None = None
+    observed_at: date | datetime | None = None
+
+
+class AssetFindingsResponse(BaseModel):
+    """What the platform holds about one asset, across every module (WI-12/AST-22).
+
+    The optional row fields are sent as `null` rather than omitted, which is why the
+    route declares this model without `response_model_exclude_none`: the client
+    types them `string | null`, and a key that disappears would be a different
+    answer from the one it was written against.
+    """
+
+    asset: AssetFindingSubject
+    counts: AssetFindingCounts
+    #: When each module last saw a finding about this asset (WI-20), as the ISO text
+    #: that module publishes: a disclosure date or a scan timestamp.
+    last_seen: dict[str, str | None] = Field(default_factory=dict)
+    module: RelatedFindingModule
+    items: list[AssetFindingItem]
+    total: int
+    page: int
+    size: int
+    pages: int
 
 
 class AssetListResponse(PaginatedResponse[AssetResponse]):

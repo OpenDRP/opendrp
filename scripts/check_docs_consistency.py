@@ -533,6 +533,27 @@ def check_tables(root: Path, files: Sequence[Path]) -> List[str]:
                         f"shifts everything after it into the wrong column"
                     )
                 row += 1
+            # A blank line ends the table in GFM, so a row after one belongs to no
+            # table and renders as a paragraph of pipes — with its cells unchecked,
+            # because the walk above stops at the gap. The register lost forty-four
+            # findings this way, and the gate reported the page clean. A blank line
+            # followed by a *new* header and its separator is the ordinary shape and
+            # not this one; prose that merely mentions a pipe is not a row.
+            gap = row
+            while gap < len(lines) and not lines[gap].strip():
+                gap += 1
+            if gap > row and gap < len(lines) and lines[gap].strip().startswith("|"):
+                starts_a_table = gap + 1 < len(lines) and _is_delimiter_row(lines[gap + 1])
+                if not starts_a_table:
+                    orphaned = gap
+                    while orphaned < len(lines) and _is_table_row(lines[orphaned]):
+                        orphaned += 1
+                    failures.append(
+                        f"{display}:{row + 1}: a blank line ends the table, so the "
+                        f"{orphaned - gap} row(s) after it render as a paragraph of "
+                        f"pipes rather than as part of it: remove the blank line, or "
+                        f"give those rows a new header and separator"
+                    )
             index = row
     return failures
 

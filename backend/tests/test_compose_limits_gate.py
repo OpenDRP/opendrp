@@ -188,6 +188,100 @@ def test_an_exception_without_a_reason_is_reported(
     assert "without a reason" in failures[0]
 
 
+# ==============================================================================
+# The published totals
+# ==============================================================================
+def _documented_root(
+    tmp_path: Path,
+    *,
+    configuration: str | None = None,
+    deployment: str | None = None,
+) -> Path:
+    """A checkout whose two host-sizing pages are the shipped ones or a variant."""
+    docs = tmp_path / "docs"
+    docs.mkdir(parents=True, exist_ok=True)
+    for name, replacement in (
+        ("configuration.md", configuration),
+        ("deployment.md", deployment),
+    ):
+        text = (
+            replacement
+            if replacement is not None
+            else (_ROOT / "docs" / name).read_text(encoding="utf-8")
+        )
+        (docs / name).write_text(text, encoding="utf-8")
+    return tmp_path
+
+
+def test_the_published_totals_are_the_sums_compose_produces() -> None:
+    """`configuration.md` and `deployment.md` both size a host from sums.
+
+    Each number is a copy of the Compose file's `mem_limit`/`cpus` values, and
+    both pages had drifted by the same amount while the per-service table next
+    door was gated: the base row said 7.0 GiB / 7.75 CPU while the file summed to
+    8.0 / 9.0, and every cumulative row inherited the difference. An operator
+    sizing a host from either page chose a smaller machine than the caps need.
+    """
+    assert gate._check_documented_totals(_COMPOSE_TEXT, _ROOT) == []
+
+
+def test_a_stale_total_in_the_configuration_table_is_reported(tmp_path: Path) -> None:
+    document = (_ROOT / "docs" / "configuration.md").read_text(encoding="utf-8")
+    stale = document.replace(
+        "| Base (always on) | 8.0 GiB | 9.0 |",
+        "| Base (always on) | 7.0 GiB | 7.75 |",
+    )
+    assert stale != document, "the row this test edits is not in the table"
+
+    failures = gate._check_documented_totals(
+        _COMPOSE_TEXT, _documented_root(tmp_path, configuration=stale)
+    )
+
+    assert failures, "a total that disagrees with the Compose file has to be reported"
+    assert "7 GiB" in failures[0]
+    assert "8 GiB" in failures[0]
+
+
+def test_a_stale_total_in_the_host_requirements_table_is_reported(
+    tmp_path: Path,
+) -> None:
+    document = (_ROOT / "docs" / "deployment.md").read_text(encoding="utf-8")
+    stale = document.replace(
+        "| Installation, no profiles (`docker-compose.yml`) | 8.0 GiB | 9.0 |",
+        "| Installation, no profiles (`docker-compose.yml`) | 7.0 GiB | 7.75 |",
+    )
+    assert stale != document, "the row this test edits is not in the table"
+
+    failures = gate._check_documented_totals(
+        _COMPOSE_TEXT, _documented_root(tmp_path, deployment=stale)
+    )
+
+    assert failures, "a host requirement that disagrees with Compose has to be reported"
+    assert "deployment.md" in failures[0]
+
+
+def test_a_profile_no_published_total_covers_is_reported(tmp_path: Path) -> None:
+    """A new profile changes a sum the tables claim to have accounted for."""
+    text = _COMPOSE_TEXT.replace('profiles: ["hibp"]', 'profiles: ["newprov"]', 1)
+    assert text != _COMPOSE_TEXT, "the profile this test renames is not in the file"
+
+    failures = gate._check_documented_totals(text, _documented_root(tmp_path))
+
+    assert any("newprov" in failure for failure in failures), failures
+
+
+def test_a_missing_totals_table_is_reported_rather_than_passing(
+    tmp_path: Path,
+) -> None:
+    body = "# configuration\n\n(no table here)\n"
+
+    failures = gate._check_documented_totals(
+        _COMPOSE_TEXT, _documented_root(tmp_path, configuration=body)
+    )
+
+    assert failures, "a page whose table disappeared cannot be reported as agreeing"
+
+
 def test_a_named_exception_is_accepted_with_its_reason(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

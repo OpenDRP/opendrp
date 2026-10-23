@@ -67,7 +67,7 @@ ENV VITE_CANONICAL_ORIGIN=${VITE_CANONICAL_ORIGIN}
 # it, which is what makes a screenshot usable in a bug report. Defaulted to the
 # in-tree version rather than left unset, so a development build does not claim
 # to be a release it is not.
-ARG VITE_APP_VERSION=0.2.0
+ARG VITE_APP_VERSION=0.2.1
 ENV VITE_APP_VERSION=${VITE_APP_VERSION}
 ENV NODE_ENV=production
 

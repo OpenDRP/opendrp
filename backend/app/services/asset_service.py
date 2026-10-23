@@ -1,5 +1,6 @@
 import uuid
 from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import Any, Optional
 
 from sqlalchemy import and_, asc, delete, desc, exists, func, literal, or_, select, union_all
@@ -101,6 +102,20 @@ def _batched(values: Sequence[Any], size: int) -> list[list[Any]]:
     keeps an involvement lookup bounded in both directions.
     """
     return [list(values[start : start + size]) for start in range(0, len(values), size)]
+
+
+#: How many deleted identities one bulk cleanup reports. The row exists to answer
+#: "which findings went", not to copy the deleted rows into the trail: a bounded
+#: sample plus the count identifies the batch to an investigation.
+ORPHAN_SAMPLE_SIZE = 20
+
+
+@dataclass(frozen=True)
+class OrphanCleanup:
+    """What one bulk cleanup removed, and enough identity to explain it."""
+
+    deleted: int
+    sample: list[str]
 
 
 class AssetService:
@@ -487,17 +502,19 @@ class AssetService:
             if await self.asset_exists(values["asset_type"], values["normalized_value"]):
                 raise ConflictException("Asset with this value already exists")
             asset = Asset(**values)
-            self.db.add(asset)
+            # The INSERT runs in its own savepoint. A lost race rolls back this row only:
+            # a rollback of the whole session here discarded the rows an import had
+            # already written, and expired the caller's loaded objects, so the import's
+            # audit row failed on a lazy load. The caller's transaction is left alone.
+            async with self.db.begin_nested():
+                self.db.add(asset)
+                await self.db.flush()
             if commit:
                 await self.db.commit()
                 await self.db.refresh(asset)
-            else:
-                await self.db.flush()
         except IntegrityError as exc:
-            await self.db.rollback()
             raise ConflictException("Asset with this value already exists") from exc
         except ValueError as exc:
-            await self.db.rollback()
             raise BadRequestException(str(exc)) from exc
         return asset
 
@@ -587,7 +604,15 @@ class AssetService:
             # the findings that depend on this asset's *value*, under the shared
             # canonicalization — the old byte-for-byte comparison missed findings
             # the breach list happily displayed next to the same asset.
-            keys = key_variants(asset.asset_value)
+            # The asset's own type decides its keys, as it does for the orphan
+            # cleanup and the involvement lookup: an untyped read would treat a
+            # keyword as a hostname, and a keyword that equals a monitored domain
+            # would take that domain's findings with it.
+            # A key another remaining asset still answers to is not this asset's
+            # to remove: its findings are explained by that asset (the same rule the
+            # orphan cleanup applies).
+            others, other_domains = await self._keys_owned_elsewhere(asset.id)
+            keys = asset_key_variants(asset.asset_type, asset.asset_value) - others
             phishing_deleted = await self._delete_in_batches(
                 PhishingDomain,
                 PhishingDomain.id,
@@ -601,7 +626,10 @@ class AssetService:
             # mailboxes at that domain; deleting one mailbox does not touch its
             # domain. ``email_suffix_predicate`` ignores keys that are not
             # hostnames, so an email or keyword key can never widen the cascade.
-            by_email_domain = email_suffix_predicate(Breach.matched_email, keys)
+            by_email_domain = email_suffix_predicate(
+                Breach.matched_email,
+                domain_asset_variants(asset.asset_type, asset.asset_value) - other_domains,
+            )
             if by_email_domain is not None:
                 breach_conditions.append(by_email_domain)
             breach_deleted = await self._delete_in_batches(
@@ -646,6 +674,25 @@ class AssetService:
             if len(ids) < self.FINDING_BATCH_SIZE:
                 return deleted
 
+    async def _keys_owned_elsewhere(self, asset_id: uuid.UUID) -> tuple[set[str], set[str]]:
+        """Keys (and domain-only keys) that the other assets answer to.
+
+        Read once per delete, over the same rule the orphan cleanup reads. A delete is
+        an operator action, not a scan, so reading the inventory once is acceptable.
+        """
+        rows = (
+            await self.db.execute(
+                select(Asset.asset_type, func.coalesce(Asset.normalized_value, Asset.asset_value))
+                .where(Asset.id != asset_id)
+            )
+        ).all()
+        keys: set[str] = set()
+        domain_keys: set[str] = set()
+        for asset_type, value in rows:
+            keys |= asset_key_variants(asset_type, value)
+            domain_keys |= domain_asset_variants(asset_type, value)
+        return keys, domain_keys
+
     async def _asset_keys(self) -> tuple[set[str], set[str]]:
         """Every asset key variant, plus the domain-only subset (WI-08 rules)."""
         rows = (
@@ -662,7 +709,7 @@ class AssetService:
 
     async def _delete_orphans(
         self, model, id_column, value_columns, linked_in_sql, is_linked
-    ) -> int:
+    ) -> "OrphanCleanup":
         """Delete rows the SQL anti-join flags, after ``is_linked`` confirms them.
 
         The anti-join is what makes this independent of the finding table's size:
@@ -670,8 +717,14 @@ class AssetService:
         of every finding and every asset. ``is_linked`` re-checks those candidates
         with the shared IDNA-aware rule, because SQL cannot tell that a Unicode
         spelling and its punycode form are the same host.
+
+        What it deletes is returned with a bounded sample of the identities: the
+        rows commit batch by batch, so once this returns the deleted rows are not
+        readable anywhere and a count alone cannot answer why a particular finding
+        disappeared (AUD-030).
         """
         deleted = 0
+        sample: list[str] = []
         while True:
             rows = (
                 await self.db.execute(
@@ -682,17 +735,21 @@ class AssetService:
                 )
             ).all()
             if not rows:
-                return deleted
+                return OrphanCleanup(deleted=deleted, sample=sample)
             orphan_ids = [row[0] for row in rows if not is_linked(*row[1:])]
             if not orphan_ids:
-                return deleted
+                return OrphanCleanup(deleted=deleted, sample=sample)
+            for orphan_id in orphan_ids:
+                if len(sample) >= ORPHAN_SAMPLE_SIZE:
+                    break
+                sample.append(str(orphan_id))
             result = await self.db.execute(delete(model).where(id_column.in_(orphan_ids)))
             deleted += result.rowcount or 0
             await self.db.commit()
             if len(rows) < self.FINDING_BATCH_SIZE:
-                return deleted
+                return OrphanCleanup(deleted=deleted, sample=sample)
 
-    async def clean_orphan_phishing_findings(self) -> int:
+    async def clean_orphan_phishing_findings(self) -> "OrphanCleanup":
         """Delete phishing findings whose matched asset no longer exists (WI-10)."""
         from app.models.phishing import PhishingDomain
 
@@ -708,7 +765,7 @@ class AssetService:
             lambda matched_asset: bool(key_variants(matched_asset) & asset_keys),
         )
 
-    async def clean_orphan_breach_findings(self) -> int:
+    async def clean_orphan_breach_findings(self) -> "OrphanCleanup":
         """Delete breach findings that no longer match any configured asset (WI-10).
 
         The email-to-domain branch is an equality on ``EmailDomain``, which

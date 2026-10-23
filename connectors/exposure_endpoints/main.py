@@ -28,9 +28,11 @@ OPERATION = "lookup"
 
 #: Failures that say "this attempt failed", not "this account cannot scan":
 #: another target is worth trying, because the provider did answer the ones before
-#: it. `invalid_credentials`, `access_denied`, `quota_denied` and an exhausted
-#: request budget are deliberately absent — the next target would fail for the
-#: same reason, and trying it spends a request to learn nothing.
+#: it. A refused reservation (`quota_denied`, `source_disabled`,
+#: `provider_access_denied`, `quota_backend_unavailable`), `invalid_credentials`,
+#: `access_denied` and an exhausted request budget are deliberately absent — the
+#: next target would fail for the same reason, and trying it spends a request to
+#: learn nothing.
 RECOVERABLE_ERRORS = frozenset(
     {
         "network_or_invalid_response",
@@ -101,7 +103,17 @@ class ExposureEndpointsConnector(ConnectorBase):
             )
         except ConnectorAPIError as exc:
             # A refused reservation must stop the scan, not let a request slip past quota.
-            raise ProviderError("quota_denied") from exc
+            # The core's status says which refusal it is, and each one sends the operator
+            # to a different page: a spent budget, a source an operator disabled, an
+            # account nobody approved, or a quota backend that is down. Collapsing them
+            # into one word made the first run of a new connector read as "out of quota".
+            code = {
+                429: "quota_denied",
+                409: "source_disabled",
+                403: "provider_access_denied",
+                503: "quota_backend_unavailable",
+            }.get(exc.status_code, "quota_denied")
+            raise ProviderError(code) from exc
 
     def _policy(self, config):
         policy = {}

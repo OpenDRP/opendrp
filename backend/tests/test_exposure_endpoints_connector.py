@@ -50,6 +50,30 @@ def _netlas_host(host_payload):
     return handler
 
 
+@pytest.mark.asyncio
+async def test_a_refused_reservation_names_the_reason_the_core_gave(netlas):
+    """A spent budget, a disabled source and an unapproved account are three answers.
+
+    The core already distinguishes them (429, 409, 403 from `/me/quota/provider`),
+    and every one of them used to reach the job summary as `quota_denied`. The most
+    common first-run case — a connector run before its source account is approved —
+    then read as a quota problem, which is the wrong page to send an operator to.
+    """
+    from opendrp_connector.base import ConnectorAPIError
+
+    expected = {
+        429: "quota_denied",
+        409: "source_disabled",
+        403: "provider_access_denied",
+        503: "quota_backend_unavailable",
+    }
+    for status, code in expected.items():
+        netlas._request = AsyncMock(side_effect=ConnectorAPIError(status, "refused"))
+        with pytest.raises(endpoint_providers.ProviderError) as refused:
+            await netlas._reserve("job-1", "lookup")
+        assert str(refused.value) == code, status
+
+
 @pytest.fixture
 def netlas(monkeypatch):
     _env(monkeypatch, "netlas", "exposure-netlas-endpoints")

@@ -100,8 +100,118 @@ def engine_kwargs(url: str, settings_=settings) -> dict:
     return kwargs
 
 
+def install_sqlite_transaction_control(engine) -> bool:
+    """Make SQLite start a real transaction, so ``begin_nested()`` really nests.
+
+    pysqlite's default mode does not emit ``BEGIN``: it lets the driver commit
+    each statement unless a transaction was explicitly opened. SQLAlchemy's
+    ``Session`` still thinks it is in a transaction, and ``SAVEPOINT`` in SQLite
+    starts one when none is open — so a savepoint that happens to be a session's
+    first real statement becomes the *outermost* transaction, and its ``RELEASE``
+    **commits**. Every caller that wraps a statement in ``begin_nested()`` to keep
+    it retryable then loses the ability to roll it back: the asset create that
+    promises "the mutation and its audit row are one transaction" stores the row
+    even when the audit write refuses, and an ingestion batch's per-row savepoint
+    stops being per-row. On PostgreSQL, where the savepoint sits inside a real
+    transaction, the same code is correct — which is why the difference is
+    invisible until the suite runs on SQLite.
+
+    The fix keeps the driver's default transactions and adds the two SQLAlchemy
+    swallows: the driver goes to autocommit (``isolation_level = None``), and we
+    send ``BEGIN`` ourselves in exactly the two places the pysqlite default would
+    have sent one anyway, plus the place it got wrong:
+
+    * **before a DML statement** — pysqlite begins a transaction for INSERT /
+      UPDATE / DELETE, which is what makes a session ``rollback()`` undo them; in
+      autocommit mode nothing would;
+    * **before a SAVEPOINT** — so the savepoint nests inside a real transaction
+      and its ``RELEASE`` no longer commits (the defect above).
+
+    Read-only statements are deliberately left out, as they are in the pysqlite
+    default: a ``SELECT`` does not need a transaction to be correct, and one would
+    hold a SHARED lock for as long as its session lives. Emitting ``BEGIN`` at the
+    start of *every* transaction — what the SQLAlchemy documentation shows, and the
+    first attempt here — does exactly that, and then a second connection's commit
+    waits out the busy timeout whenever any other session sits between a SELECT and
+    its rollback: ``database is locked``, from a statement that is not the one at
+    fault. Beginning at the write instead keeps the writer's transaction short and
+    gives it no read snapshot to upgrade.
+
+    Returns ``True`` when the listeners were installed (a SQLite engine) and
+    ``False`` otherwise, so a caller can apply it unconditionally.
+    """
+    from sqlalchemy import event
+    from sqlalchemy.exc import OperationalError
+
+    sync_engine = getattr(engine, "sync_engine", engine)
+    if getattr(getattr(engine, "dialect", None), "name", None) != "sqlite":
+        return False
+
+    @event.listens_for(sync_engine, "connect")
+    def _autocommit_driver(dbapi_connection, connection_record):
+        # A driver that starts its own transactions cannot be told when to begin
+        # one; with this, the BEGINs below happen only when we ask for them.
+        try:
+            dbapi_connection.isolation_level = None
+        except Exception:
+            pass
+
+    # Key in ``connection.info`` saying this connection already has a real
+    # transaction open, so a second write does not BEGIN again.
+    _OPEN = "opendrp.sqlite_real_transaction"
+
+    def _begin(connection) -> None:
+        """Open the real transaction this connection is about to need."""
+        if connection.info.get(_OPEN):
+            return
+        connection.info[_OPEN] = True
+        try:
+            connection.exec_driver_sql("BEGIN")
+        except OperationalError as exc:
+            # A caller that opened a transaction itself (``gather_report_data``
+            # does, to fix one read snapshot) already has one; BEGIN is refused
+            # and nothing needs opening.
+            if "within a transaction" not in str(exc):
+                connection.info.pop(_OPEN, None)
+                raise
+
+    #: The statement kinds pysqlite opened a transaction for, as a fallback for
+    #: writes that reach the driver as text rather than as a Core/ORM statement.
+    _WRITE_PREFIXES = ("insert", "update", "delete", "replace")
+
+    def _is_write(context, statement: str) -> bool:
+        if context is not None and (
+            getattr(context, "isinsert", False)
+            or getattr(context, "isupdate", False)
+            or getattr(context, "isdelete", False)
+        ):
+            return True
+        first = statement.lstrip().split(None, 1)[0].lower() if statement else ""
+        return first in _WRITE_PREFIXES
+
+    @event.listens_for(sync_engine, "before_cursor_execute")
+    def _begin_before_write(connection, cursor, statement, parameters, context, executemany):
+        if _is_write(context, statement):
+            _begin(connection)
+
+    @event.listens_for(sync_engine, "savepoint")
+    def _begin_before_savepoint(connection, name):
+        _begin(connection)
+
+    @event.listens_for(sync_engine, "commit")
+    @event.listens_for(sync_engine, "rollback")
+    def _forget(connection, *args):
+        # The transaction is over, so the next write has to open a new one.
+        connection.info.pop(_OPEN, None)
+
+    return True
+
+
 _async_url = settings.DATABASE_URL_ASYNCPG
 engine = create_async_engine(_async_url, **engine_kwargs(_async_url, settings))
+# A SQLite deployment (the test suite, and a developer's local run) needs the same
+# savepoint semantics PostgreSQL has; see the docstring above.
+install_sqlite_transaction_control(engine)
 
 AsyncSessionLocal = async_sessionmaker(
     engine,

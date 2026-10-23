@@ -1,7 +1,7 @@
 import math
 import uuid
 from datetime import timezone
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, Query, Request
 from pydantic import BaseModel
@@ -33,18 +33,24 @@ from app.services.ingestion_service import BREACH_EXPOSURE_KINDS
 from app.services.scan_admission import NoEnabledConnector, ScanAdmissionUnavailable, ScanAlreadyRunning
 from app.core.manual_rate_limit import SCOPE_ASSETS, enforce_manual_rate_limit
 from app.models.asset import Asset, AssetType
-from app.schemas.asset import AssetCreate, validate_and_normalize_asset_value
+from app.schemas.asset import (
+    AssetCreate,
+    PromotedAssetResponse,
+    validate_and_normalize_asset_value,
+)
 from app.services.asset_service import AssetService, asset_type_value
 from app.models.breach import Breach
 from app.models.connector import Connector
 from app.models.ingestion_event import IngestionEvent
 from app.models.job import Job, JobStatus
-from app.schemas.common import MAX_PAGE_SIZE
+from app.schemas.common import MAX_PAGE_SIZE, CleanupResponse
+from app.schemas.connector import ScanStartResponse
 from app.schemas.phishing import ThreatStatus
 from app.schemas.breaches import (
     BreachDomainReadiness,
     BreachDomainVerificationReadiness,
     BreachDomainVerificationRequest,
+    BreachDomainVerificationStarted,
     BreachFlag,
     BreachListResponse,
     BreachSeverity,
@@ -571,7 +577,7 @@ async def _domain_verifications(db: AsyncSession) -> list[BreachDomainVerificati
     return [latest[domain] for domain in sorted(latest)]
 
 
-@router.post("/domain-verification", status_code=202)
+@router.post("/domain-verification", status_code=202, response_model=BreachDomainVerificationStarted)
 async def request_domain_verification(
     request: Request,
     payload: BreachDomainVerificationRequest,
@@ -610,7 +616,11 @@ async def request_domain_verification(
             "connector: name the source that should verify this domain — "
             + ", ".join(sorted(conn.name for conn in enabled))
         )
-    status, error, jobs = "scheduled", None, []
+    # Typed rather than inferred so the answer's literal stays one: the model rejects
+    # a third spelling, and mypy rejects one here before the request is served.
+    status: Literal["scheduled", "no_connector"] = "scheduled"
+    error: str | None = None
+    jobs: list[Job] = []
     if not enabled:
         # Recorded as an attempt that could not be queued: "nobody verified this" and
         # "nobody asked" are different answers on the page, and only the audit row keeps
@@ -648,15 +658,16 @@ async def request_domain_verification(
             "jobs": [str(job.id) for job in jobs],
         },
     )
-    body: dict = {
-        "status": status,
-        "domain": payload.domain,
-        "action": payload.action,
-        "job_ids": [str(job.id) for job in jobs],
-    }
-    if error:
-        body["error"] = error
-    return body
+    # The model is built here rather than as a dict so the omitted `error` stays
+    # omitted: `exclude_none` on the route would also strip a null the page needs
+    # elsewhere, and a refusal is the only case that has an error to send.
+    return BreachDomainVerificationStarted(
+        status=status,
+        domain=payload.domain,
+        action=payload.action,
+        job_ids=[str(job.id) for job in jobs],
+        **({"error": error} if error else {}),
+    )
 
 
 @router.get("/provider-readiness", response_model=BreachProviderReadinessResponse)
@@ -767,7 +778,7 @@ async def provider_readiness(
     )
 
 
-@router.post("/cleanup-orphans")
+@router.post("/cleanup-orphans", response_model=CleanupResponse)
 async def clean_orphan_breach_findings(
     request: Request,
     db: AsyncSession = Depends(get_db),
@@ -776,15 +787,20 @@ async def clean_orphan_breach_findings(
     """Delete breach findings that are not linked to any configured asset."""
     from app.services.asset_service import AssetService
 
-    deleted = await AssetService(db).clean_orphan_breach_findings()
+    cleanup = await AssetService(db).clean_orphan_breach_findings()
     await AuditLogger.emit(
         db,
         action="breach.orphans.cleaned",
         ip_address=extract_ip(request),
         user_id=user.id,
-        details={"deleted": deleted},
+        # The rows commit inside the service, so this row is the only record of
+        # which findings went: the count alone cannot answer that (AUD-030).
+        details={
+            "deleted": cleanup.deleted,
+            "sample_finding_ids": cleanup.sample,
+        },
     )
-    return {"status": "completed", "deleted": deleted}
+    return {"status": "completed", "deleted": cleanup.deleted}
 
 
 @router.get("/{breach_id}", response_model=BreachResponse)
@@ -819,6 +835,11 @@ async def update_breach(
     breach = result.scalar_one_or_none()
     if not breach:
         raise NotFoundException("Breach not found")
+    # The status is mutable, so the trail has to carry both ends of the change: the
+    # current value cannot reconstruct what an earlier operator did to this row. A
+    # request that sets the status it already has is recorded as no change rather
+    # than as one.
+    previous = str(breach.status or "")
     breach.status = data.status
     await db.flush()
     await AuditLogger.emit(
@@ -826,7 +847,12 @@ async def update_breach(
         action="breach.update",
         ip_address=extract_ip(request),
         user_id=user.id,
-        details={"breach_id": str(breach_id), "changed_fields": ["status"]},
+        details={
+            "breach_id": str(breach_id),
+            "changed_fields": [] if previous == str(data.status) else ["status"],
+            "previous_status": previous,
+            "status": str(data.status),
+        },
         require_persistence=True,
         commit=False,
     )
@@ -835,7 +861,7 @@ async def update_breach(
     return _breach_payload(breach, matched_assets.get(breach.id))
 
 
-@router.post("/scan")
+@router.post("/scan", response_model=ScanStartResponse, response_model_exclude_none=True)
 async def run_breach_scan(
     request: Request,
     db: AsyncSession = Depends(get_db),
@@ -884,7 +910,12 @@ async def run_breach_scan(
     return resp_payload
 
 
-@router.post("/scan-email", status_code=202)
+@router.post(
+    "/scan-email",
+    status_code=202,
+    response_model=ScanStartResponse,
+    response_model_exclude_none=True,
+)
 async def scan_email_breaches(
     request: Request,
     payload: BreachScanEmailRequest,
@@ -914,7 +945,12 @@ async def scan_email_breaches(
     return {"status": "scheduled", "email": str(payload.email), "job_ids": [str(j.id) for j in jobs]}
 
 
-@router.post("/scan-domain", status_code=202)
+@router.post(
+    "/scan-domain",
+    status_code=202,
+    response_model=ScanStartResponse,
+    response_model_exclude_none=True,
+)
 async def scan_domain_breaches(
     request: Request,
     payload: BreachScanDomainRequest,
@@ -944,7 +980,12 @@ async def scan_domain_breaches(
     return {"status": "scheduled", "domain": payload.domain, "job_ids": [str(j.id) for j in jobs]}
 
 
-@router.post("/{breach_id}/asset", status_code=201)
+@router.post(
+    "/{breach_id}/asset",
+    status_code=201,
+    response_model=PromotedAssetResponse,
+    response_model_exclude_none=True,
+)
 async def promote_breach_finding_to_asset(
     request: Request,
     breach_id: uuid.UUID,

@@ -62,7 +62,11 @@ from app.core.mfa_policy import mfa_required_by_policy
 from app.core.security import hash_password
 from app.models.user import User, role_name
 from app.schemas.user import PASSWORD_MIN_LENGTH, validate_password_strength
-from app.services.admin_invariants import LastActiveAdminError, ensure_active_admin_remains
+from app.services.admin_invariants import (
+    LastActiveAdminError,
+    ensure_active_admin_remains,
+    lock_active_admin_set,
+)
 from app.services.refresh_sessions import revoke_refresh_families
 
 
@@ -188,6 +192,11 @@ async def cmd_create(email: str, password: str, force: bool = False) -> None:
                 )
                 sys.exit(3)
 
+        # Entering the active-admin set takes the same lock as leaving it, so an
+        # insertion and a demotion cannot interleave: the service states that
+        # every writer of the set holds it, and this is a writer that has no
+        # authenticated caller to serialise against.
+        await lock_active_admin_set(db)
         admin = User(
             email=email,
             password_hash=hash_password(password),
@@ -389,9 +398,20 @@ async def cmd_mfa_off(email: str) -> None:
             print(f"[ERROR] No user found with email: {email}")
             sys.exit(4)
         was_enabled = user.totp_enabled_at is not None
+        # The lockout that five wrong guesses produce outlives the factor, and
+        # both enrolment routes refuse while it is in force: a recovery that
+        # left it behind handed back an account that still could not enrol, for
+        # another fifteen minutes and with nothing saying why. The API reset
+        # clears both counters, and this path is the same recovery.
+        locked_until = user.mfa_locked_until
+        if locked_until is not None and locked_until.tzinfo is None:
+            locked_until = locked_until.replace(tzinfo=timezone.utc)
+        was_locked = locked_until is not None and locked_until > datetime.now(timezone.utc)
         user.totp_secret = None
         user.totp_enabled_at = None
         user.totp_last_used_step = None
+        user.mfa_failed_attempts = 0
+        user.mfa_locked_until = None
         # Recovery is not a downgrade: the account owes a factor, and the platform
         # refuses it everywhere except the page that enrols one until it does.
         user.must_enrol_mfa = True
@@ -404,6 +424,7 @@ async def cmd_mfa_off(email: str) -> None:
                 "target_email": user.email,
                 "method": "cli_mfa_off",
                 "was_enabled": was_enabled,
+                "mfa_lockout_cleared": was_locked,
                 "refresh_families_revoked": revoked,
                 "onboarding_required": ["mfa"],
             },

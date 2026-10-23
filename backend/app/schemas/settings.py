@@ -1,6 +1,6 @@
 import re
 import uuid
-from typing import Literal
+from typing import Annotated, Any, Literal
 
 from app.services.module_aliases import canonical_module_id
 from datetime import datetime
@@ -396,6 +396,122 @@ class AlertPolicyResponse(BaseModel):
 
 class TestEmailRequest(BaseModel):
     to: EmailStr | None = None
+
+
+class TestEmailResponse(BaseModel):
+    """What `POST /settings/test-email` answers when the test message went out.
+
+    Two fields, both always present: the recipient the service actually used (the
+    request's `to`, or the configured alert address when it is omitted) and the
+    status. The SPA has its own interface for this, compared with this model by
+    `scripts/check_api_types.py`.
+    """
+
+    status: str
+    to: str
+
+
+class TestTelegramResponse(BaseModel):
+    """What `POST /settings/test-telegram` answers, chat by chat.
+
+    The four counts are the route's promise: `sent` is how many chats accepted the
+    message, `total` how many were attempted, `validated` how many the bot could
+    reach, and `validation_failed` the difference.
+
+    `results` stays a list of provider objects rather than a nested model on
+    purpose. Each entry is Telegram's own chat shape — `chat_id` and `ok`, plus
+    either the chat metadata of an accepted send or the error code of a rejected
+    one — and a strict entry model would have to add nulls for the fields the other
+    variant omits, changing the bytes the SPA receives today. The entry shape is
+    declared in the client (`TelegramChatValidationResult`) and served as a payload
+    of its own by `POST /settings/validate-telegram`.
+    """
+
+    sent: int
+    total: int
+    validated: int
+    validation_failed: int
+    results: list[dict[str, Any]]
+
+
+class DatabasePoolSettings(BaseModel):
+    """The connection pool the process is actually running with.
+
+    Read from `core_settings` rather than from the Compose file, because the
+    question this endpoint answers is what the container received — the two can
+    disagree after a recreate that did not happen.
+    """
+
+    size: int
+    max_overflow: int
+    pool_timeout_seconds: int
+
+
+class RuntimeTimeouts(BaseModel):
+    """The three timeouts an operator is most likely to have just changed.
+
+    The last two are `float` in `core/config.py` and stay `float` here, so the
+    diagnostics page prints `3.0` and `45.0` exactly as the applied settings hold
+    them rather than an integer that looks like a different value.
+    """
+
+    statement_ms: int
+    command_seconds: float
+    outbound_dns_seconds: float
+
+
+class RuntimeConfigurationResponse(BaseModel):
+    """What `GET /settings/runtime` answers: applied configuration, never secrets.
+
+    The route deliberately exposes no connection URL and no credential; this model is
+    the enumeration of what it may expose, so a field added to the handler without a
+    field here is dropped rather than leaked.
+    """
+
+    app_env: str
+    version: str
+    database_pool: DatabasePoolSettings
+    timeouts: RuntimeTimeouts
+    resource_limits_source: str
+
+
+class TelegramChatOkResult(BaseModel):
+    """One chat the bot could reach, with the metadata `getChat` reported.
+
+    The three chat fields are nullable but not optional: they are keys the provider
+    answer always produces, and a null title is a value Telegram sent rather than a
+    field this platform invented. That is what keeps the response's bytes the same as
+    the dict this model replaced.
+    """
+
+    chat_id: str
+    ok: Literal[True]
+    chat_type: str | None
+    username: str | None
+    title: str | None
+
+
+class TelegramChatErrorResult(BaseModel):
+    """One chat the bot could not reach, with the reason it could not."""
+
+    chat_id: str
+    ok: Literal[False]
+    error_code: str
+    error: str
+
+
+class TelegramValidationResponse(BaseModel):
+    """What `POST /settings/validate-telegram` answers, chat by chat.
+
+    `ok` discriminates the two row shapes rather than one row model whose unused
+    fields would arrive as nulls: a validation pass and a failed validation do not
+    have the same keys, and the SPA's `TelegramChatValidationResult` already declares
+    both.
+    """
+
+    valid: int
+    total: int
+    results: list[Annotated[TelegramChatOkResult | TelegramChatErrorResult, Field(discriminator="ok")]]
 
 
 class TestTelegramRequest(BaseModel):

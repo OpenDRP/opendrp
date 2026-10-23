@@ -353,6 +353,52 @@ class TestGenerateAndSave:
         assert not list(tmp_path.glob(".*.tmp"))
 
 
+class TestRenderBounds:
+    """AUD-041: the report is bounded before it becomes one document.
+
+    `REPORT_MAX_ROWS` bounds each section and nothing bounded the file: five
+    sections at the documented maximum appended roughly 250,000 table rows to one
+    in-memory fPDF object, and the only check on the result was a warning below
+    10 KiB. The renderer refuses instead of attempting it, and a file that still
+    grows past the byte ceiling is removed before publication.
+    """
+
+    def test_the_documented_default_fills_the_document_exactly(self):
+        from app.services.report_service import (
+            MAX_RENDERED_REPORT_ROWS,
+            ensure_renderable,
+        )
+
+        sections = ("assets", "phishing", "breaches", "exposure", "dns")
+        data = {name: [None] * 5000 for name in sections}
+        assert sum(len(rows) for rows in data.values()) == MAX_RENDERED_REPORT_ROWS
+        ensure_renderable(data)
+
+    def test_a_report_at_the_documented_maximum_is_refused_before_rendering(self, tmp_path):
+        from app.services.report_service import MAX_RENDERED_REPORT_ROWS, ensure_renderable
+
+        sections = ("assets", "phishing", "breaches", "exposure", "dns")
+        data = {name: [None] * 50000 for name in sections}
+        assert sum(len(rows) for rows in data.values()) > MAX_RENDERED_REPORT_ROWS
+        with pytest.raises(ValueError, match="report_too_large"):
+            ensure_renderable(data)
+
+        path = tmp_path / "too_large.pdf"
+        with pytest.raises(ValueError, match="report_too_large"):
+            ReportService.generate_pdf_sync(str(path), data, "qa@example.com")
+        assert not path.exists(), "a refused report must not leave a file behind"
+
+    def test_a_file_over_the_byte_ceiling_is_removed_rather_than_published(self, tmp_path, monkeypatch):
+        from app.services import report_service
+
+        monkeypatch.setattr(report_service, "MAX_REPORT_BYTES", 32)
+        path = tmp_path / "bloated.pdf"
+        path.write_bytes(b"x" * 64)
+        with pytest.raises(ValueError, match="report_too_large"):
+            report_service.enforce_output_bound(str(path))
+        assert not path.exists()
+
+
 class TestGeneratePdfSync:
     @pytest.mark.asyncio
     async def test_generate_pdf_minimal_data_writes_valid_pdf_file(self, tmp_path, db_session):

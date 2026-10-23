@@ -7,7 +7,7 @@ from datetime import datetime
 from enum import Enum as PyEnum
 from typing import Any
 
-from sqlalchemy import DateTime, ForeignKey, JSON, String, Text, Uuid
+from sqlalchemy import DateTime, ForeignKey, Index, JSON, String, Text, Uuid
 from sqlalchemy.orm import Mapped, mapped_column, relationship, validates
 
 from app.core.database import Base, TimestampMixin, UUIDMixin
@@ -50,6 +50,12 @@ _JOB_STATUSES = {m.value for m in JobStatus}
 
 class Job(Base, UUIDMixin, TimestampMixin):
     __tablename__ = "jobs"
+    __table_args__ = (
+        # Every connector polls `claim_work` — `status='pending'`, oldest first —
+        # so the composite is the table's most frequent read. Declared here as in
+        # the baseline, because the test schema is built from these models.
+        Index("ix_jobs_status_created", "status", "created_at"),
+    )
 
     job_type: Mapped[str] = mapped_column(String(50), nullable=False, index=True)
     status: Mapped[str] = mapped_column(

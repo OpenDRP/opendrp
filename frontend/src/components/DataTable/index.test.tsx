@@ -137,7 +137,7 @@ describe("PaginatedDataTable", () => {
     // A sorted column says so to assistive technology, and the next click on it
     // reverses the direction rather than starting over.
     expect(screen.getByRole("columnheader", { name: /Name/ })).toHaveAttribute("aria-sort", "ascending");
-    await user.click(screen.getByRole("button", { name: "Sort by Name" }));
+    await user.click(screen.getByRole("button", { name: /^Sort by Name/ }));
     expect(onSortChange).toHaveBeenCalledWith({ field: "name", direction: "desc" });
   });
 
@@ -203,5 +203,97 @@ describe("PaginatedDataTable", () => {
     separator.focus();
     await user.keyboard("{ArrowRight}");
     expect(localStorage.getItem("test-table")).toContain("136");
+  });
+
+  /**
+   * The state a delete on the last page leaves behind: 15 rows over two pages, the
+   * operator on page 2, and the row they removed was the only one there. The
+   * server answers an empty page, so the table has to ask for the page that now
+   * exists — otherwise it reports "nothing matches" about 14 matching rows and
+   * prints a range that runs backwards ("16–15 of 15").
+   */
+  it("asks to move off a page the result no longer has", () => {
+    const onPageChange = vi.fn();
+    renderTable({ page: 3, pageSize: 10, total: 15, rows: [], onPageChange });
+
+    expect(onPageChange).toHaveBeenCalledWith(2);
+  });
+
+  /**
+   * The table used to report its own state only to the eye: an arrow beside the
+   * sorted column, a width that changed while a handle was focused, a page number
+   * drawn in a different colour. `aria-sort` described the `<th>`, which is not
+   * where focus is, so activating the sort button announced nothing; the resize
+   * handle was a focusable `separator` with no value, so the arrow keys changed a
+   * number nobody could hear; and the current page was only a fill.
+   */
+  it("names the direction it is showing, and announces the one it applied", async () => {
+    const user = userEvent.setup();
+    const onSortChange = vi.fn();
+    renderTable({
+      columns: [{ ...columns[0], sortable: true }, columns[1]],
+      sort: { field: "name", direction: "asc" },
+      onSortChange,
+    });
+
+    expect(
+      screen.getByRole("button", { name: "Sort by Name, currently ascending" }),
+    ).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: /^Sort by Name/ }));
+    expect(screen.getByRole("status")).toHaveTextContent("Sorted by Name, descending.");
+  });
+
+  it("gives a resize handle a value, so the arrow keys are not silent", async () => {
+    const user = userEvent.setup();
+    renderTable();
+
+    const handle = screen.getByRole("separator", { name: "Resize Name column" });
+    expect(handle).toHaveAttribute("aria-orientation", "vertical");
+    expect(handle).toHaveAttribute("aria-valuenow", "120");
+    expect(handle).toHaveAttribute("aria-valuemin", "80");
+    expect(handle).toHaveAttribute("aria-valuemax", "640");
+    expect(handle).toHaveAttribute("aria-valuetext", "120 pixels");
+
+    handle.focus();
+    await user.keyboard("{ArrowRight}");
+    expect(screen.getByRole("separator", { name: "Resize Name column" })).toHaveAttribute(
+      "aria-valuenow",
+      "136",
+    );
+  });
+
+  it("marks the page it is showing", () => {
+    renderTable();
+    expect(screen.getByRole("button", { name: "1" })).toHaveAttribute("aria-current", "page");
+    expect(screen.getByRole("button", { name: "2" })).not.toHaveAttribute("aria-current");
+  });
+
+  it("reaches every control in the table with the keyboard alone", async () => {
+    const user = userEvent.setup();
+    renderTable({
+      columns: [{ ...columns[0], sortable: true }, { ...columns[1], sortable: true }],
+      sort: null,
+      onSortChange: vi.fn(),
+    });
+
+    // Header controls in reading order: the sort button, then the handle of the
+    // same column, twice. No click and no pointer event is involved.
+    await user.tab();
+    expect(screen.getByRole("button", { name: "Sort by Name" })).toHaveFocus();
+    await user.tab();
+    expect(screen.getByRole("separator", { name: "Resize Name column" })).toHaveFocus();
+    await user.tab();
+    expect(screen.getByRole("button", { name: "Sort by Status" })).toHaveFocus();
+    await user.tab();
+    expect(screen.getByRole("separator", { name: "Resize Status column" })).toHaveFocus();
+    await user.tab();
+    expect(screen.getByRole("combobox", { name: "Items per page" })).toHaveFocus();
+    // First and Previous are disabled on page 1, so the page buttons are the next
+    // stops and the footer is reachable without a pointer.
+    await user.tab();
+    expect(screen.getByRole("button", { name: "1" })).toHaveFocus();
+    await user.tab();
+    expect(screen.getByRole("button", { name: "2" })).toHaveFocus();
   });
 });

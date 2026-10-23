@@ -1,8 +1,9 @@
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
-from sqlalchemy import select, update
+from sqlalchemy import delete, select, update
 
 from app.core.config import settings
 from app.models.alert_delivery import AlertDelivery, AlertDeliveryStatus
@@ -292,3 +293,222 @@ async def test_stale_ack_cannot_complete_new_claim(db_session, monkeypatch):
     await queue.mark_sent(rows, token=old_token)
     await db_session.refresh(rows[0])
     assert rows[0].status == AlertDeliveryStatus.delivering
+
+
+@pytest.mark.asyncio
+async def test_an_empty_queue_answers_idle(db_session):
+    assert await AlertDeliveryService(db_session).process_one_group(max_attempts=3) == {
+        "status": "idle",
+        "count": 0,
+    }
+
+
+def test_an_unknown_channel_is_named_rather_than_dialled():
+    with pytest.raises(ValueError, match="unknown alert delivery channel"):
+        AlertDeliveryService._channel_of(SimpleNamespace(channel="sms"))
+
+
+@pytest.mark.asyncio
+async def test_finishing_an_empty_group_is_a_no_op(db_session):
+    queue = AlertDeliveryService(db_session)
+
+    await queue.mark_sent([])
+    await queue.mark_failed([], "nothing to fail", max_attempts=3)
+
+
+@pytest.mark.asyncio
+async def test_releasing_an_unknown_recipient_says_not_found(db_session):
+    result = await AlertDeliveryService(db_session).release_recipient(key="no-such-recipient")
+
+    assert result == {"key": "no-such-recipient", "found": False, "released": False}
+
+
+@pytest.mark.asyncio
+async def test_a_digest_batch_says_it_is_a_digest(db_session, monkeypatch):
+    await configured(db_session)
+    monkeypatch.setattr(settings, "ALERT_AGGREGATION_DELAY_SECONDS", 0)
+    queue = AlertDeliveryService(db_session)
+    for index in range(2):
+        await queue.enqueue(
+            threat_type="phishing",
+            details={"phishing_domain": f"quiet-{index}.example", "digest": True},
+        )
+    await db_session.commit()
+    sent: list[str] = []
+
+    async def _send(_self, text, **_kwargs):
+        sent.append(text)
+        return True
+
+    monkeypatch.setattr(AlertService, "_send_telegram", _send)
+
+    assert (await queue.process_one_group(max_attempts=3))["status"] == "sent"
+    assert "OpenDRP PHISHING DIGEST" in sent[0]
+    assert "quiet-1.example" in sent[0]
+
+
+async def _configured_email(db):
+    row = SystemSettings(
+        email_alerts_enabled=True,
+        smtp_host="smtp.example",
+        smtp_port=587,
+        alert_email_user_ids=[],
+        telegram_alerts_enabled=False,
+    )
+    row.alert_recipient_email_decrypted = "soc@example.com"
+    db.add(row)
+    await db.commit()
+    return row
+
+
+@pytest.mark.asyncio
+async def test_an_email_batch_carries_the_change_class_in_its_subject(
+    db_session, monkeypatch
+):
+    await _configured_email(db_session)
+    monkeypatch.setattr(settings, "ALERT_AGGREGATION_DELAY_SECONDS", 0)
+    queue = AlertDeliveryService(db_session)
+    for address in ("a@example.com", "b@example.com"):
+        await queue.enqueue(
+            threat_type="breach",
+            details={
+                "matched_email": address,
+                "breach_name": "Example",
+                "change_class": "incident_grew",
+            },
+        )
+    await db_session.commit()
+    subjects: list[str] = []
+
+    async def _email(_self, *, to, subject, html_body, plain_body=None):
+        subjects.append(subject)
+        return True
+
+    monkeypatch.setattr(AlertService, "_send_email_smtp", _email)
+
+    assert (await queue.process_one_group(max_attempts=3))["status"] == "sent"
+    assert subjects and "(Incident grew)" in subjects[0]
+
+
+@pytest.mark.asyncio
+async def test_a_provider_that_returns_false_fails_the_group(db_session, monkeypatch):
+    await configured(db_session)
+    monkeypatch.setattr(settings, "ALERT_AGGREGATION_DELAY_SECONDS", 0)
+    queue = AlertDeliveryService(db_session)
+    await queue.enqueue(threat_type="phishing", details={"phishing_domain": "x.example"})
+    await db_session.commit()
+
+    async def _refuse(_self, _text, **_kwargs):
+        return False
+
+    monkeypatch.setattr(AlertService, "_send_telegram", _refuse)
+
+    assert (await queue.process_one_group(max_attempts=3))["status"] == "failed"
+    row = (await db_session.execute(select(AlertDelivery))).scalar_one()
+    assert row.status == AlertDeliveryStatus.failed
+    assert "Provider refused" in (row.last_error or "")
+
+
+@pytest.mark.asyncio
+async def test_selected_users_are_resolved_to_their_active_addresses(db_session):
+    from app.models.user import User, UserRole
+
+    active = User(
+        email="on-call@example.com",
+        password_hash="x",
+        role=UserRole.analyst,
+        is_active=True,
+    )
+    inactive = User(
+        email="gone@example.com",
+        password_hash="x",
+        role=UserRole.analyst,
+        is_active=False,
+    )
+    db_session.add_all([active, inactive])
+    await db_session.commit()
+    config = SystemSettings(
+        email_alerts_enabled=True,
+        smtp_host="smtp.example",
+        smtp_port=587,
+        alert_email_user_ids=[str(active.id), str(inactive.id)],
+        telegram_alerts_enabled=False,
+    )
+    db_session.add(config)
+    await db_session.commit()
+
+    destinations = await AlertDeliveryService(db_session)._configured_destinations()
+
+    assert ("email", "on-call@example.com") in destinations
+    assert ("email", "gone@example.com") not in destinations
+
+
+@pytest.mark.asyncio
+async def test_a_group_whose_recipient_row_is_gone_is_not_claimed(
+    db_session, monkeypatch
+):
+    from app.models.alert_delivery import AlertRecipientState
+
+    monkeypatch.setattr(settings, "ALERT_AGGREGATION_DELAY_SECONDS", 0)
+    queue = AlertDeliveryService(db_session)
+    await queue.enqueue(threat_type="phishing", details={"phishing_domain": "x.example"})
+    await db_session.commit()
+    await db_session.execute(delete(AlertRecipientState))
+    await db_session.commit()
+
+    assert await queue.claim_group() == []
+
+
+@pytest.mark.asyncio
+async def test_a_live_lease_defers_only_that_recipient(db_session, monkeypatch):
+    from app.models.alert_delivery import AlertRecipientState
+
+    await configured(db_session)
+    monkeypatch.setattr(settings, "ALERT_AGGREGATION_DELAY_SECONDS", 0)
+    queue = AlertDeliveryService(db_session)
+    await queue.enqueue(threat_type="phishing", details={"phishing_domain": "x.example"})
+    await db_session.commit()
+    key = AlertDeliveryService.recipient_key("telegram", "-1001234")
+    db_session.add(
+        AlertRecipientState(
+            key=key,
+            lease_token="held-by-a-worker",
+            lease_expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+        )
+    )
+    await db_session.commit()
+
+    assert await queue.claim_group() == []
+    row = (await db_session.execute(select(AlertDelivery))).scalar_one()
+    assert row.status == AlertDeliveryStatus.pending
+
+
+@pytest.mark.asyncio
+async def test_a_spent_hold_requeues_only_its_own_deliveries(db_session, monkeypatch):
+    """A recipient whose window is still running keeps its ambiguity."""
+    from app.models.alert_delivery import AlertRecipientState
+
+    await configured(db_session)
+    monkeypatch.setattr(settings, "ALERT_AGGREGATION_DELAY_SECONDS", 0)
+    queue = AlertDeliveryService(db_session)
+    await queue.enqueue(threat_type="phishing", details={"phishing_domain": "one.example"})
+    await queue.enqueue(threat_type="phishing", details={"phishing_domain": "two.example"})
+    await db_session.commit()
+    rows = await queue.claim_group()
+    await queue.mark_failed(rows, AlertDeliveryAmbiguousError("unknown"), max_attempts=3)
+    other_key = AlertDeliveryService.recipient_key("telegram", "-1009999")
+    db_session.add(AlertRecipientState(key=other_key))
+    other = AlertDelivery(status=AlertDeliveryStatus.ambiguous, channel="telegram", target="-1009999", threat_type="phishing", payload={})
+    db_session.add(other)
+    await db_session.commit()
+    await db_session.execute(
+        update(AlertRecipientState)
+        .where(AlertRecipientState.key != other_key)
+        .values(next_send_at=datetime.now(timezone.utc) - timedelta(seconds=1))
+    )
+    await db_session.commit()
+
+    await queue.claim_group()
+
+    await db_session.refresh(other)
+    assert other.status == AlertDeliveryStatus.ambiguous

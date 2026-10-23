@@ -103,10 +103,13 @@ vi.mock("@/components/DataTable", () => ({
   ),
 }));
 vi.mock("@/components/ui/confirm-dialog", () => ({
-  ConfirmDialog: ({ open, title, onConfirm, onCancel }: any) =>
+  // `children` is rendered because the page puts the API's refusal inside the
+  // dialog: a mock that dropped it could not tell an inline error from none.
+  ConfirmDialog: ({ open, title, onConfirm, onCancel, children }: any) =>
     open ? (
       <div role="dialog">
         <h2>{title}</h2>
+        {children}
         <button onClick={onCancel}>Cancel confirmation</button>
         <button onClick={onConfirm}>Confirm action</button>
       </div>
@@ -147,6 +150,15 @@ function renderPage() {
 
 function selectByLabel(label: string) {
   return screen.getByLabelText(label) as HTMLSelectElement;
+}
+
+/** A promise the test settles itself, so a pending mutation can be observed. */
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((settle) => {
+    resolve = settle;
+  });
+  return { promise, resolve };
 }
 
 describe("UsersPage", () => {
@@ -224,6 +236,53 @@ describe("UsersPage", () => {
         rate_limit_minutes: 0,
       }),
     );
+  });
+
+  it("sends an administrator's password reset as new_password, and refuses one without a value", async () => {
+    // Two ways this silently does nothing: a checked box with no value (the API
+    // would accept the update and reset nothing) and the camelCase field name
+    // (Pydantic drops it). Both are checked here rather than discovered by an
+    // administrator who believes the password was changed.
+    const user = userEvent.setup();
+    renderPage();
+    await screen.findByText("analyst@example.com");
+    // The second row is the analyst; the first is the signed-in administrator.
+    await user.click(screen.getAllByRole("button", { name: "Edit user" })[1]);
+    const dialog = screen.getByRole("dialog");
+    expect(within(dialog).getByLabelText("Email")).toHaveValue("analyst@example.com");
+
+    await user.click(within(dialog).getByLabelText("Reset password"));
+    await user.click(within(dialog).getByRole("button", { name: "Save changes" }));
+
+    expect(toastMock).toHaveBeenCalledWith({
+      variant: "destructive",
+      title: "Validation",
+      description: "New password required when reset is checked.",
+    });
+    expect(updateUserMock).not.toHaveBeenCalled();
+
+    await user.type(within(dialog).getByLabelText("Temporary password"), "Temp-Pass-1A");
+    await user.click(within(dialog).getByRole("button", { name: "Save changes" }));
+
+    await waitFor(() =>
+      expect(updateUserMock).toHaveBeenCalledWith(
+        "analyst-1",
+        expect.objectContaining({ new_password: "Temp-Pass-1A" }),
+      ),
+    );
+  });
+
+  it("closes the edit dialog without a request when the operator cancels", async () => {
+    const user = userEvent.setup();
+    renderPage();
+    await screen.findByText("analyst@example.com");
+    await user.click(screen.getAllByRole("button", { name: "Edit user" })[1]);
+    const dialog = screen.getByRole("dialog");
+
+    await user.click(within(dialog).getByRole("button", { name: "Cancel" }));
+
+    expect(updateUserMock).not.toHaveBeenCalled();
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
   });
 
   it("sends the configured rate limit and clamps it to the allowed range", async () => {
@@ -491,8 +550,72 @@ describe("UsersPage", () => {
     expect(screen.getByText(/No email was queued/)).toBeInTheDocument();
   });
 
-  it("sends one bulk deactivation for the selected accounts", async () => {
+  it("keeps the deactivation dialog up until the answer, then closes it", async () => {
+    // Closing on the click made the pending state invisible and turned the API's
+    // 409 (the last active administrator) into a toast after the dialog was gone.
+    const pending = deferred<unknown>();
+    updateUserMock.mockReturnValue(pending.promise);
     const user = userEvent.setup();
+    renderPage();
+    await screen.findByText("analyst@example.com");
+
+    const deactivateButton = screen
+      .getAllByRole("button", { name: "Deactivate" })
+      .find((button) => !button.hasAttribute("disabled"));
+    await user.click(deactivateButton!);
+    await user.click(screen.getByRole("button", { name: "Confirm action" }));
+
+    // Still open while the request is in flight.
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+    expect(updateUserMock).toHaveBeenCalledWith("analyst-1", { is_active: false });
+
+    pending.resolve(analyst);
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+  });
+
+  it("shows the server's last-administrator refusal inside the delete dialog", async () => {
+    deleteUserMock.mockRejectedValue({
+      response: { status: 409, data: { detail: "Cannot remove the last active admin" } },
+    });
+    const user = userEvent.setup();
+    renderPage();
+    await screen.findByText("analyst@example.com");
+
+    // The signed-in administrator's own row offers no delete, so the only
+    // "Delete user" button here belongs to the other account.
+    await user.click(screen.getByRole("button", { name: "Delete user" }));
+    await user.click(screen.getByRole("button", { name: "Confirm action" }));
+
+    // The refusal is read where the decision was made; the dialog does not vanish
+    // and leave a fading toast as the only record of why nothing happened.
+    const dialog = await screen.findByRole("dialog");
+    expect(await within(dialog).findByRole("alert")).toHaveTextContent(
+      "Cannot remove the last active admin",
+    );
+    expect(deleteUserMock).toHaveBeenCalledWith("analyst-1");
+  });
+
+  it("drops a selection once the list no longer shows those rows", async () => {
+    // The batch route applies any ids it is given. A selection that survives a
+    // filter change is therefore a deactivation of accounts the operator can no
+    // longer see, which is how a "1 selected" panel acted on a hidden row.
+    const user = userEvent.setup();
+    renderPage();
+    await screen.findByText("analyst@example.com");
+
+    await user.click(screen.getByRole("checkbox", { name: "Select analyst@example.com" }));
+    expect(screen.getByText("1 selected")).toBeInTheDocument();
+
+    await user.type(screen.getByPlaceholderText("Search by email or name..."), "oncall");
+
+    await waitFor(() => expect(listUsersMock).toHaveBeenCalledWith(
+      expect.objectContaining({ search: "oncall" }),
+    ));
+    await waitFor(() => expect(screen.queryByText("1 selected")).not.toBeInTheDocument());
+    expect(screen.queryByRole("region", { name: "Bulk actions" })).not.toBeInTheDocument();
+  });
+
+  it("sends one bulk deactivation for the selected accounts", async () => {    const user = userEvent.setup();
     renderPage();
     await screen.findByText("analyst@example.com");
 

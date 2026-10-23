@@ -107,6 +107,78 @@ class TestAssetInvolvement:
         )
         assert reported["last_seen"]["dns"] is None
 
+    async def test_the_findings_answer_is_the_shape_the_client_declares(
+        self, client, db_session, auth_headers_admin
+    ):
+        """The page's payload is a declaration, not whatever the route composed.
+
+        The route answered a `dict`, so the nine keys the SPA reads were checked
+        only by the compiler and the rows were whatever `_related_row` happened to
+        build. Two decisions are pinned here because a later "tidy" could undo
+        either: the optional row fields stay `null` keys rather than disappearing
+        (the client types them `string | null`), and `observed_at` keeps each
+        module's own kind of moment — a breach publishes a bare date, a scan a
+        timestamp — instead of one invented midnight.
+        """
+        from app.schemas.asset import AssetFindingCounts
+        from app.services.asset_matching import RELATED_FINDING_MODULES
+
+        asset = await self._create(client, auth_headers_admin, f"shape.{MARK}")
+        created = await self._phishing(db_session, f"shape.{MARK}")
+        await self._breach_email_at(
+            db_session, f"shape.{MARK}", f"analyst@shape.{MARK}"
+        )
+        url = f"/api/v1/assets/{asset['id']}/findings"
+
+        phishing = await client.get(url, headers=auth_headers_admin)
+        assert phishing.status_code == 200, phishing.text
+        body = phishing.json()
+        assert set(body) == {
+            "asset",
+            "counts",
+            "last_seen",
+            "module",
+            "items",
+            "total",
+            "page",
+            "size",
+            "pages",
+        }
+        assert set(body["asset"]) == {"id", "asset_type", "asset_value", "is_active"}
+        # The counters are a closed record on the client: the module tuple plus
+        # the sum. A module added without the schema fails here instead of
+        # arriving as an extra key no interface describes.
+        assert set(body["counts"]) == {*RELATED_FINDING_MODULES, "total"}
+        assert set(AssetFindingCounts.model_fields) == set(body["counts"])
+
+        row = body["items"][0]
+        assert set(row) == {
+            "id",
+            "module",
+            "title",
+            "matched_asset",
+            "source",
+            "status",
+            "observed_at",
+        }
+        assert row["module"] == "phishing"
+        assert row["observed_at"].startswith(created.strftime("%Y-%m-%dT%H:%M"))
+        # A timestamp, not the date the breach row publishes below: the two kinds
+        # of moment stay distinguishable on the wire.
+        assert len(row["observed_at"]) > len("2024-01-01")
+
+        breaches = await client.get(
+            url, headers=auth_headers_admin, params={"module": "breaches"}
+        )
+        assert breaches.status_code == 200, breaches.text
+        breach_row = breaches.json()["items"][0]
+        assert breach_row["matched_asset"] == f"analyst@shape.{MARK}"
+        # Every row carries all seven keys, and a value a module has nothing to say
+        # about is a null rather than a missing key: `last_seen` below is the one
+        # such value this fixture can produce, and the client reads it as null.
+        assert body["last_seen"]["dns"] is None
+        assert breach_row["observed_at"] == "2024-01-01"
+
     async def test_has_findings_answers_which_assets_are_involved(
         self, client, db_session, auth_headers_admin
     ):

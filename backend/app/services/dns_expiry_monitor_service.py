@@ -28,6 +28,44 @@ def parse_date(value: object) -> datetime | None:
         return None
 
 
+def tls_port(row: DNSObservation) -> int:
+    """The port a probe's control belongs to.
+
+    The worker names it twice — in `metadata.port` and in `record_type`
+    (`TLS:8443`, with plain `TLS` for the default port) — and either spelling is
+    enough. 443 is the answer when neither names one, which is the port the
+    worker probes by default.
+    """
+    port = (row.metadata_json or {}).get("port")
+    if isinstance(port, int) and not isinstance(port, bool) and 0 < port < 65536:
+        return port
+    record_type = row.record_type or ""
+    if record_type.startswith("TLS:"):
+        try:
+            candidate = int(record_type[4:])
+        except ValueError:
+            return 443
+        if 0 < candidate < 65536:
+            return candidate
+    return 443
+
+
+def tls_kind(row: DNSObservation) -> str:
+    """The control kind for one probed certificate: `tls:<port>` (AUD-036).
+
+    A control keyed by asset alone made a second port overwrite the first: the
+    unique key is (asset, kind), every probe became `kind="tls"`, and the
+    thresholds the first port had already sent were cleared with it. The port is
+    part of the thing being reminded about, so it is part of the key.
+    """
+    return f"tls:{tls_port(row)}"
+
+
+def kind_is_tls(kind: str) -> bool:
+    """Whether a control kind is a live-TLS one, with or without its port."""
+    return kind == "tls" or kind.startswith("tls:")
+
+
 def monitor_state(row: DNSExpiryMonitor, now: datetime) -> str:
     if row.successful_at and utc(row.successful_at) < utc(now) - timedelta(hours=settings.DNS_EXPIRY_MAX_AGE_HOURS):
         return "stale"
@@ -46,7 +84,8 @@ async def update_monitor(db: AsyncSession, row: DNSObservation, *, now: datetime
         # The one control kind that answers "what is served now" instead of "what was
         # issued": its evidence is a handshake this platform performed against its own
         # asset, which is what makes a reminder actionable (F-05 in the DNS & TLS audit).
-        kind = "tls"
+        # The port is part of the control's identity (AUD-036).
+        kind = tls_kind(row)
         state = str(row.metadata_json.get("check_state", ""))
         if state not in {"verified", "expired", "failed", "incomplete", "skipped_no_public_address"}:
             raise ValueError("invalid tls probe state")
@@ -75,6 +114,8 @@ async def update_monitor(db: AsyncSession, row: DNSObservation, *, now: datetime
     asset = (await db.execute(select(Asset).where(Asset.asset_type == AssetType.domain, sql_key(Asset.normalized_value).in_(sorted(key_variants(row.subject))), *asset_scope(POLICY_SCAN)).limit(1))).scalar_one_or_none()
     if asset is None:
         return
+    if kind.startswith("tls:"):
+        await _adopt_portless_tls_control(db, asset.id, kind)
     values = dict(asset_id=asset.id, kind=kind, subject=row.subject, state="unverified", checked_at=now, alerted_thresholds=[])
     if db.bind.dialect.name == "postgresql":
         await db.execute(pg_insert(DNSExpiryMonitor).values(**values).on_conflict_do_nothing(index_elements=["asset_id", "kind"]))
@@ -107,6 +148,36 @@ async def update_monitor(db: AsyncSession, row: DNSObservation, *, now: datetime
     monitor.certificate_id = cert_id if isinstance(cert_id, str) else None
     monitor.not_before = issued
     monitor.observation_id = row.id
+
+
+async def _adopt_portless_tls_control(db: AsyncSession, asset_id, kind: str) -> None:
+    """Rename a pre-port TLS control to the port it was actually probing.
+
+    An installation built before the port dimension holds one `kind="tls"` row
+    per asset. The first probe to arrive for that asset renames it in place, so
+    the threshold history it carries survives and the next sweep finds it under
+    the port key. Idempotent: a control already at the port key is left alone,
+    and the rename never creates a second row.
+    """
+    port_row = (
+        await db.execute(
+            select(DNSExpiryMonitor.id).where(
+                DNSExpiryMonitor.asset_id == asset_id, DNSExpiryMonitor.kind == kind
+            )
+        )
+    ).first()
+    if port_row is not None:
+        return
+    portless = (
+        await db.execute(
+            select(DNSExpiryMonitor)
+            .where(DNSExpiryMonitor.asset_id == asset_id, DNSExpiryMonitor.kind == "tls")
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if portless is not None:
+        portless.kind = kind
+        await db.flush()
 
 
 def monitor_payload(row: DNSExpiryMonitor, now: datetime) -> dict:

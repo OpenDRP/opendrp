@@ -54,6 +54,24 @@ class UserBase(BaseModel):
         return str(v)
 
 
+class UserBriefResponse(BaseModel):
+    """One row of `GET /users/brief`: the alert-recipient checkboxes.
+
+    Four fields because that is what the checkboxes need, and `UserBase` is
+    deliberately not reused: it carries `full_name` and `rate_limit_minutes`, and
+    adding them to this payload is a change nothing asked for. The enum coercion is
+    the same as `UserBase`'s, so `role` is `"admin"` on the wire rather than an
+    enum member.
+    """
+
+    id: uuid.UUID
+    email: EmailAddress
+    role: UserRole
+    is_active: bool
+
+    model_config = ConfigDict(use_enum_values=True)
+
+
 class UserResponse(UserBase):
     id: uuid.UUID
     created_at: datetime
@@ -286,6 +304,18 @@ class AcceptInvitationRequest(BaseModel):
     @classmethod
     def _validate_new_password(cls, value: SecretStr) -> SecretStr:
         return validate_password_strength(value)  # type: ignore[return-value]
+
+
+class InvitationAccepted(BaseModel):
+    """What `POST /auth/accept-invitation` answers once the password is stored.
+
+    One word, and deliberately not a session: spending the link does not sign the
+    account in, so the page sends the person to the sign-in form. `accepted` is a
+    literal because the route has one success and answers 401 for every failure —
+    invalid and expired links alike.
+    """
+
+    status: Literal["accepted"]
 
 
 class UserBulkRequest(BaseModel):

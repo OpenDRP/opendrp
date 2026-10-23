@@ -1,8 +1,18 @@
+import asyncio
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 
-from app.services.alert_service import AlertService
+from app.core.config import settings
+from app.core.exceptions import BadRequestException
+from app.services.alert_service import (
+    AlertDeliveryAmbiguousError,
+    AlertDeliveryCancelledError,
+    AlertDeliveryTransientError,
+    AlertService,
+)
 
 
 class TestTemplateAutoescape:
@@ -169,3 +179,312 @@ class TestTelegramHtmlEscape:
         text = post_mock.call_args.kwargs["json"]["text"]
         assert "<b>BOLD TITLE</b>" not in text
         assert "&lt;b&gt;BOLD TITLE&lt;/b&gt;" in text
+
+
+def _settings(**overrides) -> SimpleNamespace:
+    base = {
+        "smtp_host": None,
+        "smtp_port": 587,
+        "smtp_user": None,
+        "smtp_password_decrypted": None,
+        "smtp_from_email_decrypted": None,
+        "email_alerts_enabled": False,
+        "alert_email_user_ids": None,
+        "alert_recipient_email_decrypted": None,
+        "telegram_bot_token_decrypted": "123:abc",
+        "telegram_chat_ids": ["-1001"],
+        "telegram_alerts_enabled": False,
+    }
+    base.update(overrides)
+    return SimpleNamespace(**base)
+
+
+class _RaisingClient:
+    def __init__(self, error: Exception) -> None:
+        self.error = error
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_exc) -> bool:
+        return False
+
+    async def post(self, _url, json=None):
+        raise self.error
+
+
+class TestTelegramTransportClassification:
+    @pytest.mark.asyncio
+    async def test_a_connect_error_is_transient(self, db_session, monkeypatch):
+        svc = AlertService(db_session)
+        svc._audit_alert = AsyncMock()
+        monkeypatch.setattr(
+            httpx, "AsyncClient", lambda **kwargs: _RaisingClient(httpx.ConnectError("no route"))
+        )
+        with patch.object(
+            AlertService, "_get_settings", new_callable=AsyncMock, return_value=_settings()
+        ):
+            with pytest.raises(AlertDeliveryTransientError, match="telegram connection unavailable"):
+                await svc._send_telegram("hi", chat_id="-1001")
+
+    @pytest.mark.asyncio
+    async def test_a_lost_response_is_ambiguous(self, db_session, monkeypatch):
+        svc = AlertService(db_session)
+        svc._audit_alert = AsyncMock()
+        monkeypatch.setattr(
+            httpx, "AsyncClient", lambda **kwargs: _RaisingClient(asyncio.TimeoutError())
+        )
+        with patch.object(
+            AlertService, "_get_settings", new_callable=AsyncMock, return_value=_settings()
+        ):
+            with pytest.raises(AlertDeliveryAmbiguousError, match="acceptance unknown"):
+                await svc._send_telegram("hi", chat_id="-1001")
+
+
+class TestChatResult:
+    def test_a_200_without_a_json_body_is_still_a_valid_chat(self):
+        result = AlertService._telegram_chat_result(
+            "-1", SimpleNamespace(status_code=200, text="<html>not json</html>")
+        )
+        assert result == {
+            "chat_id": "-1",
+            "ok": True,
+            "chat_type": None,
+            "username": None,
+            "title": None,
+        }
+
+    def test_a_non_200_is_reported_with_its_provider_code(self):
+        result = AlertService._telegram_chat_result(
+            "-1",
+            SimpleNamespace(
+                status_code=403, text='{"description": "bot was blocked by the user"}'
+            ),
+        )
+        assert result["ok"] is False
+        assert result["error_code"] == "bot_blocked"
+
+
+class TestChatValidation:
+    @pytest.mark.asyncio
+    async def test_an_unusable_token_is_refused_before_the_request(self, db_session):
+        svc = AlertService(db_session)
+        with pytest.raises(BadRequestException, match="unusable"):
+            await svc.validate_telegram_chats(
+                _settings(telegram_bot_token_decrypted="123456789:@evil.example/x")
+            )
+
+    @pytest.mark.asyncio
+    async def test_a_spent_deadline_names_the_reason(self, db_session, monkeypatch):
+        svc = AlertService(db_session)
+        svc._audit_alert = AsyncMock()
+        monkeypatch.setattr(settings, "ALERT_HEALTH_CHECK_TIMEOUT_SECONDS", 0.0)
+
+        result = await svc.validate_telegram_chats(
+            _settings(telegram_chat_ids=["-1", "-2"])
+        )
+
+        assert result["valid"] == 0
+        assert {item["error_code"] for item in result["results"]} == {"deadline_exceeded"}
+
+    @pytest.mark.asyncio
+    async def test_a_transport_error_is_reported_per_chat(self, db_session, monkeypatch):
+        svc = AlertService(db_session)
+        svc._audit_alert = AsyncMock()
+        monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: _RaisingClient(httpx.ConnectError("x")))
+
+        class _Getter(_RaisingClient):
+            async def get(self, _url, params=None):
+                raise self.error
+
+        monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: _Getter(httpx.ConnectError("x")))
+
+        result = await svc.validate_telegram_chats(_settings())
+
+        assert result["results"][0]["error_code"] == "provider_unavailable"
+
+
+class TestTestSendEdges:
+    @pytest.mark.asyncio
+    async def test_a_chat_that_failed_validation_is_passed_through(self, db_session):
+        svc = AlertService(db_session)
+        svc._audit_alert = AsyncMock()
+        svc.validate_telegram_chats = AsyncMock(
+            return_value={
+                "valid": 0,
+                "total": 1,
+                "results": [
+                    {
+                        "chat_id": "-1",
+                        "ok": False,
+                        "error_code": "chat_not_found",
+                        "error": "Telegram cannot find this chat.",
+                    }
+                ],
+            }
+        )
+
+        result = await svc.send_test_telegram(_settings())
+
+        assert result["sent"] == 0
+        assert result["results"][0]["error_code"] == "chat_not_found"
+        assert result["validation_failed"] == 1
+
+    @pytest.mark.asyncio
+    async def test_a_spent_deadline_is_reported_rather_than_raised(
+        self, db_session, monkeypatch
+    ):
+        svc = AlertService(db_session)
+        svc._audit_alert = AsyncMock()
+        svc.validate_telegram_chats = AsyncMock(
+            return_value={
+                "valid": 1,
+                "total": 1,
+                "results": [{"chat_id": "-1", "ok": True}],
+            }
+        )
+        monkeypatch.setattr(settings, "ALERT_HEALTH_CHECK_TIMEOUT_SECONDS", 0.0)
+
+        result = await svc.send_test_telegram(_settings())
+
+        assert result["results"][0]["error_code"] == "deadline_exceeded"
+
+
+class TestNotificationBuild:
+    def test_a_finding_on_a_known_origin_links_to_its_own_page(self, db_session, monkeypatch):
+        svc = AlertService(db_session)
+        monkeypatch.setattr(settings, "CORS_ORIGINS", ["https://drp.example.com"])
+        finding_id = "11111111-1111-1111-1111-111111111111"
+        item = {"finding_id": finding_id, "Current value": "evil.example"}
+
+        notification = svc._build_notification(
+            threat_type="phishing",
+            label="Phishing",
+            subject="s",
+            findings=[item],
+            bounded=[item],
+            job_id="job-1",
+            link="https://drp.example.com/phishing",
+        )
+
+        assert notification.rows[0]["Finding link"] == (
+            f"https://drp.example.com/phishing?finding_id={finding_id}"
+        )
+        assert notification.rows[0]["Current value"] == "evil.example"
+
+    def test_no_usable_origin_means_no_link(self, db_session, monkeypatch):
+        svc = AlertService(db_session)
+        monkeypatch.setattr(settings, "CORS_ORIGINS", ["not-a-url", "http://127.0.0.1:3000"])
+
+        assert svc._platform_link("phishing") is None
+
+
+class TestAggregatedDeliveryEdges:
+    @pytest.mark.asyncio
+    async def test_no_enabled_destination_is_cancelled(self):
+        svc = AlertService(AsyncMock())
+        svc._audit_alert = AsyncMock()
+        with patch.object(
+            AlertService, "_get_settings", new_callable=AsyncMock, return_value=_settings()
+        ):
+            with pytest.raises(AlertDeliveryCancelledError, match="No enabled destination"):
+                await svc.send_aggregated_alert_notification(
+                    threat_type="phishing",
+                    findings=[{"phishing_domain": "evil.example"}],
+                    job_id="job-1",
+                    channel="email",
+                )
+
+    @pytest.mark.asyncio
+    async def test_the_subject_names_the_worst_severity(self):
+        svc = AlertService(AsyncMock())
+        svc._audit_alert = AsyncMock()
+        subjects: list[str] = []
+
+        async def _email(*, to, subject, html_body, plain_body=None):
+            subjects.append(subject)
+            return True
+
+        svc._send_email_smtp = _email
+        with patch.object(
+            AlertService,
+            "_get_settings",
+            new_callable=AsyncMock,
+            return_value=_settings(
+                email_alerts_enabled=True,
+                alert_recipient_email_decrypted="soc@example.com",
+            ),
+        ):
+            await svc.send_aggregated_alert_notification(
+                threat_type="phishing",
+                findings=[
+                    {"phishing_domain": "evil.example", "severity": "high"},
+                    {"phishing_domain": "low.example", "severity": "info"},
+                ],
+                job_id="job-1",
+                channel="email",
+            )
+
+        assert subjects == ["[OpenDRP Alert] Phishing: 2 new findings (high)"]
+
+    @pytest.mark.asyncio
+    async def test_a_breach_subject_names_the_change_class(self):
+        svc = AlertService(AsyncMock())
+        svc._audit_alert = AsyncMock()
+        subjects: list[str] = []
+
+        async def _email(*, to, subject, html_body, plain_body=None):
+            subjects.append(subject)
+            return True
+
+        svc._send_email_smtp = _email
+        with patch.object(
+            AlertService,
+            "_get_settings",
+            new_callable=AsyncMock,
+            return_value=_settings(
+                email_alerts_enabled=True,
+                alert_recipient_email_decrypted="soc@example.com",
+            ),
+        ):
+            await svc.send_aggregated_alert_notification(
+                threat_type="breach",
+                findings=[
+                    {"matched_email": "a@example.com", "breach_name": "X", "change_class": "incident_grew"},
+                    {"matched_email": "b@example.com", "breach_name": "X", "change_class": "incident_grew"},
+                ],
+                job_id="job-1",
+                channel="email",
+            )
+
+        assert subjects == [
+            "[OpenDRP Alert] Credential breach: 2 new findings (Incident grew)"
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_provider_that_declines_is_a_failure(self):
+        svc = AlertService(AsyncMock())
+        svc._audit_alert = AsyncMock()
+
+        async def _email(**_kwargs):
+            return False
+
+        svc._send_email_smtp = _email
+        with patch.object(
+            AlertService,
+            "_get_settings",
+            new_callable=AsyncMock,
+            return_value=_settings(
+                email_alerts_enabled=True,
+                alert_recipient_email_decrypted="soc@example.com",
+            ),
+        ):
+            with pytest.raises(RuntimeError, match="did not accept"):
+                await svc.send_aggregated_alert_notification(
+                    threat_type="phishing",
+                    findings=[{"phishing_domain": "evil.example"}],
+                    job_id="job-1",
+                    channel="email",
+                )
+
+        assert svc._audit_alert.await_args.kwargs["action"] == "alert.dispatch.failed"

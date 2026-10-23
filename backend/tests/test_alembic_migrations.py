@@ -197,10 +197,16 @@ async def test_clean_database_upgrades_to_head_and_seeds_required_registry(monke
             shipped = {row.name: row for row in connectors}
             #: Where a row's settings live: the keyed provider an operator switches
             #: on by hand carries an empty config for them to fill in, while the
-            #: rows a Compose profile enables are declared with none. The account
-            #: the quota is drawn from holds the credential either way, and the
-            #: application reads both spellings as "no settings yet".
-            assert _json_value(shipped["dns-netlas"].config) == {}
+            #: rows a Compose profile enables are declared with none. The netlas
+            #: rows are the exception: they carry the provider's own limits as
+            #: config (AUD-021), because the core applies a declaration instead of
+            #: naming a provider, and the certificate bucket needs its own cap.
+            netlas_caps = {
+                "requests_per_minute_ceiling": 60,
+                "certificate_requests_per_minute": 3,
+            }
+            for name in ("dns-netlas", "phishing-netlas", "exposure-netlas"):
+                assert _json_value(shipped[name].config) == netlas_caps
             assert shipped["phishing-shodan"].config is None
             assert shipped["dns-virustotal"].config is None
             # The provider-backed DNS workers are enabled by the profile that starts

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -107,6 +108,89 @@ class TestVerifiedChain:
 
         assert environment.verify.await_args.kwargs["full"] is True
         assert environment.emit.await_args.kwargs["details"]["full"] is True
+
+
+class TestBreakNotification:
+    """The page a break sends: one outbox row, and it never becomes a second failure.
+
+    The task's other tests replace ``_notify_break`` because they are about the
+    verdict. These pin the page itself, which is the only part of the nightly
+    check an operator actually sees at 04:45.
+    """
+
+    @staticmethod
+    def _session(db):
+        class _Context:
+            async def __aenter__(self):
+                return db
+
+            async def __aexit__(self, *_exc_info):
+                return False
+
+        return _Context()
+
+    @pytest.mark.asyncio
+    async def test_a_break_is_queued_as_one_notification_event(self, db_session, monkeypatch):
+        import uuid
+        from sqlalchemy import select
+
+        from app.core import database
+        from app.models.ingestion_event import IngestionEvent
+
+        monkeypatch.setattr(database, "AsyncSessionLocal", lambda: self._session(db_session))
+        details = {
+            "checked": 12,
+            "through_seq": 12,
+            "first_broken_seq": 7,
+            "reason": "hash_mismatch",
+            "full": True,
+            "checked_at": "2026-10-20T04:45:00+00:00",
+        }
+
+        await it._notify_break(details)
+
+        rows = (
+            await db_session.execute(select(IngestionEvent))
+        ).scalars().all()
+        assert len(rows) == 1
+        event = rows[0]
+        assert event.kind == "notification"
+        assert event.module == "module:operations"
+        assert event.payload["title"] == "[OpenDRP] Audit chain verification failed"
+        assert event.payload["fields"]["first_broken_seq"] == 7
+        # The id is derived from the finding, so a repeat pass over the same
+        # break cannot page the operator twice.
+        expected = uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            "audit-chain-break:"
+            + json.dumps(
+                {key: value for key, value in details.items() if key != "checked_at"},
+                sort_keys=True,
+            ),
+        )
+        assert event.entity_id == expected
+
+        await it._notify_break({**details, "checked_at": "2026-10-20T05:45:00+00:00"})
+        again = (await db_session.execute(select(IngestionEvent))).scalars().all()
+        assert len(again) == 1
+
+    @pytest.mark.asyncio
+    async def test_a_channel_that_cannot_be_reached_does_not_fail_the_check(
+        self, db_session, monkeypatch
+    ):
+        """The audit row and the log line are already written; the page is best effort."""
+        from app.core import database
+
+        monkeypatch.setattr(database, "AsyncSessionLocal", lambda: self._session(db_session))
+
+        async def _unavailable(*_args, **_kwargs):
+            raise RuntimeError("operator channels are down")
+
+        monkeypatch.setattr(
+            "app.services.ingestion_events.record_event", _unavailable
+        )
+
+        await it._notify_break({"first_broken_seq": 1, "reason": "gap"})
 
 
 class TestBrokenChain:

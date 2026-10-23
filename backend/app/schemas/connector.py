@@ -478,6 +478,34 @@ MAX_FINDINGS_PER_BATCH = 500
 #: assembled its payload wrongly rather than a catalogue that grew.
 MAX_CATALOGUE_ENTRIES_PER_BATCH = 500
 
+
+class ScanStartResponse(BaseModel):
+    """What a scan route answers once its jobs are queued.
+
+    Six routes share this declaration, and they do not send the same keys: `error`
+    appears only when the queue refused, `email` and `domain` belong to the two
+    targeted breach scans, and `sources`/`offline_connectors` are the
+    `enqueue_ready_sources` answer the DNS route and the connectors inventory read.
+    The optional fields are therefore declared once and excluded when null
+    (`response_model_exclude_none=True` on each route), so an absent key stays
+    absent instead of becoming `null` — the only reason one model can serve six
+    routes without changing a byte.
+
+    `sources` stays provider-shaped: each entry is a connector object with its
+    status and either the jobs it queued or the reason it did not, and the SPA models
+    the half it reads. `status` is text rather than an enum because the handlers
+    answer `scheduled`, `blocked` and `no_connector`.
+    """
+
+    status: str
+    job_ids: list[str]
+    sources: list[dict[str, Any]] | None = None
+    offline_connectors: list[str] | None = None
+    error: str | None = None
+    email: str | None = None
+    domain: str | None = None
+
+
 __all__ = [
     "MAX_ATTRIBUTES",
     "MAX_CATALOGUE_ENTRIES_PER_BATCH",
@@ -486,5 +514,6 @@ __all__ = [
     "BreachFinding",
     "ConnectorFinding",
     "PhishingFinding",
+    "ScanStartResponse",
     "sanitize_attributes",
 ]

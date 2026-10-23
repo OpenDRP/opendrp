@@ -229,10 +229,13 @@ async def test_this_replicas_requests_are_counted(client, monkeypatch):
 
     assert response.status_code == 200
     assert 'opendrp_http_requests_total{method="GET",status_class="2xx"}' in response.text
-    assert "opendrp_http_requests_in_flight 0" in response.text
+    # One: the scrape is itself a request this replica is handling at the moment
+    # it renders. A zero here would mean the document came from counters nobody
+    # is incrementing any more — the state this test exists to catch.
+    assert "opendrp_http_requests_in_flight 1" in response.text
     # The counters belong to this process, and the middleware reads the same
-    # object the test does — a reset rebinds the module global, which is why the
-    # middleware must not capture it.
+    # object the test does — a reset rebinds the module global, which is why
+    # nothing may capture it at import time.
     assert metrics_module.request_metrics.samples()
 
 
@@ -249,6 +252,56 @@ def test_resetting_the_counters_replaces_them_for_the_live_middleware():
     assert not [
         sample for sample in metrics_module.request_metrics.samples() if sample.name.startswith("opendrp_http_requests_total")
     ]
+
+
+@pytest.mark.asyncio
+async def test_a_reset_reaches_the_scrape_endpoint(client, monkeypatch):
+    """The endpoint must render the counters the middleware is incrementing.
+
+    ``reset_request_metrics`` rebinds the module global, so anything holding the
+    old object keeps reporting a previous life's numbers. The middleware reads
+    the global on every request for exactly this reason; the scrape endpoint has
+    to do the same, or a fresh process answers a scrape with the counters it had
+    before the reset and never advances.
+    """
+    _enable(monkeypatch)
+    reset_request_metrics()
+    reset_request_metrics()
+
+    await client.get("/api/v1/health")
+    response = await client.get(_ENDPOINT, headers=HEADERS)
+
+    assert response.status_code == 200
+    series = [
+        line
+        for line in response.text.splitlines()
+        if line.startswith("opendrp_http_requests_total{")
+    ]
+    assert series == ['opendrp_http_requests_total{method="GET",status_class="2xx"} 1']
+
+
+@pytest.mark.asyncio
+async def test_a_made_up_method_does_not_become_its_own_series(client, monkeypatch):
+    """The method label is an enumeration, not whatever the caller sent.
+
+    An HTTP method is a token the client chooses, and a route that does not
+    accept it still passes through this middleware. Recording it verbatim lets an
+    unauthenticated caller decide how many series the exposition carries — one
+    per invented verb — which is the cardinality explosion the label rules exist
+    to prevent, in the time-series database as well as in this process.
+    """
+    _enable(monkeypatch)
+    reset_request_metrics()
+
+    rejected = await client.request("PURGE", "/api/v1/health")
+    assert rejected.status_code == 405
+    response = await client.get(_ENDPOINT, headers=HEADERS)
+
+    assert 'method="PURGE"' not in response.text
+    assert (
+        'opendrp_http_requests_total{method="OTHER",status_class="4xx"} 1'
+        in response.text
+    )
 
 
 # ==============================================================================

@@ -45,12 +45,16 @@ from app.services.ingestion_events import record_event
 CERTIFICATE_SOURCES = ("tlsprobe", "ctlogs", "virustotal", "shodan", "netlas")
 
 #: Where a fingerprint may come from, in preference order. ``certificate_id`` is what
-#: our own probe writes on its control row; the rest are provider spellings.
+#: our own probe and the CT control row write; ``id`` is the alone-spelling the CT
+#: worker's historical rows carry, and the one `observation_key` already keys those
+#: rows by — a projector that does not read it drops the whole CT corpus (AUD-035).
+#: The hex check below is what keeps any of them from meaning "some provider id".
 _FINGERPRINT_KEYS = (
     "fingerprint_sha256",
     "certificate_fingerprint_sha256",
     "certificate_id",
     "fingerprint",
+    "id",
 )
 
 _SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
@@ -225,6 +229,27 @@ def _sighting_signals(row: DNSObservation) -> dict[str, Any]:
     return {key: value for key, value in signals.items() if value is not None}
 
 
+def sighting_subjects(sighting: TLSCertificateSighting) -> list[str]:
+    """Every name one certificate was reported for at this endpoint (AUD-037).
+
+    The sighting is keyed by (certificate, address, port, source) on purpose:
+    re-observing the same fact refreshes a row instead of stacking a duplicate.
+    The hostnames are evidence rather than key, and the first one to arrive used
+    to be the only one stored, so a certificate served for two names at one
+    address was invisible to the issuance rule under the second name. They are
+    accumulated here, and the rule iterates the set.
+    """
+    stored = (sighting.signals or {}).get("subjects")
+    subjects = (
+        [value for value in stored if isinstance(value, str) and value]
+        if isinstance(stored, list)
+        else []
+    )
+    if sighting.subject and sighting.subject not in subjects:
+        subjects.append(sighting.subject)
+    return subjects
+
+
 async def project_observations(db: AsyncSession, *, limit: int = 5000) -> dict:
     """Turn stored observations into certificate identities and sightings.
 
@@ -320,7 +345,7 @@ async def project_observations(db: AsyncSession, *, limit: int = 5000) -> dict:
                 first_seen_at=seen_at,
                 last_seen_at=seen_at,
                 is_ours=is_ours,
-                signals=signals,
+                signals={**signals, "subjects": [observation.subject]},
                 verdict="candidate",
                 confidence=0,
             )
@@ -332,7 +357,12 @@ async def project_observations(db: AsyncSession, *, limit: int = 5000) -> dict:
             sighting.last_seen_at = max(_utc(sighting.last_seen_at, seen_at), seen_at)
             sighting.first_seen_at = min(_utc(sighting.first_seen_at, seen_at), seen_at)
             sighting.is_ours = sighting.is_ours or is_ours
-            sighting.signals = {**signals, **{k: v for k, v in (sighting.signals or {}).items() if k not in signals}}
+            merged = sorted(set(sighting_subjects(sighting)) | {observation.subject})
+            sighting.signals = {
+                **signals,
+                **{k: v for k, v in (sighting.signals or {}).items() if k not in signals},
+                "subjects": merged,
+            }
     await db.flush()
     return {"identities": created_identities, "sightings": created_sightings, "scanned": len(rows)}
 
@@ -652,65 +682,67 @@ async def evaluate_identities(db: AsyncSession, *, now: datetime | None = None) 
     ours_by_subject: dict[str, datetime] = {}
     issuers_by_subject: dict[str, set[str]] = {}
     for sighting in our_sightings:
-        if not sighting.subject:
-            continue
         identity = identities.get(sighting.identity_id)
         if identity is None:
             continue
-        if identity.not_before is not None:
-            current = ours_by_subject.get(sighting.subject)
-            ours_by_subject[sighting.subject] = max(current, _utc(identity.not_before, instant)) if current else _utc(identity.not_before, instant)
-        if identity.issuer_dn:
-            issuers_by_subject.setdefault(sighting.subject, set()).add(identity.issuer_dn.lower())
+        for subject in sighting_subjects(sighting):
+            if identity.not_before is not None:
+                current = ours_by_subject.get(subject)
+                ours_by_subject[subject] = max(current, _utc(identity.not_before, instant)) if current else _utc(identity.not_before, instant)
+            if identity.issuer_dn:
+                issuers_by_subject.setdefault(subject, set()).add(identity.issuer_dn.lower())
     for sighting in sightings:
         identity = identities.get(sighting.identity_id)
-        if identity is None or sighting.is_ours or not sighting.subject:
+        if identity is None or sighting.is_ours:
             continue
         if identity.origin != "ct" or identity.not_before is None:
             continue
-        baseline = ours_by_subject.get(sighting.subject)
-        if baseline is None:
-            continue
         issued = _utc(identity.not_before, instant)
-        if issued <= baseline:
-            continue
-        if _exception_match(exceptions, identity=identity, sighting=sighting) is not None:
-            suppressed += 1
-            continue
-        # Bound to a local so the emptiness check and the lookup above read as one
-        # question: an issuer the platform has not seen on our own certificates is
-        # what makes a fresh issuance for our name more than a renewal.
-        issuer = identity.issuer_dn or ""
-        unknown_issuer = bool(issuer) and issuer.lower() not in issuers_by_subject.get(sighting.subject, set())
-        confidence = 1 + (1 if unknown_issuer else 0)
-        sighting.confidence = confidence
-        sighting.signals = {**(sighting.signals or {}), "rules": ["R3"]}
-        queued_issuance = await record_event(
-            db,
-            kind="notification",
-            module="dns",
-            entity_id=sighting.id,
-            payload={
-                "severity": "medium",
-                "rule": "tls.certificate.unexpected",
-                "title": f"{sighting.subject}: a certificate we did not deploy was issued for this name",
-                "host": sighting.subject,
-                "Certificate fingerprint (SHA-256)": identity.fingerprint_sha256,
-                "Issuer": identity.issuer_dn or "unknown",
-                "Issued at (UTC)": issued.isoformat(),
-                "Our newest certificate for this name": baseline.isoformat(),
-                "Issuer known for this name": "no" if unknown_issuer else "yes",
-                "Confidence": str(confidence),
-                "What to do": (
-                    "Confirm with the certificate authority who requested it, check the "
-                    "ACME/DNS accounts that can prove control of this name, and revoke it "
-                    "if it is not ours."
-                ),
-            },
-            dedup=_digest("R3", sighting.subject, identity.fingerprint_sha256),
-        )
-        if queued_issuance:
-            queued["R3"] += 1
+        # One sighting can name several hostnames; each is the question R3 asks,
+        # and each gets its own baseline and its own event (AUD-037).
+        for subject in sighting_subjects(sighting):
+            baseline = ours_by_subject.get(subject)
+            if baseline is None:
+                continue
+            if issued <= baseline:
+                continue
+            if _exception_match(exceptions, identity=identity, sighting=sighting) is not None:
+                suppressed += 1
+                continue
+            # Bound to a local so the emptiness check and the lookup above read as one
+            # question: an issuer the platform has not seen on our own certificates is
+            # what makes a fresh issuance for our name more than a renewal.
+            issuer = identity.issuer_dn or ""
+            unknown_issuer = bool(issuer) and issuer.lower() not in issuers_by_subject.get(subject, set())
+            confidence = 1 + (1 if unknown_issuer else 0)
+            sighting.confidence = confidence
+            sighting.signals = {**(sighting.signals or {}), "rules": ["R3"]}
+            queued_issuance = await record_event(
+                db,
+                kind="notification",
+                module="dns",
+                entity_id=sighting.id,
+                payload={
+                    "severity": "medium",
+                    "rule": "tls.certificate.unexpected",
+                    "title": f"{subject}: a certificate we did not deploy was issued for this name",
+                    "host": subject,
+                    "Certificate fingerprint (SHA-256)": identity.fingerprint_sha256,
+                    "Issuer": identity.issuer_dn or "unknown",
+                    "Issued at (UTC)": issued.isoformat(),
+                    "Our newest certificate for this name": baseline.isoformat(),
+                    "Issuer known for this name": "no" if unknown_issuer else "yes",
+                    "Confidence": str(confidence),
+                    "What to do": (
+                        "Confirm with the certificate authority who requested it, check the "
+                        "ACME/DNS accounts that can prove control of this name, and revoke it "
+                        "if it is not ours."
+                    ),
+                },
+                dedup=_digest("R3", subject, identity.fingerprint_sha256),
+            )
+            if queued_issuance:
+                queued["R3"] += 1
 
     # --- R4: a service stack that echoes ours ------------------------------------
     # Not an alert: matching a JARM and a title is strong evidence of a clone and weak
@@ -965,6 +997,7 @@ async def identities_payload(
                     {
                         "id": item.id,
                         "subject": item.subject,
+                        "subjects": sighting_subjects(item),
                         "ip": item.ip,
                         "port": item.port,
                         "source": item.source,

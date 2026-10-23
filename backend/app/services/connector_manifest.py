@@ -30,6 +30,8 @@ work* and *shapes of data*.
 from __future__ import annotations
 
 import json
+import hashlib
+import math
 import re
 
 from app.services.module_aliases import canonical_job_type, canonical_module_id
@@ -487,14 +489,29 @@ def finding_adapter_for(spec: ModuleSpec) -> FindingBatchValidator | None:
     return FindingBatchValidator(model)
 
 
+_DEDUP_KEY_MAX_LEN = 512
+
+
 def declared_dedup_key(spec: ModuleSpec, finding: dict[str, Any]) -> str:
-    """Comparison key of a finding, from the module's declared dedup fields."""
+    """Comparison key of a finding, from the module's declared dedup fields.
+
+    Each value is escaped before the join: a ``|`` or ``\\`` inside a value would
+    otherwise let two different field tuples produce the same key, and the second
+    finding would be dropped as a duplicate of the first.
+
+    A key longer than the stored column is replaced by its digest rather than cut:
+    cutting kept only the first 512 characters, so findings whose values share that
+    prefix collided. The digest is over the whole key, so it stays distinct.
+    """
     parts: list[str] = []
     for name in spec.dedup_fields:
         raw = finding.get(name)
         value = "" if raw is None else re.sub(r"\s+", " ", str(raw).strip())
-        parts.append(value)
-    return "|".join(parts)[:512]
+        parts.append(value.replace("\\", "\\\\").replace("|", "\\|"))
+    key = "|".join(parts)
+    if len(key) > _DEDUP_KEY_MAX_LEN:
+        return "sha256:" + hashlib.sha256(key.encode("utf-8")).hexdigest()
+    return key
 
 
 def declared_title(spec: ModuleSpec, finding: dict[str, Any]) -> str:
@@ -590,6 +607,17 @@ def resolve_manifest(
 # ---------------------------------------------------------------------------
 
 
+#: The most a single configuration value may carry. The typed branch has been
+#: bounded at this length; a connector that declared no schema was not, so one
+#: string of any size could be stored in the row and read back into every
+#: connector's health payload (AUD-019).
+CONFIG_STRING_LIMIT = 2000
+#: An integer setting's whole shape. The old test stripped leading minus signs and
+#: then handed the value to ``int()``, so `--5` passed the test and raised out of
+#: the route as a 500.
+_INTEGER_VALUE = re.compile(r"^[+-]?\d+$")
+
+
 def _coerce_field(key: str, field: dict[str, Any], value: Any) -> Any:
     expected = str(field.get("type") or "str")
     if expected == "bool":
@@ -603,24 +631,31 @@ def _coerce_field(key: str, field: dict[str, Any], value: Any) -> Any:
             raise BadRequestException(f"config '{key}' must be an integer")
         if isinstance(value, int):
             return value
-        if isinstance(value, str) and value.strip().lstrip("-").isdigit():
+        if isinstance(value, str) and _INTEGER_VALUE.match(value.strip()):
             return int(value.strip())
         raise BadRequestException(f"config '{key}' must be an integer")
     if expected == "float":
         if isinstance(value, bool):
             raise BadRequestException(f"config '{key}' must be a number")
         if isinstance(value, (int, float)):
-            return float(value)
+            return _finite(key, float(value))
         if isinstance(value, str):
             try:
-                return float(value.strip())
+                return _finite(key, float(value.strip()))
             except ValueError as exc:
                 raise BadRequestException(f"config '{key}' must be a number") from exc
         raise BadRequestException(f"config '{key}' must be a number")
     if not isinstance(value, str):
         raise BadRequestException(f"config '{key}' must be a string")
-    if len(value) > 2000:
+    if len(value) > CONFIG_STRING_LIMIT:
         raise BadRequestException(f"config '{key}' is too long")
+    return value
+
+
+def _finite(key: str, value: float) -> float:
+    """A number the JSON column can hold. ``nan`` and ``inf`` are not JSON."""
+    if not math.isfinite(value):
+        raise BadRequestException(f"config '{key}' must be a finite number")
     return value
 
 
@@ -647,6 +682,11 @@ def validate_connector_config(manifest: dict[str, Any], config: Any) -> dict[str
                 raise BadRequestException(f"unknown config key '{key}'")
             if not isinstance(raw_value, (bool, int, float, str)):
                 raise BadRequestException(f"config '{key}' must be a scalar")
+            if isinstance(raw_value, float):
+                cleaned[key] = _finite(key, raw_value)
+                continue
+            if isinstance(raw_value, str) and len(raw_value) > CONFIG_STRING_LIMIT:
+                raise BadRequestException(f"config '{key}' is too long")
             cleaned[key] = raw_value
             continue
         cleaned[key] = _coerce_field(key, field, raw_value)

@@ -132,8 +132,10 @@ alembic/versions/__pycache__/
 # report, so without this line a coverage run leaves a directory that a broad
 # `git add` would commit.
 frontend/coverage/
-# Written by the critical-coverage gate (Makefile + CI), never committed.
+# Written by the critical-coverage gate (Makefile + CI) and by the coverage
+# program's own full runs, never committed.
 coverage-critical.json
+coverage.json
 htmlcov/
 .tox/
 .ruff_cache/

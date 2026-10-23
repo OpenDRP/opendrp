@@ -59,7 +59,9 @@ def async_task(func: Callable[..., Any]) -> Callable[..., Any]:
 #: * ``purge_expired_data`` deletes rows past a cutoff in bounded batches: a
 #:   repeated sweep removes what is still expired and nothing else;
 #: * ``verify_audit_chain`` advances a cursor per chunk and resumes from it, so a
-#:   second pass re-verifies a range rather than double-counting it.
+#:   second pass re-verifies a range rather than double-counting it;
+#: * ``rescore_phishing_candidates`` recomputes a score from the stored signals, so
+#:   a second run writes the same numbers and reports that nothing moved.
 #:
 #: Two tasks are deliberately absent. ``process_enrichment_events`` and
 #: ``check_dns_expiry_alerts`` write rows (an enrichment, a queued expiry alert)
@@ -70,6 +72,7 @@ _LATE_ACKNOWLEDGED_TASKS = (
     "deliver_pending_alerts",
     "refresh_scan_schedules",
     "purge_expired_data",
+    "rescore_phishing_candidates",
     "verify_audit_chain",
 )
 
@@ -109,6 +112,7 @@ celery_app = Celery(
         # Scan execution lives in connector containers. The core only
         # schedules connector jobs and processes normalized findings.
         "app.tasks.alert_tasks",
+        "app.tasks.phishing_tasks",
         "app.tasks.report_tasks",
         "app.tasks.retention_tasks",
         "app.tasks.scheduler_tasks",
@@ -216,6 +220,15 @@ celery_app.conf.update(
             "schedule": crontab(hour=4, minute=15),
             "options": {"queue": "default"},
         },
+        # 04:45 UTC, after the sweep: the pass that makes a stored confidence agree
+        # with the weights this build carries (AUD-033). It reads `signals` and
+        # writes `confidence`, so it belongs after the night's scans have landed and
+        # before an analyst opens the list in the morning.
+        "rescore-phishing-candidates-daily": {
+            "task": "rescore_phishing_candidates",
+            "schedule": crontab(hour=4, minute=45),
+            "options": {"queue": "default"},
+        },
         # A bounded resumable full pass: one chunk per minute. Retirement
         # cannot delete the part an active cycle has not verified yet.
         "verify-audit-chain-daily": {
@@ -233,6 +246,7 @@ celery_app.conf.update(
         "send_phishing_digest": {"queue": "alerts"},
         "send_breach_digest": {"queue": "alerts"},
         "process_enrichment_events": {"queue": "default"},
+        "rescore_phishing_candidates": {"queue": "default"},
         # An account notice is small and must not wait behind a batch of alert
         # deliveries, which is why it shares the default queue rather than
         # `alerts`; its own limit is the platform default (RWI-15).

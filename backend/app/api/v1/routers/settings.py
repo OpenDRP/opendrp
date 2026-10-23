@@ -10,13 +10,17 @@ from app.schemas.settings import (
     SystemSettingsResponse,
     SystemSettingsUpdate,
     TestEmailRequest,
+    TestEmailResponse,
+    RuntimeConfigurationResponse,
+    TelegramValidationResponse,
     TestTelegramRequest,
+    TestTelegramResponse,
 )
 from app.services.alert_policy import resolve_alert_policy
 from app.services.settings_service import (
-    _ENCRYPTED_FIELDS,
     SettingsService,
-    is_unchanged_masked_value,
+    settings_audit_changes,
+    settings_audit_snapshot,
 )
 
 router = APIRouter(prefix="/settings", tags=["System Settings"])
@@ -39,7 +43,7 @@ async def get_settings(
     return settings
 
 
-@router.get("/runtime")
+@router.get("/runtime", response_model=RuntimeConfigurationResponse)
 async def get_runtime_configuration(
     request: Request,
     db: AsyncSession = Depends(get_db),
@@ -98,25 +102,24 @@ async def update_settings(
 ):
     service = SettingsService(db)
     s = await service.get_singleton()
-    raw_dump = data.model_dump(exclude_unset=True)
-
-    updated_fields = [
-        k
-        for k, v in raw_dump.items()
-        if k != "expected_version" and not (
-            k in _ENCRYPTED_FIELDS
-            and is_unchanged_masked_value(
-                v, getattr(s, _ENCRYPTED_FIELDS[k], None)
-            )
-        )
-    ]
+    # Snapshotted before the service mutates the row in place, and compared with
+    # the row as it will be saved: the difference is what the trail records, with
+    # both ends of each transition. The submitted payload is not a change set —
+    # the page sends the whole form back on every save, and a job that names every
+    # field claims a change that did not happen (the defect AUD-029 was).
+    before = settings_audit_snapshot(s)
     result = await service.update_settings(s, data, commit=False)
+    changes = settings_audit_changes(before, settings_audit_snapshot(result))
     await AuditLogger.emit(
         db,
         action="settings.update",
         ip_address=extract_ip(request),
         user_id=user.id,
-        details={"updated_fields": updated_fields, "version": result.version},
+        details={
+            "updated_fields": sorted(changes),
+            "changes": changes,
+            "version": result.version,
+        },
         require_persistence=True,
         commit=False,
     )
@@ -124,7 +127,7 @@ async def update_settings(
     return result
 
 
-@router.post("/test-email", status_code=200)
+@router.post("/test-email", status_code=200, response_model=TestEmailResponse)
 async def send_test_email(
     request: Request,
     req: TestEmailRequest,
@@ -157,7 +160,7 @@ async def send_test_email(
     return result
 
 
-@router.post("/validate-telegram", status_code=200)
+@router.post("/validate-telegram", status_code=200, response_model=TelegramValidationResponse)
 async def validate_telegram(
     request: Request,
     req: TestTelegramRequest,
@@ -182,7 +185,7 @@ async def validate_telegram(
     return result
 
 
-@router.post("/test-telegram", status_code=200)
+@router.post("/test-telegram", status_code=200, response_model=TestTelegramResponse)
 async def send_test_telegram(
     request: Request,
     req: TestTelegramRequest,

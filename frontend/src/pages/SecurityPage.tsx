@@ -211,6 +211,30 @@ export default function SecurityPage() {
     },
   });
 
+  /** Copy the codes as they are shown: one per line.
+   *
+   * The join used an escaped backslash, so every code after the first arrived on
+   * the same line with a literal `\n` between them — a paste into a password
+   * manager or a note yielded one unusable string. A clipboard that is missing or
+   * refuses the write also has to say so: a silent no-op looks like success.
+   */
+  async function copyRecoveryCodes() {
+    try {
+      if (!navigator.clipboard?.writeText) throw new Error("clipboard unavailable");
+      await navigator.clipboard.writeText(recoveryCodes.join("\n"));
+      toast({
+        title: "Recovery codes copied",
+        description: "Store them where you can reach them without this device.",
+      });
+    } catch {
+      toast({
+        variant: "destructive",
+        title: "Could not copy the codes",
+        description: "Select them and copy by hand — each code works once.",
+      });
+    }
+  }
+
   const enabled = status.data?.enabled === true;
   const busy = disable.isPending || changePassword.isPending || rotateRecovery.isPending;
 
@@ -329,7 +353,7 @@ export default function SecurityPage() {
       {enabled && <Card>
         <CardHeader><CardTitle as="h2">Recovery codes</CardTitle><CardDescription>Use one code instead of an authenticator code if you lose your device. Each code works once.</CardDescription></CardHeader>
         <CardContent className="space-y-3">
-          {recoveryCodes.length > 0 ? <><div className="grid grid-cols-2 gap-2 rounded-md border p-3 font-mono text-sm">{recoveryCodes.map((item) => <code key={item}>{item}</code>)}</div><p className="text-xs text-destructive">Copy or print these now. They will disappear when you leave this page.</p><Button variant="outline" onClick={() => void navigator.clipboard?.writeText(recoveryCodes.join("\\n"))}><Copy className="w-4 h-4" />Copy codes</Button></> : <><p className="text-xs text-muted-foreground">Generating a new set invalidates all previous codes. Re-authenticate to continue.</p><Button variant="outline" disabled={busy || !password || code.length !== 6} onClick={() => rotateRecovery.mutate()}>Generate new recovery codes</Button></>}
+          {recoveryCodes.length > 0 ? <><div className="grid grid-cols-2 gap-2 rounded-md border p-3 font-mono text-sm">{recoveryCodes.map((item) => <code key={item}>{item}</code>)}</div><p className="text-xs text-destructive">Copy or print these now. They will disappear when you leave this page.</p><Button variant="outline" onClick={() => void copyRecoveryCodes()}><Copy className="w-4 h-4" />Copy codes</Button></> : <><p className="text-xs text-muted-foreground">Generating a new set invalidates all previous codes. Re-authenticate to continue.</p><Button variant="outline" disabled={busy || !password || code.length !== 6} onClick={() => rotateRecovery.mutate()}>Generate new recovery codes</Button></>}
         </CardContent>
       </Card>}
 

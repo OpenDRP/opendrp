@@ -21,21 +21,34 @@ def safe_snapshot(value, key=""):
 
 
 def fact_text(value):
+    """One fact as a person reads it, where empty and missing are not the same.
+
+    ``None`` is a fact nobody reported — a lookup that has not run, a column that
+    has never been filled — and prints as ``N/A``. An empty string is a fact that
+    *was* reported and carries nothing, and printing it as a blank made the two
+    indistinguishable: a reader could not tell an empty registrar lookup from a
+    field that was never looked up (AUD-015). It prints the mark the table
+    renderer already uses for a value that carries nothing, with the reason.
+    """
     if isinstance(value, (dict, list)):
         return json.dumps(value, ensure_ascii=False, sort_keys=True)
-    return str(value if value is not None else "N/A")
+    if value is None:
+        return "N/A"
+    if isinstance(value, str) and not value.strip():
+        return "— (empty)"
+    return str(value)
 
 
 def telegram_parts(notification, limit, batch_id=None):
     """Split text BEFORE escaping; every part has balanced independent markup."""
-    header = f"🚨 <b>OpenDRP {html.escape(notification.label.upper())}</b>\n<b>{notification.total} new findings</b>\n"
+    header = f"🚨 <b>OpenDRP {html.escape(notification.label.upper())}</b>\n<b>{notification.counted()}</b>\n"
     header += "\n".join(f"<b>{html.escape(k)}:</b> {html.escape(v)}" for k, v in notification.groups)
     footer = f"\nJob <code>{html.escape(notification.job_id)}</code>"
     if notification.link:
         footer += f'\n<a href="{html.escape(notification.link, quote=True)}">Open in OpenDRP</a>'
     # At small configured limits omit the redundant summary, never a finding.
     if len(header) + len(footer) + 100 >= limit:
-        header = f"🚨 <b>OpenDRP {html.escape(notification.label.upper())}</b>\n{notification.total} new findings"
+        header = f"🚨 <b>OpenDRP {html.escape(notification.label.upper())}</b>\n{notification.counted()}"
         footer = f"\nJob {html.escape(notification.job_id)}"
     reserve = len(header) + len(footer) + 90
     if reserve >= limit:

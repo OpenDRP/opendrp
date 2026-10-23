@@ -315,6 +315,9 @@ _CONNECTOR_SEED = (
         },
         "aliases": ["netlas-phishing", "netlas-phishing-default"],
         "source": "netlas",
+        # The provider's own rate limits travel with the connector that calls it
+        # (AUD-021). The core applies a declaration; it no longer names a provider.
+        "config": {"requests_per_minute_ceiling": 60, "certificate_requests_per_minute": 3},
     },
     {
         "name": "dns-netlas",
@@ -329,6 +332,7 @@ _CONNECTOR_SEED = (
         },
         "aliases": ["netlas-dns-security", "netlas-dns-security-default"],
         "source": "netlas",
+        "config": {"requests_per_minute_ceiling": 60, "certificate_requests_per_minute": 3},
     },
     {
         "name": "exposure-netlas",
@@ -343,6 +347,7 @@ _CONNECTOR_SEED = (
         },
         "aliases": ["netlas-exposure", "netlas-exposure-default"],
         "source": "netlas",
+        "config": {"requests_per_minute_ceiling": 60, "certificate_requests_per_minute": 3},
     },
 )
 
@@ -471,7 +476,6 @@ def upgrade() -> None:
         sa.Column("expires_at", sa.DateTime(timezone=True)),
         sa.Column("status", sa.String(length=16), nullable=False, server_default="current"),
         sa.Column("metadata_json", sa.JSON(), nullable=False, server_default=sa.text("'{}'::json")),
-        sa.Column("alerted_thresholds", sa.JSON(), nullable=False, server_default=sa.text("'[]'::json")),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.text("now()")),
         sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.text("now()")),
         sa.PrimaryKeyConstraint("id", name="pk_dns_security_observations"),
@@ -1055,8 +1059,13 @@ def upgrade() -> None:
         sa.Column("attempt_count", sa.Integer(), nullable=False, server_default=sa.text("0")),
         sa.Column("claimed_by_connector", sa.String(length=100)),
         sa.Column("lease_token", sa.String(length=64)),
-        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
-        sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
+        # The two timestamps every other table in this revision gives a server
+        # default. `jobs` was the one table that did not, so an INSERT which
+        # omitted them failed NotNullViolation on a migrated PostgreSQL while the
+        # SQLite test schema — built from `TimestampMixin`, which declares the
+        # default — accepted the same statement.
+        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.text("now()")),
+        sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.text("now()")),
         sa.Column("connector_id", sa.Uuid()),
         sa.Column("schedule_key", sa.String(length=128)),
         sa.PrimaryKeyConstraint("id", name="pk_jobs"),
@@ -1265,7 +1274,9 @@ def upgrade() -> None:
                 "status": status,
                 "default_job_type": row["default_job_type"],
                 "manifest": row["manifest"],
-                "config": {} if status == "disabled" else None,
+                "config": row.get("config")
+                if row.get("config") is not None
+                else ({} if status == "disabled" else None),
                 "provider": row.get("source"),
                 "quota_group": "default" if row.get("source") else None,
                 "source_account_id": account_ids.get(row.get("source")),

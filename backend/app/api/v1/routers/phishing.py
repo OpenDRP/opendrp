@@ -27,10 +27,15 @@ from app.services.source_observations import sources_for_candidate, sources_for_
 from app.core.manual_rate_limit import SCOPE_ASSETS, enforce_manual_rate_limit
 from app.models import DrpPhishingDomain
 from app.models.asset import Asset, AssetType
-from app.schemas.asset import AssetCreate, validate_and_normalize_asset_value
+from app.schemas.asset import (
+    AssetCreate,
+    PromotedAssetResponse,
+    validate_and_normalize_asset_value,
+)
 from app.services.asset_service import AssetService, asset_type_value
 from app.models.phishing import PhishingCandidateSignal
-from app.schemas.common import MAX_PAGE_SIZE, PaginatedResponse
+from app.schemas.common import MAX_PAGE_SIZE, CleanupResponse, PaginatedResponse
+from app.schemas.connector import ScanStartResponse
 from app.schemas.phishing import (
     AlertSignalName,
     DetectionSource,
@@ -179,7 +184,7 @@ async def list_threats(
     return PaginatedResponse(items=items, total=total, page=page, size=size, pages=pages)
 
 
-@router.post("/threats/cleanup-orphans")
+@router.post("/threats/cleanup-orphans", response_model=CleanupResponse)
 async def clean_orphan_phishing_findings(
     request: Request,
     db: AsyncSession = Depends(get_db),
@@ -188,15 +193,21 @@ async def clean_orphan_phishing_findings(
     """Delete phishing findings that are not linked to any configured asset."""
     from app.services.asset_service import AssetService
 
-    deleted = await AssetService(db).clean_orphan_phishing_findings()
+    cleanup = await AssetService(db).clean_orphan_phishing_findings()
     await AuditLogger.emit(
         db,
         action="phishing.threat.orphans.cleaned",
         ip_address=extract_ip(request),
         user_id=user.id,
-        details={"deleted": deleted},
+        # Batch by batch and committed inside the service: this row is the only
+        # record of which findings went (AUD-030, the same shape as the breach
+        # cleanup).
+        details={
+            "deleted": cleanup.deleted,
+            "sample_finding_ids": cleanup.sample,
+        },
     )
-    return {"status": "completed", "deleted": deleted}
+    return {"status": "completed", "deleted": cleanup.deleted}
 
 
 @router.get("/threats/{threat_id}", response_model=PhishingThreatResponse)
@@ -350,7 +361,12 @@ async def update_threat(
     )
 
 
-@router.post("/scan/dnstwist", status_code=202, response_model=dict)
+@router.post(
+    "/scan/dnstwist",
+    status_code=202,
+    response_model=ScanStartResponse,
+    response_model_exclude_none=True,
+)
 async def trigger_dnstwist_scan(
     request: Request,
     db: AsyncSession = Depends(get_db),
@@ -406,7 +422,12 @@ async def trigger_dnstwist_scan(
     return payload
 
 
-@router.post("/scan/shodan", status_code=202, response_model=dict)
+@router.post(
+    "/scan/shodan",
+    status_code=202,
+    response_model=ScanStartResponse,
+    response_model_exclude_none=True,
+)
 async def trigger_shodan_scan(
     request: Request,
     db: AsyncSession = Depends(get_db),
@@ -455,7 +476,12 @@ async def trigger_shodan_scan(
     return payload
 
 
-@router.post("/threats/{threat_id}/asset", status_code=201)
+@router.post(
+    "/threats/{threat_id}/asset",
+    status_code=201,
+    response_model=PromotedAssetResponse,
+    response_model_exclude_none=True,
+)
 async def promote_threat_to_asset(
     request: Request,
     threat_id: uuid.UUID,

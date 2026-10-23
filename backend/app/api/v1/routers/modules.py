@@ -128,18 +128,42 @@ async def update_module(
     if payload.label is None and payload.description is None and payload.enabled is None:
         raise BadRequestException("nothing to update")
     spec = await require_module(db, module_id)
+    # Both ends of every transition the request can make, taken before the row is
+    # touched. A rename row that carries only the new label leaves an investigator
+    # unable to tell what the module was called when the findings in it arrived;
+    # the same reasoning as `settings.update` (AUD-049) and AUD-029's triage row.
+    before = {
+        "label": spec.label,
+        "description": spec.description,
+        "enabled": spec.enabled,
+    }
     if payload.label is not None or payload.description is not None:
         spec = await update_module_metadata(
             db, module_id, label=payload.label, description=payload.description, commit=False
         )
     if payload.enabled is not None:
         spec = await set_module_enabled(db, module_id, enabled=payload.enabled, commit=False)
+    after = {
+        "label": spec.label,
+        "description": spec.description,
+        "enabled": spec.enabled,
+    }
+    changes = {
+        name: {"from": before[name], "to": after[name]}
+        for name in before
+        if before[name] != after[name]
+    }
     await AuditLogger.emit(
         db,
         action="module.updated",
         ip_address=extract_ip(request),
         user_id=user.id,
-        details={"module": spec.id, "enabled": spec.enabled, "label": spec.label},
+        details={
+            "module": spec.id,
+            "enabled": spec.enabled,
+            "label": spec.label,
+            "changes": changes,
+        },
         require_persistence=True,
         commit=False,
     )

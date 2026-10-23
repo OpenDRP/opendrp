@@ -12,9 +12,11 @@ from typing import Literal
 from app.services.alert_policy import AlertPolicy, policy_from_environment
 from app.services.phishing_score_service import alert_band
 
-#: The bands the phishing budget routes a candidate into (WI-07, W1.4), plus the
-#: silence an analyst's rejection asks for (WI-12).
-PhishingRoute = Literal["immediate", "digest", "list", "suppressed", "unknown"]
+#: The bands the phishing budget routes a candidate into (WI-07, W1.4), plus the two
+#: silences an analyst asks for: a rejection (WI-12) and a resolution.
+PhishingRoute = Literal[
+    "immediate", "digest", "list", "suppressed", "closed", "unknown"
+]
 
 
 def phishing_alert_route(
@@ -50,6 +52,17 @@ def phishing_alert_route(
     that the daily digest still reports on, and re-reporting a candidate somebody has
     already judged would train an operator to ignore the channel. A verdict of nothing
     (`None`) is the ordinary case and falls through to the score.
+
+    The investigation status is read next, and for the same kind of reason. A
+    ``resolved`` candidate is one an operator has closed, and the digest has always
+    excluded those rows — so routing the same row by its score alone made resolution
+    mean two different things in the two bands above `list`: the immediate band kept
+    announcing a closed candidate, while the middle band consumed its event as
+    "digest" and the digest then filtered the row out, which reported the arrival
+    nowhere at all. `closed` is the third silence, and it is what keeps the set of
+    candidates the digest skips identical to the set the channel does not reach: a
+    confirmed-and-resolved candidate still routes `immediate`, because confirmation
+    asks to be told about exactly these changes.
     """
     if candidate is None:
         return "unknown"
@@ -57,6 +70,8 @@ def phishing_alert_route(
         return "suppressed"
     if candidate.verdict == "confirmed":
         return "immediate"
+    if candidate.status == "resolved":
+        return "closed"
     active = policy if policy is not None else policy_from_environment()
     band = alert_band(int(candidate.confidence or 0), policy=active)
     if band == "direct":

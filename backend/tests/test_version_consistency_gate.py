@@ -54,6 +54,15 @@ _CONSISTENT = {
         '[project]\nname = "opendrp-connector-sdk"\nversion = "0.2.0"\n'
     ),
     "frontend/package.json": '{\n  "name": "opendrp-frontend",\n  "version": "0.2.0"\n}\n',
+    # The three statements a release bump leaves behind: the template a new
+    # installation copies, and the two build defaults that become the version
+    # the SPA prints.
+    ".env.example": "# Application\nOPENDRP_VERSION=0.2.0\nLOG_LEVEL=INFO\n",
+    "docker-compose.yml": (
+        "services:\n  frontend:\n    build:\n      args:\n"
+        "        VITE_APP_VERSION: ${OPENDRP_VERSION:-0.2.0}\n"
+    ),
+    "frontend/Dockerfile": "FROM nginx:1.29.8-alpine3.23\nARG VITE_APP_VERSION=0.2.0\n",
 }
 
 
@@ -114,6 +123,64 @@ def test_a_stale_spa_package_is_reported(tmp_path: Path) -> None:
 
     assert len(failures) == 1, failures
     assert "frontend package.json=1.0.0" in failures[0]
+
+
+def test_a_stale_env_template_is_reported(tmp_path: Path) -> None:
+    """The value a new installation copies is the release it will run.
+
+    `make up` builds the images from this checkout and Settings reports
+    `OPENDRP_VERSION` while the health endpoint reports the code's own version, so
+    a template naming the previous release is an installation displaying two
+    versions — and an image tag nobody released.
+    """
+    root = _checkout(tmp_path, {".env.example": "OPENDRP_VERSION=0.1.9\n"})
+
+    failures = gate.check(root)
+
+    assert len(failures) == 1, failures
+    assert "env template OPENDRP_VERSION=0.1.9" in failures[0]
+
+
+def test_a_stale_compose_display_version_is_reported(tmp_path: Path) -> None:
+    """The SPA's build argument fallback is the version the UI prints."""
+    root = _checkout(
+        tmp_path,
+        {
+            "docker-compose.yml": (
+                "services:\n  frontend:\n    build:\n      args:\n"
+                "        VITE_APP_VERSION: ${OPENDRP_VERSION:-0.1.9}\n"
+            )
+        },
+    )
+
+    failures = gate.check(root)
+
+    assert len(failures) == 1, failures
+    assert "compose VITE_APP_VERSION=0.1.9" in failures[0]
+
+
+def test_a_stale_dockerfile_display_version_is_reported(tmp_path: Path) -> None:
+    """A direct `docker build frontend/` bakes this default into the bundle."""
+    root = _checkout(
+        tmp_path,
+        {"frontend/Dockerfile": "FROM nginx:1.29.8-alpine3.23\nARG VITE_APP_VERSION=0.1.9\n"},
+    )
+
+    failures = gate.check(root)
+
+    assert len(failures) == 1, failures
+    assert "frontend Dockerfile VITE_APP_VERSION=0.1.9" in failures[0]
+
+
+def test_a_missing_env_template_is_a_finding(tmp_path: Path) -> None:
+    """Absent is not consistent: a template nobody can read cannot be checked."""
+    root = _checkout(tmp_path, {})
+    (root / ".env.example").unlink()
+
+    failures = gate.check(root)
+
+    assert len(failures) == 1, failures
+    assert ".env.example: cannot read" in failures[0]
 
 
 def test_a_connector_package_that_stopped_being_read_is_reported(
