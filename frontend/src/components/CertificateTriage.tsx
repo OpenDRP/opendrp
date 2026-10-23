@@ -61,6 +61,26 @@ function signalSummary(sighting: TLSCertificateSighting): string {
   return parts.join(" · ");
 }
 
+/**
+ * Every hostname a sighting was reported for.
+ *
+ * A certificate served for several names at one address is one sighting (AUD-037):
+ * the endpoint and the source do not change with the name, so the payload carries
+ * the set and the row prints all of it — a reviewer looking at a shared address has
+ * to see the neighbour's name the rules acted on. `subject` is the name the row was
+ * created with, and the whole answer for evidence collected before the set existed.
+ */
+function subjectNames(sighting: TLSCertificateSighting): string[] {
+  const names = sighting.subjects?.length ? sighting.subjects : sighting.subject ? [sighting.subject] : [];
+  return [...new Set(names)];
+}
+
+function SightingSubjects({ sighting }: { sighting: TLSCertificateSighting }) {
+  const names = subjectNames(sighting);
+  if (names.length === 0) return null;
+  return <span className="font-mono text-xs">{names.join(" · ")}</span>;
+}
+
 function verdictBadge(verdict: TLSSightingVerdict) {
   if (verdict === "confirmed_foreign") return <Badge variant="destructive">Confirmed foreign</Badge>;
   if (verdict === "candidate") return <Badge variant="outline">Needs review</Badge>;
@@ -213,7 +233,7 @@ export default function CertificateTriage() {
                       {sighting.ip ?? "no address"}
                       {sighting.port ? `:${sighting.port}` : ""}
                     </span>
-                    {sighting.subject && <span className="font-mono text-xs">{sighting.subject}</span>}
+                    <SightingSubjects sighting={sighting} />
                     <span className="text-xs text-muted-foreground">{sighting.source}</span>
                     {verdictBadge(sighting.verdict)}
                     {sighting.confidence > 0 && <span className="text-xs text-muted-foreground">confidence {sighting.confidence}</span>}

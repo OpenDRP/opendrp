@@ -82,6 +82,10 @@ export default function AuditPage() {
   const [jobId, setJobId] = useState("");
   const [actorId, setActorId] = useState("");
   const [outcome, setOutcome] = useState("");
+  // The chain's own cursor. `GET /audit/logs` accepts `after_seq`, and without it
+  // an investigator told "the break is at seq 8412" can only page back through
+  // the trail from the newest entry.
+  const [afterSeq, setAfterSeq] = useState("");
   const integrity = useQuery({ queryKey: ["audit-integrity"], queryFn: endpoints.auditIntegrity, staleTime: 60_000 });
   const debouncedSearch = useDebounce(search, 400);
   const [actionFilter, setActionFilter] = useState<string | undefined>();
@@ -103,8 +107,9 @@ export default function AuditPage() {
       user_email: debouncedUserEmail || undefined,
       from_date: buildUtcDate(fromDate),
       to_date: toDateUtc(),
+      after_seq: sequenceCursor(afterSeq),
     }),
-    [page, size, debouncedSearch, actionFilter, debouncedUserEmail, fromDate, toDate, requestId, jobId, actorId, outcome]
+    [page, size, debouncedSearch, actionFilter, debouncedUserEmail, fromDate, toDate, requestId, jobId, actorId, outcome, afterSeq]
   );
 
   const { data: actionsData, isLoading: actionsLoading } = useQuery<AuditActionsCatalog>({
@@ -245,11 +250,21 @@ export default function AuditPage() {
     setJobId("");
     setActorId("");
     setOutcome("");
+    setAfterSeq("");
     setActionFilter(undefined);
     setUserEmail("");
     setFromDate("");
     setToDate("");
     setPage(1);
+  }
+
+  /** The cursor, or nothing: a half-typed value must not become `NaN` or `0`,
+   *  which would silently mean "from the beginning of the chain". */
+  function sequenceCursor(raw: string): number | undefined {
+    const trimmed = raw.trim();
+    if (!/^\d+$/.test(trimmed)) return undefined;
+    const value = Number(trimmed);
+    return Number.isSafeInteger(value) ? value : undefined;
   }
 
   function buildUtcDate(iso: string | undefined): string | undefined {
@@ -374,7 +389,14 @@ export default function AuditPage() {
           </CardDescription>
         </CardHeader>
         <CardContent>
-          <div className="flex flex-wrap gap-3 mb-3"><Input aria-label="Audit request ID" placeholder="Exact request ID" value={requestId} onChange={(e) => { setRequestId(e.target.value); setPage(1); }} /><Input aria-label="Audit job UUID" placeholder="Exact job UUID" value={jobId} onChange={(e) => { setJobId(e.target.value); setPage(1); }} /><Input aria-label="Audit actor UUID" placeholder="Exact actor UUID" value={actorId} onChange={(e) => { setActorId(e.target.value); setPage(1); }} /><select aria-label="Audit outcome" value={outcome} onChange={(e) => { setOutcome(e.target.value); setPage(1); }}><option value="">All outcomes</option><option value="success">Non-failure actions</option><option value="failure">Failure actions</option></select></div>
+          <div className="flex flex-wrap gap-3 mb-3"><Input aria-label="Audit request ID" placeholder="Exact request ID" value={requestId} onChange={(e) => { setRequestId(e.target.value); setPage(1); }} /><Input aria-label="Audit job UUID" placeholder="Exact job UUID" value={jobId} onChange={(e) => { setJobId(e.target.value); setPage(1); }} /><Input aria-label="Audit actor UUID" placeholder="Exact actor UUID" value={actorId} onChange={(e) => { setActorId(e.target.value); setPage(1); }} /><Input
+              aria-label="Audit sequence cursor"
+              inputMode="numeric"
+              placeholder="From sequence"
+              title="Show entries with a higher sequence number, oldest first — the way to start at the point where a verification stopped."
+              value={afterSeq}
+              onChange={(e) => { setAfterSeq(e.target.value); setPage(1); }}
+            /><select aria-label="Audit outcome" value={outcome} onChange={(e) => { setOutcome(e.target.value); setPage(1); }}><option value="">All outcomes</option><option value="success">Non-failure actions</option><option value="failure">Failure actions</option></select></div>
           <div className="grid grid-cols-1 md:grid-cols-3 lg:grid-cols-6 gap-3">
             <div className="relative lg:col-span-2">
               <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />

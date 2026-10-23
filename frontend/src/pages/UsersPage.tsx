@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Plus, Search, Pencil, Trash2, RefreshCw, Check, X, ShieldAlert, ShieldCheck, ShieldOff, Eye, UserRound, RotateCcw, Download, MonitorSmartphone, Power, MailPlus, Copy, Send } from "lucide-react";
 import { describeApiError, endpoints } from "@/lib/api";
@@ -164,6 +164,15 @@ export default function UsersPage() {
     placeholderData: (previousData) => previousData,
   });
 
+  // The batch route applies whatever ids it is handed, so a selection that
+  // outlives the list it was made in is a batch over accounts the operator can no
+  // longer see — the same rule the assets page follows. The dependencies are
+  // exactly the query key: a change of page, size or filter drops the selection,
+  // and a refresh of the same view keeps it.
+  useEffect(() => {
+    setSelectedIds([]);
+  }, [page, size, debouncedSearch, roleFilter, activeFilter, signedInFilter, supportView]);
+
   const createMut = useMutation({
     mutationFn: (d: UserFormState) => endpoints.createUser({
       email: d.email.trim(),
@@ -222,6 +231,10 @@ export default function UsersPage() {
     onSuccess: (_result, vars) => {
       qc.invalidateQueries({ queryKey: ["users"] });
       setTogglingUserId(null);
+      // The dialog stays up until the answer arrives, so a refusal is read where
+      // the decision was made rather than as a toast after it disappeared.
+      setDeactivateOpen(false);
+      setDeactivatingUser(null);
       toast({ title: vars.is_active ? "User activated" : "User deactivated" });
     },
     onError: (e: any) => {
@@ -239,6 +252,8 @@ export default function UsersPage() {
     mutationFn: (id: string) => endpoints.resetUserMfa(id),
     onSuccess: (_result, _id) => {
       qc.invalidateQueries({ queryKey: ["users"] });
+      setMfaResetOpen(false);
+      setMfaResetUser(null);
       toast({
         title: "Second factor cleared",
         description:
@@ -312,6 +327,7 @@ export default function UsersPage() {
     onSuccess: (result, operation) => {
       qc.invalidateQueries({ queryKey: ["users"] });
       setSelectedIds([]);
+      setBulkConfirm(null);
       toast({
         title: operation === "deactivate" ? "Accounts deactivated" : "Accounts activated",
         description:
@@ -428,6 +444,8 @@ export default function UsersPage() {
     mutationFn: (id: string) => endpoints.deleteUser(id),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["users"] });
+      setDeleteOpen(false);
+      setDeletingUser(null);
       toast({ title: "User deleted" });
     },
     onError: (e: any) => {
@@ -814,7 +832,7 @@ export default function UsersPage() {
             {/* The three slices support asks for, in the list they are already
                 looking at — a separate counters panel would be a second query
                 and would show zeros while the first one is loading (U-3). */}
-            <Select value={supportView} onValueChange={(v: string) => { setSupportView(v as SupportView); setPage(1); setSelectedIds([]); }}>
+            <Select value={supportView} onValueChange={(v: string) => { setSupportView(v as SupportView); setPage(1); }}>
               <SelectTrigger aria-label="Filter by support view"><SelectValue placeholder="Support view" /></SelectTrigger>
               <SelectContent>
                 <SelectItem value="all">Every account</SelectItem>
@@ -881,7 +899,11 @@ export default function UsersPage() {
 
       <ConfirmDialog
         open={deactivateOpen}
-        onOpenChange={setDeactivateOpen}
+        onOpenChange={(open) => {
+          if (!open && toggleActiveMut.isPending) return;
+          setDeactivateOpen(open);
+          if (!open) setDeactivatingUser(null);
+        }}
         variant="destructive"
         title="Deactivate user?"
         description={deactivatingUser ? (
@@ -894,15 +916,23 @@ export default function UsersPage() {
             setTogglingUserId(deactivatingUser.id);
             toggleActiveMut.mutate({ id: deactivatingUser.id, is_active: false });
           }
-          setDeactivateOpen(false);
-          setDeactivatingUser(null);
         }}
         onCancel={() => setDeactivatingUser(null)}
-      />
+      >
+        {toggleActiveMut.isError && (
+          <p role="alert" className="text-sm text-destructive">
+            {describeApiError(toggleActiveMut.error, "The account could not be deactivated.")}
+          </p>
+        )}
+      </ConfirmDialog>
 
       <ConfirmDialog
         open={deleteOpen}
-        onOpenChange={setDeleteOpen}
+        onOpenChange={(open) => {
+          if (!open && deleteMut.isPending) return;
+          setDeleteOpen(open);
+          if (!open) setDeletingUser(null);
+        }}
         variant="destructive"
         title="Permanently delete user?"
         description={deletingUser ? (
@@ -912,15 +942,23 @@ export default function UsersPage() {
         confirmLoading={deleteMut.isPending}
         onConfirm={() => {
           if (deletingUser) deleteMut.mutate(deletingUser.id);
-          setDeleteOpen(false);
-          setDeletingUser(null);
         }}
         onCancel={() => setDeletingUser(null)}
-      />
+      >
+        {deleteMut.isError && (
+          <p role="alert" className="text-sm text-destructive">
+            {describeApiError(deleteMut.error, "The account could not be deleted.")}
+          </p>
+        )}
+      </ConfirmDialog>
 
       <ConfirmDialog
         open={mfaResetOpen}
-        onOpenChange={setMfaResetOpen}
+        onOpenChange={(open) => {
+          if (!open && mfaResetMut.isPending) return;
+          setMfaResetOpen(open);
+          if (!open) setMfaResetUser(null);
+        }}
         variant="destructive"
         title="Clear this account's second factor?"
         description={mfaResetUser ? (
@@ -930,11 +968,15 @@ export default function UsersPage() {
         confirmLoading={mfaResetMut.isPending}
         onConfirm={() => {
           if (mfaResetUser) mfaResetMut.mutate(mfaResetUser.id);
-          setMfaResetOpen(false);
-          setMfaResetUser(null);
         }}
         onCancel={() => setMfaResetUser(null)}
-      />
+      >
+        {mfaResetMut.isError && (
+          <p role="alert" className="text-sm text-destructive">
+            {describeApiError(mfaResetMut.error, "The second factor could not be cleared.")}
+          </p>
+        )}
+      </ConfirmDialog>
 
       <Dialog open={inviteOpen} onOpenChange={(open) => { if (!open) closeInvite(); }}>
         <DialogContent className="sm:max-w-lg">
@@ -1077,7 +1119,10 @@ export default function UsersPage() {
 
       <ConfirmDialog
         open={bulkConfirm !== null}
-        onOpenChange={(open) => { if (!open) setBulkConfirm(null); }}
+        onOpenChange={(open) => {
+          if (!open && bulkMut.isPending) return;
+          if (!open) setBulkConfirm(null);
+        }}
         variant={bulkConfirm === "deactivate" ? "destructive" : "default"}
         title={bulkConfirm === "deactivate" ? "Deactivate the selected accounts?" : "Activate the selected accounts?"}
         description={
@@ -1095,10 +1140,15 @@ export default function UsersPage() {
         confirmLoading={bulkMut.isPending}
         onConfirm={() => {
           if (bulkConfirm) bulkMut.mutate(bulkConfirm);
-          setBulkConfirm(null);
         }}
         onCancel={() => setBulkConfirm(null)}
-      />
+      >
+        {bulkMut.isError && (
+          <p role="alert" className="text-sm text-destructive">
+            {describeApiError(bulkMut.error, "The selection was refused; nothing was changed.")}
+          </p>
+        )}
+      </ConfirmDialog>
 
       <Dialog open={dialogOpen} onOpenChange={(o) => { if (!o) resetForm(); setDialogOpen(o); }}>
         <DialogContent className="sm:max-w-md">

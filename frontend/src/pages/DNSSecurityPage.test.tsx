@@ -225,4 +225,81 @@ describe("DNSSecurityPage", () => {
     await user.click(screen.getByRole("button", { name: "Rescan" }));
     await waitFor(() => expect(mocks.toast).toHaveBeenCalledWith(expect.objectContaining({ variant: "destructive", description: "No online connector is available" })));
   });
+
+  it("explains a refused promotion instead of closing the confirmation silently", async () => {
+    // The API refuses a promotion it cannot store (the asset already exists, the
+    // value is not a concrete host). The operator sees the reason the server gave
+    // rather than a dialog that did nothing and no asset in the list.
+    mocks.list.mockResolvedValue({ items: [{ id: "dns-1", subject: "example.com", observation_type: "dns_record", record_type: "A", value: "203.0.113.9", source: "ctlogs", status: "current", metadata: {}, subject_in_assets: false, value_asset_target: "203.0.113.9", value_in_assets: false }], total: 1, page: 1, size: 20, pages: 1 });
+    mocks.promote.mockRejectedValue(new Error("A wildcard is not a concrete hostname"));
+    const user = userEvent.setup();
+    renderPage();
+    const target = await screen.findByText("203.0.113.9");
+    await user.click(within(target.closest("td")!).getByRole("button", { name: "Add 203.0.113.9 to Assets" }));
+    await user.click(screen.getByRole("button", { name: "Add to Assets" }));
+    await waitFor(() =>
+      expect(mocks.toast).toHaveBeenCalledWith(
+        expect.objectContaining({
+          variant: "destructive",
+          title: "Could not add asset",
+          description: "A wildcard is not a concrete hostname",
+        }),
+      ),
+    );
+  });
+
+  it("explains a refused deletion and keeps the observation on screen", async () => {
+    // A delete the server never performed must not look like one it did: the row
+    // is still there, and the toast is the only place the refusal is stated.
+    mocks.list.mockResolvedValue({ items: [{ id: "dns-1", subject: "example.com", observation_type: "dns_record", record_type: "A", value: "203.0.113.1", source: "resolver", status: "current", metadata: {} }], total: 1, page: 1, size: 20, pages: 1 });
+    mocks.remove.mockRejectedValue(new Error("The requested item no longer exists. Refresh the list."));
+    const user = userEvent.setup();
+    renderPage();
+    await user.click(await screen.findByRole("button", { name: "Delete DNS observation" }));
+    await user.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Delete" }));
+    await waitFor(() =>
+      expect(mocks.toast).toHaveBeenCalledWith(
+        expect.objectContaining({
+          variant: "destructive",
+          title: "Could not delete observation",
+          description: "The requested item no longer exists. Refresh the list.",
+        }),
+      ),
+    );
+    expect(screen.getByText("203.0.113.1")).toBeInTheDocument();
+  });
+
+  it("explains a refused orphan cleanup", async () => {
+    mocks.cleanup.mockRejectedValue(new Error("Another cleanup is already running"));
+    const user = userEvent.setup();
+    renderPage();
+    await user.click(screen.getByRole("button", { name: "Clean orphans" }));
+    await user.click(screen.getByRole("button", { name: "Clean entries" }));
+    await waitFor(() =>
+      expect(mocks.toast).toHaveBeenCalledWith(
+        expect.objectContaining({
+          variant: "destructive",
+          title: "Cleanup failed",
+          description: "Another cleanup is already running",
+        }),
+      ),
+    );
+  });
+
+  it("says on the row itself when a provider scores the name malicious (F-09)", async () => {
+    // The count is what an operator triages on, so it is on the row rather than
+    // only in the tooltip: a badge that reads "Suspicious" without the numbers
+    // cannot be compared between rows.
+    mocks.list.mockResolvedValue({ items: [
+      { id: "vt-1", subject: "malicious.example", observation_type: "vt_domain", record_type: null, value: "malicious.example", source: "virustotal", status: "current", metadata: { suspicious: true, analysis_malicious: 7, analysis_suspicious: 2 } },
+      { id: "vt-2", subject: "quiet.example", observation_type: "vt_domain", record_type: null, value: "quiet.example", source: "virustotal", status: "current", metadata: { suspicious: false } },
+      { id: "p-1", subject: "prod.example", observation_type: "tls_certificate", record_type: null, value: "prod.example", source: "tlsprobe", status: "current", metadata: {}, evidence_count: 3 },
+    ], total: 3, page: 1, size: 20, pages: 1 });
+    renderPage();
+    expect(await screen.findByText("Suspicious · 9")).toBeInTheDocument();
+    expect(screen.getByTitle(/7 engine\(s\) flag it malicious, 2 suspicious/)).toBeInTheDocument();
+    // A name the provider scores clean still says where the row came from.
+    expect(screen.getByText("Reputation")).toBeInTheDocument();
+    expect(screen.getByText("Served certificate · 3 records")).toBeInTheDocument();
+  });
 });

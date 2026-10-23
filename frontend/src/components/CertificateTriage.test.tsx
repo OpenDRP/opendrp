@@ -126,6 +126,32 @@ describe("CertificateTriage", () => {
     expect(mocks.certificates).toHaveBeenCalledWith({ foreign_only: true, page: 1, size: 25 });
   });
 
+  it("names every hostname a certificate was reported for, not just the one that created the row", async () => {
+    // AUD-037: one certificate served for two names at one address is one sighting,
+    // and the rules act on both names. A row that printed only the name it was
+    // created with hid the neighbour the reviewer is being asked to judge.
+    mocks.certificates.mockResolvedValue({
+      items: [
+        {
+          ...CERTIFICATE,
+          sightings: [
+            {
+              ...FOREIGN_SIGHTING,
+              subject: "mail.example.com",
+              subjects: ["mail.example.com", "portal.example.com"],
+            },
+          ],
+        },
+      ],
+      total: 1,
+      page: 1,
+      size: 25,
+      pages: 1,
+    });
+    renderCard();
+    expect(await screen.findByText("mail.example.com · portal.example.com")).toBeInTheDocument();
+  });
+
   it("records a verdict only after the operator confirms it", async () => {
     const user = userEvent.setup();
     renderCard();

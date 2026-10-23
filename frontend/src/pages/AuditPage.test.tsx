@@ -64,6 +64,36 @@ describe("AuditPage", () => {
     expect(logsMock).toHaveBeenCalledWith(expect.objectContaining({ page: 1, size: 20 }));
   });
 
+  it("starts the view at a known sequence and clears the cursor on reset", async () => {
+    // `GET /audit/logs` accepts `after_seq`; without the field, an investigator
+    // told which sequence a verification stopped at could only page back from the
+    // newest entry to reach it.
+    const user = userEvent.setup();
+    renderPage();
+    await screen.findByText("Added asset example.com");
+
+    const cursor = screen.getByRole("textbox", { name: "Audit sequence cursor" });
+    await user.type(cursor, "8412");
+
+    await waitFor(() =>
+      expect(logsMock).toHaveBeenLastCalledWith(
+        expect.objectContaining({ page: 1, after_seq: 8412 }),
+      ),
+    );
+
+    await user.click(screen.getByRole("button", { name: "Reset filters" }));
+    expect(cursor).toHaveValue("");
+
+    // A cursor typed after the reset is a new one. If the reset had left the
+    // value in place, this would be sent as 841299 — the field appends.
+    await user.type(cursor, "99");
+    await waitFor(() =>
+      expect(logsMock).toHaveBeenLastCalledWith(
+        expect.objectContaining({ page: 1, after_seq: 99 }),
+      ),
+    );
+  });
+
   it("resets entered filters and reloads unfiltered audit data", async () => {
     const user = userEvent.setup();
     renderPage();

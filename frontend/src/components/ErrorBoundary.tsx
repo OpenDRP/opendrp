@@ -1,4 +1,4 @@
-import { Component, type ReactNode, type ErrorInfo } from "react";
+import { Component, createRef, type ReactNode, type ErrorInfo } from "react";
 import { Button } from "@/components/ui/button";
 
 interface Props {
@@ -18,6 +18,8 @@ interface State {
  * and produce a blank white screen with no message.
  */
 export class ErrorBoundary extends Component<Props, State> {
+  private readonly containerRef = createRef<HTMLDivElement>();
+
   constructor(props: Props) {
     super(props);
     this.state = { hasError: false, error: null };
@@ -32,6 +34,31 @@ export class ErrorBoundary extends Component<Props, State> {
     console.error("[ErrorBoundary] Caught unhandled error:", error, info.componentStack);
   }
 
+  /**
+   * Move focus into the recovery screen.
+   *
+   * A render error replaces the entire tree, and the element that had focus goes
+   * with it: focus falls back to `<body>`, so a keyboard user is left at the top
+   * of a page whose message is somewhere above them and whose tab order starts
+   * over. The container is a `role="alert"`, which announces the failure, and
+   * focusable for exactly this reason.
+   *
+   * Both lifecycles: the first error of a mount is committed as the mount itself
+   * (`getDerivedStateFromError` has already run), so a boundary that only looked in
+   * `componentDidUpdate` would stay silent exactly once — the time it matters most.
+   */
+  componentDidMount() {
+    this.focusRecovery();
+  }
+
+  componentDidUpdate(_props: Props, previous: State) {
+    if (!previous.hasError) this.focusRecovery();
+  }
+
+  private focusRecovery() {
+    if (this.state.hasError) this.containerRef.current?.focus();
+  }
+
   handleReset = () => {
     this.setState({ hasError: false, error: null });
   };
@@ -42,7 +69,12 @@ export class ErrorBoundary extends Component<Props, State> {
 
       return (
         <div className="min-h-screen flex items-center justify-center bg-background p-6">
-          <div className="max-w-lg w-full text-center space-y-5 p-8 border border-destructive/30 rounded-2xl bg-card shadow-lg">
+          <div
+            ref={this.containerRef}
+            role="alert"
+            tabIndex={-1}
+            className="max-w-lg w-full text-center space-y-5 p-8 border border-destructive/30 rounded-2xl bg-card shadow-lg focus:outline-none"
+          >
             <div className="mx-auto w-16 h-16 rounded-full bg-destructive/10 flex items-center justify-center">
               <svg className="w-8 h-8 text-destructive" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
                 <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />

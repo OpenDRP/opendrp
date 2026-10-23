@@ -76,8 +76,7 @@ function response(overrides: Record<string, unknown> = {}) {
   };
 }
 
-function renderPage() {
-  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+function renderPage(queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } })) {
   return render(
     <QueryClientProvider client={queryClient}>
       <MemoryRouter initialEntries={["/assets/asset-1"]}>
@@ -187,6 +186,39 @@ describe("AssetDetailPage", () => {
     expect(screen.queryByText(/No phishing findings/)).not.toBeInTheDocument();
   });
 
+  it("retries the same read after a failure and then shows the rows", async () => {
+    // The failed read is an answer about the moment, not about the asset: the
+    // retry has to ask again and, when the second answer arrives, replace the
+    // error with what the module actually holds.
+    findingsMock.mockRejectedValueOnce(new Error("network down"));
+    const user = userEvent.setup();
+    renderPage();
+
+    await user.click(await screen.findByRole("button", { name: "Try again" }));
+
+    expect(await screen.findByText("look-alike.example")).toBeInTheDocument();
+    expect(screen.queryByText("network down")).not.toBeInTheDocument();
+    expect(findingsMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("re-reads the open module when the operator refreshes", async () => {
+    const user = userEvent.setup();
+    renderPage();
+    await screen.findByText("look-alike.example");
+    await user.click(screen.getByRole("tab", { name: /Breaches/ }));
+    await waitFor(() =>
+      expect(findingsMock).toHaveBeenCalledWith("asset-1", expect.objectContaining({ module: "breaches" })),
+    );
+    const before = findingsMock.mock.calls.length;
+
+    await user.click(screen.getByRole("button", { name: "Refresh" }));
+
+    await waitFor(() => expect(findingsMock.mock.calls.length).toBe(before + 1));
+    // The refresh repeats the open module at the page the operator is on rather
+    // than falling back to the first tab.
+    expect(findingsMock).toHaveBeenLastCalledWith("asset-1", expect.objectContaining({ module: "breaches" }));
+  });
+
   it("says when the module the operator is reading last saw the asset (WI-20)", async () => {
     const user = userEvent.setup();
     renderPage();
@@ -226,5 +258,44 @@ describe("AssetDetailPage", () => {
     const back = await screen.findByRole("link", { name: /All assets/ });
     expect(back).toHaveAttribute("href", "/assets");
     expect(within(back).getByText("All assets")).toBeInTheDocument();
+  });
+
+  /**
+   * The asset's own record is a second read, and it is the one that carries
+   * criticality, both dates and the "monitored by" card. When it failed the page
+   * still rendered — heading "Asset", no badge, no dates — and said nothing, so a
+   * refusal (a deleted asset, a narrowed role, a transport error) looked like an
+   * asset nobody had ever filled in. The findings table could succeed at the same
+   * time, which is exactly when the silence was most misleading.
+   */
+  it("says the asset record could not be read instead of showing a nameless asset", async () => {
+    getAssetMock.mockRejectedValue(new Error("asset record unavailable"));
+    renderPage();
+
+    // The findings are a different read, and they still answer: the page is usable.
+    expect(await screen.findByText("look-alike.example")).toBeInTheDocument();
+
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent("asset record unavailable");
+  });
+
+  /**
+   * The record used to be cached for the life of the tab (`staleTime: Infinity`
+   * with `refetchOnMount: false`) and nothing invalidated it, so an edit made on
+   * the inventory page — a criticality, the value itself — was visible in the list
+   * and invisible here after navigating back. One read per open is the intent;
+   * reading nothing again is not.
+   */
+  it("re-reads the record when the asset is opened again", async () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const first = renderPage(client);
+    expect(await screen.findByText("high")).toBeInTheDocument();
+    first.unmount();
+
+    getAssetMock.mockResolvedValue({ ...record, criticality: "critical" });
+    renderPage(client);
+
+    expect(await screen.findByText("critical")).toBeInTheDocument();
+    expect(getAssetMock).toHaveBeenCalledTimes(2);
   });
 });

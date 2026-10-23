@@ -283,8 +283,15 @@ export default function PhishingPage() {
 
   const deleteMut = useMutation({
     mutationFn: (id: string) => endpoints.deletePhishingThreat(id),
-    onSuccess: () => { qc.invalidateQueries({ queryKey: ["phishing"] }); toast({ title: "Threat deleted" }); },
-    onError: (e: any) => toast({ variant: "destructive", title: "Delete failed", description: describeApiError(e) }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["phishing"] });
+      toast({ title: "Threat deleted" });
+      // The dialog closes when the API has answered, not when it was clicked
+      // (WI-21): a refusal has to be readable where the decision was made.
+      setDeleteOpen(false);
+      setDeletingThreat(null);
+    },
+    onError: () => { /* shown inside the dialog, which stays open */ },
   });
 
   const cleanOrphansMut = useMutation({
@@ -310,7 +317,10 @@ export default function PhishingPage() {
     onSuccess: ({ result, jobs }) => {
       qc.invalidateQueries({ queryKey: ["phishing"] });
       const succeeded = result.job_ids.length;
-      const reasons = result.sources.filter(source => source.status !== "queued" && source.status !== "disabled")
+      // `sources` is optional on `ScanStartResult`: six scan routes share the type and
+      // not all of them report per-source admission. A module scan does, and `?? []`
+      // keeps the toast honest if a future route stops.
+      const reasons = (result.sources ?? []).filter(source => source.status !== "queued" && source.status !== "disabled")
         .map(source => `${source.connector}: ${source.reason || source.status}`);
       const jobSummary = summarizeScanJobs(jobs);
       if (succeeded && !reasons.length && (jobSummary.pending > 0 || jobs.length === 0)) {
@@ -716,21 +726,29 @@ export default function PhishingPage() {
 
       <ConfirmDialog
         open={deleteOpen}
-        onOpenChange={setDeleteOpen}
+        onOpenChange={(open) => {
+          if (!open && deleteMut.isPending) return;
+          setDeleteOpen(open);
+          if (!open) setDeletingThreat(null);
+        }}
         variant="destructive"
         title="Delete threat?"
         description={deletingThreat ? (
           <>You are about to permanently delete phishing threat <span className="font-mono font-semibold">{deletingThreat.phishing_domain}</span>. This action cannot be undone.</>
         ) : "This action cannot be undone."}
-        confirmLabel="Delete threat"
+        confirmLabel={deleteMut.isPending ? "Deleting…" : "Delete threat"}
         confirmLoading={deleteMut.isPending}
         onConfirm={() => {
           if (deletingThreat) deleteMut.mutate(deletingThreat.id);
-          setDeleteOpen(false);
-          setDeletingThreat(null);
         }}
         onCancel={() => setDeletingThreat(null)}
-      />
+      >
+        {deleteMut.isError && (
+          <p role="alert" className="text-sm text-destructive">
+            {describeApiError(deleteMut.error)}
+          </p>
+        )}
+      </ConfirmDialog>
 
       <Dialog
         open={rejecting !== null}

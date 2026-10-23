@@ -39,6 +39,25 @@ describe("ErrorBoundary", () => {
     expect(screen.getByText("recovered content")).toBeInTheDocument();
   });
 
+  /**
+   * A render error replaces the tree, and the element that had focus goes with it:
+   * focus falls back to `<body>`. The recovery screen was a plain box, so neither
+   * the message nor the fact that the page had changed reached a screen reader, and
+   * a keyboard user was left tabbing from the top of a page whose explanation was
+   * above them.
+   */
+  it("announces the recovery screen and moves focus into it", () => {
+    render(
+      <ErrorBoundary>
+        <Broken />
+      </ErrorBoundary>,
+    );
+
+    const recovery = screen.getByRole("alert");
+    expect(recovery).toHaveTextContent("Something went wrong");
+    expect(recovery).toHaveFocus();
+  });
+
   it("uses a custom fallback when provided", () => {
     render(
       <ErrorBoundary fallback={<div>custom fallback</div>}>

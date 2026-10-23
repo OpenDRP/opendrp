@@ -284,8 +284,15 @@ export default function BreachesPage() {
 
   const deleteMut = useMutation({
     mutationFn: (id: string) => endpoints.deleteBreach(id),
-    onSuccess: () => { qc.invalidateQueries({ queryKey: ["breaches"] }); toast({ title: "Breach match deleted" }); },
-    onError: (e: any) => toast({ variant: "destructive", title: "Delete failed", description: describeApiError(e) }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["breaches"] });
+      toast({ title: "Breach match deleted" });
+      // Closed here rather than on the click: the dialog is where the decision
+      // was made, so it is where a slow delete and a refusal are read (WI-21).
+      setDeleteOpen(false);
+      setDeletingBreach(null);
+    },
+    onError: () => { /* shown inside the dialog, which stays open */ },
   });
 
   // An attempt whose domain the last scan did not name — no scan has finished, or the
@@ -940,21 +947,31 @@ export default function BreachesPage() {
 
       <ConfirmDialog
         open={deleteOpen}
-        onOpenChange={setDeleteOpen}
+        onOpenChange={(open) => {
+          // An in-flight delete is the one state the dialog may not be dismissed
+          // from: the row it names is about to change, and the answer belongs here.
+          if (!open && deleteMut.isPending) return;
+          setDeleteOpen(open);
+          if (!open) setDeletingBreach(null);
+        }}
         variant="destructive"
         title="Delete breach match?"
         description={deletingBreach ? (
           <>You are about to permanently delete the breach match for <span className="font-semibold">{deletingBreach.title}</span> (<span className="font-mono">{deletingBreach.matched_domain || deletingBreach.matched_email}</span>). This action cannot be undone.</>
         ) : "This action cannot be undone."}
-        confirmLabel="Delete breach"
+        confirmLabel={deleteMut.isPending ? "Deleting…" : "Delete breach"}
         confirmLoading={deleteMut.isPending}
         onConfirm={() => {
           if (deletingBreach) deleteMut.mutate(deletingBreach.id);
-          setDeleteOpen(false);
-          setDeletingBreach(null);
         }}
         onCancel={() => setDeletingBreach(null)}
-      />
+      >
+        {deleteMut.isError && (
+          <p role="alert" className="text-sm text-destructive">
+            {describeApiError(deleteMut.error)}
+          </p>
+        )}
+      </ConfirmDialog>
     </div>
   );
 }

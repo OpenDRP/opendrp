@@ -3,6 +3,8 @@ import type { AxiosRequestConfig, AxiosResponse } from "axios";
 
 import {
   api,
+  describeApiError,
+  endpoints,
   flattenErrorDetail,
   isMfaRequiredError,
   isOnboardingRequiredError,
@@ -305,5 +307,161 @@ describe("frontend API boundary", () => {
     expect(first?.access_token).toBe("token-1");
     expect(second?.access_token).toBe("token-1");
     expect(useAuthStore.getState().token).toBe("token-1");
+  });
+
+  /**
+   * One refresh, one replay, and no second attempt when the replay is refused.
+   *
+   * The loop this guards against is not hypothetical: the retry re-enters the
+   * response interceptor, so a marker on the replayed config is the only thing
+   * that stops a `401` that survives the refresh from asking for another one. An
+   * unbounded retry would rotate the refresh token per lap until the family was
+   * revoked — the operator's session destroyed by the very mechanism meant to
+   * save it.
+   */
+  it("replays once after a refresh and stops when the replay is refused again", async () => {
+    const user = { id: "u1", role: "viewer" } as never;
+    useAuthStore.setState({ user, token: "stale-token" });
+    let refreshes = 0;
+    let replays = 0;
+
+    api.defaults.adapter = async (config) => {
+      if (String(config.url).includes("/auth/refresh")) {
+        refreshes += 1;
+        return response(config, {
+          access_token: "refreshed-token",
+          expires_in: 900,
+          token_type: "bearer",
+          user,
+        });
+      }
+      if (config.headers?.Authorization === "Bearer refreshed-token") {
+        replays += 1;
+      }
+      throw {
+        config,
+        response: response(config, { detail: "Not this session after all" }, 401),
+        isAxiosError: true,
+      };
+    };
+
+    await expect(api.get("/assets")).rejects.toBeDefined();
+
+    expect(refreshes).toBe(1);
+    expect(replays).toBe(1);
+  });
+
+  /**
+   * A `401` is not always the session's fault.
+   *
+   * Four routes verify a credential the operator typed: the current password, a
+   * TOTP code, an invitation token, and a sign-out whose refresh cookie has
+   * already lapsed. The API answers a *wrong value* with `401` ("Current password
+   * is incorrect", "Invalid MFA code", "This invitation is invalid or has
+   * expired"), and the interceptor used to read every one of them as an expired
+   * session: it cleared a valid session, told the operator their session had
+   * expired, and navigated away from the form — losing the enrolment secret the
+   * form was about to confirm. The session here is valid; only the value typed
+   * into it was not.
+   */
+  it("does not sign an operator out because a current password was refused", async () => {
+    const user = { id: "u1", role: "admin" } as never;
+    useAuthStore.setState({ user, token: "valid-token" });
+    const unauthorized = vi.fn();
+    window.addEventListener("auth:unauthorized", unauthorized);
+    let calls = 0;
+
+    api.defaults.adapter = async (config) => {
+      calls += 1;
+      throw {
+        config,
+        response: response(config, { detail: "Current password is incorrect" }, 401),
+        isAxiosError: true,
+      };
+    };
+
+    await expect(endpoints.changePassword("wrong-password", "NewPassword123!")).rejects.toSatisfy(
+      (error: unknown) => describeApiError(error).includes("Current password is incorrect"),
+    );
+
+    // One request: a refreshed token cannot make a wrong password right.
+    expect(calls).toBe(1);
+    expect(unauthorized).not.toHaveBeenCalled();
+    expect(useAuthStore.getState().token).toBe("valid-token");
+    expect(useAuthStore.getState().user).toEqual(user);
+    window.removeEventListener("auth:unauthorized", unauthorized);
+  });
+
+  it("does not sign an operator out because a second-factor code was refused", async () => {
+    const user = { id: "u1", role: "admin" } as never;
+    useAuthStore.setState({ user, token: "valid-token" });
+    const unauthorized = vi.fn();
+    window.addEventListener("auth:unauthorized", unauthorized);
+
+    api.defaults.adapter = async (config) => {
+      throw {
+        config,
+        response: response(config, { detail: "Invalid password" }, 401),
+        isAxiosError: true,
+      };
+    };
+
+    await expect(endpoints.mfaEnable("wrong-password", "000000")).rejects.toBeDefined();
+
+    expect(unauthorized).not.toHaveBeenCalled();
+    expect(useAuthStore.getState().token).toBe("valid-token");
+    window.removeEventListener("auth:unauthorized", unauthorized);
+  });
+
+  /**
+   * The invitation page is public: the token *is* the credential, and there is no
+   * session to expire. A mistyped token used to announce a sign-out, which showed
+   * "Session expired" on top of the page's own explanation and navigated to the
+   * sign-in form — the one page that cannot help somebody accept an invitation.
+   */
+  it("does not announce an expired session for a rejected invitation token", async () => {
+    useAuthStore.getState().clearAuth();
+    const unauthorized = vi.fn();
+    window.addEventListener("auth:unauthorized", unauthorized);
+
+    api.defaults.adapter = async (config) => {
+      throw {
+        config,
+        response: response(config, { detail: "This invitation is invalid or has expired" }, 401),
+        isAxiosError: true,
+      };
+    };
+
+    await expect(endpoints.acceptInvitation("stale-token", "NewPassword123!")).rejects.toBeDefined();
+
+    expect(unauthorized).not.toHaveBeenCalled();
+    window.removeEventListener("auth:unauthorized", unauthorized);
+  });
+
+  /**
+   * The sign-out handler clears the session before it calls the API, on purpose:
+   * reaching `/logout` must sign the operator out even when the call fails. A
+   * `401` there is the API saying the cookie it was given had already lapsed —
+   * which is the outcome the operator asked for. Announcing "Session expired"
+   * after a deliberate sign-out is the wrong explanation for the right result.
+   */
+  it("does not announce an expired session when signing out fails", async () => {
+    const unauthorized = vi.fn();
+    window.addEventListener("auth:unauthorized", unauthorized);
+
+    // What `LogoutHandler` does first.
+    useAuthStore.getState().clearAuth();
+    api.defaults.adapter = async (config) => {
+      throw {
+        config,
+        response: response(config, { detail: "CSRF validation failed" }, 401),
+        isAxiosError: true,
+      };
+    };
+
+    await expect(endpoints.logout()).resolves.toBeUndefined();
+
+    expect(unauthorized).not.toHaveBeenCalled();
+    window.removeEventListener("auth:unauthorized", unauthorized);
   });
 });

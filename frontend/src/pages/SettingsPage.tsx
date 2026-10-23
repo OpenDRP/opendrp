@@ -25,6 +25,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { Badge } from "@/components/ui/badge";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Form, FormControl, FormField, FormItem, FormLabel, FormMessage } from "@/components/ui/form";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { Skeleton } from "@/components/ui/skeleton";
 import { toast } from "@/components/ui/use-toast";
 
@@ -250,7 +251,7 @@ export default function SettingsPage() {
   const testTgMut = useMutation({
     mutationFn: (chatId?: string) => endpoints.sendTestTelegram(chatId || undefined),
     onSuccess: (r) => {
-      setTelegramValidation({ valid: r.validated ?? r.sent, total: r.total, results: r.results || [] });
+      setTelegramValidation({ valid: r.validated ?? r.sent ?? 0, total: r.total ?? 0, results: r.results || [] });
       const failed = (r.results || []).filter((x: any) => !x.ok);
       if (failed.length) {
         toast({ variant: "destructive", title: `Sent to ${r.sent}/${r.total} chats`, description: failed.map((f: any) => `${f.chat_id}: ${f.error}`).join("; ").slice(0, 300) });
@@ -334,6 +335,10 @@ export default function SettingsPage() {
     { name: string; token: string; rotated: boolean } | null
   >(null);
   const [setupConnectorId, setSetupConnectorId] = useState("");
+  // Revoking is one click away from rotating, and its cost is a connector that
+  // can no longer claim work until a new token is issued *and* its container is
+  // recreated. It is asked for, never assumed.
+  const [revokingConnector, setRevokingConnector] = useState<Connector | null>(null);
 
   const connectorTokenMut = useMutation({
     mutationFn: ({ id }: { id: string }) => issueConnectorToken(id),
@@ -353,6 +358,7 @@ export default function SettingsPage() {
     onSuccess: (conn) => {
       qc.invalidateQueries({ queryKey: ["connectors"] });
       setIssuedToken(null);
+      setRevokingConnector(null);
       toast({
         title: `Credential revoked for ${conn.name}`,
         description: "The connector entry and its job history were kept.",
@@ -606,7 +612,7 @@ export default function SettingsPage() {
                     onStatus={(status) => connectorStatusMut.mutate({ id: c.id, status })}
                     onConfig={(config) => connectorConfigMut.mutate({ id: c.id, config })}
                     onIssueToken={() => connectorTokenMut.mutate({ id: c.id })}
-                    onRevokeToken={() => connectorTokenRevokeMut.mutate({ id: c.id })}
+                    onRevokeToken={() => setRevokingConnector(c)}
                     busy={
                       connectorStatusMut.isPending ||
                       connectorConfigMut.isPending ||
@@ -952,6 +958,40 @@ export default function SettingsPage() {
           </form>
         </Form>
       )}
+
+      <ConfirmDialog
+        open={revokingConnector !== null}
+        onOpenChange={(open) => {
+          if (!open && connectorTokenRevokeMut.isPending) return;
+          if (!open) setRevokingConnector(null);
+        }}
+        variant="destructive"
+        title="Revoke this connector's credential?"
+        description={
+          revokingConnector ? (
+            <>
+              The credential stops authenticating at once, so{" "}
+              <span className="font-semibold">{revokingConnector.name}</span> can no longer claim work.
+              The connector and its job history are kept; a new token has to be issued and the worker
+              recreated with it before scanning resumes.
+            </>
+          ) : (
+            "The connector loses access until a new token is issued."
+          )
+        }
+        confirmLabel="Revoke credential"
+        confirmLoading={connectorTokenRevokeMut.isPending}
+        onConfirm={() => {
+          if (revokingConnector) connectorTokenRevokeMut.mutate({ id: revokingConnector.id });
+        }}
+        onCancel={() => setRevokingConnector(null)}
+      >
+        {connectorTokenRevokeMut.isError && (
+          <p role="alert" className="text-sm text-destructive">
+            {describeApiError(connectorTokenRevokeMut.error, "The credential could not be revoked.")}
+          </p>
+        )}
+      </ConfirmDialog>
     </div>
   );
 }
@@ -1013,6 +1053,19 @@ function ScheduleRow({
   );
 }
 
+/**
+ * Every minute the API accepts, not a five-minute grid.
+ *
+ * The control is a Radix `Select`: when its `value` is absent from the item list,
+ * Radix answers the mismatch by calling `onValueChange("")` — which this form
+ * turns into `0` and marks dirty. A stored minute of 17 (set through the API, a
+ * module schedule or an environment value) therefore rendered blank *and* began
+ * as 0 in the payload, so saving an unrelated setting silently moved the scan.
+ * Offering the whole range keeps every stored value resolvable, so nothing is
+ * rewritten behind the operator's back; 17 renders as 17.
+ */
+const MINUTE_OPTIONS = Array.from({ length: 60 }, (_, minute) => minute);
+
 function HourMinuteSelect({ control, hourName, minuteName }: { control: any; hourName: any; minuteName: any }) {
   const hour = useController({ control, name: hourName }).field;
   const minute = useController({ control, name: minuteName }).field;
@@ -1030,7 +1083,7 @@ function HourMinuteSelect({ control, hourName, minuteName }: { control: any; hou
       <Select value={String(minute.value)} onValueChange={(v) => minute.onChange(Number(v))}>
         <SelectTrigger className="w-24 !h-8 text-xs" aria-label="Minute"><SelectValue /></SelectTrigger>
         <SelectContent className="max-h-56">
-          {[0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55].map((m) => (
+          {MINUTE_OPTIONS.map((m) => (
             <SelectItem key={m} value={String(m)} className="text-xs font-mono">{String(m).padStart(2, "0")}</SelectItem>
           ))}
         </SelectContent>

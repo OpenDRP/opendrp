@@ -9,10 +9,15 @@
 
   --color-primary: hsl(var(--primary));
   --color-primary-foreground: hsl(var(--primary-foreground));
+  /* The hover fill is its own token rather than `bg-primary/90`: blending the
+     fill toward the page lightens it, so the label loses contrast exactly while
+     the pointer is on it. These are darker than the resting fill instead. */
+  --color-primary-hover: hsl(var(--primary-hover));
   --color-secondary: hsl(var(--secondary));
   --color-secondary-foreground: hsl(var(--secondary-foreground));
   --color-destructive: hsl(var(--destructive));
   --color-destructive-foreground: hsl(var(--destructive-foreground));
+  --color-destructive-hover: hsl(var(--destructive-hover));
   --color-muted: hsl(var(--muted));
   --color-muted-foreground: hsl(var(--muted-foreground));
   --color-accent: hsl(var(--accent));
@@ -47,29 +52,38 @@
     --card-foreground: 240 10% 3.9%;
     --popover: 0 0% 100%;
     --popover-foreground: 240 10% 3.9%;
-    --primary: 142 71% 45%;
+    /* 30% rather than 45%: white on the old green measured 2.30:1, so every
+       primary button label, badge and tooltip failed WCAG AA (4.5:1) and the
+       focus ring failed the 3:1 non-text floor. At 30% the same pair is 4.8:1
+       and `text-primary` is legible as text on the page. `lib/themeContrast.test.ts`
+       computes these numbers from this file; change a value and it says so. */
+    --primary: 142 71% 30%;
     --primary-foreground: 0 0% 100%;
+    --primary-hover: 142 71% 24%;
     --secondary: 240 4.8% 95.9%;
     --secondary-foreground: 240 5.9% 10%;
     --muted: 240 4.8% 95.9%;
     --muted-foreground: 240 3.8% 46.1%;
     --accent: 240 4.8% 95.9%;
     --accent-foreground: 240 5.9% 10%;
-    --destructive: 0 84.2% 60.2%;
+    /* 45% rather than 60.2%: white on the old red was 3.60:1, which is below AA
+       for the toast description and for a destructive button's label. */
+    --destructive: 0 84% 45%;
     --destructive-foreground: 0 0% 98%;
+    --destructive-hover: 0 84% 38%;
     --border: 240 5.9% 90%;
     --input: 240 5.9% 90%;
-    --ring: 142 71% 45%;
+    --ring: 142 71% 30%;
     --radius: 0.55rem;
 
     --sidebar-background: 0 0% 100%;
     --sidebar-foreground: 240 10% 3.9%;
-    --sidebar-primary: 142 71% 45%;
+    --sidebar-primary: 142 71% 30%;
     --sidebar-primary-foreground: 0 0% 100%;
     --sidebar-accent: 240 4.8% 95.9%;
     --sidebar-accent-foreground: 240 5.9% 10%;
     --sidebar-border: 240 5.9% 90%;
-    --sidebar-ring: 142 71% 45%;
+    --sidebar-ring: 142 71% 30%;
   }
 
   .dark {
@@ -79,8 +93,11 @@
     --card-foreground: 0 0% 98%;
     --popover: 222 47% 11%;
     --popover-foreground: 0 0% 98%;
+    /* The dark accent stays bright, so its label is the dark ink instead of
+       white: white on 142 70% 45% is 2.32:1, ink on it is 8.6:1. */
     --primary: 142 70% 45%;
-    --primary-foreground: 0 0% 100%;
+    --primary-foreground: 240 10% 4%;
+    --primary-hover: 142 70% 38%;
     --secondary: 217 33% 17%;
     --secondary-foreground: 0 0% 98%;
     --muted: 217 33% 17%;
@@ -89,6 +106,7 @@
     --accent-foreground: 0 0% 98%;
     --destructive: 0 62.8% 45%;
     --destructive-foreground: 0 0% 98%;
+    --destructive-hover: 0 63% 35%;
     --border: 217 33% 20%;
     --input: 217 33% 20%;
     --ring: 142 70% 45%;
@@ -96,7 +114,7 @@
     --sidebar-background: 222 47% 6%;
     --sidebar-foreground: 0 0% 98%;
     --sidebar-primary: 142 70% 45%;
-    --sidebar-primary-foreground: 0 0% 100%;
+    --sidebar-primary-foreground: 240 10% 4%;
     --sidebar-accent: 217 33% 17%;
     --sidebar-accent-foreground: 0 0% 98%;
     --sidebar-border: 217 33% 18%;

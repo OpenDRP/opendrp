@@ -96,6 +96,10 @@ const MAX_PAGE_SIZE = 200;
 //: operator saw as a table that could not load at all.
 const PAGE_SIZE_OPTIONS = [10, 20, 50, MAX_PAGE_SIZE] as const;
 const RESIZE_HANDLE_WIDTH = 6;
+//: The widest a column may be dragged or arrowed to. A bound rather than
+//: `Math.max` alone: the handle is a focusable widget and a widget whose value
+//: has no maximum cannot describe itself to assistive technology.
+const MAX_COLUMN_WIDTH = 640;
 
 export function PaginatedDataTable<T = any>({
   columns,
@@ -125,6 +129,22 @@ export function PaginatedDataTable<T = any>({
   onSortChange,
 }: PaginatedDataTableProps<T>) {
   const pages = Math.max(0, Math.ceil(total / pageSize));
+
+  /**
+   * Move off a page the result no longer has.
+   *
+   * A delete on the last page is the reachable case: 15 rows over two pages, the
+   * operator is on page 2 and removes its only row, and the server answers page 2
+   * of a one-page result with no rows. The table then renders its empty state —
+   * "No assets match the current filters" about a filter that still matches 14 —
+   * and the footer reads "16–15 of 15". The parent owns `page`, so the table asks
+   * it to move rather than describing a page that is not there. `pages === 0` is
+   * deliberately ignored: that is what a placeholder or a still-loading page looks
+   * like, and clamping it would fight the page the operator is loading.
+   */
+  React.useEffect(() => {
+    if (pages > 0 && page > pages) onPageChange(pages);
+  }, [pages, page, onPageChange]);
   const selected = React.useMemo(() => new Set(selectedIds), [selectedIds]);
   const rowKey = (row: T, index: number): string =>
     getRowId?.(row, index) ?? String((row as any)?.id ?? index);
@@ -156,6 +176,17 @@ export function PaginatedDataTable<T = any>({
     );
   }
 
+  /**
+   * The sentence a screen reader hears after the ordering changes.
+   *
+   * `aria-sort` on the `<th>` describes the state, but the state it describes is
+   * not what the operator is focused on: the button is, and a change to an
+   * ancestor's attribute is not announced. The label carries the direction too,
+   * and this live region says the whole sentence, so the answer to "did that
+   * click do anything, and which way?" does not depend on re-reading the header.
+   */
+  const [announcement, setAnnouncement] = React.useState("");
+
   function changeSort(column: DataTableColumn<T>) {
     if (!onSortChange || !column.sortable) return;
     // A first click asks ascending, the second reverses the same field. The
@@ -163,6 +194,9 @@ export function PaginatedDataTable<T = any>({
     // descending explicitly, never by a third state the UI only implies.
     const direction: "asc" | "desc" =
       sort?.field === column.key && sort.direction === "asc" ? "desc" : "asc";
+    setAnnouncement(
+      `Sorted by ${String(column.title)}, ${direction === "asc" ? "ascending" : "descending"}.`,
+    );
     onSortChange({ field: column.key, direction });
   }
 
@@ -197,7 +231,7 @@ export function PaginatedDataTable<T = any>({
       const delta = e.clientX - r.startX;
       const col = columns.find(c => c.key === r.key);
       const minW = col?.minWidth ?? 60;
-      const newW = Math.max(minW, r.startWidth + delta);
+      const newW = Math.min(MAX_COLUMN_WIDTH, Math.max(minW, r.startWidth + delta));
       setColWidths(prev => ({ ...prev, [r.key]: newW }));
     };
     const onMouseUp = () => {
@@ -279,6 +313,10 @@ export function PaginatedDataTable<T = any>({
 
   return (
     <div className="flex flex-col gap-3">
+      {/* The ordering the page is now showing, announced once per change. */}
+      <p className="sr-only" role="status">
+        {announcement}
+      </p>
       <div className="relative">
         <div className="pointer-events-none absolute right-0 top-0 bottom-0 z-10 w-8 bg-gradient-to-l from-background to-transparent sm:hidden" aria-hidden="true" />
         <div
@@ -337,7 +375,13 @@ export function PaginatedDataTable<T = any>({
                         <button
                           type="button"
                           onClick={() => changeSort(col)}
-                          aria-label={`Sort by ${String(col.title)}`}
+                          aria-label={
+                            sorted && sort
+                              ? `Sort by ${String(col.title)}, currently ${
+                                  sort.direction === "asc" ? "ascending" : "descending"
+                                }`
+                              : `Sort by ${String(col.title)}`
+                          }
                           className="inline-flex items-center gap-1 hover:text-foreground"
                         >
                           {col.title}
@@ -352,9 +396,18 @@ export function PaginatedDataTable<T = any>({
                         col.title
                       )}
                     </div>
+                    {/* A focusable `separator` is a widget: without a value and
+                        its bounds, the arrow keys change a width the user cannot
+                        read out. The bounds are the column's own minimum and the
+                        widest the table allows. */}
                     <div
                       role="separator"
                       aria-label={`Resize ${String(col.title)} column`}
+                      aria-orientation="vertical"
+                      aria-valuenow={Math.round(w)}
+                      aria-valuemin={col.minWidth ?? 60}
+                      aria-valuemax={MAX_COLUMN_WIDTH}
+                      aria-valuetext={`${Math.round(w)} pixels`}
                       tabIndex={0}
                       onMouseDown={(e) => onMouseDown(e, col.key, w)}
                       onKeyDown={(e) => {
@@ -362,7 +415,10 @@ export function PaginatedDataTable<T = any>({
                         e.preventDefault();
                         const delta = e.key === "ArrowRight" ? 16 : -16;
                         const minW = col.minWidth ?? 60;
-                        setColWidths(prev => ({ ...prev, [col.key]: Math.max(minW, w + delta) }));
+                        setColWidths(prev => ({
+                          ...prev,
+                          [col.key]: Math.min(MAX_COLUMN_WIDTH, Math.max(minW, w + delta)),
+                        }));
                       }}
                       className="absolute top-0 right-0 h-full cursor-col-resize select-none touch-none z-10 hover:bg-primary/30 transition-colors"
                       style={{ width: RESIZE_HANDLE_WIDTH }}
@@ -486,6 +542,7 @@ export function PaginatedDataTable<T = any>({
                   variant={pn === page ? "default" : "outline"}
                   size="sm"
                   className="h-8 min-w-[32px] px-2 text-xs"
+                  aria-current={pn === page ? "page" : undefined}
                   onClick={() => onPageChange(pn)}
                 >
                   {pn}

@@ -100,13 +100,41 @@ export function MfaEnrolment({
     }
   };
 
+  /** Copy the codes as they are shown: one per line.
+   *
+   * The join was an escaped backslash — `"\\n"` in the source is a backslash and
+   * an `n` — so the clipboard received every code on one line separated by a
+   * literal `\n`, and pasting into a password manager or a note yielded one
+   * unusable string. The security page carried the same bug and was fixed alone
+   * (AUD-068); this block owns the enrolment flow, so it owns the copy as well.
+   * A clipboard that is missing or refuses the write has to say so, because a
+   * silent no-op looks exactly like success on the one screen the codes are
+   * shown on.
+   */
+  async function copyRecoveryCodes() {
+    try {
+      if (!navigator.clipboard?.writeText) throw new Error("clipboard unavailable");
+      await navigator.clipboard.writeText(recoveryCodes.join("\n"));
+      toast({
+        title: "Recovery codes copied",
+        description: "Store them where you can reach them without this device.",
+      });
+    } catch {
+      toast({
+        variant: "destructive",
+        title: "Could not copy the codes",
+        description: "Select them and copy by hand — each code works once.",
+      });
+    }
+  }
+
   if (recoveryCodes.length > 0) {
     return (
       <div className="space-y-4">
         <h3 className="font-semibold">Save your recovery codes</h3>
         <p className="text-sm text-muted-foreground">Each code works once if you lose access to your authenticator. They are shown only now.</p>
         <div className="grid grid-cols-2 gap-2 rounded-md border p-3 font-mono text-sm">{recoveryCodes.map((item) => <code key={item}>{item}</code>)}</div>
-        <Button variant="outline" onClick={() => void navigator.clipboard?.writeText(recoveryCodes.join("\\n"))}><Copy className="w-4 h-4 mr-2" />Copy recovery codes</Button>
+        <Button variant="outline" onClick={() => void copyRecoveryCodes()}><Copy className="w-4 h-4 mr-2" />Copy recovery codes</Button>
         <Button onClick={() => { setRecoveryCodes([]); onEnrolled?.(); }}>I saved the codes</Button>
       </div>
     );
