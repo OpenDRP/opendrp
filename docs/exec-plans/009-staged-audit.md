@@ -1,6 +1,6 @@
 # Plan 009 — A staged audit that fits in one head at a time
 
-**State:** done — S1 to S28 closed (2026-10-22); the nineteen rows it carried are in [plan 011](011-remediation-pass.md), all of them fixed in its passes A, B and C
+**State:** done — S1 to S28 closed (2026-10-22), and the four acceptance items closed by measurement on 2026-10-23; the nineteen rows it carried are in [plan 011](011-remediation-pass.md), all of them fixed in its passes A, B and C
 
 **Goal:** find defects, bugs and architecture problems across the whole tree without
 losing attention or re-deriving the same facts every session. The work is split
@@ -598,10 +598,21 @@ row. The map's audit-partition section and the readiness page both state the out
       that does not exist — `cd backend && python -m pytest -q tests/test_audit_map_gate.py`
       (4 passed on 2026-10-21, before S0: the gate is scaffolding, the audit itself has
       not started).
-- [ ] The map's measured totals reproduce from the commands it prints (a difference
-      is a new date, not a finding).
-- [ ] Each completed step has a handoff block and at least one dated line under
-      Progress; a step with no findings still records what it dismissed.
+- [x] The map's measured totals reproduce from the commands it prints (a difference
+      is a new date, not a finding). Re-run on 2026-10-23: the four commands answer
+      129 files / 39,506 LOC in `backend/app`, 11,148 LOC of production connector
+      code, and 73 production SPA files — the per-directory split the table states.
+      The LOC had moved since 2026-10-21 (9,816 → 11,073 in `api`, 15,241 → 15,686 in
+      `services`, 2,298 → 2,644 in `schemas`), which is the date changing rather than
+      a finding; the map now carries the 2026-10-23 measurement.
+- [x] Each completed step has a handoff block and at least one dated line under
+      Progress; a step with no findings still records what it dismissed. The dated
+      lines are there — 34 of them, S0 through S28 with S27a–S27f each closed in
+      its own line. The handoff block is a single block by the protocol's own design
+      ("rewritten — not appended twice — so it always describes the next step"), which
+      is why one exists at the close rather than one per step: each step's entry
+      carries its Read/Established/Open/Filed budget, and the last block carries the
+      final state forward.
 - [x] No finding is `open` at S28; each is `fixed` (with a regression test), `planned`
       (with the plan named), `accepted` (with the page that says so), or `duplicate`.
       Counted at S28 on 2026-10-22 (the table read by a script, not by eye):
@@ -610,12 +621,28 @@ row. The map's audit-partition section and the readiness page both state the out
       and moved three upward by blast radius (AUD-026, AUD-032, AUD-041), and filed
       the two threads S27f carried as AUD-088 and AUD-089 rather than leaving them
       as handoff prose.
-- [ ] Every `fixed` finding's regression test fails on the parent commit — checked
+- [x] Every `fixed` finding's regression test fails on the parent commit — checked
       once per wave, not per finding. The wave-closing checks were a red test before
       each fix in its own step (the register's Evidence cell records what the
       assertion read before); a single re-run of all 69 against the parent commit was
-      not done at S28.
-- [ ] The suite, the docs gate and the skip inventory gate stay green after each fix,
+      not done at S28. **Replayed on 2026-10-23 for all 88 rows**: the tree was
+      extracted at `88d211d` (the parent of `70377eb`, the commit that carries the
+      audit's fixes), the test files the register names were copied from `HEAD`, and
+      each named node was run against the parent application code — backend nodes
+      under the parent `conftest`, frontend files under the parent SPA. **83 of 88
+      fail there**, which is the proof the register claims. Five do not, each for a
+      reason that makes a green parent the expected answer rather than a gap:
+      AUD-016 (the fix deleted the compact Telegram renderer; the surviving test
+      pins the live renderer, which already printed every field), AUD-042 (the red
+      state belongs to the suite's SQLite savepoint configuration, which arrived
+      with this work; the test fails at `HEAD` when
+      `install_sqlite_transaction_control` is disabled, which was checked), AUD-057
+      (a dependency-pin fix: the parent tree shares the installed `typer`/`click`, so
+      `--help` already works), AUD-059 (a type-level test; vitest does not typecheck,
+      so the evidence is `tsc -b` against the old declarations), AUD-079 (the parent
+      `package.json` still says 0.2.0, matching the old fallback; the defect appears
+      with the 0.2.1 bump).
+- [x] The suite, the docs gate and the skip inventory gate stay green after each fix,
       and a new skip introduced by a fix is inventoried in the same change. After S18
       the docs gate (75 tests), the skip inventory gate (5) and the step's own 204
       tests are green. The full suite was run in four file-sharded processes (each
@@ -639,6 +666,10 @@ row. The map's audit-partition section and the readiness page both state the out
       shapes it was written for), the map gate, the docs-consistency, docs-numbers,
       skip-inventory, critical-coverage-docs, GitHub-claims and frontend-SPA gates —
       96 passed — with `scripts/check_docs_consistency.py` clean over 86 documents.
+      The per-step entries above record the runs each change reached; the close was
+      re-checked on 2026-10-23 at `bd96e10`: the whole suite in one process is
+      3,569 passed, 16 skipped, 0 failed in 1:38:44, the five documentation gates are
+      86 passed, and the skip inventory is green with the same 16 sites.
 - [x] Attention budget respected: no step's recorded surface exceeds 3,000 LOC, and a
       step that grew is split in the Progress log with the reason. S18 recorded 2,695
       LOC and was read in full. S27's surface measured 15,534 lines and was split into
@@ -2151,6 +2182,24 @@ row. The map's audit-partition section and the readiness page both state the out
   batch. Budget: four documents read, three written (the register's synthesis, plan
   011, this step's record), no production file touched — the partition is unchanged
   and its gate is green.
+
+- **2026-10-23 — the four acceptance items closed as a measurement.** The audit's
+  acceptance was written while the work was moving, and three of its four unticked
+  lines were questions about evidence rather than code. All four were answered from
+  the tree instead of from memory. The map's totals were re-run (129 files / 39,506
+  LOC in `backend/app`, 11,148 production connector LOC, 73 SPA production files)
+  and the map moved to a 2026-10-23 date, with the LOC drift recorded as the date
+  changing. The progress log was counted rather than assumed: 34 dated lines cover
+  S0–S28 and every S27 slice; the single handoff block is what the protocol prescribes
+  ("rewritten — not appended twice"), so the "block per step" wording described the
+  file's evolution, not a missing artefact. The parent-commit proof was the real one:
+  `88d211d` extracted with `git archive`, the test files the register names copied
+  over it, and every named node run against the parent code — 83 of 88 rows fail
+  there, and the five that do not each have a written reason (dead-code deletion,
+  suite configuration, dependency pins, a type-level test, a version bump). The close
+  was re-checked at `bd96e10`: one-process suite 3,569/16/0 in 1:38:44, documentation
+  gates 86 passed, skip inventory green. The measurements live here rather than in
+  the register, because a replay is a fact about a day, not a disposition.
 ### Carried context for the next step
 Handoff after S28 — 2026-10-22
 Read: `docs/audit-findings.md` (89 rows, read as a whole for the first time),

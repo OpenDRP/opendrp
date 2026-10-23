@@ -7,7 +7,7 @@ break, and what has already been decided". The staged audit in
 partition is enforced by `backend/tests/test_audit_map_gate.py`: every production
 file below belongs to exactly one audit step.
 
-Counts were measured on 2026-10-21 with the commands in
+Counts were measured on 2026-10-23 with the commands in
 [keeping this page true](#keeping-this-page-true). They are the size of the
 surface, not a claim about quality.
 
@@ -22,7 +22,7 @@ surface, not a claim about quality.
   +--------------------- API process ----------------------------------------+
   | main.py: request context → metrics → CORS → security headers             |
   | api/deps.py: bearer access token → user → role → audit context           |
-  | api/v1/routers/*.py (16)  ──►  services/*.py (42)  ──►  models (20)      |
+  | api/v1/routers/*.py (16)  ──►  services/*.py (45)  ──►  models (20)      |
   |        auth, users, assets, alerts, breaches, phishing, dns, connectors, |
   |        audit, jobs, reports, dashboard, settings, modules, metrics       |
   +------------------------------+-------------------------------------------+
@@ -54,27 +54,25 @@ provider quirk or a defect, and the difference is decided by the shared client i
 
 | Area | Files | LOC | What it is |
 |---|---|---|---|
-| `backend/app/api` | 18 | 9,816 | 16 routers, 129 route decorators, `deps.py` |
-| `backend/app/core` | 24 | 6,079 | config, database, security, audit chain, metrics, rate limits, egress |
-| `backend/app/services` | 45 | 15,241 | the behaviour: ingestion, assets, alerts, modules, connectors |
-| `backend/app/tasks` | 7 | 1,654 | Celery: scheduler, delivery, reports, retention, integrity |
-| `backend/app/models` | 20 | 1,609 | SQLAlchemy mappings, 1 baseline migration |
-| `backend/app/schemas` | 12 | 2,298 | request/response contracts and their validators |
+| `backend/app/api` | 18 | 11,073 | 16 routers, 129 route decorators, `deps.py` |
+| `backend/app/core` | 24 | 6,389 | config, database, security, audit chain, metrics, rate limits, egress |
+| `backend/app/services` | 45 | 15,686 | the behaviour: ingestion, assets, alerts, modules, connectors |
+| `backend/app/tasks` | 8 | 1,873 | Celery: scheduler, delivery, reports, retention, integrity |
+| `backend/app/models` | 20 | 1,648 | SQLAlchemy mappings, 1 baseline migration |
+| `backend/app/schemas` | 12 | 2,644 | request/response contracts and their validators |
 | `backend/scripts` | 15 | 3,933 | migrate, seed, admin, key rotation, schema/coverage gates |
-| `connectors/` | 18 | 11,100 | 7 workers + the shared SDK (3,639 more LOC of worker tests) |
-| `frontend/src` | 73 | 26,229 | SPA: pages, lib, components (LOC includes 53 test files) |
-| `scripts/` | 19 | 5,607 | repo gates, E2E, backup/restore, release checks |
-| `docs/` | 76 | 28,999 | operator pages, plans, measured status |
+| `connectors/` | 20 | 14,856 | 7 workers + the shared SDK (3,708 more LOC of worker tests) |
+| `frontend/src` | 73 | 28,166 | SPA: pages, lib, components (LOC includes 56 test files) |
+| `scripts/` | 19 | 6,462 | repo gates, E2E, backup/restore, release checks |
+| `docs/` | 105 | 34,447 | operator pages, plans, measured status |
 | `backend/tests` | 232 | 78,184 | the suite: **3,569 passing, 16 skipped** in the 2026-10-23 single-process run, counted over the same day's 232 files |
 
 The largest single modules are where a defect travels furthest:
-`routers/auth.py` (1,260), `services/ingestion_service.py` (1,214),
-`routers/connectors.py` (1,214), `services/connector_service.py` (1,199),
-`routers/users.py` (1,183), `routers/breaches.py` (1,099),
-`routers/assets.py` (1,012), `services/tls_identity_service.py` (993),
-`services/ingestion_events.py` (948), `core/config.py` (890),
-`services/alert_service.py` (775), `services/phishing_score_service.py` (769),
-`services/asset_service.py` (769), `services/alert_delivery_service.py` (743).
+`routers/connectors.py` (1,424), `routers/auth.py` (1,317),
+`services/ingestion_service.py` (1,214), `routers/users.py` (1,210),
+`services/connector_service.py` (1,199), `routers/breaches.py` (1,140),
+`routers/assets.py` (1,033), `services/tls_identity_service.py` (1,026),
+`services/ingestion_events.py` (972), `core/config.py` (931).
 
 ## Layer rules
 
