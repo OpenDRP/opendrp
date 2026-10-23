@@ -123,6 +123,9 @@ SCHEMA_PAIRS: Mapping[str, str] = {
     "UserInvite": "UserInviteResponse",
     "UserBulkResult": "UserBulkResponse",
     "MfaRecoveryCodes": "MfaRecoveryCodesResponse",
+    "SourceAccountCreated": "SourceAccountCreated",
+    "SourceAccountPolicyUpdated": "SourceAccountPolicyUpdated",
+    "SourceAccountApiKey": "SourceAccountApiKeyState",
 }
 
 #: Routes whose successful response describes no row, and the interface the SPA

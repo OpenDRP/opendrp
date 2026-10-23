@@ -325,6 +325,43 @@ class SourceAccountOut(BaseModel):
     api_key_hint: str | None = None
 
 
+class SourceAccountCreated(BaseModel):
+    """What `POST /connectors/accounts` answers: the id, and nothing else.
+
+    The settings page needs the id of the account it just created — to bind it or to
+    set its key — and the list is where the rest of the row comes from. Answering
+    `SourceAccountOut` here would be a second description of the same resource with
+    every other field made optional.
+    """
+
+    id: uuid.UUID
+
+
+class SourceAccountPolicyUpdated(BaseModel):
+    """What approving a policy answers: the account, and the document it stored.
+
+    `policy` is the same `SourceAccountPolicy` the list sends, because it is the same
+    stored document; the route excludes nulls so an approval that set none keeps
+    `{"approved": true}` instead of gaining two keys the operator never wrote.
+    """
+
+    id: uuid.UUID
+    policy: SourceAccountPolicy
+
+
+class SourceAccountApiKeyState(BaseModel):
+    """What setting or clearing a provider key answers — both routes, one shape.
+
+    `api_key_hint` is null rather than absent after a clear: the page has to be able
+    to tell "no key" from "the answer did not say", which is the opposite of the
+    list route's `exclude_none`. The ciphertext is never part of this shape.
+    """
+
+    id: uuid.UUID
+    has_api_key: bool
+    api_key_hint: str | None = None
+
+
 class ConnectorHealth(BaseModel):
     """One connector's health, in the one shape every role receives.
 
@@ -1206,7 +1243,7 @@ async def list_source_accounts(db: AsyncSession = Depends(get_db)):
     ]
 
 
-@router.post("/accounts")
+@router.post("/accounts", response_model=SourceAccountCreated)
 async def create_source_account(payload: SourceAccountRequest, request: Request, db: AsyncSession = Depends(get_db), user=Depends(require_admin)):
     from app.services.source_accounts import provision_account
     account, created, credential_ref_updated = await provision_account(db, **payload.model_dump())
@@ -1216,7 +1253,7 @@ async def create_source_account(payload: SourceAccountRequest, request: Request,
     return {"id": account.id}
 
 
-@router.patch("/accounts/{account_id}/policy")
+@router.patch("/accounts/{account_id}/policy", response_model=SourceAccountPolicyUpdated, response_model_exclude_none=True)
 async def update_account_policy(account_id: uuid.UUID, payload: SourceAccountPolicyRequest, request: Request, db: AsyncSession = Depends(get_db), user=Depends(require_admin)):
     from app.services.source_accounts import approve_policy
     account = await approve_policy(
@@ -1232,11 +1269,15 @@ class SourceAccountApiKeyRequest(BaseModel):
     api_key: str = Field(min_length=1, max_length=512, pattern=r"^[\x21-\x7e]+$")
 
 
-def _api_key_state(account) -> dict:
-    return {"id": account.id, "has_api_key": bool(account.api_key_encrypted), "api_key_hint": account.api_key_hint}
+def _api_key_state(account) -> SourceAccountApiKeyState:
+    return SourceAccountApiKeyState(
+        id=account.id,
+        has_api_key=bool(account.api_key_encrypted),
+        api_key_hint=account.api_key_hint,
+    )
 
 
-@router.put("/accounts/{account_id}/api-key")
+@router.put("/accounts/{account_id}/api-key", response_model=SourceAccountApiKeyState)
 async def set_source_account_api_key(account_id: uuid.UUID, payload: SourceAccountApiKeyRequest, request: Request, db: AsyncSession = Depends(get_db), user=Depends(require_admin)):
     from app.services.source_accounts import set_api_key
     account = await set_api_key(db, account_id, payload.api_key)
@@ -1245,7 +1286,7 @@ async def set_source_account_api_key(account_id: uuid.UUID, payload: SourceAccou
     return _api_key_state(account)
 
 
-@router.delete("/accounts/{account_id}/api-key")
+@router.delete("/accounts/{account_id}/api-key", response_model=SourceAccountApiKeyState)
 async def clear_source_account_api_key(account_id: uuid.UUID, request: Request, db: AsyncSession = Depends(get_db), user=Depends(require_admin)):
     from app.services.source_accounts import clear_api_key
     account = await clear_api_key(db, account_id)

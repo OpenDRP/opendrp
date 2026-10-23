@@ -47,6 +47,9 @@ import type {
   RuntimeConfiguration,
   SecurityActivity,
   SourceAccount,
+  SourceAccountApiKey,
+  SourceAccountCreated,
+  SourceAccountPolicyUpdated,
   SystemSettings,
   TLSCertificate,
   TLSSightingVerdict,
@@ -629,10 +632,10 @@ export const endpoints = {
   getJob: (id: string) => api.get<Job>(`/jobs/${id}`).then((r) => r.data),
   listConnectors: () => api.get<Connector[]>("/connectors").then((r) => r.data),
   listSourceAccounts: () => api.get<SourceAccount[]>("/connectors/accounts").then((r) => r.data),
-  createSourceAccount: (data: { source_id: string; name: string; credential_ref?: string }) => api.post<{ id: string }>("/connectors/accounts", data).then((r) => r.data),
-  approveSourceAccount: (id: string, policy: { approved: boolean; requests_per_minute: number; daily_budget: number }) => api.patch<{ id: string; policy: SourceAccount["policy"] }>(`/connectors/accounts/${id}/policy`, policy).then((r) => r.data),
-  setSourceAccountApiKey: (id: string, apiKey: string) => api.put<{ id: string; has_api_key: boolean; api_key_hint: string | null }>(`/connectors/accounts/${id}/api-key`, { api_key: apiKey }).then((r) => r.data),
-  clearSourceAccountApiKey: (id: string) => api.delete<{ id: string; has_api_key: boolean; api_key_hint: string | null }>(`/connectors/accounts/${id}/api-key`).then((r) => r.data),
+  createSourceAccount: (data: { source_id: string; name: string; credential_ref?: string }) => api.post<SourceAccountCreated>("/connectors/accounts", data).then((r) => r.data),
+  approveSourceAccount: (id: string, policy: { approved: boolean; requests_per_minute: number; daily_budget: number }) => api.patch<SourceAccountPolicyUpdated>(`/connectors/accounts/${id}/policy`, policy).then((r) => r.data),
+  setSourceAccountApiKey: (id: string, apiKey: string) => api.put<SourceAccountApiKey>(`/connectors/accounts/${id}/api-key`, { api_key: apiKey }).then((r) => r.data),
+  clearSourceAccountApiKey: (id: string) => api.delete<SourceAccountApiKey>(`/connectors/accounts/${id}/api-key`).then((r) => r.data),
   bindConnectorAccount: (connectorId: string, accountId: string) =>
     api
       .patch<Connector>(`/connectors/${connectorId}/account`, null, {

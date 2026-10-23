@@ -776,6 +776,36 @@ export interface SourceAccount {
   api_key_hint?: string | null;
 }
 
+/**
+ * What `POST /connectors/accounts` answers: the id of the account it provisioned.
+ *
+ * The row itself comes from the list; this route answers an id because that is what
+ * the page needs to bind the account or set its key, and the client used to spell
+ * it as `{ id: string }` with nothing to compare.
+ */
+export interface SourceAccountCreated {
+  id: string;
+}
+
+/** What approving a policy answers: the account, and the document it stored. */
+export interface SourceAccountPolicyUpdated {
+  id: string;
+  policy: SourceAccount["policy"];
+}
+
+/**
+ * What setting or clearing a provider key answers — both routes, one shape.
+ *
+ * `api_key_hint` is `null` after a clear rather than absent: the page has to be
+ * able to say "no key" and not merely "nothing to show", which is why this face of
+ * the account keeps its nulls while the list drops them.
+ */
+export interface SourceAccountApiKey {
+  id: string;
+  has_api_key: boolean;
+  api_key_hint: string | null;
+}
+
 export interface Connector {
   id: string;
   name: string;
