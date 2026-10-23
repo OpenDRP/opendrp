@@ -560,6 +560,8 @@ describe("SettingsPage", () => {
     15000,
   );
 
+  // The render plus the typed fields run past the 5 s default on a loaded CI
+  // runner; the neighbour above carries the same bound for the same reason.
   it("surfaces SMTP test-email errors", async () => {
     const user = userEvent.setup();
     sendTestEmailMock.mockRejectedValueOnce({ response: { data: { detail: "SMTP unavailable" } } });
@@ -572,5 +574,5 @@ describe("SettingsPage", () => {
         expect.objectContaining({ variant: "destructive", title: "Test email failed" }),
       ),
     );
-  });
+  }, 15000);
 });
