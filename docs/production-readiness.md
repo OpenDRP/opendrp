@@ -419,11 +419,28 @@ is about what the toolchain was allowed to hide rather than about the bug itself
    or should have been shared — the module scan (which `ScanStartResult` already
    described), the DNS cleanup (`CleanupResult`), and the two session revocations —
    and naming them exposed the four routes behind them, which declared nothing; they
-   declare their rows now. The literals that remain (`/reports/generate`, the
-   connector-account writes, the bulk user operation, the invitation answers) have no
-   declaration on either side yet, which is a smaller hole of a different shape.
-   Generating the client from `/openapi.json` would remove the class rather than the
-   instance. The
+   declare their rows now. The remaining twelve went the same way in
+   [plan 039](exec-plans/039-contract-closeout.md): the three whose model already
+   existed (`UserInvite`, `UserBulkResult`, `MfaRecoveryCodes`) were named on the
+   client alone, and the eight routes that declared nothing — creating and approving
+   a source account, its two key routes, generating a report, accepting an invitation,
+   asking a source to verify a domain and recording a certificate verdict — declare
+   their rows now, so the gate compares **51** interfaces and no response in the
+   client is written as an inline literal at all.
+   What is left is the class itself: the client is still hand-written, so an interface
+   can disagree with the route it is paired with in a direction the gate does not ask
+   about (a field the server sends and the client omits is allowed, deliberately), and
+   a route added to the API still appears in no helper until somebody writes one.
+   **The decision on generating the client from `/openapi.json` is to keep it
+   hand-written for now, and the condition for revisiting is stated rather than
+   vague:** the two helpers that turn an error body into the sentence a page shows
+   (`describeApiError` and `flattenErrorDetail` in `frontend/src/lib/errors.ts`) are
+   shaped around this API's envelope, and a generated client hands back the raw
+   response. A migration is worth its cost when it can keep them — either a generated
+   client re-exported through a thin `api.<verb>` façade, so no page changes, or paths
+   and payloads generated while the helpers stay the entry point. Until then this
+   limitation is the price of an error surface that reads like the API wrote it.
+   The
    documentation half of it was closed earlier: `docs/api.md` is compared against
    the schema in both directions by `tests/test_api_docs_contract.py`, so a route
    added, renamed or removed without the reference moving fails the suite.
@@ -498,7 +515,7 @@ is about what the toolchain was allowed to hide rather than about the bug itself
     on SQLite.
 17. **The suite is green in one process, and the tests a green run skips are the
     ones this host cannot host.** The whole suite ran once, in a single process, on
-    2026-10-23: 3,539 passed, 16 skipped and none failed in 1:29:03. The skips are
+    2026-10-23: 3,569 passed, 16 skipped and none failed in 1:38:44. The skips are
     not failures hidden behind a filter — each prints its reason under `-rs` — and
     they are the properties SQLite cannot express (row locking in three suites, the
     three PostgreSQL-only suites, the Alembic round trip) or services this host does
@@ -924,20 +941,22 @@ than smoothed over.
 Like the blocks above, nothing enforces these numbers: they are a dated reading of
 one tree, and the gates are what keep the properties true.
 
-### 2026-10-23 (the tree plans 006-038 close on)
+### 2026-10-23 (the tree plans 006-039 close on)
 
 Measured on a host virtual environment on Windows with `COVERAGE_CORE=sysmon`, no
 Redis service and no PostgreSQL — the same shape as the 2026-10-15 block above, and
 in **one process** rather than four shards, because the single-process run is the
-claim limitation 17 makes. The run that follows plan 014 is the one recorded here.
+claim limitation 17 makes. It is the run that follows plan 039's last models: the
+30 tests the contract program added are counted, and the pair count is the gate's
+answer after the twelve literals became interfaces.
 
 | Area | Value |
 |---|---|
-| Backend suite (full, one pass, `tests/`, `-q`) | **3,539 passed, 16 skipped, none failed** in 1:29:03 |
+| Backend suite (full, one pass, `tests/`, `-q`) | **3,569 passed, 16 skipped, none failed** in 1:38:44 (5,924 s) |
 | What the 16 skips are | the properties SQLite cannot host — row locks in three suites, the three PostgreSQL-only suites and the Alembic round trip — plus four Celery tests that need a live broker and one connector test that resolves DNS through `aiodns`. Each prints its reason under `-rs`; CI's `backend` and `production-integration` jobs run them |
-| The contract gate (`backend/scripts/check_api_types.py`) | OK — 41 interfaces compared with the models their routes send, 109 request calls named against the route table, `UNMODELLED` empty |
+| The contract gate (`backend/scripts/check_api_types.py`) | OK — 51 interfaces compared with the models their routes send, 109 request calls named against the route table, `UNMODELLED` empty |
 | The four gates the audit and the contract program added | `test_audit_register_gate` green with no register row `open`, `duplicate` or undispositioned; `test_skip_inventory_gate` green against the page's inventory; `test_audit_map_gate` green — every production file belongs to exactly one audit step; `test_connector_test_isolation` green, so a module that needs the SDK imports it rather than inheriting it |
-| Frontend suite and typecheck | the client tests the contract program touched pass and `tsc -b` is clean; the full SPA suite is run in CI, not in every plan |
+| Frontend suite and typecheck | `tsc -b` clean; the three suite files that read the contract types — `src/lib/endpoints.test.ts`, `src/lib/api.test.ts`, `src/types/api.test.ts` — pass (127 tests in 9.75s); the full SPA suite is run in CI, not in every plan |
 | Not measured here | the PostgreSQL-only suites and the migration round trip, `docker compose up`, both E2E scripts and the `mypy` ratchet: each needs the Compose stack or the tooling container |
 
 Like the blocks above, these are a dated reading of one tree; the gates keep the

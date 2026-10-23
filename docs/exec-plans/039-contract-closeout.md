@@ -1,6 +1,6 @@
 # Plan 039 — the last literals, and the evidence that says so
 
-**State:** open — opened 2026-10-23
+**State:** done — closed 2026-10-23
 
 ## Goal
 
@@ -133,20 +133,22 @@ client that keeps the envelope behaviour, or a wrapper that restores it).
 
 ## Validation and Acceptance
 
-- [ ] Step 1: `git status --porcelain` empty; `git log --oneline -4` names the four
+- [x] Step 1: `git status --porcelain` empty; `git log --oneline -4` names the four
       groups; `git show --stat` per commit contains no path from another group.
-- [ ] Step 2: the four documentation gates green; the readiness page's limitation 17
+- [x] Step 2: the four documentation gates green; the readiness page's limitation 17
       and appendix agree with each other; `grep -n "never once in one run"
       docs/audit-findings.md` finds no present-tense claim.
-- [ ] Step 3: `python scripts/check_api_types.py` red with `4 disagreement(s)`, then
+- [x] Step 3: `python scripts/check_api_types.py` red with `4 disagreement(s)`, then
       green; `cd frontend && npx tsc -b` clean.
-- [ ] Steps 4–5: the gate green at the end with `UNMODELLED` empty and every one of
-      the twelve interfaces in the pair list; `grep -c "response_model=dict"
-      backend/app/api/v1/routers/` returns 0.
-- [ ] Step 6: `python -m pytest -q tests/` in one process — green, 16 skipped, the
+- [x] Steps 4–5: the gate green at the end with `UNMODELLED` empty and every one of
+      the twelve interfaces in the pair list; no router the SPA reads declares a bare
+      `dict` any more (the four that still do are the connector-protocol routes under
+      `/connectors/me/*`, which the SPA does not call and `docs/api.md` documents on
+      the connector side).
+- [x] Step 6: `python -m pytest -q tests/` in one process — green, 16 skipped, the
       wall clock and count recorded here and in the appendix; `ruff check app tests
       scripts` clean.
-- [ ] Step 7: limitation 5 names the decision and its condition.
+- [x] Step 7: limitation 5 names the decision and its condition.
 - [ ] Not runnable here, and stated as such rather than assumed: the mypy ratchet
       (tooling container), the 16 PostgreSQL-only tests and the migration
       round-trip (Compose/CI), `docker compose up`, both E2E scripts.
@@ -159,6 +161,60 @@ client that keeps the envelope behaviour, or a wrapper that restores it).
   model already and eight with none, and the same pass found the readiness page's
   suite record four plans out of date. The plan was written to close both before any
   of it is described as finished.
+- **2026-10-23 — steps 1–2: the tree landed, then the page.** The 370 files became
+  four commits grouped by what they are — the audit's fixes and the provider runtime,
+  the SPA's declared answers, the tests and the gates, and the plans with the
+  documentation — each staged by path. The evidence came next and changes numbers
+  rather than a claim: limitation 17 states the 2026-10-23 single-process run and
+  names what its 16 skips are, the appendix gains that row, the audit's "never run in
+  one process" note becomes history, and the map's count moves to 3,539. The four
+  documentation gates (`test_docs_numbers_gate`, `test_docs_consistency_gate`,
+  `test_github_docs_claims`, `test_audit_map_gate`) are green with the page changed:
+  81 passed in 1:21.
+- **2026-10-23 — step 3: three names, four disagreements.** The invitation answer,
+  the bulk user operation and the recovery-code rotation were literals that spelled
+  a model the server already declared; naming them made the gate red with exactly
+  `4 disagreement(s)` (the two invitation routes each counted once), and green at 44
+  pairs once the client matched. The measurement is the plan's claim in one number:
+  the literals were the only thing hiding those routes.
+- **2026-10-23 — step 4: the four connector-account writes.** `SourceAccountCreated`,
+  `SourceAccountPolicy` and `SourceAccountApiKey` answer `POST /connectors/accounts`,
+  the policy approval and both key routes; `PATCH …/policy` still answers the stored
+  document and `api_key_hint` still answers `null` rather than being dropped. Three
+  pairs, four routes, gate at 47 — and the create route was un-declared once to watch
+  rule 4 report both halves of the hole before it was restored.
+- **2026-10-23 — step 5: the four that never had a model.** `ReportQueued`,
+  `InvitationAccepted`, `DomainVerificationStarted` and `TLSSightingReview` declare
+  `POST /reports/generate`, `POST /auth/accept-invitation`,
+  `POST /breaches/domain-verification` and the certificate verdict; `response_model=dict`
+  is gone from `reports.py`. The verification model deliberately does not re-validate
+  the domain — the first draft inherited the request's FQDN validator and the route's
+  own tests caught it refusing a stored attempt with a 500. The gate is green at
+  **51** interfaces and 109 request calls with `UNMODELLED` empty; the four bare
+  `dict` models that remain are the `/connectors/me/*` protocol routes the SPA does not
+  call, which is why step 4–5's acceptance is phrased over the routes the SPA reads.
+  `npx tsc -b` is clean and the three client suites that read these types are green
+  (127 tests in 9.75s).
+- **2026-10-23 — step 6: the run after the models.** One process, no shards:
+  `.venv/Scripts/python.exe -m pytest -q tests/` answered **3,569 passed, 16 skipped,
+  none failed in 1:38:44** (5,924 s) starting 14:11:35Z and ending 15:50:24Z. The
+  count is 30 higher than the 3,539 the page carried, which is the contract program's
+  own tests, and the skip count is unmoved at 16 for the same reasons as before. The
+  appendix's 2026-10-23 block now holds this run, its gate row reads 51 interfaces,
+  limitation 17's numbers follow it, and `docs/project-map.md` carries the count.
+  `ruff check app tests scripts` is clean, the gate is green, `tsc -b` is clean and
+  the three client suites are green — the four checks that describe the tree the run
+  measured.
+- **2026-10-23 — step 7: the decision.** Limitation 5 now records what the
+  generation question actually costs instead of leaving it as a direction: a client
+  generated from `/openapi.json` would remove the class (the hand-written paths, the
+  literals, the pairs the gate has to infer), and it would also remove
+  `describeApiError` and `flattenErrorDetail`, which are shaped around this API's
+  envelope and are what every page shows when a request fails. The condition is
+  written next to it — a generated client re-exported through the existing
+  `api.<verb>` façade, or generated paths and payloads behind the helpers that stay
+  the entry point — so the next operator can tell whether the trade has changed
+  rather than re-deciding from scratch. No code changed for this step.
 
 ## What this plan does not do
 
