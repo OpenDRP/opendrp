@@ -54,13 +54,35 @@ from pathlib import Path
 from typing import List, Sequence, Tuple
 
 _PYPROJECT = Path("backend") / "pyproject.toml"
-_REQUIREMENTS: Tuple[Path, ...] = (
-    Path("backend") / "requirements.txt",
-    Path("backend") / "requirements-dev.txt",
-    Path("connectors") / "dnstwist" / "requirements.txt",
-    Path("connectors") / "shodan" / "requirements.txt",
-    Path("connectors") / "hibp" / "requirements.txt",
-)
+
+#: The one manifest that never ships, and therefore needs no hashes: it installs
+#: the test and lint tooling into a development image and into CI, never into a
+#: release.
+_DEV_REQUIREMENTS = Path("backend") / "requirements-dev.txt"
+
+
+def requirements_manifests(root: Path) -> Tuple[List[Path], List[Path]]:
+    """The manifests to scan: `(shipped, development)`, read from the tree.
+
+    The shipped set is discovered rather than enumerated, because the hand-kept
+    list drifted the way hand lists do: `connectors/exposure_endpoints`
+    was in neither tuple, and `dns_security`/`intelligence` were named only in
+    the hash list — which the scan loop never reached, since it iterated the
+    other one. Three of the six manifests every connector image installs with
+    `--require-hashes` were therefore unchecked, and a seventh connector would
+    have been a fourth. The tree that holds the manifests is the only list that
+    cannot fall behind it.
+    """
+    shipped = [Path("backend") / "requirements.txt"]
+    connectors = root / "connectors"
+    if connectors.is_dir():
+        shipped.extend(
+            sorted(
+                path.relative_to(root)
+                for path in connectors.glob("*/requirements.txt")
+            )
+        )
+    return shipped, [_DEV_REQUIREMENTS]
 
 #: Poetry tables that would redeclare the dependency set by another resolution
 #: rule. A group name in the middle is matched as ``.*`` — any Poetry group.
@@ -78,18 +100,6 @@ _DIRECT_REF = re.compile(r"^[A-Za-z0-9._-]+\s+@\s+file://\S+$")
 #: A hash line in a generated lock: `--hash=sha256:<64 hex>`, optionally with the
 #: backslash that continues the block to the next digest.
 _HASH_LINE = re.compile(r"^--hash=sha256:[0-9a-f]{64}(?:\s*\\)?$")
-
-#: The manifests that are installed into a shipped image with `--require-hashes`.
-#: `requirements-dev.txt` is deliberately absent: it never ships.
-_HASHED_REQUIREMENTS: Tuple[Path, ...] = (
-    Path("backend") / "requirements.txt",
-    Path("connectors") / "dnstwist" / "requirements.txt",
-    Path("connectors") / "shodan" / "requirements.txt",
-    Path("connectors") / "hibp" / "requirements.txt",
-    Path("connectors") / "dns_security" / "requirements.txt",
-    Path("connectors") / "intelligence" / "requirements.txt",
-)
-
 
 def check_pyproject(source: str) -> List[str]:
     failures: List[str] = []
@@ -163,7 +173,13 @@ def check(root: Path) -> List[str]:
     except OSError as exc:
         failures.append(f"{_PYPROJECT}: cannot read ({exc})")
 
-    for relative in _REQUIREMENTS:
+    shipped, development = requirements_manifests(root)
+    # Shipped manifests are installed with `--require-hashes`; the development
+    # one is pinned exactly but hashed by nothing, because it never ships.
+    for relative, require_hashes in [
+        *( (path, True) for path in shipped ),
+        *( (path, False) for path in development ),
+    ]:
         try:
             source = (root / relative).read_text(encoding="utf-8")
         except OSError as exc:
@@ -171,7 +187,7 @@ def check(root: Path) -> List[str]:
             continue
         failures.extend(
             check_requirements(
-                relative, source, require_hashes=relative in _HASHED_REQUIREMENTS
+                relative, source, require_hashes=require_hashes
             )
         )
 

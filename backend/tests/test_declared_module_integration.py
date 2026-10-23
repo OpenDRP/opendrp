@@ -179,6 +179,26 @@ class TestDeclareModule:
         assert entry["storage"] == "generic"
         assert entry["job_types"] == ["code_leak.repo_scan"]
         assert entry["connectors"][0]["config_schema"]["depth"]["label"] == "Scan depth"
+        # A declared module answers the same nine keys as a built-in one: the
+        # registry is data, and the shape does not branch on where it came from.
+        assert set(entry) == {
+            "label",
+            "description",
+            "job_types",
+            "connectors",
+            "finding_kind",
+            "asset_types",
+            "storage",
+            "builtin",
+            "enabled",
+        }
+        assert set(entry["connectors"][0]) == {
+            "name",
+            "status",
+            "job_type",
+            "asset_types",
+            "config_schema",
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -323,6 +343,186 @@ class TestDeclaredModuleWork:
             "rejected": 0,
             "errors": [],
         }
+
+    @pytest.mark.asyncio
+    async def test_a_pipe_in_a_dedup_field_does_not_merge_two_findings(
+        self, client, db_session, auth_headers_admin
+    ):
+        """The key is a join of field values, so the separator has to be escaped.
+
+        Without it, ``a|b`` + ``c`` and ``a`` + ``b|c`` produce the same key and the
+        second finding is treated as a revision of the first — its payload
+        overwrites one that described something else, and no event fires for
+        either. The values come from a provider, so a repository name, a path or
+        a category carrying a pipe is a real input rather than an attack.
+        """
+        await _declare(client, auth_headers_admin)
+        _, headers = await _connector_headers(db_session)
+        await ConnectorService(db_session).enqueue_module_scan(
+            connector_type="code_leak", created_by=None, title="Repo scan"
+        )
+        work = (await client.get("/api/v1/connectors/me/work", headers=headers)).json()
+        left = {
+            "repository": "github.com/acme|app",
+            "file_path": "src/config.py",
+            "secret_kind": "aws_access_key",
+        }
+        right = {
+            "repository": "github.com/acme",
+            "file_path": "app|src/config.py",
+            "secret_kind": "aws_access_key",
+        }
+        with patch(
+            "app.services.ingestion_service.AlertDeliveryService.enqueue",
+            new_callable=AsyncMock,
+        ):
+            first = await client.post(
+                f"/api/v1/connectors/me/findings/{work['job_id']}",
+                headers=_submitting(headers, work),
+                json=[left],
+            )
+            second = await client.post(
+                f"/api/v1/connectors/me/findings/{work['job_id']}",
+                headers=_submitting(headers, work),
+                json=[right],
+            )
+        assert first.status_code == 200, first.text
+        assert second.status_code == 200, second.text
+        assert first.json()["created"] == 1
+        assert second.json()["created"] == 1
+        rows = list(
+            (
+                await db_session.execute(
+                    select(Finding).where(Finding.module == "code_leak")
+                )
+            ).scalars()
+        )
+        assert len(rows) == 2
+        assert {row.payload["repository"] for row in rows} == {
+            "github.com/acme|app",
+            "github.com/acme",
+        }
+
+    @pytest.mark.asyncio
+    async def test_long_dedup_values_that_share_a_prefix_stay_distinct(
+        self, client, db_session, auth_headers_admin
+    ):
+        """A key cut to the column width must not merge findings that differ after it.
+
+        Each declared value may be 512 characters, and the joined key is stored in a
+        512-character column. Cutting it at that width kept only the first 512
+        characters, so two findings with the same long repository and paths differing
+        only in the last characters produced one key and the second was dropped as a
+        duplicate, with no event.
+        """
+        await _declare(client, auth_headers_admin)
+        _, headers = await _connector_headers(db_session)
+        await ConnectorService(db_session).enqueue_module_scan(
+            connector_type="code_leak", created_by=None, title="Repo scan"
+        )
+        work = (await client.get("/api/v1/connectors/me/work", headers=headers)).json()
+        repository = "r" * 512
+        first = {
+            "repository": repository,
+            "file_path": "p" * 500 + "1",
+            "secret_kind": "aws_access_key",
+        }
+        second = {
+            "repository": repository,
+            "file_path": "p" * 500 + "2",
+            "secret_kind": "aws_access_key",
+        }
+        with patch(
+            "app.services.ingestion_service.AlertDeliveryService.enqueue",
+            new_callable=AsyncMock,
+        ):
+            one = await client.post(
+                f"/api/v1/connectors/me/findings/{work['job_id']}",
+                headers=_submitting(headers, work),
+                json=[first],
+            )
+            two = await client.post(
+                f"/api/v1/connectors/me/findings/{work['job_id']}",
+                headers=_submitting(headers, work),
+                json=[second],
+            )
+        assert one.status_code == 200, one.text
+        assert two.status_code == 200, two.text
+        assert one.json()["created"] == 1
+        assert two.json()["created"] == 1
+        rows = list(
+            (
+                await db_session.execute(
+                    select(Finding).where(Finding.module == "code_leak")
+                )
+            ).scalars()
+        )
+        assert len(rows) == 2
+
+    @pytest.mark.asyncio
+    async def test_a_finding_whose_event_fails_is_rolled_back_alone(
+        self, client, db_session, auth_headers_admin
+    ):
+        """A batch commits per item: a finding is stored only together with its event.
+
+        Each item runs in its own savepoint, and its notification is written inside
+        that savepoint. When one item's event write fails, that item's finding is
+        rolled back with it and counted as rejected, while the other items in the same
+        batch are stored and their events kept. No finding is left without its event.
+        """
+        from app.models.ingestion_event import IngestionEvent
+        from app.services import ingestion_service
+
+        await _declare(client, auth_headers_admin)
+        _, headers = await _connector_headers(db_session)
+        await ConnectorService(db_session).enqueue_module_scan(
+            connector_type="code_leak", created_by=None, title="Repo scan"
+        )
+        work = (await client.get("/api/v1/connectors/me/work", headers=headers)).json()
+        real_record_event = ingestion_service.record_event
+        calls: list[int] = []
+
+        async def flaky_record_event(db, **kwargs):
+            calls.append(1)
+            if len(calls) == 2:
+                raise ValueError("event write failed")
+            return await real_record_event(db, **kwargs)
+
+        batch = [
+            {"repository": f"github.com/acme/{name}", "file_path": "a.py", "secret_kind": "k"}
+            for name in ("one", "two", "three")
+        ]
+        with patch(
+            "app.services.ingestion_service.AlertDeliveryService.enqueue",
+            new_callable=AsyncMock,
+        ), patch.object(ingestion_service, "record_event", flaky_record_event):
+            response = await client.post(
+                f"/api/v1/connectors/me/findings/{work['job_id']}",
+                headers=_submitting(headers, work),
+                json=batch,
+            )
+        assert response.status_code == 200, response.text
+        assert response.json()["created"] == 2
+        assert response.json()["rejected"] == 1
+        rows = list(
+            (
+                await db_session.execute(
+                    select(Finding).where(Finding.module == "code_leak")
+                )
+            ).scalars()
+        )
+        events = list(
+            (
+                await db_session.execute(
+                    select(IngestionEvent).where(
+                        IngestionEvent.module == "module:code_leak"
+                    )
+                )
+            ).scalars()
+        )
+        assert len(rows) == 2
+        assert len(events) == 2
+        assert {event.entity_id for event in events} == {row.id for row in rows}
 
     @pytest.mark.asyncio
     async def test_findings_of_a_declared_module_are_listed_by_module(

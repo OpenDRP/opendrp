@@ -122,9 +122,27 @@ async def test_observation_refresh_preserves_first_seen_and_updates_source_state
 
 
 @pytest.mark.asyncio
-async def test_refresh_preserves_expiry_threshold_history_until_expiry_changes(
+async def test_refresh_leaves_the_registration_controls_history_alone(
     db_session,
 ):
+    """The history belongs to the control, and a refresh does not erase it.
+
+    This used to read a second copy on the observation, which nothing in the
+    platform ever wrote: the only list that is ever appended is the monitor's
+    (AUD-038). The guarantee is the same one; the row that owns it moved.
+    """
+    from app.models.asset import Asset, AssetType
+    from app.models.dns_expiry_monitor import DNSExpiryMonitor
+
+    db_session.add(
+        Asset(
+            asset_type=AssetType.domain,
+            asset_value="example.com",
+            normalized_value="example.com",
+            is_active=True,
+        )
+    )
+    await db_session.commit()
     payload = {
         "observation_type": "rdap",
         "subject": "example.com",
@@ -133,22 +151,20 @@ async def test_refresh_preserves_expiry_threshold_history_until_expiry_changes(
         "expires_at": (datetime.now(timezone.utc) + timedelta(days=10)).isoformat(),
     }
     await ingest_dns_observations(db_session, source="rdap", findings=[payload])
-    row = (await db_session.execute(select(DNSObservation))).scalar_one()
-    row.alerted_thresholds = [30]
+    monitor = (await db_session.execute(select(DNSExpiryMonitor))).scalar_one()
+    monitor.alerted_thresholds = [30]
     await db_session.commit()
 
     await ingest_dns_observations(db_session, source="rdap", findings=[payload])
-    refreshed = (await db_session.execute(select(DNSObservation))).scalar_one()
-    assert refreshed.alerted_thresholds == [30]
+    assert monitor.alerted_thresholds == [30]
 
     changed_expiry = {
         **payload,
         "expires_at": (datetime.now(timezone.utc) + timedelta(days=20)).isoformat(),
     }
     await ingest_dns_observations(db_session, source="rdap", findings=[changed_expiry])
-    refreshed = (await db_session.execute(select(DNSObservation))).scalar_one()
-    await db_session.refresh(refreshed)
-    assert refreshed.alerted_thresholds == []
+    await db_session.refresh(monitor)
+    assert monitor.alerted_thresholds == []
 
 
 @pytest.mark.asyncio
@@ -170,7 +186,6 @@ async def test_expiry_alerts_use_rdap_expiry_and_only_mark_successfully_queued(
         expires_at=now + timedelta(days=10),
         status="current",
         metadata_json={},
-        alerted_thresholds=[],
     )
     dns = DNSObservation(
         observation_key="b" * 64,
@@ -184,7 +199,6 @@ async def test_expiry_alerts_use_rdap_expiry_and_only_mark_successfully_queued(
         expires_at=now + timedelta(seconds=60),
         status="current",
         metadata_json={},
-        alerted_thresholds=[],
     )
     db_session.add_all([rdap, dns])
     await db_session.commit()
@@ -212,8 +226,10 @@ async def test_expiry_alerts_use_rdap_expiry_and_only_mark_successfully_queued(
     assert await queue_expiry_alerts(db_session, now=now) == 0
     assert len(calls) == 1
     assert "domain registration expires in 10 day" in calls[0]["details"]["title"]
-    await db_session.refresh(rdap)
-    assert rdap.alerted_thresholds == []
+    from app.models.dns_expiry_monitor import DNSExpiryMonitor
+
+    control = (await db_session.execute(select(DNSExpiryMonitor))).scalar_one()
+    assert control.alerted_thresholds == []
 
 
 @pytest.mark.asyncio

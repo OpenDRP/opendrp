@@ -76,6 +76,42 @@ async def test_a_breach_promotes_the_mailbox_it_names(
 
 
 @pytest.mark.asyncio
+async def test_a_promotion_answers_the_asset_a_read_answers(
+    client, db_session, auth_headers_analyst
+):
+    """The nested asset is the resource `GET /assets/{id}` describes, not the row.
+
+    The answer used to be a SQLAlchemy object put through `jsonable_encoder`, so
+    the keys were whatever columns the table happened to carry and a new column
+    would have reached the browser without a declaration. A promotion and a read
+    now answer the same shape, and the timestamps go through the same serializer
+    (`Z`, not `+00:00`); this test is what makes that a contract rather than an
+    accident of two paths agreeing today.
+    """
+    breach = _breach()
+    db_session.add(breach)
+    await db_session.commit()
+
+    promoted = await client.post(
+        f"/api/v1/breaches/{breach.id}/asset", headers=auth_headers_analyst
+    )
+    assert promoted.status_code == 201, promoted.text
+    body = promoted.json()
+    read = await client.get(
+        f"/api/v1/assets/{body['asset']['id']}", headers=auth_headers_analyst
+    )
+    assert read.status_code == 200, read.text
+
+    # `findings` is computed by the read and not by a promotion, so it is the one
+    # key the two answers may differ by — and on a promotion it is absent, not null.
+    assert set(body["asset"]) == set(read.json()) - {"findings"}
+    assert body["asset"]["created_at"].endswith("Z")
+    assert body["asset"]["updated_at"].endswith("Z")
+    # The breach answer has no source; `exclude_none` keeps the key out.
+    assert "source" not in body
+
+
+@pytest.mark.asyncio
 async def test_a_breach_without_a_mailbox_promotes_its_domain(
     client, db_session, auth_headers_analyst
 ):

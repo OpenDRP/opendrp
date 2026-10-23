@@ -108,6 +108,87 @@ def test_environment_marker_on_exact_pin_is_allowed():
     assert _gate.check_requirements(Path("r.txt"), source) == []
 
 
+# --- every manifest the tree ships is scanned --------------------------------
+#: A pin with the hash line a generated lock carries.
+_HASHED_PIN = "fastapi==0.141.1\n    --hash=sha256:" + "a" * 64 + "\n"
+
+
+def _shipped_tree(tmp_path: Path, overrides: dict) -> Path:
+    """The smallest checkout the gate accepts, with `overrides` applied."""
+    files = {
+        "backend/pyproject.toml": (
+            '[tool.poetry]\nname = "opendrp-backend"\nversion = "0.2.1"\n'
+        ),
+        "backend/requirements-dev.txt": "pytest==9.0.3\n",
+        "backend/requirements.txt": _HASHED_PIN,
+    }
+    for connector in (
+        "dnstwist",
+        "shodan",
+        "hibp",
+        "dns_security",
+        "intelligence",
+        "exposure_endpoints",
+    ):
+        files[f"connectors/{connector}/requirements.txt"] = _HASHED_PIN
+    files.update(overrides)
+    for relative, text in files.items():
+        path = tmp_path / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+    return tmp_path
+
+
+def test_every_connector_manifest_the_tree_ships_is_scanned(tmp_path: Path) -> None:
+    """The list of manifests is the tree's, not a copy that can fall behind.
+
+    The shipped set was hand-kept, and three of the six manifests every connector
+    image installs with `--require-hashes` went unchecked: `dns_security` and
+    `intelligence` were named for a hash rule the scan loop never reached, and
+    `exposure_endpoints` was in neither list. A new connector's manifest is the
+    same omission one release later.
+    """
+    root = _shipped_tree(tmp_path, {})
+
+    shipped, dev = _gate.requirements_manifests(root)
+
+    assert set(shipped) == {
+        Path("backend/requirements.txt"),
+        Path("connectors/dnstwist/requirements.txt"),
+        Path("connectors/shodan/requirements.txt"),
+        Path("connectors/hibp/requirements.txt"),
+        Path("connectors/dns_security/requirements.txt"),
+        Path("connectors/intelligence/requirements.txt"),
+        Path("connectors/exposure_endpoints/requirements.txt"),
+    }
+    assert dev == [Path("backend/requirements-dev.txt")]
+
+
+def test_a_range_in_a_connector_manifest_is_reported(tmp_path: Path) -> None:
+    root = _shipped_tree(
+        tmp_path,
+        {"connectors/exposure_endpoints/requirements.txt": "requests>=2.0\n"},
+    )
+
+    failures = _gate.check(root)
+
+    assert failures, "a range in a shipped manifest has to be a failure"
+    assert any("exposure_endpoints" in failure for failure in failures), failures
+
+
+def test_a_connector_pin_without_a_hash_is_reported(tmp_path: Path) -> None:
+    """Every connector image installs its manifest with `--require-hashes`."""
+    root = _shipped_tree(
+        tmp_path,
+        {"connectors/intelligence/requirements.txt": "fastapi==0.141.1\n"},
+    )
+
+    failures = _gate.check(root)
+
+    assert failures, "a shipped pin without a hash has to be a failure"
+    assert any("intelligence" in failure for failure in failures), failures
+
+
 # --- end-to-end over the repository -------------------------------------------
 
 

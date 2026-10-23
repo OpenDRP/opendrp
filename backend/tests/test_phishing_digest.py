@@ -202,6 +202,7 @@ class TestRouting:
             def __init__(self, confidence: int) -> None:
                 self.confidence = confidence
                 self.verdict = None
+                self.status = "active"
 
         assert phishing_alert_route(_Row(95)) == "immediate"
         assert phishing_alert_route(_Row(60)) == "immediate"
@@ -213,10 +214,31 @@ class TestRouting:
         # score to decide with, and dropping the message would be deciding anyway.
         assert phishing_alert_route(None) == "unknown"
 
+    def test_a_resolved_candidate_is_silent_in_every_band(self):
+        """One resolution, one rule: the digest skips the row, so the channel must too.
+
+        `queue_phishing_digest` excludes a resolved candidate, which is the module's
+        statement that closing a finding means an operator is done reading about it.
+        The routing used to read only the score, so the same closed candidate was
+        announced immediately in the band above and *lost* in the middle one — the
+        event was consumed for the digest and the digest then filtered the row out.
+        """
+
+        class _Row:
+            def __init__(self, confidence: int) -> None:
+                self.confidence = confidence
+                self.verdict = None
+                self.status = "resolved"
+
+        assert phishing_alert_route(_Row(95)) == "closed"
+        assert phishing_alert_route(_Row(59)) == "closed"
+        assert phishing_alert_route(_Row(0)) == "closed"
+
     def test_disabling_the_digest_makes_the_budget_binary(self, monkeypatch):
         class _Row:
             confidence = 45
             verdict = None
+            status = "active"
 
         assert phishing_alert_route(_Row()) == "digest"
         monkeypatch.setattr(settings, "ALERT_PHISHING_DIGEST_ENABLED", False)
@@ -226,6 +248,7 @@ class TestRouting:
         class _Row:
             confidence = 70
             verdict = None
+            status = "active"
 
         assert phishing_alert_route(_Row()) == "immediate"
         monkeypatch.setattr(settings, "ALERT_CONFIDENCE_DIRECT", 90)
@@ -266,6 +289,11 @@ async def test_ten_candidates_become_one_message_and_one_digest(db_session, mail
             assert f"Domain={domain}" in digest_mail
         else:
             assert f"Domain={domain}" not in digest_mail
+    # A digest is a summary of candidates, not four findings: the counted line in
+    # the body reads the way the subject does. Batch 04 of the coverage program
+    # recorded this mismatch rather than fixing it; plan 007 step 2 closes it.
+    assert "4 candidates below the alert threshold" in digest_mail
+    assert "new findings" not in digest_mail
     # The middle band is reported with the score that kept it out of the inbox and
     # the signals that score came from (WI-08), or the reader cannot triage it.
     assert "Confidence=55" in digest_mail
@@ -278,6 +306,58 @@ async def test_ten_candidates_become_one_message_and_one_digest(db_session, mail
     # next run reports what is new rather than the same four look-alikes.
     for domain, _, band in BANDS:
         assert (rows[domain].digest_queued_at is not None) is (band == "digest")
+
+
+class _TelegramBox:
+    """The messages a chat would have received, captured at the send boundary."""
+
+    def __init__(self) -> None:
+        self.texts: list[str] = []
+
+    async def send(self, text, chat_id=None) -> bool:
+        self.texts.append(text)
+        return True
+
+
+@pytest.fixture
+def telegram_box(monkeypatch) -> _TelegramBox:
+    """An installation whose only channel is Telegram, and no network under it."""
+    sink = _TelegramBox()
+    monkeypatch.setattr(AlertService, "_send_telegram", sink.send)
+    monkeypatch.setattr(settings, "ALERT_AGGREGATION_DELAY_SECONDS", 0)
+    monkeypatch.setattr(settings, "ALERT_RECIPIENT_INTERVAL_SECONDS", 0)
+    return sink
+
+
+async def configured_telegram(db) -> SystemSettings:
+    row = SystemSettings(telegram_alerts_enabled=True, telegram_chat_ids=["-1001"])
+    row.telegram_bot_token_decrypted = "123:token"
+    db.add(row)
+    await db.commit()
+    return row
+
+
+@pytest.mark.asyncio
+async def test_the_digest_telegram_message_counts_candidates_not_findings(
+    db_session, telegram_box
+):
+    """The chat says what the subject says: four candidates, not four findings."""
+    await configured_telegram(db_session)
+    await seed_bands(db_session)
+    assert await dispatch_notification_events(db_session) == 3
+    await drain(db_session)
+
+    # The band that interrupts someone still speaks in findings: only the summary
+    # changes what it counts.
+    assert any("3 new findings" in text for text in telegram_box.texts)
+
+    assert await queue_phishing_digest(db_session) == {"queued": 4, "candidates": 4}
+    await drain(db_session)
+
+    digest_texts = [text for text in telegram_box.texts if "PHISHING DIGEST" in text]
+    assert len(digest_texts) == 1
+    assert "4 candidates below the alert threshold" in digest_texts[0]
+    assert "new findings" not in digest_texts[0]
 
 
 @pytest.mark.asyncio

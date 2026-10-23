@@ -102,7 +102,6 @@ async def test_the_involvement_summary_and_filter_work_on_postgres():
         last_seen_at=now,
         status="current",
         metadata_json={},
-        alerted_thresholds=[],
     )
     exposure = SourceObservation(
         module="exposure",

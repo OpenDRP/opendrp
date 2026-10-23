@@ -15,6 +15,7 @@ from sqlalchemy import select
 
 from app.core import totp
 from app.core.security import verify_password
+from app.models.audit import AuditLog
 from app.models.token import RefreshTokenFamily
 
 PASSWORD = "TestPass123!"
@@ -29,6 +30,45 @@ def _unavailable_audit(monkeypatch) -> None:
         raise RuntimeError("audit unavailable")
 
     monkeypatch.setattr("app.core.audit.prepare_entry", fail)
+
+
+@pytest.mark.asyncio
+async def test_login_is_refused_when_the_trail_is_unavailable(
+    client, db_session, test_viewer, monkeypatch
+):
+    """A session is a state change: it must not exist without its sign-in row.
+
+    The route used to commit the refresh family and then write
+    ``auth.login.success``, so a failing audit write left a usable session no log
+    line mentions — the one event a SIEM uses to notice an account in use.
+    """
+    _unavailable_audit(monkeypatch)
+    # Read the id before the request: the refusal rolls the shared session back,
+    # which expires the instance and would make this access lazy IO.
+    viewer_id = test_viewer.id
+    response = await client.post(
+        "/api/v1/auth/login",
+        json={"email": test_viewer.email, "password": PASSWORD},
+    )
+    assert response.status_code == 503, response.text
+    assert "set-cookie" not in response.headers
+
+    families = (
+        await db_session.execute(
+            select(RefreshTokenFamily).where(RefreshTokenFamily.user_id == viewer_id)
+        )
+    ).scalars().all()
+    assert families == [], "no refresh family may survive an unrecorded sign-in"
+
+    await db_session.refresh(test_viewer)
+    assert test_viewer.last_login_at is None
+
+    rows = (
+        await db_session.execute(
+            select(AuditLog).where(AuditLog.action == "auth.login.success")
+        )
+    ).scalars().all()
+    assert rows == []
 
 
 @pytest.mark.asyncio

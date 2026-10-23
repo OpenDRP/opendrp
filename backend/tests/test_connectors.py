@@ -679,6 +679,61 @@ class TestConnectorConfigContract:
             validate_connector_config(bare, {"foo": 1, "bad": {"nested": 1}})
         assert validate_connector_config(bare, {"foo": 1}) == {"foo": 1}
 
+    def test_a_malformed_setting_is_a_refusal_not_an_internal_error(self):
+        """AUD-019: three values the route could not answer with a 400.
+
+        `--5` passed the digit test and then raised out of the route as a 500;
+        `nan` and `inf` were stored in the JSON column, where they are not JSON;
+        and a connector that declared no schema took a string of any length.
+        """
+        from app.core.exceptions import BadRequestException
+        from app.services.connector_manifest import (
+            build_manifest,
+            validate_connector_config,
+        )
+        from app.services.module_registry import BUILTIN_MODULE_DEFINITIONS
+
+        row = {item["id"]: item for item in BUILTIN_MODULE_DEFINITIONS}["phishing"]
+        phishing = ModuleSpec(
+            id=row["id"],
+            label=row["label"],
+            description=row["description"],
+            finding_kind=row["finding_kind"],
+            asset_types=tuple(row["asset_types"]),
+            fields=row["fields"],
+            dedup_fields=tuple(row["dedup_fields"]),
+            title_field=row["title_field"],
+            storage=row["storage"],
+        )
+        manifest = build_manifest(
+            module_spec=phishing,
+            job_type="phishing.typed",
+            config_schema={
+                "limit": {"type": "int"},
+                "ratio": {"type": "float"},
+            },
+        )
+
+        for key, value in (
+            ("limit", "--5"),
+            ("limit", "2.5"),
+            ("limit", ""),
+            ("ratio", "nan"),
+            ("ratio", "inf"),
+            ("ratio", "-inf"),
+        ):
+            with pytest.raises(BadRequestException, match=f"config '{key}'"):
+                validate_connector_config(manifest, {key: value})
+
+        # What the schema does describe still arrives, sign and all.
+        assert validate_connector_config(manifest, {"limit": "-3"}) == {"limit": -3}
+        assert validate_connector_config(manifest, {"ratio": " 2.5 "}) == {"ratio": 2.5}
+
+        bare = build_manifest(module_spec=phishing, job_type="phishing.bare")
+        with pytest.raises(BadRequestException, match="is too long"):
+            validate_connector_config(bare, {"note": "x" * 2001})
+        assert validate_connector_config(bare, {"note": "x" * 2000}) == {"note": "x" * 2000}
+
     @pytest.mark.asyncio
     async def test_config_persists_and_reaches_work_payload(self, db_session):
         svc = ConnectorService(db_session)

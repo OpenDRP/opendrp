@@ -69,15 +69,33 @@ run_once() {
         return 1
     fi
 
-    if [ "$BACKUP_REPORTS" = "1" ] && [ -d "$REPORTS_DIR" ]; then
-        reports_archive="$BACKUP_DIR/reports-${stamp}.tgz"
-        # `-C` + a relative name keeps the archive free of the source path, so it
-        # can be extracted anywhere.
-        if tar -czf "$reports_archive" -C "$(dirname "$REPORTS_DIR")" "$(basename "$REPORTS_DIR")" 2>/dev/null; then
-            log "archived the report store to ${reports_archive}"
+    if [ "$BACKUP_REPORTS" = "1" ]; then
+        if [ ! -d "$REPORTS_DIR" ]; then
+            # A store that is not there is not a failed dump, but it is not the
+            # backup the runbook describes either, and the difference has to be
+            # visible: the pass used to say nothing at all and end with "done".
+            # On an installation this means the volume did not mount where
+            # REPORTS_DIR points.
+            log "WARNING: ${REPORTS_DIR} is not a directory, so the report store is NOT in this backup; the database dump is unaffected. See docs/backup-restore.md."
         else
-            rm -f "$reports_archive"
-            log "WARNING: could not archive ${REPORTS_DIR}; the database dump is unaffected"
+            reports_archive="$BACKUP_DIR/reports-${stamp}.tgz"
+            # `-C` + a relative name keeps the archive free of the source path, so
+            # it can be extracted anywhere. The single top-level entry is the
+            # basename of REPORTS_DIR — `reports` on both Compose file sets — and
+            # the runbook's extraction commands depend on that name.
+            if ! tar -czf "$reports_archive" -C "$(dirname "$REPORTS_DIR")" "$(basename "$REPORTS_DIR")" 2>/dev/null; then
+                rm -f "$reports_archive"
+                log "WARNING: could not archive ${REPORTS_DIR}; the database dump is unaffected"
+            elif listing="$(tar -tzf "$reports_archive" 2>/dev/null)"; then
+                # The same rule as the dump's `pg_restore --list`: an archive that
+                # cannot be read back is not a backup. Caught here, at the moment
+                # it is written, rather than in a restore during an incident.
+                entries="$(printf '%s\n' "$listing" | wc -l | tr -d ' ')"
+                log "archived the report store to ${reports_archive} (${entries} entries, readable)"
+            else
+                log "FAILED: ${reports_archive} cannot be listed, so the report store is not in this backup"
+                return 1
+            fi
         fi
     fi
 

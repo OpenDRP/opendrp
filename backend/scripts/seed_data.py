@@ -3,6 +3,7 @@ import asyncio
 import random
 from datetime import datetime, timedelta, timezone
 from sqlalchemy import select, text
+from app.core.config import settings
 from app.core.database import AsyncSessionLocal
 from app.core.security import hash_password
 from app.models import User, Asset, Breach, DrpPhishingDomain, SystemSettings
@@ -12,13 +13,69 @@ from app.schemas.asset import validate_and_normalize_asset_value
 app = typer.Typer(help="OpenDRP demo data seeder")
 
 
+@app.callback()
+def _cli() -> None:
+    """Demo data for a throwaway development database.
+
+    The callback is what makes ``all`` a subcommand. With one command and no
+    callback Typer flattens the group, so the documented spelling
+    (``python -m scripts.seed_data all --yes``, the one ``make seed-demo`` and
+    CONTRIBUTING use) answered "Got unexpected extra argument (all)" and the demo
+    seed never ran.
+    """
+
+
 @app.command()
 def all(
-    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation prompts"),
-    force: bool = typer.Option(False, "--force", "-f", help="Re-seed even if data exists (DELETE existing)"),
+    # Both flags are plain booleans: the pinned pair is compatible
+    # (typer==0.12.5 with click==8.1.8), so Click fills `flag_value` from the
+    # default and `--force` arrives as True. An explicit `flag_value=True` stood
+    # here to work around Click 8.5, which filled nothing — and the same version
+    # gap made `--help` exit 1 with `make_metavar() missing 1 required positional
+    # argument: 'ctx'`. The pins are the fix; the workaround is gone with them.
+    yes: bool = typer.Option(
+        False,
+        "--yes",
+        "-y",
+        help="Skip the confirmation prompt (automation)",
+    ),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        "-f",
+        help="Re-seed even if data exists (deletes the demo rows first)",
+    ),
 ):
     """Run all seeders: users + assets + phishing + breaches."""
+    if force:
+        _require_permission_to_delete(yes=yes)
     asyncio.run(_seed_all(force=force))
+
+
+def _require_permission_to_delete(*, yes: bool) -> None:
+    """Refuse ``--force`` unless a human said so and this is not production.
+
+    ``--force`` starts with ``TRUNCATE ... CASCADE``, which on this schema also
+    empties ``jobs``, ``reports`` and the certificate review rows. The flag
+    declared as "skip confirmation prompts" was never read, so the destructive
+    path ran against whatever database ``DATABASE_URL`` named with no prompt at
+    all — and no environment check separates a demo database from a real one.
+    """
+    if settings.APP_ENV.lower() == "production":
+        typer.echo(
+            "Refusing --force: APP_ENV=production. It deletes rows, and a demo "
+            "database is the only place that is acceptable.",
+            err=True,
+        )
+        raise typer.Exit(1)
+    if yes:
+        return
+    if not typer.confirm(
+        "This deletes every demo user, asset, phishing candidate and breach, with "
+        "the jobs and reports that cascade from them. Continue?"
+    ):
+        typer.echo("Cancelled: nothing was deleted.", err=True)
+        raise typer.Exit(1)
 
 
 async def _seed_all(force: bool):

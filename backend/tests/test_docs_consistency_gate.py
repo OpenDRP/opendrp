@@ -323,6 +323,76 @@ def test_a_table_row_with_a_missing_cell_is_reported(tmp_path: Path) -> None:
     assert "2 cell(s)" in failures[0]
 
 
+def test_a_blank_line_inside_a_table_is_reported(tmp_path: Path) -> None:
+    """GFM ends a table at a blank line: the rows after it render as pipes.
+
+    The register carried five of them, so forty-four findings — and two rows with
+    an extra unescaped pipe among them — were a paragraph nobody checked, while
+    `check_tables` walked only the first thirty-three rows and reported nothing.
+    A gate whose message promises "every table row matches its header" has to see
+    the rows that are not in the table any more.
+    """
+    root = _checkout(
+        tmp_path,
+        {
+            "README.md": (
+                "# OpenDRP\n\n"
+                "| Setting | Default |\n"
+                "|---|---|\n"
+                "| `A` | 1 |\n"
+                "\n"
+                "| `B` | 2 |\n"
+            ),
+        },
+    )
+
+    failures = gate.check(root)
+
+    assert len(failures) == 1, failures
+    assert "README.md:6" in failures[0]
+    assert "blank line" in failures[0]
+
+
+def test_a_blank_line_before_a_new_table_is_not_a_finding(tmp_path: Path) -> None:
+    """A header and its separator start a table; a gap before one is ordinary."""
+    root = _checkout(
+        tmp_path,
+        {
+            "README.md": (
+                "# OpenDRP\n\n"
+                "| Setting | Default |\n"
+                "|---|---|\n"
+                "| `A` | 1 |\n"
+                "\n"
+                "| Other | Value |\n"
+                "|---|---|\n"
+                "| `B` | 2 |\n"
+            ),
+        },
+    )
+
+    assert gate.check(root) == []
+
+
+def test_a_blank_line_before_prose_with_a_pipe_is_not_a_finding(tmp_path: Path) -> None:
+    """Prose that mentions a pipe is not a continuation of the table above it."""
+    root = _checkout(
+        tmp_path,
+        {
+            "README.md": (
+                "# OpenDRP\n\n"
+                "| Setting | Default |\n"
+                "|---|---|\n"
+                "| `A` | 1 |\n"
+                "\n"
+                "A shell pipeline is written `a | b` and is not a table row.\n"
+            ),
+        },
+    )
+
+    assert gate.check(root) == []
+
+
 def test_a_table_inside_a_fence_is_an_example(tmp_path: Path) -> None:
     root = _checkout(
         tmp_path,

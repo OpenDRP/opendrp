@@ -66,6 +66,8 @@ _MAKE_TARGET_QUOTED = re.compile(r"`make ([a-z][a-z0-9-]*)`")
 _CI_JOB = re.compile(r"`([a-z][a-z0-9-]*)` job")
 #: A target definition in the Makefile.
 _MAKE_DEFINITION = re.compile(r"^([a-zA-Z][a-zA-Z0-9_.-]*):", re.MULTILINE)
+#: A target name in the Makefile's help text (each line is `@echo "  <name> ..."`).
+_MAKE_HELP_ENTRY = re.compile(r'@echo "  ([A-Za-z][A-Za-z0-9_-]*)')
 
 
 def _page_text() -> str:
@@ -107,6 +109,35 @@ def test_every_ci_job_the_pages_name_exists():
     named = set(_CI_JOB.findall(_page_text()))
     assert named, "neither page names a CI job"
     assert named - jobs == set()
+
+
+def test_make_help_lists_every_target():
+    """CONTRIBUTING.md: "`make help` lists every target."
+
+    Seven targets were missing from the help text, including `lint-backend` —
+    which the page's own table tells a contributor to run — and the three
+    connector-credential targets, so the documented way to issue a credential was
+    found only by reading the Makefile. A target that exists and is not listed is
+    the difference between a discoverable command and a rumour.
+    """
+    text = _MAKEFILE.read_text(encoding="utf-8")
+    targets = set(_MAKE_DEFINITION.findall(text)) - {"help"}
+    listed = set(_MAKE_HELP_ENTRY.findall(text))
+    assert targets - listed == set()
+
+
+def test_the_health_target_uses_the_port_the_installation_publishes():
+    """`make health` is the documented post-start check, on any BACKEND_PORT.
+
+    The target curled `http://localhost:8000` outright while the wizard writes
+    `BACKEND_PORT` (`127.0.0.1:8000` by default, and `--backend-port` changes it,
+    as can a hand edit of `.env`). On any other port the check reported "API is
+    unreachable" for a healthy stack, which is the one answer an operator acts on.
+    """
+    text = _MAKEFILE.read_text(encoding="utf-8")
+    recipe = text.split("\nhealth:", 1)[1].split("\nclean:", 1)[0]
+    assert "BACKEND_PORT" in recipe
+    assert "localhost:8000" not in recipe
 
 
 def test_the_wizard_runs_on_the_python_the_readme_promises():

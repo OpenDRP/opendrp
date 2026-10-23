@@ -103,6 +103,42 @@ async def test_accepting_sets_the_password_and_clears_the_invitation(
 
 
 @pytest.mark.asyncio
+async def test_accepting_a_reissued_link_ends_the_sessions_that_predate_it(
+    client, auth_headers_admin
+):
+    """Acceptance is a credential change, so it also ends what the old one authorised.
+
+    An account can be re-invited after it has been used — a lost device, a
+    password nobody trusts any more — and a refresh family that survived the new
+    password would keep the very session the re-invitation was meant to end.
+    """
+    body = await _invite(client, auth_headers_admin)
+    first = await _accept(client, body["invitation_token"])
+    assert first.status_code == 200, first.text
+
+    login = await client.post(
+        "/api/v1/auth/login",
+        json={"email": "invited@example.com", "password": "InvitedPass123!"},
+    )
+    assert login.status_code == 200, login.text
+    stale = login.cookies.get("opendrp_refresh")
+    assert stale
+
+    reissued = await client.post(
+        f"/api/v1/users/{body['user']['id']}/invitation", headers=auth_headers_admin
+    )
+    assert reissued.status_code == 200, reissued.text
+    second = await _accept(
+        client, reissued.json()["invitation_token"], "SecondPass123!"
+    )
+    assert second.status_code == 200, second.text
+
+    r = await client.post("/api/v1/auth/refresh", json={"refresh_token": stale})
+    assert r.status_code == 401, r.text
+    assert "revoked" in r.json()["detail"].lower()
+
+
+@pytest.mark.asyncio
 async def test_a_second_use_of_the_same_link_is_refused(
     client, auth_headers_admin
 ):

@@ -272,6 +272,46 @@ class TestJobServiceListJobs:
         assert {j.id for j in page1}.isdisjoint({j.id for j in page2})
 
 
+def test_a_relationship_that_cannot_load_does_not_break_the_response():
+    """`created_by_email` is a convenience, never a reason to fail the view.
+
+    `created_by_user` is a lazily-loaded relationship. Reading it outside the
+    session that loaded the row raises (``MissingGreenlet`` under asyncio); the
+    view must then say it does not know the email rather than turn a readable job
+    into a 500.
+    """
+    from datetime import datetime, timezone
+
+    from app.api.v1.routers.jobs import _to_response
+
+    class _Job:
+        id = uuid.uuid4()
+        job_type = "phishing.dnstwist"
+        status = "success"
+        task_id = None
+        title = "no-session"
+        error_message = None
+        params = None
+        result_summary = None
+        created_at = datetime.now(timezone.utc)
+        started_at = None
+        finished_at = None
+        lease_expires_at = None
+        last_heartbeat_at = None
+        attempt_count = 0
+        claimed_by_connector = None
+        created_by = None
+        lease_token = "never-published"
+
+        @property
+        def created_by_user(self):
+            raise RuntimeError("MissingGreenlet")
+
+    response = _to_response(_Job())
+    assert response.created_by_email is None
+    assert "never-published" not in response.model_dump_json()
+
+
 class TestJobsRouter:
     @pytest.mark.asyncio
     async def test_list_jobs_requires_auth(self, client):
@@ -376,6 +416,62 @@ class TestJobsRouter:
         )
         assert rows, "jobs listing must be audited"
         assert rows[-1].details.get("total") >= 1
+
+    @pytest.mark.asyncio
+    async def test_admin_reads_any_job_and_the_read_is_audited(
+        self, client, auth_headers_admin, db_session, test_admin
+    ):
+        job = await _mk_job(db_session, created_by=test_admin.id, title="detail-view")
+        r = await client.get(f"/api/v1/jobs/{job.id}", headers=auth_headers_admin)
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["title"] == "detail-view"
+        assert body["created_by_email"] == test_admin.email
+        # The lease token is a capability, not a field of the view.
+        assert "lease_token" not in body
+
+        rows = list(
+            (
+                await db_session.execute(
+                    select(AuditLog).where(AuditLog.action == "job.view")
+                )
+            ).scalars()
+        )
+        assert rows and rows[-1].details.get("job_id") == str(job.id)
+
+    @pytest.mark.asyncio
+    async def test_another_accounts_job_is_a_404_not_a_403(
+        self, client, auth_headers_analyst, db_session, test_admin
+    ):
+        """A 403 would confirm the job exists, which is the thing being withheld.
+
+        An analyst may only read their own and the platform's jobs; somebody
+        else's is indistinguishable from an id that was never issued.
+        """
+        from app.models.job import Job as JobModel
+
+        foreign = await _mk_job(db_session, created_by=test_admin.id, title="not-yours")
+        r = await client.get(f"/api/v1/jobs/{foreign.id}", headers=auth_headers_analyst)
+        assert r.status_code == 404, r.text
+        assert r.json()["detail"] == "Job not found"
+        # The row is still there: the refusal is about the reader, not the row.
+        assert await db_session.get(JobModel, foreign.id) is not None
+
+    @pytest.mark.asyncio
+    async def test_a_job_with_no_creator_is_readable_and_reports_no_email(
+        self, client, auth_headers_analyst, db_session
+    ):
+        """Platform-scheduled jobs belong to nobody, and analysts may see them."""
+        job = await _mk_job(db_session, created_by=None, title="system-sweep")
+        r = await client.get(f"/api/v1/jobs/{job.id}", headers=auth_headers_analyst)
+        assert r.status_code == 200, r.text
+        assert r.json()["created_by"] is None
+        assert r.json()["created_by_email"] is None
+
+    @pytest.mark.asyncio
+    async def test_an_unknown_job_is_a_404(self, client, auth_headers_admin):
+        r = await client.get(f"/api/v1/jobs/{uuid.uuid4()}", headers=auth_headers_admin)
+        assert r.status_code == 404, r.text
 
     @pytest.mark.asyncio
     async def test_delete_job_admin_removes_row_and_audits(

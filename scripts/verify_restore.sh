@@ -7,6 +7,16 @@
 # the data you expect. The only honest check is a real restore, into a database
 # nobody is using, followed by reading something back.
 #
+# The dump is half of a backup. The other half is `reports-<stamp>.tgz`, written
+# beside it by the same pass, and this script used to restore the database and
+# never open it — so an empty, truncated or wrongly-rooted archive passed every
+# gate the repository has, and the first person to find out was an operator whose
+# restored instance listed reports it could not download. The archive is now
+# listed, extracted into a scratch directory and read back the same way, on the
+# same run. `REQUIRE_REPORT_ARCHIVE=1` turns "there was no archive beside this
+# dump" into a failure, which is what CI sets: a job that silently stopped
+# capturing the store would otherwise stay green.
+#
 # This runs from the same container as the backup itself:
 #
 #   make backup-verify
@@ -22,6 +32,10 @@ PGUSER="${PGUSER:?PGUSER must be set}"
 : "${PGPASSWORD:?PGPASSWORD must be set}"
 BACKUP_DIR="${BACKUP_DIR:-/backups}"
 SCRATCH_DB="${SCRATCH_DB:-opendrp_restore_check}"
+# The store's path inside this container, which is what the archive's top-level
+# entry is named after: `/reports`, so the archive holds `reports/…`.
+REPORTS_DIR="${REPORTS_DIR:-/reports}"
+REQUIRE_REPORT_ARCHIVE="${REQUIRE_REPORT_ARCHIVE:-0}"
 
 export PGPASSWORD
 
@@ -41,6 +55,79 @@ if [ ! -f "$dump" ]; then
     log "FAILED: no dump at ${dump}. Take one first: make backup"
     exit 1
 fi
+
+# The archive a pass writes beside its dump: `opendrp-<stamp>.dump` and
+# `reports-<stamp>.tgz` share the stamp. `latest.dump` carries no stamp of its
+# own, so the newest archive beside it is the one the last pass wrote — the same
+# assumption `backup.sh` relies on when it prunes.
+report_archive() {
+    case "${dump##*/}" in
+        opendrp-*.dump)
+            stamp="${dump##*/opendrp-}"
+            printf '%s/reports-%s.tgz\n' "$(dirname "$dump")" "${stamp%.dump}"
+            ;;
+        *)
+            ls -1 "$(dirname "$dump")"/reports-*.tgz 2>/dev/null | tail -n 1
+            ;;
+    esac
+}
+
+# Prove the other half of the backup: list the archive, extract it into a
+# scratch directory nobody is using, and read a file back out of it.
+check_report_archive() {
+    archive="$(report_archive)"
+    if [ -z "$archive" ] || [ ! -f "$archive" ]; then
+        if [ "$REQUIRE_REPORT_ARCHIVE" = "1" ]; then
+            log "FAILED: REQUIRE_REPORT_ARCHIVE=1 but there is no report archive beside ${dump}"
+            return 1
+        fi
+        log "note: no report archive beside ${dump}; this backup carries the database only, and the report store was not part of it"
+        return 0
+    fi
+
+    if ! listing="$(tar -tzf "$archive" 2>/dev/null)"; then
+        log "FAILED: ${archive} is not a readable archive; the report store cannot be restored from it"
+        return 1
+    fi
+
+    # The archive is made with `tar -C <parent> <basename>`, so it holds exactly
+    # one top-level entry, named after the store. Extracting an archive rooted
+    # somewhere else would write beside the store rather than into it, which is
+    # the restore that leaves the downloads missing.
+    store_name="$(basename "$REPORTS_DIR")"
+    tops="$(printf '%s\n' "$listing" | cut -d/ -f1 | sort -u | sed '/^$/d' | tr '\n' ' ')"
+    tops="$(printf '%s' "$tops" | sed 's/ $//')"
+    if [ "$tops" != "$store_name" ]; then
+        log "FAILED: ${archive} holds '${tops}' at the top level, not '${store_name}'; extracting it would not restore the store"
+        return 1
+    fi
+
+    scratch="$(mktemp -d)"
+    if ! tar -xzf "$archive" -C "$scratch" 2>/dev/null; then
+        rm -rf "$scratch"
+        log "FAILED: ${archive} cannot be extracted, so the store it holds cannot be restored"
+        return 1
+    fi
+    files="$(find "$scratch" -type f | wc -l | tr -d ' ')"
+    if [ "${files:-0}" -lt 1 ]; then
+        # Not a failure: a store that held no report is archived faithfully, and
+        # a backup taken before the first report legitimately looks like this.
+        rm -rf "$scratch"
+        log "note: ${archive} archived an empty report store; there was no report to read back"
+        return 0
+    fi
+    sample="$(find "$scratch/$store_name" -type f | head -n 1)"
+    if [ ! -s "$sample" ]; then
+        rm -rf "$scratch"
+        log "FAILED: ${archive} restored ${files} file(s), and the first (${sample##*/}) is empty; the store it holds is not usable"
+        return 1
+    fi
+    rm -rf "$scratch"
+    log "OK — ${archive} restored: the report store ('${store_name}/', ${files} file(s)), the first file read back non-empty"
+    return 0
+}
+
+check_report_archive || exit 1
 
 log "restoring ${dump} into scratch database '${SCRATCH_DB}'"
 # FORCE terminates any leftover connection to the scratch database, so a previous

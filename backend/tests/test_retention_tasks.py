@@ -743,6 +743,9 @@ class TestPurgeTask:
         assert set(summary) == {
             "drp_audit_logs",
             "reports",
+            # The schedule ledger is swept too: its rows are unreachable once the
+            # scheduler's ten-minute lookback has passed them.
+            "schedule_occurrences",
             "drp_refresh_families",
             "alert_deliveries",
             "ingestion_events",
@@ -751,3 +754,178 @@ class TestPurgeTask:
             "certificate_scope_exceptions",
         }
         json.dumps(summary)  # the Celery result must be JSON-serializable
+
+
+# ---------------------------------------------------------------------------
+# S18: a generation nobody is running any more, and the schedule ledger
+# ---------------------------------------------------------------------------
+
+
+async def _stuck_generation(db, *, minutes_ago: int):
+    """A report left in ``generating``, with the job row its request created."""
+    from app.models.job import Job, JobType
+
+    started = datetime.now(timezone.utc) - timedelta(minutes=minutes_ago)
+    report = Report(
+        report_name="abandoned",
+        file_path="",
+        status="generating",
+        generation_started_at=started,
+    )
+    db.add(report)
+    await db.commit()
+    job = Job(
+        job_type=JobType.report_generate.value,
+        status="running",
+        started_at=started,
+        params={"report_id": str(report.id), "report_name": "abandoned"},
+    )
+    db.add(job)
+    await db.commit()
+    return report, job
+
+
+async def _queued_reports(db) -> int:
+    """The number the report admission path compares with REPORT_QUEUE_MAX_PENDING."""
+    return int(
+        (
+            await db.execute(
+                select(func.count(Report.id)).where(
+                    Report.status.in_(("pending", "generating"))
+                )
+            )
+        ).scalar_one()
+    )
+
+
+class TestAbandonedReportGeneration:
+    """A report nobody is generating must not hold the queue forever.
+
+    ``POST /reports/generate`` refuses with ``429`` once
+    ``REPORT_QUEUE_MAX_PENDING`` rows are ``pending`` or ``generating``, and
+    ``purge_expired_reports`` deliberately skips both states. A worker killed
+    after the ``generating`` update therefore owns a global admission slot with
+    nothing left to release it.
+    """
+
+    @pytest.mark.asyncio
+    async def test_an_abandoned_generation_becomes_failed_and_frees_its_slot(
+        self, db_session
+    ):
+        report, job = await _stuck_generation(db_session, minutes_ago=180)
+        assert await _queued_reports(db_session) == 1
+
+        reconciled = await rt.reconcile_abandoned_report_generations(
+            db_session, now=datetime.now(timezone.utc)
+        )
+
+        assert reconciled == [str(report.id)]
+        await db_session.refresh(report)
+        await db_session.refresh(job)
+        assert report.status == "failed"
+        assert report.generation_started_at is None
+        assert job.status == "error"
+        assert job.error_message == "report_generation_abandoned"
+        assert job.finished_at is not None
+        assert await _queued_reports(db_session) == 0
+        actions = set(
+            (await db_session.execute(select(AuditLog.action))).scalars().all()
+        )
+        assert "report.generate.abandoned" in actions
+
+    @pytest.mark.asyncio
+    async def test_a_generation_inside_the_timeout_is_left_alone(self, db_session):
+        report, job = await _stuck_generation(db_session, minutes_ago=1)
+
+        assert (
+            await rt.reconcile_abandoned_report_generations(
+                db_session, now=datetime.now(timezone.utc)
+            )
+            == []
+        )
+
+        await db_session.refresh(report)
+        await db_session.refresh(job)
+        assert report.status == "generating"
+        assert job.status == "running"
+
+    @pytest.mark.asyncio
+    async def test_a_pending_report_is_not_touched(self, db_session):
+        report = Report(report_name="queued", file_path="", status="pending")
+        db_session.add(report)
+        await db_session.commit()
+
+        assert (
+            await rt.reconcile_abandoned_report_generations(
+                db_session, now=datetime.now(timezone.utc)
+            )
+            == []
+        )
+
+        await db_session.refresh(report)
+        assert report.status == "pending"
+
+    @pytest.mark.asyncio
+    async def test_the_sweep_reconciles_it_without_waiting_for_retention(
+        self, db_session, monkeypatch
+    ):
+        monkeypatch.setattr(settings, "AUDIT_RETENTION_DAYS", 0)
+        monkeypatch.setattr(settings, "REPORT_RETENTION_DAYS", 365)
+        report, job = await _stuck_generation(db_session, minutes_ago=180)
+
+        await rt.run_retention_sweep(db_session, now=datetime.now(timezone.utc))
+
+        await db_session.refresh(report)
+        assert report.status == "failed"
+
+
+class TestScheduleOccurrenceLedger:
+    """``schedule_occurrences`` is a ledger with no retention of its own.
+
+    The scheduler re-examines ten minutes, and every entry it writes is keyed by
+    the connector and the occurrence minute, so a row older than that window can
+    never be consulted again. Nothing deleted them, which made the table grow
+    with every fired occurrence for the life of the installation.
+    """
+
+    async def _occurrence(self, db, *, created_days_ago: int):
+        from app.models.job import ScheduleOccurrence
+
+        key = f"{uuid.uuid4()}:2026-01-01T00:00:00+00:00"
+        db.add(
+            ScheduleOccurrence(
+                key=key, job_id=None, created_at=_old(created_days_ago)
+            )
+        )
+        await db.commit()
+        return key
+
+    @pytest.mark.asyncio
+    async def test_occurrences_past_the_window_are_pruned_and_fresh_ones_kept(
+        self, db_session
+    ):
+        from app.models.job import ScheduleOccurrence
+
+        stale = await self._occurrence(db_session, created_days_ago=40)
+        fresh = await self._occurrence(db_session, created_days_ago=1)
+
+        result = await rt.purge_schedule_occurrences(
+            db_session, now=datetime.now(timezone.utc), batch_size=100
+        )
+
+        assert result.deleted_rows == 1
+        remaining = set(
+            (await db_session.execute(select(ScheduleOccurrence.key))).scalars().all()
+        )
+        assert remaining == {fresh}
+        assert stale not in remaining
+
+    @pytest.mark.asyncio
+    async def test_the_sweep_reports_the_table_it_pruned(self, db_session, monkeypatch):
+        monkeypatch.setattr(settings, "AUDIT_RETENTION_DAYS", 0)
+        monkeypatch.setattr(settings, "REPORT_RETENTION_DAYS", 0)
+        await self._occurrence(db_session, created_days_ago=40)
+
+        results = await rt.run_retention_sweep(db_session, now=datetime.now(timezone.utc))
+
+        assert results["schedule_occurrences"].deleted_rows == 1

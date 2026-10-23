@@ -888,9 +888,37 @@ class TestAdminEndpoints:
         )
         resp = await client.get("/api/v1/connectors/modules", headers=auth_headers_viewer)
         assert resp.status_code == 200
-        phishing = resp.json()["modules"]["phishing"]
+        body = resp.json()
+        # The map is keyed by module id because modules are data; the envelope is
+        # the only key, and every entry carries the same nine, registry row or not.
+        assert set(body) == {"modules"}
+        phishing = body["modules"]["phishing"]
+        assert set(phishing) == {
+            "label",
+            "description",
+            "job_types",
+            "connectors",
+            "finding_kind",
+            "asset_types",
+            "storage",
+            "builtin",
+            "enabled",
+        }
         assert "phishing.lookalike" in phishing["job_types"]
         assert phishing["connectors"][0]["asset_types"] == ["domain"]
+        assert set(phishing["connectors"][0]) == {
+            "name",
+            "status",
+            "job_type",
+            "asset_types",
+            "config_schema",
+        }
+        # A connector whose type no registry row declares is named after its type,
+        # with an empty description: the metadata keys are present, never null.
+        assert isinstance(phishing["label"], str) and isinstance(
+            phishing["description"], str
+        )
+        assert phishing["connectors"][0]["status"] in {"enabled", "disabled"}
 
     @pytest.mark.asyncio
     async def test_patch_config_requires_admin(self, client, db_session, auth_headers_analyst):
@@ -1339,3 +1367,45 @@ class TestConnectorHealthBlockedReason:
         resp = await client.get("/api/v1/connectors/health", headers=auth_headers_admin)
         item = next(i for i in resp.json()["items"] if i["name"] == "hibp")
         assert item["blocked_reason"] is None
+
+@pytest.mark.asyncio
+async def test_the_health_answer_is_the_shape_the_client_declares(
+    client, db_session, auth_headers_admin
+):
+    """The page's payload is a declaration, not a composed dict.
+
+    Two things this asserts could be undone by a later "cleanup": the answer keeps
+    all nineteen keys for every role (the admin fields as nulls, which is why the
+    route does not exclude them), and `checked_at` is the worker's own text rather
+    than a parsed timestamp — a `datetime` field would have normalized the offset
+    the worker sent.
+    """
+    conn = await ConnectorService(db_session).register(
+        name="hibp", connector_type="breaches", default_job_type="breaches.hibp"
+    )
+    conn.provider = "hibp"
+    conn.readiness = {
+        "credentials_configured": True,
+        "credential_state": "valid",
+        "checked_at": "2026-10-23T05:00:00.123456+02:00",
+        "capabilities": ["email"],
+    }
+    await db_session.commit()
+
+    resp = await client.get("/api/v1/connectors/health", headers=auth_headers_admin)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert set(body) == {"items", "generated_at"}
+    # `generated_at` is a timestamp the server just took, so it is a full
+    # instant with a zone; the row's own heartbeat is registration time.
+    assert body["generated_at"].endswith("Z") or "+" in body["generated_at"]
+
+    item = next(i for i in body["items"] if i["name"] == "hibp")
+    assert len(item) == 19
+    assert item["status"] == "enabled"
+    assert item["health"] == "healthy"
+    assert item["credentials_configured"] is True
+    assert item["credential_state"] == "valid"
+    assert item["readiness"]["capabilities"] == ["email"]
+    # Byte-for-byte: the worker's offset survives, which a datetime field would not.
+    assert item["checked_at"] == "2026-10-23T05:00:00.123456+02:00"

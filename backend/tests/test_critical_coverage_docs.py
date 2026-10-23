@@ -4,9 +4,10 @@
 below their threshold. That promise was a second copy of the gate's map, and the
 release before this one shipped with the copies out of step — the page named a
 table the gate did not hold, and nothing could tell. The gate now prints the
-`--cov=` flags for the modules it checks (`--cov-args`), so the run and the gate
-cannot disagree; these tests keep the page on that same list, and keep the flag
-output resolvable.
+coverage flag the runs use (`--cov-args`), so the run and the gate cannot
+disagree; these tests keep the page on the gate's own list, keep that output a
+single flag over the package the gated modules live in, and keep a report that
+drops one of them a failure rather than a pass.
 
 Dated snapshots in the appendix are deliberately out of scope: they describe a
 tree, not the gate, and are meant to differ from today's rule.
@@ -15,6 +16,7 @@ tree, not the gate, and are meant to differ from today's rule.
 from __future__ import annotations
 
 import importlib.util
+import json
 import re
 import sys
 from pathlib import Path
@@ -72,12 +74,23 @@ def test_the_page_states_the_threshold_the_gate_enforces():
         )
 
 
-def test_the_gate_prints_a_cov_flag_for_every_module_it_checks(capsys):
+def test_the_gate_prints_the_package_flag_the_runs_use(capsys):
     assert _gate.main(["--cov-args"]) == 0
-    flags = capsys.readouterr().out.split()
-    assert len(flags) == len(_gate.THRESHOLDS)
-    assert all(flag.startswith("--cov=") for flag in flags)
-    # Dotted module names, which is what the coverage tool resolves by import;
-    # a file path here is the spelling that silently measured nothing.
-    assert all(not flag.endswith(".py") and "/" not in flag for flag in flags)
-    assert f"--cov={sorted(_gate.THRESHOLDS)[0][:-3].replace('/', '.')}" in flags
+    assert capsys.readouterr().out.split() == ["--cov=app"]
+
+
+def test_a_report_missing_a_gated_module_fails_the_gate(tmp_path, capsys):
+    """A package measurement cannot silently drop a module: absence is failure.
+
+    This is the failure the dotted per-module flags were introduced to prevent —
+    a report without the file reported as a missing measurement while the coverage
+    asked about was fine. The package flag makes that impossible by measuring
+    everything, and this test keeps the gate's own check honest for a report that
+    was produced some other way.
+    """
+    report = tmp_path / "coverage.json"
+    report.write_text(json.dumps({"files": {}}), encoding="utf-8")
+    assert _gate.main([str(report)]) == 1
+    output = capsys.readouterr().out
+    assert "critical coverage gate: FAILED" in output
+    assert "missing from coverage report" in output

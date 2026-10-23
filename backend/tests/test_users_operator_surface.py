@@ -227,6 +227,28 @@ class TestSessions:
             assert row["current"] is False
 
     @pytest.mark.asyncio
+    async def test_looking_at_another_accounts_sessions_is_recorded(
+        self, client, db_session, test_viewer, auth_headers_admin
+    ):
+        """`GET /users/{id}` records `users.view`; the session list is the same read.
+
+        Which devices an account can still be used through is the administrator
+        read most worth being able to explain afterwards — and it was the one read
+        of somebody else's account that left no row at all.
+        """
+        await _session(db_session, test_viewer)
+        response = await client.get(
+            f"/api/v1/users/{test_viewer.id}/sessions", headers=auth_headers_admin
+        )
+        assert response.status_code == 200, response.text
+
+        rows = await _audit_rows(db_session, "users.view")
+        assert len(rows) == 1
+        assert rows[0].details["target_user_id"] == str(test_viewer.id)
+        assert rows[0].details["view"] == "sessions"
+        assert rows[0].details["results"] == 1
+
+    @pytest.mark.asyncio
     async def test_revoking_all_signs_out_every_live_session_and_audits_once(
         self, client, db_session, test_viewer, auth_headers_admin
     ):
@@ -297,6 +319,37 @@ class TestBulk:
         assert len(rows) == 1, "one batch, one row"
         assert rows[0].details["changed"] == 2
         assert rows[0].details["operation"] == "deactivate"
+
+    @pytest.mark.asyncio
+    async def test_reactivating_a_selection_clears_the_stale_lockout(
+        self, client, db_session, auth_headers_admin
+    ):
+        """Turning an account back on must not leave the lockout set while it was off.
+
+        `PUT is_active=true` clears the counters and says why: reactivation must
+        not restore stale lock state. The batch is the same change, and it used to
+        answer "changed" while the account still could not sign in.
+        """
+        dormant = await _make_user(
+            db_session,
+            "dormant@example.com",
+            active=False,
+            locked_until=datetime.now(timezone.utc) + timedelta(minutes=10),
+            failed_login_attempts=6,
+        )
+
+        response = await client.post(
+            "/api/v1/users/bulk",
+            json={"operation": "activate", "user_ids": [str(dormant.id)]},
+            headers=auth_headers_admin,
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["changed"] == 1
+
+        await db_session.refresh(dormant)
+        assert dormant.is_active is True
+        assert dormant.locked_until is None
+        assert dormant.failed_login_attempts == 0
 
     @pytest.mark.asyncio
     async def test_the_caller_cannot_deactivate_themselves_in_a_batch(

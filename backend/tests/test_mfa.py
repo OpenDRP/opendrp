@@ -622,6 +622,122 @@ class TestRecoveryCodes:
         assert test_admin.mfa_locked_until is not None
 
 
+class TestSessionsThatPredateTheFactor:
+    """A refresh token minted before enrolment must not outlive the factor.
+
+    The project map claims MFA cannot be skipped by a token minted before
+    enrolment. An access token is short-lived, so the credential that matters is
+    the refresh token: it mints access tokens for its whole lifetime without ever
+    asking for a code, which would turn "the password leaked, so I turned on MFA"
+    into a change the holder of the old session can ignore. Enrolment therefore
+    ends every *other* session, in the same transaction as the factor itself.
+    """
+
+    @pytest.mark.anyio
+    async def test_enrolment_ends_a_session_that_predates_the_factor(self, test_admin):
+        from app.main import app
+        from httpx import ASGITransport, AsyncClient
+
+        async def _browser():
+            browser = AsyncClient(transport=ASGITransport(app=app), base_url="http://t")
+            login = await browser.post(
+                "/api/v1/auth/login",
+                json={"email": test_admin.email, "password": PASSWORD},
+            )
+            assert login.status_code == 200, login.text
+            return browser, login
+
+        holder, holder_login = await _browser()
+        stale_browser, stale_login = await _browser()
+        try:
+            headers = {"Authorization": f"Bearer {holder_login.json()['access_token']}"}
+            await _enrol(holder, headers)
+
+            stale_refresh = stale_login.cookies.get("opendrp_refresh")
+            assert stale_refresh
+            stale = await stale_browser.post(
+                "/api/v1/auth/refresh", json={"refresh_token": stale_refresh}
+            )
+            assert stale.status_code == 401, stale.text
+            assert "revoked" in stale.json()["detail"].lower()
+
+            # The browser that enrolled the factor keeps its session: it is the
+            # one the account holder is sitting in front of.
+            current = await holder.post(
+                "/api/v1/auth/refresh",
+                json={"refresh_token": holder_login.cookies.get("opendrp_refresh")},
+            )
+            assert current.status_code == 200, current.text
+        finally:
+            await holder.aclose()
+            await stale_browser.aclose()
+
+
+class TestFactorAttemptBudget:
+    """Every endpoint that checks a six-digit code spends the same budget.
+
+    Six digits is a small space; the lockout only bounds it if *every* code check
+    counts. The sign-in path does (`test_mfa_failure_budget_locks_even_missing_code`);
+    these pin the two endpoints that used to check the counter without ever
+    incrementing it.
+    """
+
+    @pytest.mark.anyio
+    async def test_wrong_codes_on_disable_lock_the_account(
+        self, client, auth_headers_admin, test_admin, db_session
+    ):
+        secret, _spent = await _enrol(client, auth_headers_admin)
+        for _ in range(5):
+            r = await client.post(
+                "/api/v1/auth/mfa/disable",
+                json={"password": PASSWORD, "code": _wrong_code(secret)},
+                headers=auth_headers_admin,
+            )
+            assert r.status_code == 401, r.text
+
+        await db_session.refresh(test_admin)
+        assert test_admin.mfa_locked_until is not None
+        assert test_admin.totp_enabled_at is not None, "guessing must not remove the factor"
+
+        # The correct next code is refused by the lock, not accepted because the
+        # password was right.
+        blocked = await client.post(
+            "/api/v1/auth/mfa/disable",
+            json={"password": PASSWORD, "code": _code_for(secret, 1)},
+            headers=auth_headers_admin,
+        )
+        assert blocked.status_code == 429, blocked.text
+
+    @pytest.mark.anyio
+    async def test_wrong_codes_on_recovery_code_rotation_lock_the_account(
+        self, client, auth_headers_admin, test_admin, db_session
+    ):
+        secret, _spent = await _enrol(client, auth_headers_admin)
+        await db_session.refresh(test_admin)
+        original_codes = list(test_admin.mfa_recovery_codes or [])
+        assert original_codes
+
+        for _ in range(5):
+            r = await client.post(
+                "/api/v1/auth/mfa/recovery-codes/rotate",
+                json={"password": PASSWORD, "code": _wrong_code(secret)},
+                headers=auth_headers_admin,
+            )
+            assert r.status_code == 401, r.text
+
+        await db_session.refresh(test_admin)
+        assert test_admin.mfa_locked_until is not None
+
+        blocked = await client.post(
+            "/api/v1/auth/mfa/recovery-codes/rotate",
+            json={"password": PASSWORD, "code": _code_for(secret, 1)},
+            headers=auth_headers_admin,
+        )
+        assert blocked.status_code == 429, blocked.text
+        await db_session.refresh(test_admin)
+        assert test_admin.mfa_recovery_codes == original_codes
+
+
 async def _enrol(client, headers) -> tuple[str, str]:
     """Complete enrolment; returns the secret and the code that was spent."""
     setup = await client.post(
@@ -661,3 +777,181 @@ async def _make_user_with_factor(db_session, email: str) -> User:
     await db_session.commit()
     await db_session.refresh(user)
     return user
+
+
+async def _last_audit(db_session, action: str) -> AuditLog | None:
+    rows = (
+        (
+            await db_session.execute(
+                select(AuditLog)
+                .where(AuditLog.action == action)
+                .order_by(AuditLog.timestamp.desc())
+                .limit(1)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return rows[0] if rows else None
+
+
+class TestEnrolmentEdges:
+    """The second step of an enrolment that a client can reach by mistake.
+
+    Every branch here answers a request that is well-formed and authenticated:
+    enrolling twice, confirming without a code, confirming with the wrong
+    password, and confirming after the pending secret is gone. The first three are
+    what a retrying client produces; the last is what a database restore or a
+    cleared column produces, and it must not look like a wrong code — the account
+    holder has done nothing wrong and needs to be told to start again.
+    """
+
+    @pytest.mark.anyio
+    async def test_enable_is_refused_once_a_factor_is_active(
+        self, client, auth_headers_admin
+    ):
+        await _enrol(client, auth_headers_admin)
+
+        again = await client.post(
+            "/api/v1/auth/mfa/enable",
+            json={"password": PASSWORD, "code": "123456"},
+            headers=auth_headers_admin,
+        )
+
+        assert again.status_code == 409
+        assert "already enabled" in again.json()["detail"]
+
+    @pytest.mark.anyio
+    async def test_enable_asks_for_the_code_before_checking_the_password(
+        self, client, auth_headers_admin
+    ):
+        """The field a client forgot is named, rather than reported as a bad login."""
+        setup = await client.post(
+            "/api/v1/auth/mfa/setup",
+            json={"password": PASSWORD},
+            headers=auth_headers_admin,
+        )
+        assert setup.status_code == 200
+
+        r = await client.post(
+            "/api/v1/auth/mfa/enable",
+            json={"password": PASSWORD},
+            headers=auth_headers_admin,
+        )
+
+        assert r.status_code == 400
+        assert "code" in r.json()["detail"].lower()
+
+    @pytest.mark.anyio
+    async def test_a_wrong_password_at_the_second_step_is_audited(
+        self, client, auth_headers_admin, db_session
+    ):
+        setup = await client.post(
+            "/api/v1/auth/mfa/setup",
+            json={"password": PASSWORD},
+            headers=auth_headers_admin,
+        )
+        secret = setup.json()["secret"]
+
+        r = await client.post(
+            "/api/v1/auth/mfa/enable",
+            json={"password": "NotThePassword1", "code": _code_for(secret)},
+            headers=auth_headers_admin,
+        )
+
+        assert r.status_code == 401
+        row = await _last_audit(db_session, "auth.mfa.setup_failed")
+        assert row is not None, "a failed second step must leave a trail"
+        assert row.details["reason"] == "invalid_password"
+
+    @pytest.mark.anyio
+    async def test_a_lost_pending_secret_says_to_start_the_enrolment_again(
+        self, client, test_admin, auth_headers_admin, db_session
+    ):
+        setup = await client.post(
+            "/api/v1/auth/mfa/setup",
+            json={"password": PASSWORD},
+            headers=auth_headers_admin,
+        )
+        assert setup.status_code == 200
+
+        await db_session.refresh(test_admin)
+        test_admin.totp_secret = None
+        await db_session.commit()
+
+        r = await client.post(
+            "/api/v1/auth/mfa/enable",
+            json={"password": PASSWORD, "code": "123456"},
+            headers=auth_headers_admin,
+        )
+
+        assert r.status_code == 409
+        assert "Start the enrolment" in r.json()["detail"]
+
+
+class TestRecoveryCodeRotationEdges:
+    """Rotation answers three different refusals, and one of them is a replay."""
+
+    @pytest.mark.anyio
+    async def test_rotation_requires_an_enabled_factor(
+        self, client, auth_headers_admin
+    ):
+        r = await client.post(
+            "/api/v1/auth/mfa/recovery-codes/rotate",
+            json={"password": PASSWORD, "code": "123456"},
+            headers=auth_headers_admin,
+        )
+
+        assert r.status_code == 409
+        assert "second factor" in r.json()["detail"].lower()
+
+    @pytest.mark.anyio
+    async def test_rotation_with_the_wrong_password_is_refused_and_audited(
+        self, client, auth_headers_admin, db_session
+    ):
+        await _enrol(client, auth_headers_admin)
+
+        r = await client.post(
+            "/api/v1/auth/mfa/recovery-codes/rotate",
+            json={"password": "Nope12345", "code": "000000"},
+            headers=auth_headers_admin,
+        )
+
+        assert r.status_code == 401
+        row = await _last_audit(db_session, "auth.mfa.failure")
+        assert row is not None
+        assert row.details["reason"] == "invalid_password_on_recovery_codes"
+
+    @pytest.mark.anyio
+    async def test_rotation_cannot_replay_the_code_that_enrolled_the_factor(
+        self, client, auth_headers_admin
+    ):
+        """The enrolment code is spent; rotating with it must not mint a new set."""
+        _secret, enrol_code = await _enrol(client, auth_headers_admin)
+
+        r = await client.post(
+            "/api/v1/auth/mfa/recovery-codes/rotate",
+            json={"password": PASSWORD, "code": enrol_code},
+            headers=auth_headers_admin,
+        )
+
+        assert r.status_code == 401
+        assert r.json()["detail"] == "Invalid MFA code"
+
+    @pytest.mark.anyio
+    async def test_rotation_replaces_every_code_and_records_the_change(
+        self, client, auth_headers_admin, db_session
+    ):
+        secret, _enrol_code = await _enrol(client, auth_headers_admin)
+
+        r = await client.post(
+            "/api/v1/auth/mfa/recovery-codes/rotate",
+            json={"password": PASSWORD, "code": _code_for(secret, 1)},
+            headers=auth_headers_admin,
+        )
+
+        assert r.status_code == 200
+        assert len(r.json()["codes"]) == 10
+        row = await _last_audit(db_session, "auth.mfa.recovery_codes.rotated")
+        assert row is not None
+        assert row.details["count"] == 10

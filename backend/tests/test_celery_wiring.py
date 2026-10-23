@@ -7,7 +7,9 @@ class TestCeleryWiring:
         assert "app.tasks.report_tasks" in includes
         assert "app.tasks.scheduler_tasks" in includes
         assert "app.tasks.retention_tasks" in includes
-        assert "app.tasks.phishing_tasks" not in includes
+        # Core-owned since AUD-033: the nightly rescore of stored scores is this
+        # platform's own sweep, not a provider's scan.
+        assert "app.tasks.phishing_tasks" in includes
         assert "app.tasks.hibp_tasks" not in includes
 
     def test_routes_exclude_legacy_provider_tasks(self):

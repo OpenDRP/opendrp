@@ -59,6 +59,117 @@ async def test_overview_returns_the_three_sections_the_page_used_to_fetch(
 
 
 @pytest.mark.asyncio
+async def test_the_overview_is_the_shape_the_client_declares(client, auth_headers_viewer):
+    """Every block the page reads is declared, and every key it reads is still sent.
+
+    The overview answered a dict of three payloads, so its field names were checked
+    by the compiler alone. This walks the levels the models now declare: the
+    envelope, the summary, the KPI with its captions, the platform block, a timeline
+    day (whose extra keys are the registry's series) and the channel envelope.
+    """
+    body = (
+        await client.get("/api/v1/dashboard/overview", headers=auth_headers_viewer)
+    ).json()
+
+    assert set(body) == {"summary", "connectors", "channels", "generated_at"}
+    summary = body["summary"]
+    assert set(summary) == {
+        "kpi",
+        "timeline",
+        "timeline_series",
+        "timeline_excluded",
+        "timeline_comparison",
+        "phishing_by_source",
+        "assets_by_criticality",
+        "platform",
+    }
+    assert set(summary["kpi"]) == {
+        "total_assets",
+        "total_phishing",
+        "total_breaches",
+        "active_threats_7d",
+        "new_breach_incidents_7d",
+        "breach",
+    }
+    breach = summary["kpi"]["breach"]
+    assert set(breach) == {
+        "window_days",
+        "total_findings",
+        "findings_by_exposure_kind",
+        "active_findings_7d",
+        "new_incidents_7d",
+        "catalogue_incidents",
+        "undated_incidents",
+        "catalogue_sources",
+        "catalogue_synced_at",
+        "captions",
+    }
+    # A number and its caption travel together: the page prints both.
+    assert set(breach["captions"]) == {
+        "total_findings",
+        "active_findings_7d",
+        "new_incidents_7d",
+        "findings_by_exposure_kind",
+    }
+
+    platform = summary["platform"]
+    assert set(platform) == {
+        "database",
+        "redis",
+        "audit_degraded",
+        "connectors",
+        "oldest_running_job_seconds",
+        "deliveries",
+    }
+    assert set(platform["connectors"]) == {
+        "enabled",
+        "disabled",
+        "silent",
+        "longest_silence",
+    }
+    assert set(platform["deliveries"]) == {"counts", "stuck", "waiting_recipients"}
+    assert set(platform["deliveries"]["counts"]) == {
+        "pending",
+        "delivering",
+        "sent",
+        "failed",
+        "cancelled",
+        "ambiguous",
+    }
+
+    # A day carries `date` plus one count per registry series, and nothing else: the
+    # keys are data, which is why the row model allows extras instead of naming them.
+    series_keys = {item["key"] for item in summary["timeline_series"]}
+    assert len(summary["timeline"]) == 30
+    assert set(summary["timeline"][0]) == {"date", *series_keys}
+
+    assert set(body["channels"]) == {"items", "delivery_queue", "generated_at"}
+    assert set(body["channels"]["delivery_queue"]) == {"waiting_recipients"}
+    channel = body["channels"]["items"][0]
+    assert set(channel) == {
+        "channel",
+        "label",
+        "enabled",
+        "configured",
+        "health",
+        "message",
+        "latency_ms",
+        "probe_state",
+        "checked_at",
+        "from_cache",
+        "delivery",
+    }
+    assert set(channel["delivery"]) == {
+        "counts",
+        "oldest_unresolved_at",
+        "oldest_unresolved_age_seconds",
+        "retrying",
+        "stuck",
+        "degraded_reason",
+    }
+
+
+@pytest.mark.asyncio
 async def test_overview_and_the_old_endpoints_agree_on_every_section(
     client, auth_headers_viewer, db_session
 ):

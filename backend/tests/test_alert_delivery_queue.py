@@ -230,3 +230,114 @@ async def test_max_attempts_marks_delivery_failed(db_session, alerts_configured)
     stored = await db_session.get(AlertDelivery, row.id)
     assert stored.status == AlertDeliveryStatus.failed
     assert stored.next_attempt_at is None
+
+
+@pytest.mark.asyncio
+async def test_the_queue_answer_is_the_shape_the_client_declares(
+    client, db_session, auth_headers_admin
+):
+    """The queue page's payload is a declaration, not a composed dict.
+
+    The counters are keyed by the statuses the table holds, and a row with no batch,
+    job, error or next attempt still answers all ten keys: the client types those
+    nullable, and a key that vanished would be a different answer from the one the
+    page was written against. `batch_id` is nullable here although the client's type
+    says `string` — the column says so, and one such row must not fail the listing.
+    """
+    now = datetime.now(timezone.utc)
+    db_session.add_all(
+        [
+            AlertDelivery(
+                threat_type="phishing",
+                channel="telegram",
+                payload={"phishing_domain": "evil.example"},
+                status=AlertDeliveryStatus.pending,
+                batch_id="batch-1",
+                parts=[{"part": 1}, {"part": 2}],
+                acknowledged_parts=1,
+                attempts=2,
+                next_attempt_at=now,
+            ),
+            AlertDelivery(
+                threat_type="phishing",
+                channel="email",
+                payload={},
+                status=AlertDeliveryStatus.failed,
+                last_error="smtp 421",
+            ),
+            AlertDelivery(
+                threat_type="breach",
+                channel="email",
+                payload={},
+                status=AlertDeliveryStatus.sent,
+            ),
+        ]
+    )
+    await db_session.commit()
+
+    response = await client.get("/api/v1/alerts/queue", headers=auth_headers_admin)
+    assert response.status_code == 200, response.text
+    body = response.json()
+
+    assert set(body) == {"counts", "items"}
+    # One counter per status present, and only those: the map is data.
+    assert body["counts"] == {
+        AlertDeliveryStatus.pending: 1,
+        AlertDeliveryStatus.failed: 1,
+        AlertDeliveryStatus.sent: 1,
+    }
+    assert len(body["items"]) == 3
+    for item in body["items"]:
+        assert set(item) == {
+            "id",
+            "batch_id",
+            "job_id",
+            "channel",
+            "status",
+            "attempts",
+            "acknowledged_parts",
+            "parts",
+            "last_error",
+            "next_attempt_at",
+        }
+
+    by_status = {item["status"]: item for item in body["items"]}
+    pending = by_status[AlertDeliveryStatus.pending]
+    assert pending["batch_id"] == "batch-1"
+    assert pending["parts"] == 2 and pending["acknowledged_parts"] == 1
+    assert pending["attempts"] == 2
+    assert pending["next_attempt_at"].startswith(now.strftime("%Y-%m-%dT%H:%M"))
+    # A resolved row has nothing to retry and no batch: the keys are present as nulls.
+    sent_row = by_status[AlertDeliveryStatus.sent]
+    assert sent_row["batch_id"] is None
+    assert sent_row["job_id"] is None
+    assert sent_row["last_error"] is None
+    assert sent_row["next_attempt_at"] is None
+
+
+@pytest.mark.asyncio
+async def test_the_queue_listing_stops_at_fifty_while_the_counters_do_not(
+    client, db_session, auth_headers_admin
+):
+    """The page shows the fifty newest rows; the counters describe the whole queue.
+
+    Two numbers over two different populations, and the difference is the point: an
+    operator must be able to see that the queue is longer than the page.
+    """
+    db_session.add_all(
+        [
+            AlertDelivery(
+                threat_type="phishing",
+                channel="email",
+                payload={},
+                status=AlertDeliveryStatus.pending,
+            )
+            for _ in range(52)
+        ]
+    )
+    await db_session.commit()
+
+    body = (await client.get("/api/v1/alerts/queue", headers=auth_headers_admin)).json()
+
+    assert len(body["items"]) == 50
+    assert body["counts"][AlertDeliveryStatus.pending] == 52

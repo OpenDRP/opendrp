@@ -24,7 +24,12 @@ import httpx
 import pytest
 
 from app.core.exceptions import BadRequestException
-from app.services.alert_service import AlertService
+from app.services.alert_service import (
+    AlertDeliveryAmbiguousError,
+    AlertDeliveryPermanentError,
+    AlertDeliveryTransientError,
+    AlertService,
+)
 
 
 def _settings(**overrides) -> SimpleNamespace:
@@ -551,3 +556,219 @@ class TestOperatorMessage:
         # No plain body: the subject is the fallback, and an operator reading the
         # Telegram channel must still learn what happened.
         assert "broken" in text
+
+
+class _FailingSmtp:
+    """An SMTP client that fails where the queue's retry decision is made."""
+
+    error: Exception | None = None
+    phase = "send"
+
+    def __init__(self, *_args, **_kwargs) -> None:
+        pass
+
+    def __enter__(self) -> "_FailingSmtp":
+        return self
+
+    def __exit__(self, *_exc) -> bool:
+        return False
+
+    def ehlo(self) -> None:
+        pass
+
+    def starttls(self, context=None) -> None:
+        pass
+
+    def login(self, _user, _password) -> None:
+        if _FailingSmtp.phase == "login":
+            raise _FailingSmtp.error
+
+    def send_message(self, _message) -> None:
+        if _FailingSmtp.phase == "send":
+            raise _FailingSmtp.error
+
+
+@pytest.fixture
+def failing_smtp(monkeypatch):
+    monkeypatch.setattr(smtplib, "SMTP", _FailingSmtp)
+    monkeypatch.setattr(smtplib, "SMTP_SSL", _FailingSmtp)
+    # The destination check is a separate gate with its own tests; this file is
+    # about how a failure the transport already reached is classified.
+    monkeypatch.setattr(
+        "app.services.alert_service.ensure_allowed",
+        lambda host, port=None: ("203.0.113.5",),
+    )
+    _FailingSmtp.phase = "send"
+    _FailingSmtp.error = None
+    return _FailingSmtp
+
+
+async def _send(service, monkeypatch, **overrides):
+    monkeypatch.setattr(
+        service, "_get_settings", AsyncMock(return_value=_settings(**overrides))
+    )
+    return await service._send_email_smtp(
+        to="a@b.example", subject="s", html_body="<p>x</p>"
+    )
+
+
+class TestSmtpFailureClassification:
+    """Permanent, transient and ambiguous are different rows in the queue."""
+
+    @pytest.mark.asyncio
+    async def test_a_rejected_login_is_permanent(self, service, failing_smtp, monkeypatch):
+        failing_smtp.phase = "login"
+        failing_smtp.error = smtplib.SMTPAuthenticationError(535, b"bad credentials")
+
+        with pytest.raises(AlertDeliveryPermanentError, match="smtp authentication failed"):
+            await _send(service, monkeypatch, smtp_user="u", smtp_password_decrypted="p")
+
+    @pytest.mark.asyncio
+    async def test_a_rejected_recipient_or_sender_is_permanent(
+        self, service, failing_smtp, monkeypatch
+    ):
+        failing_smtp.error = smtplib.SMTPRecipientsRefused({})
+
+        with pytest.raises(
+            AlertDeliveryPermanentError, match="smtp recipient or sender rejected"
+        ):
+            await _send(service, monkeypatch)
+
+    @pytest.mark.asyncio
+    async def test_a_5xx_answer_is_permanent_and_a_4xx_answer_is_retried(
+        self, service, failing_smtp, monkeypatch
+    ):
+        failing_smtp.error = smtplib.SMTPResponseException(550, b"mailbox unavailable")
+        with pytest.raises(AlertDeliveryPermanentError, match="SMTP 550"):
+            await _send(service, monkeypatch)
+
+        failing_smtp.error = smtplib.SMTPResponseException(421, b"try again later")
+        with pytest.raises(AlertDeliveryTransientError, match="SMTP 421"):
+            await _send(service, monkeypatch)
+
+    @pytest.mark.asyncio
+    async def test_a_lost_connection_is_ambiguous_not_retried(self, service, failing_smtp, monkeypatch):
+        failing_smtp.error = smtplib.SMTPServerDisconnected("connection reset")
+        with pytest.raises(AlertDeliveryAmbiguousError, match="smtp SMTPServerDisconnected"):
+            await _send(service, monkeypatch)
+
+        failing_smtp.error = OSError("network down")
+        with pytest.raises(AlertDeliveryAmbiguousError, match="smtp OSError"):
+            await _send(service, monkeypatch)
+
+    @pytest.mark.asyncio
+    async def test_an_unknown_security_mode_is_refused(self, service, failing_smtp, monkeypatch):
+        with pytest.raises(AlertDeliveryPermanentError, match="smtp security mode is invalid"):
+            await _send(service, monkeypatch, smtp_security_mode="opportunistic")
+
+    @pytest.mark.asyncio
+    async def test_plain_mode_refuses_credentials(self, service, failing_smtp, monkeypatch):
+        with pytest.raises(AlertDeliveryPermanentError, match="SMTP credentials require TLS"):
+            await _send(
+                service,
+                monkeypatch,
+                smtp_security_mode="plain",
+                smtp_user="u",
+                smtp_password_decrypted="p",
+            )
+
+
+class _TelegramResponse:
+    """A Telegram answer with the header and body the retry hint lives in."""
+
+    def __init__(self, status_code: int, body=None, headers=None, text: str = "") -> None:
+        self.status_code = status_code
+        self._body = body
+        self.headers = headers or {}
+        self.text = text
+
+    def json(self):
+        if self._body is None:
+            raise ValueError("no json body")
+        return self._body
+
+
+class _PostingTelegramClient:
+    def __init__(self, response: _TelegramResponse) -> None:
+        self.response = response
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_exc) -> bool:
+        return False
+
+    async def post(self, _url, json=None):
+        return self.response
+
+
+class TestTelegramFailureClassification:
+    @pytest.mark.asyncio
+    async def test_a_429_carries_the_provider_retry_hint(self, service, monkeypatch):
+        response = _TelegramResponse(
+            429, {"parameters": {"retry_after": 45}}, headers={"Retry-After": "30"}
+        )
+        monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: _PostingTelegramClient(response))
+        monkeypatch.setattr(
+            service,
+            "_get_settings",
+            AsyncMock(return_value=_settings(telegram_bot_token_decrypted="123:abc")),
+        )
+
+        with pytest.raises(AlertDeliveryTransientError) as raised:
+            await service._send_telegram("hi", chat_id="-100")
+
+        # The larger of the header and the body wins.
+        assert raised.value.retry_after == 45
+        assert "retry_after=45" in str(raised.value)
+
+    @pytest.mark.asyncio
+    async def test_a_429_without_a_usable_hint_is_still_retried(self, service, monkeypatch):
+        response = _TelegramResponse(429, None, headers={"Retry-After": "soon"})
+        monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: _PostingTelegramClient(response))
+        monkeypatch.setattr(
+            service,
+            "_get_settings",
+            AsyncMock(return_value=_settings(telegram_bot_token_decrypted="123:abc")),
+        )
+
+        with pytest.raises(AlertDeliveryTransientError) as raised:
+            await service._send_telegram("hi", chat_id="-100")
+
+        assert raised.value.retry_after is None
+        assert "TG 429" in str(raised.value)
+
+    @pytest.mark.asyncio
+    async def test_a_rejected_chat_reports_the_provider_reason(self, service, monkeypatch):
+        response = _TelegramResponse(400, text='{"description": "chat not found"}')
+        monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: _PostingTelegramClient(response))
+        monkeypatch.setattr(
+            service,
+            "_get_settings",
+            AsyncMock(return_value=_settings(telegram_bot_token_decrypted="123:abc")),
+        )
+
+        with pytest.raises(AlertDeliveryPermanentError, match="telegram HTTP 400"):
+            await service._send_telegram("hi", chat_id="-100")
+
+    @pytest.mark.asyncio
+    async def test_an_unusable_token_is_refused_before_any_request(self, service, monkeypatch):
+        def _never(**kwargs):
+            raise AssertionError("a refused token must not open a connection")
+
+        monkeypatch.setattr(httpx, "AsyncClient", _never)
+        monkeypatch.setattr(
+            service,
+            "_get_settings",
+            AsyncMock(
+                return_value=_settings(
+                    telegram_bot_token_decrypted="123456789:@evil.example/x"
+                )
+            ),
+        )
+
+        assert await service._send_telegram("hi", chat_id="-100") is False
+        assert service._audit_alert.await_args.kwargs["action"] == "outbound.blocked"
+        assert service._audit_alert.await_args.kwargs["details"]["reason"] == (
+            "invalid_telegram_token"
+        )

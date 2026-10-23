@@ -146,6 +146,13 @@ from app.core import database as _database_module  # noqa: E402
 
 _enable_sqlite_foreign_keys(_database_module.engine)
 
+# Without real transactions, a `begin_nested()` that is a session's first
+# statement commits on RELEASE (AUD-042): the suite would then assert rollback
+# semantics that SQLite does not have, and would pass a mutation that was never
+# rolled back. The application engine gets this at import; the suite's own engine
+# needs it registered here.
+_database_module.install_sqlite_transaction_control(_test_engine)
+
 
 _TestSessionLocal = async_sessionmaker(
     _test_engine, class_=AsyncSession, expire_on_commit=False, autoflush=False

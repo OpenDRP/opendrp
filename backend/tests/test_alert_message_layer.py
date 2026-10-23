@@ -7,7 +7,8 @@ still resolve from `alert_service`, which is what every caller in the delivery
 path still uses.
 """
 
-from app.services.alert_content import fact_text
+from app.core.config import settings
+from app.services.alert_content import fact_text, telegram_parts
 from app.services.alert_message import (
     BREAKDOWN_CHARS,
     MAX_FIELD_CHARS,
@@ -19,6 +20,7 @@ from app.services.alert_message import (
     counted,
     declared_column,
     digest_heading,
+    finding_path,
     highest_severity,
     plain_text,
     plural,
@@ -110,12 +112,38 @@ def test_a_batch_subject_names_a_class_only_when_it_agrees():
 
 
 def test_digest_headings_name_the_module_and_never_an_alert():
-    label, subject = digest_heading(3)
+    label, subject, noun, tail = digest_heading(3)
     assert label == "Phishing digest"
     assert "3 candidates below the alert threshold" in subject
-    label, subject = digest_heading(1, "breach")
+    assert (noun, tail) == ("candidate", "below the alert threshold")
+    label, subject, noun, tail = digest_heading(1, "breach")
     assert label == "Breach digest"
     assert "1 new incident" in subject
+    assert (noun, tail) == ("new incident", "from one scan")
+
+
+def test_a_digest_counts_candidates_in_every_channel():
+    """The subject's wording is the body's wording: a summary is not a burst."""
+    notification = _notification(
+        label="Phishing digest",
+        subject="[OpenDRP Alert] Phishing digest: 2 candidates below the alert threshold",
+        counted_noun="candidate",
+        counted_tail="below the alert threshold",
+    )
+    rendered = [
+        plain_text(notification),
+        *telegram_parts(notification, settings.ALERT_MAX_TELEGRAM_MESSAGE_LENGTH),
+    ]
+    for text in rendered:
+        assert "2 candidates below the alert threshold" in text
+        assert "new findings" not in text
+    # A single candidate is not "1 candidates": the noun is pluralised where the
+    # wording lives, not by the channel.
+    singular = _notification(
+        total=1, counted_noun="candidate", counted_tail="below the alert threshold"
+    )
+    assert singular.counted() == "1 candidate below the alert threshold"
+    assert "1 candidate below the alert threshold" in plain_text(singular)
 
 
 def test_notification_columns_are_the_union_of_every_rows_facts():
@@ -126,8 +154,30 @@ def test_notification_columns_are_the_union_of_every_rows_facts():
 
 def test_plain_text_carries_the_facts_without_markup():
     text = plain_text(_notification(included=1))
-    assert "Findings: 2 (showing the first 1)" in text
+    assert "2 new findings (showing the first 1)" in text
     assert "Source: dns × 2" in text
     assert f"Domain={fact_text('evil.example')}" in text
     assert "Open in OpenDRP: https://drp.example/phishing" in text
     assert BREAKDOWN_CHARS == 80
+
+
+def test_a_fact_that_is_empty_does_not_read_as_one_nobody_reported():
+    """AUD-015: a blank value and a missing one are different answers.
+
+    The stored-fact readers pass `clip()`ed strings, so a registrar the registry
+    answered with nothing is `""` and a lookup that never ran is `None`. Printed
+    as a blank, the first read as the second.
+    """
+    assert fact_text(None) == "N/A"
+    assert fact_text("") == "— (empty)"
+    assert fact_text("   ") == "— (empty)"
+    assert fact_text("Registrar Inc") == "Registrar Inc"
+    assert fact_text(0) == "0"
+    assert fact_text({"a": 1}) == '{"a": 1}'
+
+
+def test_a_module_finding_links_to_its_own_page_or_the_dashboard():
+    assert finding_path("phishing") == "/phishing"
+    assert finding_path("module:code leak") == "/modules/code%20leak"
+    assert finding_path("module:") == "/dashboard"
+    assert finding_path("something-else") == "/dashboard"

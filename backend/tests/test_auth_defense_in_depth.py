@@ -61,23 +61,29 @@ async def _last_refresh_failure_reason(db, reason: str) -> AuditLog | None:
 
 
 @pytest.mark.asyncio
-async def test_login_does_not_return_tokens_when_session_persistence_fails(
-    db_session, test_admin, monkeypatch
+async def test_issue_session_stages_the_family_for_its_caller_to_commit(
+    db_session, test_admin
 ):
+    """The session becomes durable only when the caller commits it.
+
+    Sign-in commits the family together with ``auth.login.success``, so a trail
+    the platform cannot write means no session either; a commit inside this
+    helper would make that impossible (pinned in ``test_auth_audit_atomicity``).
+    """
     from datetime import datetime, timezone
-    from fastapi import HTTPException, Response
+    from fastapi import Response
     from app.api.v1.routers.auth import _issue_session
 
-    async def fail_commit():
-        raise RuntimeError("database unavailable")
-
-    monkeypatch.setattr(db_session, "commit", fail_commit)
     response = Response()
-    with pytest.raises(HTTPException) as refused:
-        await _issue_session(response, test_admin, db_session, datetime.now(timezone.utc))
+    session, family_id = await _issue_session(
+        response, test_admin, db_session, datetime.now(timezone.utc)
+    )
 
-    assert refused.value.status_code == 503
-    assert "set-cookie" not in response.headers
+    assert session.access_token and family_id
+    assert response.headers.get("set-cookie")
+    # Still pending: rolling back leaves nothing for the next sign-in to collide
+    # with, which is what an audit failure ends in.
+    await db_session.rollback()
     assert not (await db_session.execute(select(RefreshTokenFamily))).scalars().all()
 
 

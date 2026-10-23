@@ -249,7 +249,8 @@ class TestTheThreeCallersAgree:
         assert orphan.id not in resolved
 
         deleted = await AssetService(db_session).clean_orphan_breach_findings()
-        assert deleted == 1
+        assert deleted.deleted == 1
+        assert deleted.sample == [str(orphan.id)]
         remaining = list((await db_session.execute(select(Breach.id))).scalars())
         assert remaining == [linked.id]
 
@@ -268,7 +269,7 @@ class TestTheThreeCallersAgree:
         assert resolved[mailbox.id] == ("example.com", "domain")
 
         # Cleanup agrees: the row is linked, so it must survive.
-        assert await AssetService(db_session).clean_orphan_breach_findings() == 0
+        assert (await AssetService(db_session).clean_orphan_breach_findings()).deleted == 0
         assert list((await db_session.execute(select(Breach.id))).scalars()) == [mailbox.id]
 
     @pytest.mark.asyncio
@@ -293,6 +294,31 @@ class TestTheThreeCallersAgree:
         remaining = list((await db_session.execute(select(Breach.id))).scalars())
         assert remaining == [untouched.id]
         assert list((await db_session.execute(select(PhishingDomain.id))).scalars()) == []
+
+    @pytest.mark.asyncio
+    async def test_deleting_a_keyword_does_not_delete_a_domain_assets_findings(self, db_session):
+        """A cascade removes what depends on *this* asset, not on a same-named one.
+
+        A ``keyword_domain`` asset and a ``domain`` asset may share a value, since the
+        uniqueness rule is per type. The findings about the domain asset are explained
+        by it, so deleting the keyword must leave them in place. The cascade reads the
+        value with the untyped key rule, and removes them.
+        """
+        from sqlalchemy import select
+
+        from app.models.phishing import PhishingDomain
+        from app.services.asset_service import AssetService
+
+        keyword = await self._asset(db_session, asset_type="keyword_domain", value="example.com")
+        await self._asset(db_session, asset_type="domain", value="example.com")
+        owned_by_domain = await self._phishing(db_session, "example.com")
+
+        phishing_deleted, _, _ = await AssetService(db_session).delete_asset(
+            keyword, cascade_findings=True
+        )
+        assert phishing_deleted == 0
+        remaining = list((await db_session.execute(select(PhishingDomain.id))).scalars())
+        assert remaining == [owned_by_domain.id]
 
     @pytest.mark.asyncio
     async def test_deleting_a_mailbox_does_not_delete_its_domain(self, db_session):
@@ -327,7 +353,7 @@ class TestTheThreeCallersAgree:
             "paused.example",
             "domain",
         )
-        assert await AssetService(db_session).clean_orphan_breach_findings() == 0
+        assert (await AssetService(db_session).clean_orphan_breach_findings()).deleted == 0
 
     @pytest.mark.asyncio
     async def test_a_unicode_finding_is_not_orphaned_by_its_punycode_asset(self, db_session, monkeypatch):
@@ -341,7 +367,7 @@ class TestTheThreeCallersAgree:
         unicode_row = await self._breach(db_session, matched_domain="münchen.de")
         await self._breach(db_session, matched_domain="nowhere.test")
 
-        assert await AssetService(db_session).clean_orphan_breach_findings() == 1
+        assert (await AssetService(db_session).clean_orphan_breach_findings()).deleted == 1
         remaining = list((await db_session.execute(select(Breach.id))).scalars())
         assert remaining == [unicode_row.id]
 
@@ -363,7 +389,7 @@ class TestTheThreeCallersAgree:
         kept = await self._breach(db_session, matched_email="Analyst@münchen.de")
         orphan = await self._breach(db_session, matched_email="analyst@nowhere.test")
 
-        assert await AssetService(db_session).clean_orphan_breach_findings() == 1
+        assert (await AssetService(db_session).clean_orphan_breach_findings()).deleted == 1
         remaining = list((await db_session.execute(select(Breach.id))).scalars())
         assert remaining == [kept.id]
         assert orphan.id not in remaining
@@ -381,7 +407,10 @@ class TestTheThreeCallersAgree:
         for _ in range(5):
             await self._phishing(db_session, "orphan.test")
 
-        assert await AssetService(db_session).clean_orphan_phishing_findings() == 5
+        cleanup = await AssetService(db_session).clean_orphan_phishing_findings()
+        assert cleanup.deleted == 5
+        # The sample is bounded, and this cleanup fit inside it.
+        assert len(cleanup.sample) == 5
         assert len(list((await db_session.execute(select(PhishingDomain.id))).scalars())) == 1
 
     @pytest.mark.asyncio

@@ -256,6 +256,44 @@ class TestPatchBreach:
         assert details["changed_fields"] == ["status"]
 
     @pytest.mark.asyncio
+    async def test_the_triage_row_says_what_the_status_became(
+        self, client, db_session, auth_headers_analyst
+    ):
+        """A row that names the field but not its value does not explain the change.
+
+        The status is mutable, so the current value cannot reconstruct what a
+        previous operator did; without the new value (and the old one) the trail
+        answers "who touched this" and not "what did they change it to".
+        """
+        breach = await _mk_breach(db_session)
+        r = await client.patch(
+            f"/api/v1/breaches/{breach.id}",
+            json={"status": "resolved"},
+            headers=auth_headers_analyst,
+        )
+        assert r.status_code == 200, r.text
+
+        await db_session.commit()
+        rows = await _audit_actions(db_session, "breach.update")
+        assert len(rows) == 1
+        details = _details(rows[0]["details"])
+        assert details["previous_status"] == "active"
+        assert details["status"] == "resolved"
+
+        # Setting the same status again is not a change, and the row says so
+        # instead of claiming one.
+        second = await client.patch(
+            f"/api/v1/breaches/{breach.id}",
+            json={"status": "resolved"},
+            headers=auth_headers_analyst,
+        )
+        assert second.status_code == 200, second.text
+        await db_session.commit()
+        rows = await _audit_actions(db_session, "breach.update")
+        latest = _details(rows[-1]["details"])
+        assert latest["changed_fields"] == []
+
+    @pytest.mark.asyncio
     async def test_patch_missing_breach_404(self, client, auth_headers_analyst):
         r = await client.patch(
             f"/api/v1/breaches/{uuid.uuid4()}",

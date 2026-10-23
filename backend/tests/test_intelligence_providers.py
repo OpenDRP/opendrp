@@ -686,3 +686,25 @@ def test_a_domain_without_mail_is_an_answer_and_a_broken_record_is_not():
     }
     assert providers.mail_facts([{"mx": {"a": 1}}], source)["mail_capable"] is False
     assert source.record_error_codes == ["invalid_mail_record"]
+
+
+def test_a_title_the_core_would_refuse_is_cleaned_before_it_leaves_the_worker():
+    # The core validates a whole batch before it stores any of it, and it refuses a
+    # control character in finding metadata. A provider title holding a NUL, a carriage
+    # return or a line feed therefore failed the batch and every batch after it. The
+    # worker has to deliver a value the core accepts.
+    from app.schemas.connector import sanitize_attributes
+
+    record = providers.endpoint(
+        {
+            "hostname": "login.example.com",
+            "port": 443,
+            "protocol": "https",
+            "title": "Sign in\x00 page\r\nnow",
+            "last_updated": "2026-10-01T00:00:00Z",
+        }
+    )
+    assert record["title"] == "Sign in page now"
+    assert sanitize_attributes({"title": record["title"]}, strict=True) == {
+        "title": "Sign in page now"
+    }
