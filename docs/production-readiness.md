@@ -496,19 +496,26 @@ is about what the toolchain was allowed to hide rather than about the bug itself
     itself — the link, the gap detection, the retention watermark, the refusal of
     an unsigned row and key rotation — is covered by `tests/test_audit_chain.py`
     on SQLite.
-17. **The backend suite is not green outside a full stack, and the count is
-    recorded rather than an expectation of zero.** In the 2026-10-08 run, 18 of
-    1806 tests failed: six needed the Compose network (a real Redis, a connector
-    container), ten were caused by edits uncommitted at the time, and two are
-    `backend/tests/test_no_legacy_surface.py` — its
+17. **The suite is green in one process, and the tests a green run skips are the
+    ones this host cannot host.** The whole suite ran once, in a single process, on
+    2026-10-23: 3,539 passed, 16 skipped and none failed in 1:29:03. The skips are
+    not failures hidden behind a filter — each prints its reason under `-rs` — and
+    they are the properties SQLite cannot express (row locking in three suites, the
+    three PostgreSQL-only suites, the Alembic round trip) or services this host does
+    not run (a Redis broker for four Celery tests, `aiodns` for one connector test).
+    CI's `backend` and `production-integration` jobs execute them for real, and
+    limitation 2 is why the local run is SQLite at all. So "green here" means
+    "nothing failed", not "every test ran". Earlier runs were red: 18 of 1,806 tests
+    failed on 2026-10-08, for causes that no longer exist — six needed the Compose
+    network (a real Redis, a connector container), ten came from edits uncommitted
+    that day, and two were `backend/tests/test_no_legacy_surface.py`, whose
     `test_there_is_exactly_one_migration_and_it_is_the_baseline` asserted that
-    `backend/alembic/versions/` held exactly `0001_initial_schema.py` while the
-    tree held sixteen revisions, and its vocabulary half reported hits in three
-    migration files. That disagreement is closed: the history is now that one
-    baseline revision, so the gate and the tree say the same thing and those two
-    failures are gone from the list a later run compares against. [The appendix](#appendix-measurements-at-a-point-in-time)
-    lists the run with its evidence, so a later run can be compared against a known
-    list instead of rediscovered.
+    `backend/alembic/versions/` held exactly `0001_initial_schema.py` while the tree
+    held sixteen revisions; the history is now that one baseline revision, so the
+    gate and the tree agree. [The appendix](#appendix-measurements-at-a-point-in-time)
+    keeps that run with its failure list, so a later run is compared against a known
+    list instead of rediscovered, and it names the 2026-10-23 run the count above
+    comes from.
 18. **User search is a substring scan, and the threshold for an index is
     stated rather than assumed.** `GET /api/v1/users?search=` filters on
     `email ILIKE '%…%' OR full_name ILIKE '%…%'`, and no trigram index exists:
@@ -916,6 +923,25 @@ than smoothed over.
 
 Like the blocks above, nothing enforces these numbers: they are a dated reading of
 one tree, and the gates are what keep the properties true.
+
+### 2026-10-23 (the tree plans 006-038 close on)
+
+Measured on a host virtual environment on Windows with `COVERAGE_CORE=sysmon`, no
+Redis service and no PostgreSQL — the same shape as the 2026-10-15 block above, and
+in **one process** rather than four shards, because the single-process run is the
+claim limitation 17 makes. The run that follows plan 014 is the one recorded here.
+
+| Area | Value |
+|---|---|
+| Backend suite (full, one pass, `tests/`, `-q`) | **3,539 passed, 16 skipped, none failed** in 1:29:03 |
+| What the 16 skips are | the properties SQLite cannot host — row locks in three suites, the three PostgreSQL-only suites and the Alembic round trip — plus four Celery tests that need a live broker and one connector test that resolves DNS through `aiodns`. Each prints its reason under `-rs`; CI's `backend` and `production-integration` jobs run them |
+| The contract gate (`backend/scripts/check_api_types.py`) | OK — 41 interfaces compared with the models their routes send, 109 request calls named against the route table, `UNMODELLED` empty |
+| The four gates the audit and the contract program added | `test_audit_register_gate` green with no register row `open`, `duplicate` or undispositioned; `test_skip_inventory_gate` green against the page's inventory; `test_audit_map_gate` green — every production file belongs to exactly one audit step; `test_connector_test_isolation` green, so a module that needs the SDK imports it rather than inheriting it |
+| Frontend suite and typecheck | the client tests the contract program touched pass and `tsc -b` is clean; the full SPA suite is run in CI, not in every plan |
+| Not measured here | the PostgreSQL-only suites and the migration round trip, `docker compose up`, both E2E scripts and the `mypy` ratchet: each needs the Compose stack or the tooling container |
+
+Like the blocks above, these are a dated reading of one tree; the gates keep the
+properties true.
 
 ### The `alembic check` divergence measured on 2026-10-08
 

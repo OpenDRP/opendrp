@@ -65,7 +65,7 @@ provider quirk or a defect, and the difference is decided by the shared client i
 | `frontend/src` | 73 | 26,229 | SPA: pages, lib, components (LOC includes 53 test files) |
 | `scripts/` | 19 | 5,607 | repo gates, E2E, backup/restore, release checks |
 | `docs/` | 76 | 28,999 | operator pages, plans, measured status |
-| `backend/tests` | 217 | 72,452 | the suite: 3,363 passing in the 2026-10-21 full run, which predates the nine tests plans 008 and 009 added |
+| `backend/tests` | 217 | 72,452 | the suite: **3,539 passing, 16 skipped** in the 2026-10-23 single-process run, and the 217 files of the 2026-10-21 measurement |
 
 The largest single modules are where a defect travels furthest:
 `routers/auth.py` (1,260), `services/ingestion_service.py` (1,214),

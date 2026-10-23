@@ -290,8 +290,13 @@ that takes a day, and nothing in pass C was allowed to displace anything in pass
   restore walk and both E2E scripts were read and reasoned about rather than run.
   The restore's two halves are covered by `backend/tests/test_backup_scripts.py`
   under stubbed clients, which is not the same as a restore of a real backup.
-- The full backend suite was run sharded in four processes, never once in one run
-  at the end of the audit; the last single-run figure in the plan predates S22.
+- The full backend suite was run sharded in four processes during the audit and never
+  once in a single run at its close, so the last single-run figure the plan quotes
+  predates S22. That gap was closed afterwards: [plan 013](exec-plans/013-test-isolation.md)
+  made each module import what it needs rather than inherit it from a neighbour, and
+  [plan 014](exec-plans/014-full-run-findings.md)'s single-process run on 2026-10-23
+  answered 3,539 passed and 16 skipped in 1:29:03 once the seven failures it found
+  were fixed.
 - Nothing here measured the providers themselves: which endpoints a plan reaches
   and what a vendor's terms permit remain facts about an account, as
   [production-readiness.md](production-readiness.md#what-no-gate-covers) says.
