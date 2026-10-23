@@ -7,7 +7,8 @@ import re
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import case, delete, exists, or_, select
+import structlog
+from sqlalchemy import delete, exists, or_, select
 from sqlalchemy.dialects.postgresql import Insert as PGInsert, insert as pg_insert
 from sqlalchemy.dialects.sqlite import Insert as SQLiteInsert, insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -16,6 +17,8 @@ from app.models.asset import Asset, AssetType
 from app.models.dns_observation import DNSObservation
 from app.schemas.connector import DNSObservationPayload, DNS_NAME_RE
 from app.services.asset_matching import asset_sql_key
+
+log = structlog.get_logger()
 
 def normalize_subject(value: str) -> str:
     """Canonicalize a validated DNS name or address for matching and display.
@@ -150,7 +153,6 @@ async def ingest_dns_observations(
             "expires_at": payload.get("expires_at"),
             "status": payload.get("status", "current"),
             "metadata_json": payload.get("metadata") or {},
-            "alerted_thresholds": [],
             "updated_at": now,
         }
     # PostgreSQL ON CONFLICT cannot update the same target twice in one INSERT.
@@ -173,10 +175,6 @@ async def ingest_dns_observations(
                 "expires_at": statement.excluded.expires_at,
                 "status": statement.excluded.status,
                 "metadata_json": statement.excluded.metadata_json,
-                "alerted_thresholds": case(
-                    (DNSObservation.expires_at.is_distinct_from(statement.excluded.expires_at), statement.excluded.alerted_thresholds),
-                    else_=DNSObservation.alerted_thresholds,
-                ),
                 "updated_at": now,
             },
         )
@@ -194,10 +192,6 @@ async def ingest_dns_observations(
                 "expires_at": statement.excluded.expires_at,
                 "status": statement.excluded.status,
                 "metadata_json": statement.excluded.metadata_json,
-                "alerted_thresholds": case(
-                    (DNSObservation.expires_at.is_distinct_from(statement.excluded.expires_at), statement.excluded.alerted_thresholds),
-                    else_=DNSObservation.alerted_thresholds,
-                ),
                 "updated_at": now,
             },
         )
@@ -211,7 +205,22 @@ async def ingest_dns_observations(
     # that forgets it looks like a scan that succeeded and recorded nothing.
     controls = list((await db.execute(select(DNSObservation).where(DNSObservation.source == source, DNSObservation.observation_key.in_(rows_by_key), DNSObservation.observation_type.in_(["rdap", "certificate_check", "tls_probe"])).execution_options(populate_existing=True))).scalars())
     for control in controls:
-        await update_monitor(db, control, now=now)
+        try:
+            await update_monitor(db, control, now=now)
+        except ValueError as exc:
+            # A control row the monitor refuses is one row, not the scan: the
+            # observations above are the evidence every other reader works from, and
+            # letting this escape cost the whole batch and failed the connector's job
+            # (AUD-034). The refusal happens before the monitor is written, so the
+            # control keeps the state it had and the row itself is still stored — the
+            # log line is what says why its control was not advanced.
+            log.warning(
+                "dns_control_refused",
+                source=source,
+                observation_type=control.observation_type,
+                subject=control.subject,
+                reason=str(exc)[:120],
+            )
     if commit:
         await db.commit()
     else:

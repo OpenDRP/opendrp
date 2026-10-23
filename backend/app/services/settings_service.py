@@ -69,6 +69,54 @@ def looks_like_a_mask(value: str) -> bool:
     return bool(_MASK_RUN_RE.search(value))
 
 
+def settings_audit_snapshot(row: SystemSettings) -> dict[str, Any]:
+    """Every settable value, in the form an audit row may carry it.
+
+    The field list comes from the update schema rather than from a second list
+    kept here: a setting the form accepts is a setting the trail can describe, and
+    one added later is audited by default instead of changing silently.
+
+    A credential is reduced to its presence. The value itself lives encrypted in
+    the row, and this map is written into the same JSON stream the audit chain
+    feeds — a secret there would be a searchable copy of the credential for the
+    whole retention period (the rule AUD-009 enforces for provider errors).
+    Presence answers the only question the trail can answer about a secret: was
+    it replaced, or cleared?
+
+    Presence is read from the stored column rather than from the decrypting
+    property, deliberately: a value encrypted under a key this installation no
+    longer holds must not turn an unrelated save into a 500. It reads as "set",
+    which is what the row says until ``scripts/rotate_keys status`` reports it.
+    """
+    snapshot: dict[str, Any] = {}
+    for name in SystemSettingsUpdate.model_fields:
+        if name == "expected_version":
+            continue
+        if name in _ENCRYPTED_FIELDS:
+            snapshot[name] = "set" if getattr(row, name, None) else "unset"
+        else:
+            snapshot[name] = getattr(row, name, None)
+    return snapshot
+
+
+def settings_audit_changes(
+    before: dict[str, Any], after: dict[str, Any]
+) -> dict[str, dict[str, Any]]:
+    """The fields that actually changed, with both ends of the transition.
+
+    A difference rather than the submitted payload: the Settings page sends the
+    whole form back on every save, so "what arrived" claims a change on every
+    visit. What a reader needs is the pair — a threshold going 80 to 90 is a
+    tuning change, 80 to 10 is an outage, and the stored value alone cannot tell
+    a later investigator which one happened.
+    """
+    return {
+        name: {"from": before.get(name), "to": after.get(name)}
+        for name in before
+        if before.get(name) != after.get(name)
+    }
+
+
 def delivery_is_configured(row: SystemSettings) -> bool:
     """Whether an installation can deliver a notification at all right now.
 

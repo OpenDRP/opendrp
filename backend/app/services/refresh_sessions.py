@@ -26,7 +26,11 @@ from app.models.token import RefreshTokenFamily
 
 
 async def revoke_refresh_families(
-    db: AsyncSession, user_id: uuid.UUID, reason: str = "password_reset"
+    db: AsyncSession,
+    user_id: uuid.UUID,
+    reason: str = "password_reset",
+    *,
+    except_family_id: uuid.UUID | None = None,
 ) -> int:
     """Revoke every non-revoked refresh-token family of ``user_id``.
 
@@ -37,14 +41,24 @@ async def revoke_refresh_families(
     ``reason`` lands in ``revoked_reason`` and is what the next refresh attempt
     reports back, so it is written for an operator reading a log line rather than
     for a machine: ``password_reset``, ``password_change``, ``password_reset_cli``.
+
+    ``except_family_id`` keeps the browser that performs the change signed in, and
+    exists for enrolment: the other sessions are exactly the ones a factor must
+    not leave alive, but signing out the window the account holder is sitting in
+    front of would make enabling a factor end the session that enabled it.
+    Password changes pass nothing — there, the old credential authorising nothing
+    *is* the point.
     """
     now = datetime.now(timezone.utc)
+    conditions = [
+        RefreshTokenFamily.user_id == user_id,
+        RefreshTokenFamily.revoked.is_(False),
+    ]
+    if except_family_id is not None:
+        conditions.append(RefreshTokenFamily.family_id != except_family_id)
     result = await db.execute(
         sa_update(RefreshTokenFamily)
-        .where(
-            RefreshTokenFamily.user_id == user_id,
-            RefreshTokenFamily.revoked.is_(False),
-        )
+        .where(*conditions)
         .values(revoked=True, revoked_at=now, revoked_reason=reason)
     )
     return result.rowcount or 0

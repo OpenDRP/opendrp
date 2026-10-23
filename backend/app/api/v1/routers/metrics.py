@@ -25,15 +25,17 @@ import secrets
 from fastapi import APIRouter, Request, status
 from fastapi.responses import PlainTextResponse
 
+# The counters are read through the module, not imported as an object: the
+# middleware reads the module global on every request for exactly this reason (see
+# ``MetricsMiddleware``), and a `from ... import request_metrics` here would pin
+# the endpoint to the object that existed at import time — so a reset, which
+# rebinds the global, would leave the scrape reporting a previous life's numbers
+# while the middleware counted into the new one.
+from app.core import metrics as metrics_module
 from app.core.config import settings
 from app.core.exceptions import NotFoundException, UnauthorizedException
 from app.core.logging_config import get_logger
-from app.core.metrics import (
-    CONTENT_TYPE,
-    collect_database_samples,
-    render,
-    request_metrics,
-)
+from app.core.metrics import CONTENT_TYPE, collect_database_samples, render
 
 router = APIRouter(prefix="/metrics", tags=["Metrics"])
 
@@ -94,5 +96,5 @@ async def scrape_metrics(request: Request) -> PlainTextResponse:
     from app.core.database import AsyncSessionLocal
 
     async with AsyncSessionLocal() as db:
-        samples = request_metrics.samples() + await collect_database_samples(db)
+        samples = metrics_module.request_metrics.samples() + await collect_database_samples(db)
     return PlainTextResponse(render(samples), media_type=CONTENT_TYPE)

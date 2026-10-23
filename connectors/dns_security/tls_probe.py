@@ -303,6 +303,20 @@ def read_chain(pem: bytes) -> list[dict[str, Any]]:
     return facts
 
 
+def _name_covers(name: str, host: str) -> bool:
+    """Whether one certificate name matches the host, as TLS names do.
+
+    A name matches itself, and a wildcard matches exactly one label: `*.example.com`
+    covers `a.example.com` and not `a.b.example.com` or `example.com`. A parent name
+    does not cover its subdomains, so `example.com` does not cover `evil.example.com`.
+    """
+    if name == host:
+        return True
+    if name.startswith("*."):
+        return host.partition(".")[2] == name[2:]
+    return False
+
+
 def classify(
     *, exit_code: int | None, verify_result: int | None, facts: dict[str, Any] | None, host: str, now: datetime
 ) -> tuple[str, str]:
@@ -321,7 +335,7 @@ def classify(
         return "expired", "expired"
     if exit_code == 60:
         names = list(facts.get("san_dns") or []) if facts else []
-        if names and not any(name == host or host.endswith("." + name.lstrip("*.")) or name == "*." + host.split(".", 1)[-1] for name in names):
+        if names and not any(_name_covers(name, host) for name in names):
             return "failed", "name_mismatch"
         return "failed", "untrusted_or_self_signed"
     if verify_result not in (None, 0):

@@ -215,6 +215,15 @@ def register_exception_handlers(app) -> None:
             headers=getattr(exc, "headers", None) or {},
         )
 
+    #: There is deliberately no handler for ``Exception``. Starlette routes a
+    #: registered ``Exception`` handler to ``ServerErrorMiddleware``, which sits
+    #: *above* every middleware the application installs — so the response it
+    #: renders carries no ``X-Request-ID`` and no security headers, and the
+    #: handler cannot see the correlation id either. The unhandled-error response
+    #: is therefore produced by ``RequestContextMiddleware``, which is the
+    #: outermost layer and owns exactly that header; see
+    #: ``app/core/request_context.py``.
+
     @app.exception_handler(SQLAlchemyPoolTimeout)
     async def database_pool_timeout_handler(request: Request, exc: SQLAlchemyPoolTimeout):
         """Return a bounded 503 when every database connection is occupied.

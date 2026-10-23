@@ -3,8 +3,8 @@
 #
 # Regenerate after changing a dependency or its pin:
 #
-#     python scripts/lock_requirements.py requirements.txt
-#     python scripts/lock_requirements.py --check requirements.txt
+#     python scripts/lock_requirements.py backend/requirements.txt
+#     python scripts/lock_requirements.py --check backend/requirements.txt
 #
 # Every direct and transitive dependency is pinned with `==` and carries the
 # `--hash=sha256:` digests of every artifact the index publishes for that version,
@@ -264,9 +264,9 @@ cffi==2.1.1 \
     --hash=sha256:fb92203a88b3d3053034db775110081c49d28be6551923805e039924093761e4 \
     --hash=sha256:fcd22650c908d7b7da162bbfaab594a1227a15d1643a98c68b122ac642fa2264
 
-click==8.5.0 \
-    --hash=sha256:255bc9599cf7748b4b1a446ccc735421bd08a2ae529a8b88597d3de5664ee360 \
-    --hash=sha256:ba0d2089de75ea0310e2dde03160e6ca10009947fb95a182f9b54021bb272e34
+click==8.1.8 \
+    --hash=sha256:63c132bbbed01578a06712a2d1f497bb62d9c1c0d329b7903a866228027263b2 \
+    --hash=sha256:ed53c9d8990d83c2a27deae68e4ee337473f6330c040a31d4225c9574d16096a
 
 click-didyoumean==0.3.1 \
     --hash=sha256:4f82fdff0dbe64ef8ab2279bd6aa3f6a99c3b28c05aa09cbfc07c9d7fbb5a463 \

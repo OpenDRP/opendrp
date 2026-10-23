@@ -13,7 +13,7 @@ from app.models.dns_observation import DNSObservation
 from app.models.module import Module
 from app.services.alert_delivery_service import AlertDeliveryService
 from app.services.asset_matching import POLICY_SCAN, asset_scope, sql_key
-from app.services.dns_expiry_monitor_service import monitor_state, utc
+from app.services.dns_expiry_monitor_service import kind_is_tls, monitor_state, utc
 
 _THRESHOLDS = (30, 14, 7, 3, 1)
 
@@ -51,7 +51,7 @@ async def queue_expiry_alerts(db: AsyncSession, *, now: datetime | None = None) 
     # the monitor: reading them here keeps the reminder reproducible (which IP and port
     # were probed) without widening the monitor table for one kind.
     probe_evidence: dict = {}
-    observation_ids = [row.observation_id for row in rows if row.kind == "tls" and row.observation_id]
+    observation_ids = [row.observation_id for row in rows if kind_is_tls(row.kind) and row.observation_id]
     if observation_ids:
         evidence_rows = (await db.execute(select(DNSObservation.id, DNSObservation.metadata_json).where(DNSObservation.id.in_(observation_ids)))).all()
         # Spelled out as a pair rather than handed to ``dict()``: a ``Row`` is a two-member
@@ -65,7 +65,12 @@ async def queue_expiry_alerts(db: AsyncSession, *, now: datetime | None = None) 
         if threshold is None or threshold in (row.alerted_thresholds or []):
             continue
         seconds = (utc(row.expires_at) - instant).total_seconds()
-        label = {"registration": "Domain registration", "tls": "Live TLS certificate"}.get(row.kind, "Observed certificate")
+        if kind_is_tls(row.kind):
+            label = "Live TLS certificate"
+        elif row.kind == "registration":
+            label = "Domain registration"
+        else:
+            label = "Observed certificate"
         timing = "has expired" if threshold == 0 else f"expires in {math.ceil(seconds / 86400)} day(s)"
         fields = {
             "Subject": row.subject, "Expiry kind": row.kind,
@@ -75,7 +80,7 @@ async def queue_expiry_alerts(db: AsyncSession, *, now: datetime | None = None) 
             "Last successful check (UTC)": utc(row.successful_at).isoformat(),
             "Certificate ID": row.certificate_id or "Not applicable",
         }
-        if row.kind == "tls":
+        if kind_is_tls(row.kind):
             metadata = probe_evidence.get(row.observation_id) or {}
             fields["Probed address"] = str(metadata.get("probe_ip") or "unknown")[:64]
             fields["Probed port"] = str(metadata.get("port") or "unknown")[:6]
@@ -131,12 +136,16 @@ async def queue_stale_monitor_alerts(db: AsyncSession, *, now: datetime | None =
         func.coalesce(DNSExpiryMonitor.successful_at, DNSExpiryMonitor.checked_at) <= instant - freshness,
         DNSExpiryMonitor.checked_at <= instant,
     ).order_by(DNSExpiryMonitor.checked_at, DNSExpiryMonitor.id).limit(5000).with_for_update(skip_locked=True))).scalars())
-    label = {"registration": "Domain registration", "tls": "Live TLS certificate"}
     hours = settings.DNS_EXPIRY_MAX_AGE_HOURS * _STALE_FACTOR
     queued = 0
     for row in rows:
         reference = utc(row.successful_at or row.checked_at)
-        control = label.get(row.kind, "Observed certificate")
+        if kind_is_tls(row.kind):
+            control = "Live TLS certificate"
+        elif row.kind == "registration":
+            control = "Domain registration"
+        else:
+            control = "Observed certificate"
         alert = await AlertDeliveryService(db).enqueue(
             threat_type="dns",
             details={

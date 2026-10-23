@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import APIRouter, Depends, Query, Request
+from pydantic import BaseModel
 from sqlalchemy import ColumnElement, String, and_, cast, exists, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -121,6 +122,141 @@ AUDIT_ACTION_LABELS: dict[str, str] = {
 }
 
 
+class AuditActionGroup(BaseModel):
+    """One prefix segment's actions, in the order the filter menu lists them."""
+
+    category: str
+    actions: list[str]
+
+
+class AuditActionsCatalog(BaseModel):
+    """The filter catalogue: grouped for the menu, flat for the query, labelled for print.
+
+    All four keys are always sent, even though the client marks them optional: the
+    route builds every one of them, and a filter menu that guessed which keys arrived
+    would have to branch per answer. What this model does not claim is the invariant
+    the catalogue keeps — that the groups partition the flat list and that every label
+    names an action — because that belongs to the composer and the allowed-action set,
+    not to a response shape.
+    """
+
+    groups: list[AuditActionGroup]
+    total: int
+    actions: list[str]
+    labels: dict[str, str]
+
+
+class AuditFullVerification(BaseModel):
+    """How far the full pass has walked, and what stopped it when it stopped.
+
+    `at` is the chain state's timestamp passed straight through, so an aware value
+    serializes as the rest of the API serializes instants; `last_verification.at`
+    below is text because that composer converts it itself. The asymmetry is the
+    route's, and the models keep it rather than inventing one convention.
+    """
+
+    upper_seq: int
+    cursor: int
+    in_progress: bool
+    at: datetime | None
+    failure_seq: int | None
+    failure_reason: str | None
+
+
+class AuditChainMark(BaseModel):
+    """A chain position and the hash it ends on.
+
+    Used for both ends of the chain: what it has committed, and what retention has
+    retired. One model because the two blocks are one idea — the highest position, and
+    the hash the next entry links back to — and two declarations of it would drift.
+    """
+
+    through_seq: int
+    tip_hash: str | None
+
+
+class AuditArchiveState(BaseModel):
+    """What the archive is configured to do, and the last segment it holds."""
+
+    configured: bool
+    #: When set, retention stops instead of deleting rows it could not archive.
+    hold: bool
+    last_seq: int | None
+    retired: bool
+
+
+class AuditRetainedRange(BaseModel):
+    """The retained history's size and position, counted before this view is logged."""
+
+    rows: int
+    first_seq: int
+    last_seq: int
+
+
+class AuditLastVerification(BaseModel):
+    """The last successful verification, as the ISO text the composer publishes."""
+
+    through_seq: int
+    at: str | None
+
+
+class AuditKeyState(BaseModel):
+    """How many signing keys this process holds — a count, never the material."""
+
+    configured: int
+
+
+class AuditIntegrity(BaseModel):
+    """Where the audit hash chain stands, and when it was last verified.
+
+    Nulls are answers here: an empty chain has no tip hash, a healthy one has no
+    failure sequence, and an archive that never ran has no last segment. The route
+    therefore declares this model without `exclude_none`.
+    """
+
+    full_verification: AuditFullVerification
+    committed: AuditChainMark
+    archive: AuditArchiveState
+    retained: AuditRetainedRange
+    retired: AuditChainMark
+    last_verification: AuditLastVerification
+    keys: AuditKeyState
+
+
+class AuditLogRowResponse(BaseModel):
+    """One entry of the trail, as the audit page reads it.
+
+    `user_email` is nullable because it is a snapshot: the writer records
+    `details.actor_email` when it knows who acted, the listing falls back to a
+    lookup in `users`, and a row written by a writer that had neither sends `null`.
+
+    `key_id` is declared although the page does not read it. The payload sends it,
+    the column is non-nullable, and a model that omitted it would answer a narrower
+    row than the route's own SELECT — rule 2 is one-way by design, so a client may
+    model the half it uses but a model may not silently drop a field.
+    """
+
+    id: str
+    timestamp: datetime
+    user_id: str | None
+    user_email: str | None
+    #: `snapshot` when the row carries the actor's email, `current_user_lookup`
+    #: when it was resolved against the account table at read time.
+    actor_identity_source: str
+    seq: int
+    entry_hash: str
+    key_id: int
+    action: str
+    ip_address: str
+    details: dict[str, Any]
+
+
+class AuditLogPageResponse(PaginatedResponse[AuditLogRowResponse]):
+    """A page of the trail with the counters the table pages by."""
+
+    items: list[AuditLogRowResponse]
+
+
 def _group_actions_by_prefix() -> list[dict[str, Any]]:
     groups: "OrderedDict[str, list[str]]" = OrderedDict()
     for action in sorted(AUDIT_ALLOWED_ACTIONS):
@@ -132,19 +268,19 @@ def _group_actions_by_prefix() -> list[dict[str, Any]]:
     return [{"category": cat, "actions": sorted(acts)} for cat, acts in groups.items()]
 
 
-@router.get("/actions")
+@router.get("/actions", response_model=AuditActionsCatalog)
 async def list_audit_actions(
     current_user: User = Depends(require_admin),
 ):
-    return {
-        "groups": _group_actions_by_prefix(),
-        "total": len(AUDIT_ALLOWED_ACTIONS),
-        "actions": sorted(AUDIT_ALLOWED_ACTIONS),
-        "labels": AUDIT_ACTION_LABELS,
-    }
+    return AuditActionsCatalog(
+        groups=_group_actions_by_prefix(),
+        total=len(AUDIT_ALLOWED_ACTIONS),
+        actions=sorted(AUDIT_ALLOWED_ACTIONS),
+        labels=AUDIT_ACTION_LABELS,
+    )
 
 
-@router.get("/integrity")
+@router.get("/integrity", response_model=AuditIntegrity)
 async def audit_integrity(
     request: Request,
     db: AsyncSession = Depends(get_db),
@@ -196,21 +332,35 @@ async def audit_integrity(
     )
 
     archive = (await db.execute(select(AuditArchive).order_by(AuditArchive.last_seq.desc()).limit(1))).scalar_one_or_none()
-    return {
-        "full_verification": {"upper_seq": state.full_verify_upper_seq, "cursor": state.full_verify_cursor, "in_progress": bool(state.full_verify_upper_hash), "at": state.last_full_verified_at, "failure_seq": state.last_failure_seq, "failure_reason": state.last_failure_reason},
-        "committed": {"through_seq": state.committed_seq, "tip_hash": state.committed_tip_hash},
-        "archive": {"configured": bool(settings.AUDIT_ARCHIVE_DIR), "hold": settings.AUDIT_RETENTION_HOLD, "last_seq": archive.last_seq if archive else None, "retired": bool(archive and archive.retired_at)},
-        "retained": retained,
-        "retired": retired,
-        "last_verification": {
-            "through_seq": int(state.last_verified_seq or 0),
-            "at": state.last_verified_at.isoformat() if state.last_verified_at else None,
-        },
-        "keys": {"configured": len(settings.audit_chain_keys)},
-    }
+    return AuditIntegrity(
+        full_verification=AuditFullVerification(
+            upper_seq=state.full_verify_upper_seq,
+            cursor=state.full_verify_cursor,
+            in_progress=bool(state.full_verify_upper_hash),
+            at=state.last_full_verified_at,
+            failure_seq=state.last_failure_seq,
+            failure_reason=state.last_failure_reason,
+        ),
+        committed=AuditChainMark(
+            through_seq=state.committed_seq, tip_hash=state.committed_tip_hash
+        ),
+        archive=AuditArchiveState(
+            configured=bool(settings.AUDIT_ARCHIVE_DIR),
+            hold=settings.AUDIT_RETENTION_HOLD,
+            last_seq=archive.last_seq if archive else None,
+            retired=bool(archive and archive.retired_at),
+        ),
+        retained=AuditRetainedRange(**retained),
+        retired=AuditChainMark(**retired),
+        last_verification=AuditLastVerification(
+            through_seq=int(state.last_verified_seq or 0),
+            at=state.last_verified_at.isoformat() if state.last_verified_at else None,
+        ),
+        keys=AuditKeyState(configured=len(settings.audit_chain_keys)),
+    )
 
 
-@router.get("/logs", response_model=PaginatedResponse[Any])
+@router.get("/logs", response_model=AuditLogPageResponse)
 async def list_audit_logs(
     request: Request,
     action: str | None = Query(None, max_length=120),
@@ -306,22 +456,26 @@ async def list_audit_logs(
         .limit(size)
     )
     rows = (await db.execute(stmt)).all()
-    items: list[dict] = []
+    items: list[AuditLogRowResponse] = []
     for log_row, email in rows:
         items.append(
-            {
-                "id": str(log_row.id),
-                "timestamp": log_row.timestamp,
-                "user_id": str(log_row.user_id) if log_row.user_id else None,
-                "user_email": (log_row.details or {}).get("actor_email") or email,
-                "actor_identity_source": "snapshot" if (log_row.details or {}).get("actor_email") else "current_user_lookup",
-                "seq": log_row.seq,
-                "entry_hash": log_row.entry_hash,
-                "key_id": log_row.key_id,
-                "action": log_row.action,
-                "ip_address": log_row.ip_address,
-                "details": log_row.details or {},
-            }
+            AuditLogRowResponse(
+                id=str(log_row.id),
+                timestamp=log_row.timestamp,
+                user_id=str(log_row.user_id) if log_row.user_id else None,
+                user_email=(log_row.details or {}).get("actor_email") or email,
+                actor_identity_source=(
+                    "snapshot"
+                    if (log_row.details or {}).get("actor_email")
+                    else "current_user_lookup"
+                ),
+                seq=log_row.seq,
+                entry_hash=log_row.entry_hash,
+                key_id=log_row.key_id,
+                action=log_row.action,
+                ip_address=log_row.ip_address,
+                details=log_row.details or {},
+            )
         )
 
     pages = math.ceil(total / size) if size > 0 else 0
@@ -342,4 +496,6 @@ async def list_audit_logs(
             "results": total,
         },
     )
-    return PaginatedResponse(items=items, total=total, page=page, size=size, pages=pages)
+    return AuditLogPageResponse(
+        items=items, total=total, page=page, size=size, pages=pages
+    )

@@ -1,16 +1,186 @@
 import asyncio
 from datetime import datetime, timedelta, timezone
+from typing import Literal
 
 from fastapi import APIRouter, Depends, Request
+from pydantic import BaseModel, ConfigDict
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import extract_ip, get_db, require_active_account
+from app.api.v1.routers.alerts import AlertChannelsHealthResponse
+from app.api.v1.routers.connectors import ConnectorHealthResponse
 from app.core import health
 from app.core.audit import AuditLogger, audit_is_degraded
 from app.core.config import settings
 
 router = APIRouter(prefix="/dashboard", tags=["Dashboard"])
+
+
+class BreachKpiCaptions(BaseModel):
+    """What each breach number counts, in the words the page prints.
+
+    The captions travel with the numbers because the report carries the same object:
+    an operator comparing the two documents is comparing one definition, and a
+    caption that vanished from this answer would leave the page printing a number
+    without the sentence that says what it counts.
+    """
+
+    total_findings: str
+    active_findings_7d: str
+    new_incidents_7d: str
+    findings_by_exposure_kind: str
+
+
+class BreachKpi(BaseModel):
+    """The breach half of the KPI, from the one rule the report also reads (WI-16).
+
+    `catalogue_synced_at` is ISO text for the same reason `_iso` exists in
+    `breach_kpi`: the source's own date carries no offset, and the conversion is the
+    composer's decision rather than this model's.
+    """
+
+    window_days: int
+    total_findings: int
+    findings_by_exposure_kind: dict[str, int]
+    active_findings_7d: int
+    new_incidents_7d: int
+    catalogue_incidents: int
+    undated_incidents: int
+    catalogue_sources: int
+    catalogue_synced_at: str | None
+    captions: BreachKpiCaptions
+
+
+class DashboardKpi(BaseModel):
+    """The four headline numbers, plus the breach block they are explained by."""
+
+    total_assets: int
+    total_phishing: int
+    total_breaches: int
+    active_threats_7d: int
+    new_breach_incidents_7d: int
+    breach: BreachKpi
+
+
+class PhishingBySource(BaseModel):
+    source: str
+    count: int
+
+
+class AssetsByCriticality(BaseModel):
+    """One criticality's share of the active inventory.
+
+    `criticality` stays a plain string: the column is written through a validated
+    literal today, and a row adopted from elsewhere should be printed under its own
+    name rather than fail every block of the first screen over one asset.
+    """
+
+    criticality: str
+    count: int
+
+
+class DashboardTimelineSeries(BaseModel):
+    """One line of the chart: a registry module that records dated findings."""
+
+    key: str
+    label: str
+    module_id: str
+
+
+class DashboardTimelineExcluded(BaseModel):
+    """A module the chart does not count, with the reason code."""
+
+    module_id: str
+    label: str
+    reason: str
+
+
+class DashboardTimelineComparison(BaseModel):
+    """One series' totals for the window and for the 30 days before it (U-4)."""
+
+    current: int
+    previous: int
+
+
+class DashboardTimelineDay(BaseModel):
+    """A calendar day with one count per series key.
+
+    The keys are data: they are the module ids the registry declares, so the model
+    allows extras and the composer stays the only place that decides which modules a
+    day counts.
+    """
+
+    date: str
+
+    model_config = ConfigDict(extra="allow")
+
+
+class LongestSilence(BaseModel):
+    """The longest silence among enabled connectors; `seconds: null` is never-seen."""
+
+    name: str
+    seconds: int | None
+
+
+class PlatformConnectors(BaseModel):
+    enabled: int
+    disabled: int
+    silent: int
+    longest_silence: LongestSilence | None
+
+
+class PlatformDeliveryCounts(BaseModel):
+    pending: int
+    delivering: int
+    sent: int
+    failed: int
+    cancelled: int
+    ambiguous: int
+
+
+class PlatformDeliveries(BaseModel):
+    counts: PlatformDeliveryCounts
+    stuck: int
+    waiting_recipients: int
+
+
+class PlatformStatus(BaseModel):
+    """Self-diagnostics computed inside this answer, from the probes `/ready` runs."""
+
+    database: Literal["ok", "error"]
+    redis: Literal["ok", "error"]
+    audit_degraded: bool
+    connectors: PlatformConnectors
+    oldest_running_job_seconds: int | None
+    deliveries: PlatformDeliveries
+
+
+class DashboardStats(BaseModel):
+    """The summary half of the dashboard, as `/dashboard/stats` also answers it."""
+
+    kpi: DashboardKpi
+    timeline: list[DashboardTimelineDay]
+    timeline_series: list[DashboardTimelineSeries]
+    timeline_excluded: list[DashboardTimelineExcluded]
+    timeline_comparison: dict[str, DashboardTimelineComparison]
+    phishing_by_source: list[PhishingBySource]
+    assets_by_criticality: list[AssetsByCriticality]
+    platform: PlatformStatus
+
+
+class DashboardOverview(BaseModel):
+    """Everything the dashboard draws, in one request and one audit row (DHP-10).
+
+    The three sections are the payloads the page used to fetch separately, and two of
+    them reuse the models those endpoints already declare: a second declaration of one
+    reading would be a second contract to keep in step.
+    """
+
+    summary: DashboardStats
+    connectors: ConnectorHealthResponse
+    channels: AlertChannelsHealthResponse
+    generated_at: datetime
 
 
 async def _stats_payload(db: AsyncSession, now: datetime) -> dict:
@@ -224,7 +394,7 @@ async def dashboard_stats(
     )
 
 
-@router.get("/overview")
+@router.get("/overview", response_model=DashboardOverview)
 async def dashboard_overview(
     request: Request,
     db: AsyncSession = Depends(get_db),
@@ -280,13 +450,15 @@ async def dashboard_overview(
             details={"operation": "alert_channel_probe", "channels": blocked},
         )
 
-    return {
-        "summary": summary,
-        "connectors": {"items": connector_items, "generated_at": connectors_generated_at},
-        "channels": {
-            "items": channel_items,
-            "delivery_queue": delivery_queue,
-            "generated_at": assembled_at,
-        },
-        "generated_at": assembled_at,
-    }
+    return DashboardOverview(
+        summary=DashboardStats(**summary),
+        connectors=ConnectorHealthResponse(
+            items=connector_items, generated_at=connectors_generated_at
+        ),
+        channels=AlertChannelsHealthResponse(
+            items=channel_items,
+            delivery_queue=delivery_queue,
+            generated_at=assembled_at,
+        ),
+        generated_at=assembled_at,
+    )

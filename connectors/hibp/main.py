@@ -89,6 +89,13 @@ OPERATIONS = ("lookup", "search")
 MAX_DATA_CLASS_LABELS = 200
 MAX_DATA_CLASS_LABEL_LEN = 256
 
+#: The bounds the core declares for a breach finding (`BreachFinding` in
+#: `backend/app/schemas/connector.py`). Kept here as well because the core refuses a
+#: whole batch rather than one field, and a provider record nobody can predict is the
+#: case the bound exists for.
+MAX_DESCRIPTION_CHARS = 100_000
+MAX_DATA_CLASSES = 100
+MAX_DATA_CLASS_CHARS = 255
 #: How many catalogue entries ride in one submission. A batch, not the catalogue: the
 #: core stores what it is given and the worker keeps what the earlier batches achieved
 #: if the sweep is cut short. This equals the SDK's ``DEFAULT_CATALOGUE_BATCH``, which
@@ -610,10 +617,10 @@ def _catalogue_entry(meta: object) -> dict | None:
     if not name:
         return None
     classes = [
-        str(item).strip()[:255]
+        str(item).strip()[:MAX_DATA_CLASS_CHARS]
         for item in (meta.get("DataClasses") or [])
         if isinstance(item, str) and item.strip()
-    ]
+    ][:MAX_DATA_CLASSES]
     return {
         "breach_name": name[:255],
         "title": str(meta.get("Title") or "")[:512],
@@ -1783,14 +1790,26 @@ class HibpConnector(ConnectorBase):
         if logo:
             attributes["logo_path"] = logo
 
+        # The core's own bounds, applied here: it validates a whole submission and
+        # refuses all of it on one bad field, so a record past either bound would cost
+        # the scan every finding after it. A non-string member is not a data class.
+        raw_classes = meta.get("DataClasses")
+        classes = [
+            str(item)[:MAX_DATA_CLASS_CHARS]
+            for item in (raw_classes if isinstance(raw_classes, list) else [])
+            if item and isinstance(item, str)
+        ][:MAX_DATA_CLASSES]
+
         return {
             "breach_name": str(meta.get("Name", ""))[:255],
             "title": str(meta.get("Title", ""))[:255],
             "domain": str(meta.get("Domain") or "")[:255],
             "breach_date": _parse_date(meta.get("BreachDate")),
             "pwn_count": _parse_nonnegative_int(meta.get("PwnCount")),
-            "description": (str(meta.get("Description") or "") or None),
-            "data_classes": meta.get("DataClasses") or [],
+            "description": (
+                str(meta.get("Description") or "")[:MAX_DESCRIPTION_CHARS] or None
+            ),
+            "data_classes": classes,
             "attributes": attributes,
         }
 

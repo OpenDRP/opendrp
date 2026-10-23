@@ -8,12 +8,10 @@ what the delivery path renders from regardless of which channel sends and which
 module reported the finding.
 """
 
-import html
 from collections import Counter
 from dataclasses import dataclass
 from urllib.parse import quote
 
-from app.core.config import settings
 from app.services.alert_content import fact_text
 
 #: Longest single value a delivered message prints before it is clipped. A
@@ -25,9 +23,6 @@ BREAKDOWN_CHARS = 80
 #: How many distinct values a breakdown line counts before it counts the rest,
 #: so a job that matched 400 assets does not print 400 of them.
 MAX_BREAKDOWN_VALUES = 4
-#: Room kept for the "… +N more findings" line. It is what explains a truncated
-#: list, so it is charged to the budget the list was built against.
-OMISSION_NOTE_RESERVE = 64
 #: Hosts whose "link" would point at the reader's own machine rather than at
 #: this installation.
 # B104 is about binding a listener, not rejecting a URL host supplied as input.
@@ -173,15 +168,6 @@ def clip(value: object, limit: int = MAX_FIELD_CHARS) -> str:
     return text[: limit - 1].rstrip() + "…"
 
 
-def escaped(value: object, limit: int = MAX_FIELD_CHARS) -> str:
-    """`clip`, escaped for Telegram's HTML parse mode.
-
-    Clipping happens before escaping on purpose: escaping first would let a slice
-    cut `&amp;` in half, which Telegram reads as an unknown entity and rejects.
-    """
-    return html.escape(clip(value, limit))
-
-
 def counted(values: list[str]) -> str:
     """`a × 3, b × 1`: most frequent first, the tail counted rather than listed."""
     ordered = sorted(Counter(values).items(), key=lambda item: (-item[1], item[0]))
@@ -224,6 +210,18 @@ class Notification:
     rows: list[dict[str, str]]
     groups: list[tuple[str, str]]
     link: str | None
+    #: What this batch counts, as a singular noun and an optional qualification:
+    #: an alert counts "new finding"s, a phishing digest counts "candidate"s
+    #: "below the alert threshold". The module decides this; a channel that
+    #: spelled it itself would tell a summary of eighty look-alikes that eighty
+    #: things happened (the mismatch batch 04 of the coverage program recorded).
+    counted_noun: str = "new finding"
+    counted_tail: str = ""
+
+    def counted(self) -> str:
+        """`2 new findings`, or `4 candidates below the alert threshold`."""
+        phrase = plural(self.total, self.counted_noun)
+        return f"{phrase} {self.counted_tail}" if self.counted_tail else phrase
 
     @property
     def columns(self) -> list[str]:
@@ -244,71 +242,11 @@ class Notification:
         return [[row.get(name, "—") for name in self.columns] for row in self.rows]
 
 
-def telegram_finding_line(index: int, row: dict[str, str]) -> str:
-    values = list(row.values())
-    primary = escaped(values[0]) if values else "N/A"
-    details = [escaped(value) for value in values[1:4]]
-    tail = " · ".join(details)
-    if len(values) > 4:
-        tail += f" · +{len(values) - 4} more fields"
-    return f"{index}. <code>{primary}</code>" + (f" — {tail}" if tail else "")
-
-
-def telegram_text(notification: Notification) -> str:
-    """Render the summary Telegram receives, inside Telegram's own limits.
-
-    Telegram answers a message it cannot parse (unbalanced or sliced markup) or
-    one it considers too long with `400`, which the delivery queue records as a
-    permanent failure — an alert lost to a length check rather than to an outage.
-    So this never slices markup it built: the finding list is dropped line by
-    line against a budget that already reserved the footer and the note saying
-    how many findings were left out.
-    """
-    lines = [f"🚨 <b>OpenDRP {html.escape(notification.label.upper())}</b>"]
-    counted_line = f"<b>{plural(notification.total, 'new finding')}</b>"
-    if notification.included < notification.total:
-        counted_line += f" · showing {notification.included}"
-    lines.append(counted_line)
-    if notification.groups:
-        lines.append("")
-        lines.extend(
-            f"<b>{html.escape(name)}:</b> {html.escape(summary)}"
-            for name, summary in notification.groups
-        )
-    if notification.rows:
-        lines.append("")
-        lines.append("<b>Findings</b>")
-    footer = [f"Job <code>{html.escape(notification.job_id)}</code>"]
-    if notification.link:
-        footer.append(
-            f'🔗 <a href="{html.escape(notification.link, quote=True)}">Open in OpenDRP</a>'
-        )
-    footer_text = "\n".join(footer)
-    budget = (
-        settings.ALERT_MAX_TELEGRAM_MESSAGE_LENGTH
-        - OMISSION_NOTE_RESERVE
-        - len(footer_text)
-        - 1
-    )
-    text = "\n".join(lines)
-    kept = 0
-    for index, row in enumerate(notification.rows, start=1):
-        line = telegram_finding_line(index, row)
-        if len(text) + 1 + len(line) > budget:
-            break
-        text = f"{text}\n{line}"
-        kept += 1
-    if kept < len(notification.rows):
-        missing = len(notification.rows) - kept
-        text += f"\n… +{plural(missing, 'more finding')} in OpenDRP"
-    return f"{text}\n\n{footer_text}"
-
-
 def plain_text(notification: Notification) -> str:
     """The `text/plain` alternative: the same facts, readable without HTML."""
     lines = [notification.subject, ""]
     lines.append(f"Job: {notification.job_id}")
-    counted_line = f"Findings: {notification.total}"
+    counted_line = notification.counted()
     if notification.included < notification.total:
         counted_line += f" (showing the first {notification.included})"
     lines.append(counted_line)
@@ -323,7 +261,9 @@ def plain_text(notification: Notification) -> str:
     return "\n".join(lines)
 
 
-def digest_heading(count: int, threat_type: str = "phishing") -> tuple[str, str]:
+def digest_heading(
+    count: int, threat_type: str = "phishing"
+) -> tuple[str, str, str, str]:
     """The label and subject of a digest batch (WI-10, WI-06).
 
     A digest is not an alert: it is the daily statement that the channel is alive
@@ -335,15 +275,27 @@ def digest_heading(count: int, threat_type: str = "phishing") -> tuple[str, str]
     incidents were not below a threshold, there were simply more of them in one scan
     than a channel should interrupt someone for. Naming the module keeps the two
     apart in a mail list.
+
+    Returns the label, the subject, and the two pieces of the counted phrase the
+    channels print (`counted_noun`, `counted_tail`): a digest that said "4 new
+    findings" in the body while its subject said "4 candidates below the alert
+    threshold" was the defect this wording exists to prevent.
     """
     if threat_type == "breach":
         label = "Breach digest"
-        return label, (
-            f"[OpenDRP Alert] {label}: {plural(count, 'new incident')} "
-            "from one scan"
+        return (
+            label,
+            f"[OpenDRP Alert] {label}: {plural(count, 'new incident')} from one scan",
+            "new incident",
+            "from one scan",
         )
     label = "Phishing digest"
-    return label, f"[OpenDRP Alert] {label}: {plural(count, 'candidate')} below the alert threshold"
+    return (
+        label,
+        f"[OpenDRP Alert] {label}: {plural(count, 'candidate')} below the alert threshold",
+        "candidate",
+        "below the alert threshold",
+    )
 
 
 def breach_subject_class(findings: list[dict]) -> str | None:

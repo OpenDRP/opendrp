@@ -1418,7 +1418,15 @@ class ShodanConnector(ConnectorBase):
         # a request against loopback, Docker, RFC1918 or cloud metadata.
         import socket
 
-        if os.environ.get("TESTING") == "1" or os.environ.get("APP_ENV") == "test":
+        if os.environ.get("TESTING") == "1":
+            # The suite has no resolver that can answer a made-up name, so the
+            # destination check has one seam and it is this variable. `APP_ENV` is
+            # deliberately not consulted: a stack configured with the test
+            # environment — a copied `.env`, a staging box built from the test
+            # profile — would otherwise lose its only guard between a monitored
+            # name's DNS answer and this worker's network, and nothing in the log
+            # or the job summary said so (AUD-026).
+            log.warning("favicon_destination_check_disabled", host=host, reason="testing")
             addresses = {host}
         else:
             try:

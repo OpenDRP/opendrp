@@ -161,6 +161,10 @@ AUDIT_ALLOWED_ACTIONS = frozenset(
         "report.generate.failed",
         "report.generate.completed",
         "report.generate.retry",
+        # A generation no worker owns any more: the retention sweep returned it to
+        # `failed` so the report queue's global admission slot is not held by a
+        # report nobody is producing.
+        "report.generate.abandoned",
         "report.retention.expired",
         "report.delete",
         "report.list",
@@ -170,7 +174,6 @@ AUDIT_ALLOWED_ACTIONS = frozenset(
         # somewhere this platform never writes. Distinct from `.missing` on
         # purpose — one is a lost file, the other is a wrong row.
         "report.artifact.rejected",
-        "report.delete",
         # A destination the policy refused: an operator-supplied host (SMTP) or a
         # discovery-supplied one (WHOIS) that resolved into loopback, the cloud
         # metadata range, or one of this deployment's own networks.

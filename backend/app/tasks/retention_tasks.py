@@ -48,7 +48,25 @@ log = structlog.get_logger()
 #: deletes nothing writes no row: an audit trail that records daily no-ops
 #: trains its readers to ignore it.
 ACTION_RETENTION_PURGED = "audit.retention.purged"
+#: The state a report is left in when the worker that owned it disappeared.
+#: Recorded as its own action: a generation that nobody is running is an
+#: operational fact (a killed worker, a lost message), not a retention decision.
+ACTION_REPORT_GENERATION_ABANDONED = "report.generate.abandoned"
 _TEMP_ARTIFACT_RE = re.compile(r"^\.[0-9a-f]{32}\.pdf\.tmp$")
+
+#: A report is abandoned when it has been `generating` for twice the configured
+#: generation timeout (and never for less than ten minutes). The task's own hard
+#: limit is the timeout plus thirty seconds, so a renderer that is still alive
+#: cannot be older than this guard — the sweep cannot take a report away from a
+#: worker that is merely slow.
+ABANDONED_GENERATION_MIN_AGE_SECONDS = 600
+
+#: How long a `schedule_occurrences` row is kept. The scheduler re-examines the
+#: current minute and the nine before it, so an occurrence older than that window
+#: can never be consulted again; the window is kept long enough that an operator
+#: investigating a missed scan still finds the ledger. Thirty days is a reading
+#: aid, not a correctness bound.
+SCHEDULE_OCCURRENCE_RETENTION_DAYS = 30
 
 
 @dataclass
@@ -58,6 +76,9 @@ class PurgeResult:
     table: str
     deleted_rows: int = 0
     batches: int = 0
+    #: Rows the sweep *repaired* rather than deleted (reports only: a generation
+    #: that no worker owns any more is moved to `failed`, not removed).
+    reconciled: int = 0
     #: True when the batch cap was hit and rows past the cutoff remain.
     truncated: bool = False
     #: Artifacts the sweep removed from the report store (reports only).
@@ -104,6 +125,7 @@ async def purge_table(
     seq_column=None,
     hash_column=None,
     on_batch=None,
+    key_column=None,
 ) -> PurgeResult:
     """Delete rows older than ``cutoff`` in bounded batches.
 
@@ -112,9 +134,13 @@ async def purge_table(
     WAL, and on PostgreSQL delays vacuum precisely when the table most needs it.
     """
     result = PurgeResult(table=model.__tablename__)
+    # A ledger table may be keyed by something other than `id`
+    # (`schedule_occurrences` is keyed by the occurrence itself), and the
+    # batched delete is worth having one implementation of rather than two.
+    primary_key = key_column if key_column is not None else model.id
     while result.batches < max_batches:
         subquery = (
-            select(model.id)
+            select(primary_key)
             .where(timestamp_column < cutoff)
             .order_by(timestamp_column)
             .limit(batch_size)
@@ -127,7 +153,7 @@ async def purge_table(
         if seq_column is not None:
             batch_rows = (
                 await db.execute(
-                    select(seq_column, hash_column).where(model.id.in_(subquery))
+                    select(seq_column, hash_column).where(primary_key.in_(subquery))
                 )
             ).all()
             if batch_rows:
@@ -144,7 +170,7 @@ async def purge_table(
                     highest = max(signed, key=lambda item: item[0])
                     result.retired_tip_hash = highest[1]
 
-        outcome = await db.execute(delete(model).where(model.id.in_(subquery)))
+        outcome = await db.execute(delete(model).where(primary_key.in_(subquery)))
         if on_batch is not None and seq_column is not None:
             await on_batch(db, result)
         await db.commit()
@@ -396,6 +422,144 @@ async def purge_expired_reports(
     return result
 
 
+def abandoned_generation_cutoff(*, now: datetime) -> datetime:
+    """The instant before which a `generating` report has no worker behind it."""
+    seconds = max(
+        settings.REPORT_GENERATION_TIMEOUT_SECONDS * 2,
+        ABANDONED_GENERATION_MIN_AGE_SECONDS,
+    )
+    return now - timedelta(seconds=seconds)
+
+
+async def reconcile_abandoned_report_generations(
+    db, *, now: datetime, batch_size: int = 200
+) -> list[str]:
+    """Move reports nobody is generating any more to `failed`.
+
+    A report is admitted against a *global* cap: ``POST /reports/generate``
+    counts the rows that are ``pending`` or ``generating`` and answers ``429`` at
+    ``REPORT_QUEUE_MAX_PENDING``. Retention deliberately skips both states, so a
+    worker killed between the ``generating`` update and the terminal one — or a
+    message the broker never redelivers — would otherwise own one of those slots
+    for the life of the installation, and enough of them close the queue to
+    everyone.
+
+    The repair is a transition, not a deletion: the row becomes ``failed`` (which
+    the API already renders and an operator can regenerate from), the job that
+    owned it becomes ``error`` with the reason, and the sweep records one audit
+    row naming the reports it moved. Nothing is unlinked here — the artifact, if
+    the renderer finished writing one, is still the row's and is handled by the
+    ordinary cleanup paths.
+    """
+    from app.core.audit import AuditLogger
+    from app.models import Job, Report
+
+    cutoff = abandoned_generation_cutoff(now=now)
+    rows = list(
+        (
+            await db.execute(
+                select(Report)
+                .where(
+                    Report.status == "generating",
+                    Report.generation_started_at.is_not(None),
+                    Report.generation_started_at <= cutoff,
+                )
+                .order_by(Report.generation_started_at)
+                .limit(batch_size)
+                .with_for_update(skip_locked=True)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if not rows:
+        return []
+
+    report_ids = [row.id for row in rows]
+    for row in rows:
+        row.status = "failed"
+        row.generation_started_at = None
+
+    # The job row is found by the report id its request put in `params`, which is
+    # the only link the two share; `task_id` is the broker's, and a job whose
+    # message was lost keeps one that will never be used again.
+    job_ids = [
+        job_id
+        for job_id in (
+            await db.execute(
+                select(Job.id).where(
+                    Job.job_type == "report.generate",
+                    Job.status.in_(("pending", "running")),
+                    Job.params["report_id"].as_string().in_(
+                        [str(report_id) for report_id in report_ids]
+                    ),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    ]
+    if job_ids:
+        await db.execute(
+            update(Job)
+            .where(Job.id.in_(job_ids))
+            .values(
+                status="error",
+                finished_at=datetime.now(timezone.utc),
+                error_message="report_generation_abandoned",
+            )
+        )
+
+    await AuditLogger.emit(
+        db,
+        action=ACTION_REPORT_GENERATION_ABANDONED,
+        ip_address="internal:celery-beat",
+        user_id=None,
+        details={
+            "reconciled": len(report_ids),
+            "report_ids": [str(report_id) for report_id in report_ids[:50]],
+            "job_ids": [str(job_id) for job_id in job_ids[:50]],
+            "reason": "generation_abandoned",
+            "generating_since_before": cutoff.isoformat(),
+            "timeout_seconds": settings.REPORT_GENERATION_TIMEOUT_SECONDS,
+        },
+        require_persistence=True,
+        commit=False,
+    )
+    await db.commit()
+    log.warning(
+        "report_generation_abandoned",
+        reconciled=len(report_ids),
+        report_ids=[str(report_id) for report_id in report_ids[:20]],
+    )
+    return [str(report_id) for report_id in report_ids]
+
+
+async def purge_schedule_occurrences(
+    db, *, now: datetime, batch_size: int, max_batches: int = 1
+) -> PurgeResult:
+    """Delete schedule-ledger rows that can never be consulted again.
+
+    The scheduler looks at the current minute and the nine before it, and its
+    ledger key is the connector plus the occurrence minute — so an entry older
+    than that window is unreachable, while the window itself is what makes a
+    re-examined minute dispatch once (and survives the deletion of the job it
+    produced). Nothing pruned the table, so it grew with every fired occurrence
+    for the life of the installation.
+    """
+    from app.models.job import ScheduleOccurrence
+
+    return await purge_table(
+        db,
+        model=ScheduleOccurrence,
+        timestamp_column=ScheduleOccurrence.created_at,
+        cutoff=now - timedelta(days=SCHEDULE_OCCURRENCE_RETENTION_DAYS),
+        batch_size=batch_size,
+        max_batches=max_batches,
+        key_column=ScheduleOccurrence.key,
+    )
+
+
 async def run_retention_sweep(
     db, *, now: datetime | None = None
 ) -> dict[str, PurgeResult]:
@@ -446,6 +610,23 @@ async def run_retention_sweep(
             max_batches=settings.RETENTION_MAX_BATCHES_PER_RUN,
             now=moment,
         )
+
+    # Repaired after the retention decision on purpose: `purge_expired_reports`
+    # skips `pending` and `generating`, so the order cannot change what is
+    # deleted. What it changes is the admission count — the queue counts both
+    # states, and a generation nobody owns must stop being one of them.
+    results["reports"].reconciled = len(
+        await reconcile_abandoned_report_generations(
+            db, now=moment, batch_size=settings.RETENTION_BATCH_SIZE
+        )
+    )
+
+    results["schedule_occurrences"] = await purge_schedule_occurrences(
+        db,
+        now=moment,
+        batch_size=settings.RETENTION_BATCH_SIZE,
+        max_batches=settings.RETENTION_MAX_BATCHES_PER_RUN,
+    )
 
     results["drp_refresh_families"] = await purge_expired_sessions(db, now=moment)
 
@@ -587,6 +768,7 @@ async def _emit_sweep_audit(results: dict[str, PurgeResult]) -> None:
             name: {
                 "deleted_rows": r.deleted_rows,
                 "removed_artifacts": r.removed_artifacts,
+                "reconciled": r.reconciled,
                 "batches": r.batches,
                 "truncated": r.truncated,
             }
@@ -639,6 +821,7 @@ async def purge_expired_data_task(self=None, _now: datetime | None = None) -> di
         name: {
             "deleted_rows": r.deleted_rows,
             "removed_artifacts": r.removed_artifacts,
+            "reconciled": r.reconciled,
             "batches": r.batches,
             "truncated": r.truncated,
             "outside_store_paths": len(r.outside_store_paths),

@@ -6,6 +6,51 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.services.breach_severity import severity_label, severity_rank_case
 
+#: The rows one rendered document may hold. `REPORT_MAX_ROWS` bounds each of the
+#: five sections, and nothing bounded the file they are appended to: at the
+#: documented maximum one request built a document of roughly 250,000 table rows
+#: in memory before writing a single byte (AUD-041). Five sections of the default
+#: 5,000 rows fill this exactly, so a default installation is unaffected.
+MAX_RENDERED_REPORT_ROWS = 25_000
+
+#: The byte ceiling for the written document. The row ceiling is what keeps the
+#: renderer's memory bounded; this is the backstop for a formatting change that
+#: makes the same rows far larger, and a file over it is removed, not published.
+MAX_REPORT_BYTES = 64 * 1024 * 1024
+
+_REPORT_SECTION_KEYS = ("assets", "phishing", "breaches", "exposure", "dns")
+
+
+def rendered_row_count(report_data: dict) -> int:
+    """Every row the renderer would put into the document."""
+    return sum(len(report_data.get(key) or ()) for key in _REPORT_SECTION_KEYS)
+
+
+def ensure_renderable(report_data: dict) -> None:
+    """Refuse a document the renderer cannot finish, before it starts.
+
+    The refusal names the setting the operator controls, and it happens before
+    the fPDF object exists: a request that would exceed the ceiling fails fast
+    instead of holding a worker's memory until the timeout fires.
+    """
+    rows = rendered_row_count(report_data)
+    if rows > MAX_RENDERED_REPORT_ROWS:
+        raise ValueError(
+            f"report_too_large: {rows} rows exceeds the render ceiling of "
+            f"{MAX_RENDERED_REPORT_ROWS}; lower REPORT_MAX_ROWS"
+        )
+
+
+def enforce_output_bound(file_path: str) -> None:
+    """Remove a written document that is over the byte ceiling, then refuse."""
+    size = os.path.getsize(file_path)
+    if size > MAX_REPORT_BYTES:
+        os.remove(file_path)
+        raise ValueError(
+            f"report_too_large: {size} bytes exceeds the output ceiling of "
+            f"{MAX_REPORT_BYTES}"
+        )
+
 
 def _breach_kpi_caption(kpi: dict, key: str) -> str:
     """The caption a breach KPI key carries, taken from the report's own data.
@@ -280,8 +325,8 @@ class ReportService:
     @staticmethod
     def generate_pdf_sync(file_path: str, report_data: dict, generated_by_email: str) -> None:
         from fpdf import FPDF
-        import os
 
+        ensure_renderable(report_data)
         unicode_font = _find_unicode_pdf_font()
         if unicode_font is None:
             _validate_pdf_text_unicode(report_data, generated_by_email)
@@ -657,6 +702,7 @@ class ReportService:
                 pdf.ln(2)
         os.makedirs(os.path.dirname(file_path), exist_ok=True)
         pdf.output(file_path)
+        enforce_output_bound(file_path)
         if os.path.getsize(file_path) < 10240:
             import structlog
             log = structlog.get_logger()
@@ -683,6 +729,11 @@ class ReportService:
             )
         except asyncio.TimeoutError as exc:
             raise TimeoutError("report generation exceeded its configured time limit during data collection") from exc
+
+        # Refused here as well as in the renderer: this is the earliest point the
+        # row count is known, and a report that cannot be rendered must not take
+        # an executor slot first (AUD-041).
+        ensure_renderable(data)
 
         remaining_timeout = settings.REPORT_GENERATION_TIMEOUT_SECONDS - (loop.time() - generation_started)
         if remaining_timeout <= 0:

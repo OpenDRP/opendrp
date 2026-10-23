@@ -36,6 +36,9 @@ from app.schemas.asset import (
     AssetBulkResponse,
     AssetCreate,
     AssetCriticality,
+    AssetFindingCounts,
+    AssetFindingsResponse,
+    AssetFindingSubject,
     AssetImportItem,
     AssetImportRequest,
     AssetImportResponse,
@@ -570,6 +573,21 @@ def _error_detail(exc: Exception) -> str:
     return str(getattr(exc, "detail", exc))
 
 
+#: Cell prefixes a spreadsheet reads as the start of a formula.
+_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _csv_text_cell(value: object) -> object:
+    """A text cell that a spreadsheet will show as text, not evaluate.
+
+    A keyword may start with ``=``, ``+``, ``-`` or ``@``; written as-is, the cell is a
+    formula for whoever opens the export. A leading apostrophe makes it text.
+    """
+    if isinstance(value, str) and value.startswith(_FORMULA_PREFIXES):
+        return "'" + value
+    return value
+
+
 def _assets_as_csv(items, summaries: dict) -> str:
     """The export rows, with the same involvement the list shows (AST-49).
 
@@ -601,7 +619,7 @@ def _assets_as_csv(items, summaries: dict) -> str:
         writer.writerow(
             [
                 asset_type_value(asset.asset_type),
-                asset.asset_value,
+                _csv_text_cell(asset.asset_value),
                 asset.criticality,
                 "true" if asset.is_active else "false",
                 asset.created_at.isoformat() if asset.created_at else "",
@@ -926,7 +944,7 @@ async def delete_asset(
     return None
 
 
-@router.get("/{asset_id}/findings")
+@router.get("/{asset_id}/findings", response_model=AssetFindingsResponse)
 async def list_asset_findings(
     asset_id: uuid.UUID,
     request: Request,
@@ -992,21 +1010,24 @@ async def list_asset_findings(
             },
         )
 
-    return {
-        "asset": {
-            "id": str(asset.id),
-            "asset_type": asset_type_value(asset.asset_type),
-            "asset_value": asset.asset_value,
-            "is_active": asset.is_active,
-        },
-        "counts": all_counts,
+    # The rows stay dicts from `_related_row`; Pydantic validates a dict as well as
+    # an object, so the four module branches stay one function instead of four
+    # models. No `exclude_none`: the optional row fields are nulls here by contract.
+    return AssetFindingsResponse(
+        asset=AssetFindingSubject(
+            id=asset.id,
+            asset_type=asset_type_value(asset.asset_type),
+            asset_value=asset.asset_value,
+            is_active=asset.is_active,
+        ),
+        counts=AssetFindingCounts(**all_counts),
         # When each module last saw a finding about this asset (WI-20): a count
         # says an asset is involved, the date says whether that is current.
-        "last_seen": summary.last_seen,
-        "module": selected,
-        "items": [_related_row(selected, row) for row in rows],
-        "total": total,
-        "page": page,
-        "size": size,
-        "pages": math.ceil(total / size) if size else 0,
-    }
+        last_seen=summary.last_seen,
+        module=selected,
+        items=[_related_row(selected, row) for row in rows],
+        total=total,
+        page=page,
+        size=size,
+        pages=math.ceil(total / size) if size else 0,
+    )

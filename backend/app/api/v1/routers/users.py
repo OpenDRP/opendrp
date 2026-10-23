@@ -25,7 +25,7 @@ from app.core.exceptions import BadRequestException, ConflictException, NotFound
 from app.core.security import hash_password_async
 from app.models.token import RefreshTokenFamily
 from app.models.user import User, role_name
-from app.schemas.common import MAX_PAGE_SIZE, PaginatedResponse
+from app.schemas.common import MAX_PAGE_SIZE, PaginatedResponse, RevokedSessionsResponse
 from app.services.admin_invariants import (
     LastActiveAdminError,
     count_active_admins,
@@ -38,6 +38,7 @@ from app.services.user_notifications import notify_invitation, notify_owner
 from app.schemas.user import (
     SessionResponse,
     UserBulkRequest,
+    UserBriefResponse,
     UserBulkResponse,
     UserCreate,
     UserInviteRequest,
@@ -135,7 +136,23 @@ async def _ensure_active_admin_remains(
         raise ConflictException(str(exc)) from exc
 
 
-@router.get("/brief", response_model=list[dict])
+def _is_email_conflict(exc: IntegrityError) -> bool:
+    """Whether a constraint failure is the ``users.email`` uniqueness rule.
+
+    PostgreSQL names the constraint (``users_email_key``); SQLite, which the
+    test and development runs use, names the column (``users.email``). Matching
+    only the PostgreSQL spelling made a duplicate address on SQLite answer the
+    generic "constraint violation" — the one case the caller can fix.
+    """
+    message = str(exc).lower()
+    return (
+        "users_email_key" in message
+        or "users.email" in message
+        or "duplicate" in message
+    )
+
+
+@router.get("/brief", response_model=list[UserBriefResponse])
 async def list_users_brief(
     request: Request,
     db: AsyncSession = Depends(get_db),
@@ -416,7 +433,7 @@ async def create_user(
         await db.refresh(new_user)
     except IntegrityError as exc:
         await db.rollback()
-        if "users_email_key" in str(exc) or "duplicate" in str(exc).lower():
+        if _is_email_conflict(exc):
             raise ConflictException("A user with this email already exists") from exc
         raise ConflictException("Could not create user due to constraint violation") from exc
     except Exception:
@@ -628,10 +645,14 @@ async def bulk_update_users(
             # Already in the requested state: reported as skipped, not written,
             # so the count answers "what did this action change".
             continue
-        user.is_active = not deactivating
-        if deactivating:
-            user.failed_login_attempts = 0
-            user.locked_until = None
+        user.is_active = desired_active
+        # A lockout belongs to signing in, not to being active, so both
+        # directions clear it: a revived account must not come back with the
+        # counters it collected while it was off (the single-account route
+        # clears them for the same reason), and a deactivated one has no window
+        # left to wait out.
+        user.failed_login_attempts = 0
+        user.locked_until = None
         changed_users.append(user)
 
     revoked = 0
@@ -823,7 +844,7 @@ async def update_user(
         await db.refresh(user)
     except IntegrityError as exc:
         await db.rollback()
-        if "users_email_key" in str(exc):
+        if _is_email_conflict(exc):
             raise ConflictException("A user with this email already exists") from exc
         raise ConflictException("Could not update user") from exc
     except Exception:
@@ -919,6 +940,7 @@ async def unlock_user(
 
 @router.get("/{user_id}/sessions", response_model=list[SessionResponse])
 async def list_user_sessions(
+    request: Request,
     user_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_admin),
@@ -946,6 +968,23 @@ async def list_user_sessions(
             )
         )
     ).scalars().all()
+    # The same read `GET /users/{id}` records as `users.view`: the session list
+    # answers which devices the account can still be used through, which is the
+    # administrator read most worth being able to explain later. `view` names
+    # which of the account's surfaces was read, the way `method` names the path
+    # that changed a state.
+    await AuditLogger.emit_background(
+        db,
+        action="users.view",
+        ip_address=extract_ip(request),
+        user_id=current_user.id,
+        details={
+            "target_user_id": str(user_id),
+            "target_email": user.email,
+            "view": "sessions",
+            "results": len(rows),
+        },
+    )
     return [
         SessionResponse(
             id=row.family_id,
@@ -959,7 +998,11 @@ async def list_user_sessions(
     ]
 
 
-@router.delete("/{user_id}/sessions", status_code=status.HTTP_200_OK)
+@router.delete(
+    "/{user_id}/sessions",
+    status_code=status.HTTP_200_OK,
+    response_model=RevokedSessionsResponse,
+)
 async def revoke_user_sessions(
     request: Request,
     user_id: uuid.UUID,
@@ -1006,7 +1049,7 @@ async def revoke_user_sessions(
     except Exception:
         await db.rollback()
         raise
-    return {"revoked": revoked}
+    return RevokedSessionsResponse(revoked=revoked)
 
 
 @router.post("/{user_id}/mfa/reset", response_model=UserResponse)

@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import hashlib
 import secrets
+import string
 from datetime import datetime, timedelta, timezone
 
 import structlog
@@ -91,6 +92,23 @@ def generate_token(connector_name: str) -> str:
     return generate_token_and_prefix(connector_name)[0]
 
 
+#: The hint's budget. A generated label is at most 24 characters
+#: (``_safe_name(connector_name)[:24]``), so anything longer than this was not
+#: written by this core.
+_NAME_HINT_MAX = 40
+#: The hint's alphabet: the characters a generated connector name is made of.
+#: Anything else — a control character, a bidirectional override, an ANSI escape,
+#: another script — is dropped, because the value is read from a credential the
+#: *caller* wrote and then printed where an operator reads it.
+_NAME_HINT_ALPHABET = frozenset(string.ascii_lowercase + string.digits + "._-")
+
+
+def _name_hint(raw: str) -> str | None:
+    """A bounded, printable label from whatever a token's name segment holds."""
+    cleaned = "".join(ch for ch in raw.lower() if ch in _NAME_HINT_ALPHABET)
+    return cleaned[:_NAME_HINT_MAX] or None
+
+
 def connector_name_from_token(token: str | None) -> str | None:
     """Return the connector name a token *claims*, or ``None``.
 
@@ -99,11 +117,16 @@ def connector_name_from_token(token: str | None) -> str | None:
     value is a **hint and never an identity**: it is text inside a value the
     caller chose, so nothing is authorized by it, and the only thing that ever
     names a connector is a digest that resolves (:meth:`ConnectorCredentials.resolve`).
+
+    For that reason the label is filtered and bounded before it is returned
+    (AUD-018): a rejected credential is presented by an unauthenticated caller, and
+    without this it could put up to a header's worth of chosen text — control
+    characters and bidirectional overrides included — into a warning line.
     """
     parts = (token or "").strip().split("_", 2)
     if len(parts) < 3 or parts[0] != TOKEN_PREFIX:
         return None
-    return parts[1].strip().lower() or None
+    return _name_hint(parts[1].strip())
 
 
 class ConnectorCredentials:

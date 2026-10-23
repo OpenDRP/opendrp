@@ -37,4 +37,3 @@ class DNSObservation(Base, UUIDMixin, TimestampMixin):
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="current")
     metadata_json: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
-    alerted_thresholds: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
