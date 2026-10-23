@@ -103,9 +103,13 @@ equal to it.
 
 | Service set | Memory (sum of caps) | CPU (sum of caps) | Recommended host |
 |---|---:|---:|---|
-| Installation, no profiles (`docker-compose.yml`) | 7.0 GiB | 7.75 | at least 8 GiB RAM, 8 CPU cores |
-| + `backup` profile | 7.5 GiB | 8.25 | as above; the backup service is short-lived |
-| + every keyed profile (`netlas`, `shodan`, `hibp`, `virustotal`) | 10.0 GiB | 12.25 | at least 12 GiB RAM, 14 CPU cores |
+| Installation, no profiles (`docker-compose.yml`) | 8.0 GiB | 9.0 | at least 10 GiB RAM, 10 CPU cores |
+| + `backup` profile | 8.5 GiB | 9.5 | as above; the backup service is short-lived |
+| + every keyed profile (`netlas`, `shodan`, `hibp`, `virustotal`) | 11.5 GiB | 14.25 | at least 14 GiB RAM, 16 CPU cores |
+
+The rows are checked against `docker-compose.yml` by
+`scripts/check_compose_healthchecks.py`, which also checks the sentence below:
+a `mem_limit` or `cpus` value changed in the file without these sums fails CI.
 
 The two endpoint workers are outside those rows: `netlas-endpoints` and
 `shodan-endpoints` add 512 MiB and 0.75 CPU each, so add 1.0 GiB and 1.5 CPU to
@@ -158,7 +162,7 @@ it prints which figures belong to which service set.
 
 ## 1. Prepare the checkout and version
 
-This checkout declares version `0.2.0`. Local installations must set `OPENDRP_VERSION=0.2.0` and build from source; this local version bump does not publish a GitHub tag, release or GHCR images. Do not pull `0.2.0` from the registry until it has actually been published. For an available production release, check out its tag and pin the same version in `.env`:
+This checkout declares version `0.2.1`. Local installations must set `OPENDRP_VERSION=0.2.1` and build from source; this local version bump does not publish a GitHub tag, release or GHCR images. Do not pull `0.2.1` from the registry until it has actually been published. For an available production release, check out its tag and pin the same version in `.env`:
 
 ```text
 git clone https://github.com/OpenDRP/opendrp.git
@@ -180,7 +184,7 @@ One installation runs one release: this value is the image tag every service is 
 Run the wizard interactively:
 
 ```text
-python setup.py --public-url https://drp.example.com --version 0.2.0
+python setup.py --public-url https://drp.example.com --version 0.2.1
 ```
 
 On Windows, use `py -3 setup.py` if `python` is not the Python 3 launcher. The wizard uses only the Python standard library. It generates database, JWT, encryption and audit-chain secrets with the operating system CSPRNG, and it writes one shape of file: the production one. No flag selects another, because an installation that differs from the one users reach is not one worth checking.
@@ -221,7 +225,7 @@ says that on purpose.
 For a non-interactive installation, the same values come from flags:
 
 ```text
-python setup.py --non-interactive --public-url https://drp.example.com --version 0.2.0 --connectors dnstwist,hibp --mfa
+python setup.py --non-interactive --public-url https://drp.example.com --version 0.2.1 --connectors dnstwist,hibp --mfa
 ```
 
 `--version` may be omitted: the version this checkout declares is used, and a
@@ -515,7 +519,7 @@ checkout on a connected machine, then carry the images as files:
 
 ```text
 docker compose -f docker-compose.yml build
-docker save ghcr.io/opendrp/opendrp/backend:0.2.0 ghcr.io/opendrp/opendrp/frontend:0.2.0 > opendrp-images-0.2.0.tar
+docker save ghcr.io/opendrp/opendrp/backend:0.2.1 ghcr.io/opendrp/opendrp/frontend:0.2.1 > opendrp-images-0.2.1.tar
 ```
 
 The release matrix builds eight images — `backend`, `frontend`,
@@ -527,7 +531,7 @@ intelligence and endpoint images if you enable those profiles), copy the
 tarball, and load it on the target host:
 
 ```text
-docker load < opendrp-images-0.2.0.tar
+docker load < opendrp-images-0.2.1.tar
 ```
 
 Then run the deployment steps as written, without `--build` and without `docker

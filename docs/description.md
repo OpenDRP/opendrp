@@ -90,7 +90,11 @@ of signal rows behind it, so "why is this candidate at 80?" is answered from dat
 rather than by re-deriving the weights of whatever build happened to run. The score
 decides how the candidate is reported: at or above `ALERT_CONFIDENCE_DIRECT` it is
 announced, between that and `ALERT_CONFIDENCE_DIGEST` it waits for one daily digest, and
-below is list-only.
+below is list-only. Because the weights are code, a release that changes one would leave
+every stored score computed under the old table beside a breakdown computed with the
+new one; the nightly `rescore_phishing_candidates` pass (04:45 UTC) rewrites the rows
+whose score moved and reports the count, so the number an operator filters and sorts by
+is the one today's rules give it.
 
 The facts a *provider* reported are scored from the evidence the platform already
 stored, not by asking again: a page a connector found by matching the brand in its
@@ -117,7 +121,7 @@ ask), `whois_pacing` (this pass's slot went to another name at the same registry
 `whois_no_record` (the registry says nobody has registered the name — re-asked twice a day,
 because a name nobody owns can be registered), `whois_rate_limited` (the pause),
 `whois_unavailable` (no answer arrived: thirty seconds doubling to an hour),
-`whois_target_refused` (our own destination policy refused the target, which is terminal),
+`whois_target_refused` (our own destination policy refused the target — or a referral the registry's answer pointed at, since every hop is checked — which is terminal),
 and `*_exhausted` once a best-effort lookup has spent its eight attempts. Nothing of this
 appears in a connector's job summary: the enrichment is core-side, and the outbox row and
 the log are where it is read.
@@ -150,8 +154,14 @@ Every decision and un-decision is one row in the audit trail naming the verdict 
 replaced and the score it overrode.
 
 Status is `active`, `investigating` or `resolved`, in `drp_phishing_domains.status`.
-A detection that matched a monitored keyword or domain is not a takeover: there is
-no takedown workflow, and nothing in the platform requests one.
+A `resolved` candidate is the investigation equivalent of a rejection: it is not
+announced, and it is not digested, in any band — the delivery path reads the status
+after the verdict and consumes the arrival with `phishing_status_resolved`, so
+closing a finding means the same thing to the daily summary and to the channel. The
+row, its evidence and any later change stay in the list an operator works from, and
+a `confirmed` candidate still alerts however it is triaged. A detection that matched
+a monitored keyword or domain is not a takeover: there is no takedown workflow, and
+nothing in the platform requests one.
 
 ### 1.2 Breaches
 
@@ -276,7 +286,7 @@ declares its own `dns.*` job type and holds its own core-issued credential. Thei
 Expiry is an alertable fact only where a check establishes it. Registration-expiry
 reminders need a successful, fresh RDAP check (`DNS_EXPIRY_MAX_AGE_HOURS`), and
 exact-certificate expiry reminders need a separately verified, completed CT check,
-and served-certificate reminders (`kind="tls"`) need a fresh successful handshake;
+and served-certificate reminders (a control per `tls:<port>`) need a fresh successful handshake;
 all three kinds use 30/14/7/3/1-day thresholds plus one reminder after expiry. Historical CT
 evidence, DNS TTLs and provider-supplied expiry metadata do not establish an
 alertable expiry, and wildcard CT evidence can never establish a concrete asset or
@@ -524,7 +534,9 @@ minute and the nine before it; `schedule_occurrences` records the
 connector-and-UTC-minute pairs that have already run, so deduplication survives the
 deletion of the job it produced, and a Redis guard with two-second connect and read
 deadlines and a 900-second TTL covers a replica racing another. Downtime longer
-than that window is not backfilled.
+than that window is not backfilled. The ledger is pruned by the nightly sweep: an
+entry older than thirty days sits outside every window the scheduler looks at, so
+keeping it would only grow a table that is in every backup.
 
 Before a job is committed, the core also takes one Redis-backed admission slot per
 connector, shared by manual scans, scheduled scans, users and API replicas, so a
@@ -545,9 +557,16 @@ moves the row through `pending`, `generating`, `completed` or `failed`.
 `REPORT_MAX_ROWS` bounds each section and the PDF states the total, the included
 count, the limit and whether it truncated; `REPORT_QUEUE_MAX_PENDING` refuses
 further admissions with `429`; `REPORT_GENERATION_TIMEOUT_SECONDS` bounds the whole
-operation. Deletion and retention record a retryable cleanup intent before removing
-the row, and files leave storage only through the configured resolver, so a worker
-crash between the two cannot lose a file's only reference. The API never renders a
+operation. The admission cap counts `pending` and `generating` rows, and retention
+deliberately skips both, so a generation nobody is running any more — a killed
+worker, a message the broker never redelivered — is repaired rather than left to
+hold a slot: the nightly sweep returns a report that has been `generating` for
+twice the configured timeout (never less than ten minutes) to `failed`, moves its
+job to `error` with `report_generation_abandoned`, and records the reports it
+moved in one `report.generate.abandoned` row. Deletion and retention record a
+retryable cleanup intent before removing the row, and files leave storage only
+through the configured resolver, so a worker crash between the two cannot lose a
+file's only reference. The API never renders a
 report in process: without Celery the job is marked failed and the request answers
 `503`, which is what keeps a replica stateless. Reports are readable by any
 authenticated account in the installation by design — `created_by` records
@@ -637,7 +656,11 @@ rather than inferring is deliberate — a private window, cleared site data or a
 denied-storage profile all make a valid server-side session look absent, and only
 the API knows — and the single-flight refresh is shared with the `401` interceptor
 because two overlapping presentations of a rotated token read as reuse and revoke
-the family. Signing out ends the session on both sides: local state first, then
+the family. A `401` from the six routes that verify a credential typed into the
+form — the current password, a second-factor code, an invitation token — is the
+API refusing that value rather than the session: it goes back to the form that
+asked, with the API's sentence, and neither refreshes the token nor signs anyone
+out. Signing out ends the session on both sides: local state first, then
 `POST /api/v1/auth/logout`, so the cookie cannot restore the session the operator
 just ended. The refresh endpoint deletes the cookie when it refuses the token in
 it, and every refused presentation would otherwise be retried and audited once per

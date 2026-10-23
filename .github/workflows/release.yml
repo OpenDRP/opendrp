@@ -64,7 +64,10 @@ jobs:
           set -euo pipefail
           docker compose --profile '*' --env-file .env.example -f docker-compose.yml config --format json > /tmp/opendrp-compose-release.json
           python scripts/check_release_images.py /tmp/opendrp-compose-release.json
-      - name: Fail if app, pyproject and CHANGELOG disagree
+      - name: Fail if the release version disagrees with itself
+        # Ten statements, not the three this step used to name: the template a new
+        # installation copies, the Compose SPA fallback and the frontend image's
+        # ARG default are read too (AUD-075).
         run: python scripts/check_version_consistency.py
       - id: version
         name: Fail if the tag does not name the code's version

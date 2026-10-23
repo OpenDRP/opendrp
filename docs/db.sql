@@ -181,7 +181,6 @@ CREATE TABLE dns_security_observations (
     expires_at timestamp with time zone,
     status character varying(16) DEFAULT 'current'::character varying NOT NULL,
     metadata_json json DEFAULT '{}'::json NOT NULL,
-    alerted_thresholds json DEFAULT '[]'::json NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL
 );
@@ -373,8 +372,8 @@ CREATE TABLE jobs (
     attempt_count integer DEFAULT 0 NOT NULL,
     claimed_by_connector character varying(100),
     lease_token character varying(64),
-    created_at timestamp with time zone NOT NULL,
-    updated_at timestamp with time zone NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
     connector_id uuid,
     schedule_key character varying(128),
     CONSTRAINT ck_jobs_job_type_len CHECK (((char_length((job_type)::text) >= 1) AND (char_length((job_type)::text) <= 50))),

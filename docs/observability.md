@@ -133,6 +133,56 @@ A useful detection rule can therefore be written once against the id: "show ever
 log line and audit row for `web-9f8c1d2e3b4a`" answers *what did this request
 do*, across processes and across sinks.
 
+The one response that used to escape this is the unhandled 500. Starlette
+renders it in `ServerErrorMiddleware`, above every middleware the application
+installs, so it carried no `X-Request-ID` and its log line had no id — the one
+response that *is* a bug report was the one nobody could look up. It is answered
+by the correlation middleware instead: same status, same opaque
+`Internal Server Error` body (so nothing a client parses changes), the id on the
+response, and one structured line — `unhandled_exception` with `err` (the class)
+and `frame` (`file:line` that raised). The message is *not* forwarded: a route may
+raise with a value the platform was trusted to hold, and this line travels the
+same JSON stream as the audit rows. The exception is re-raised after the response,
+so the server still writes the full traceback to its own error log. The response
+has no `Content-Security-Policy`/`X-Content-Type-Options`, which is deliberate:
+the body is one fixed string served as `text/plain`, and the header policy keeps
+one owner.
+
+## The request pipeline, in order
+
+`app/main.py` registers its middleware in the order a reader should follow a
+request **outwards**: the last one added is the outermost, so reading the file
+bottom-up walks a response back to the client.
+
+| Layer | Owns | Why at this position |
+|---|---|---|
+| `RequestContextMiddleware` | the request id, the header that returns it, and the 500 for an unhandled exception | Outermost, so every line every other layer writes carries the id — including lines written on the way out of a failure |
+| `MetricsMiddleware` | the per-replica request counters | Inside the context (a counted request already has an id) and outside CORS, so a cross-origin call the CORS layer refuses is still counted: it was work this replica did, and a spike of refused calls is worth seeing |
+| `CORSMiddleware` | the browser contract | Outside the response-shaping layer, so it answers preflights before anything below it runs. A preflight carries no body, which is why the missing security headers below are harmless |
+| `SecurityHeadersMiddleware` | CSP, `nosniff`, frame/referrer/permissions policy, HSTS, `Server` | Innermost, so it is the last place a response the application produced can be touched — every route response and every handled error passes through it |
+
+## Rate-limit keys
+
+All four limits keep their state in Redis and are listed here because an
+operator investigating a lockout reads the keys, not the modules.
+
+| Key | Subject | Bound |
+|---|---|---|
+| `rl:fails:<subject>`, `rl:lock:<subject>` | `email:<lowercased address>` and `ip:<resolved client>`, one counter each | 5 failures in 15 minutes, then a lock for the same window; a successful sign-in clears both (only when it is not itself locked out) |
+| `rl:req:<user id>:<minute>`, `rl:reqnotify:<user id>:<minute>` | an authenticated account | `AUTHENTICATED_RATE_LIMIT_PER_MINUTE` (600) per fixed wall-clock minute; the notice key is claimed once per window so a blocked client writes one audit row, not one per retry |
+| `rl:req:connector-ip:<address>:<minute>` | a source address on the connector protocol, **before** the token is resolved | 600 a minute, sized against twelve workers polling every five seconds (144) |
+| `rl:manual:<user id>:<scope>` | one account's manual actions, per scope: a connector name, `reports`, `assets` | `users.rate_limit_minutes` between actions, a sliding window rather than a counter |
+
+The `ip:` bucket is keyed on `extract_ip`, which returns the peer address and
+only consults `X-Forwarded-For` when that peer is in `TRUSTED_PROXY_IPS`; it then
+walks the chain from the hop nearest the platform and stops at the first address
+it does not trust. A client therefore cannot choose its own bucket with a header
+unless the deployment trusts the peer that header came from, which the startup
+validator refuses for any range covering the data or connector networks.
+Every limit fails open when Redis is unavailable, which is the trade-off
+[security.md](security.md#accepted-risks-and-what-bounds-each-one) records, and
+the nginx edge limits are the bound that does not depend on Redis.
+
 ## Connector scans and health
 
 Connector jobs are pull-based and carry a renewable lease. A connector sends a
@@ -159,6 +209,24 @@ for the whole tree — with `details_truncated` set when the total cap actually
 dropped something, and the same bounds apply to a connector's own `summary` on
 the completion route, so a half-trusted worker cannot decide the size of an audit
 row.
+
+What is stored is sanitised before it is bounded. Provider text reaches the trail
+from three directions — a connector's own `error_code`, an operator's channel test,
+a delivery failure — and each passes `app/core/safe_errors.py` first. The rules are
+ordered and deterministic: an absolute URL keeps its host and path while
+credential-named query parameters (`key`, `token`, `secret`, `password`,
+`signature`) and Telegram bot tokens are masked; well-known key prefixes (`sk-`,
+`ghp_`, `AIza`, `AKIA`, `xox…`) are masked wherever they appear, including inside a
+JSON body; a `Bearer`/`Basic`/`Digest` value is replaced whole rather than leaving
+the token behind the scheme word; a `label<separator>value` pair is masked quoted
+or not; and a spaced label (`API key …`) is masked only when its value carries a
+digit, so ordinary prose survives triage. A worked example:
+`HTTP 403 Forbidden; body={"error":"invalid token","token":"eyJhbGciOiJIUzI1NiJ9.abc"}`
+is stored as `HTTP 403 Forbidden; body={"error":"invalid token","token":"[REDACTED]"}`
+— the diagnosis survives, the credential does not. The result is then capped
+(`limit`) and stripped of control characters before it lands in
+`connector.last_error`, a job's `error_message`, or `details.error`, so a provider
+cannot use its own error text to inflate a row or to smuggle a key into the trail.
 
 ## Report generation lifecycle
 
@@ -301,6 +369,24 @@ when it removes anything, including whether it hit its batch cap and therefore h
 more to do. A run that deletes nothing writes no row: an audit trail that records
 daily no-ops teaches its readers to ignore it.
 
+A second pass at 04:45 UTC (`rescore_phishing_candidates`) is not a sweep and keeps
+nothing bounded: it recomputes each phishing candidate's stored `confidence` from the
+signal rows behind it, because the weights are code and a release that changes one
+leaves every existing row holding a number computed under the old table. It reports
+how many scores moved and writes nothing when none did, so a quiet run is visible in
+the task result rather than in the trail.
+
+The purge row is written after the deletions commit, in its own session, because a
+sweep that has already removed rows must not be rolled back by a failure to
+describe them — and the deletion of audit rows is itself atomic with the
+`retired_through_seq` watermark, so the *chain* can never show a gap. The residual
+window is narrow and stated here rather than implied: if the worker dies between
+the commit and that row, the retirement is still visible from the chain watermark
+and `/audit/integrity`, but the single `audit.retention.purged` line a SIEM rule
+keys on is absent for that sweep, and a retry finds nothing left to delete and
+therefore writes nothing either. Read the watermark, not only the purge rows, when
+the question is "what did retention remove on the night of the 14th".
+
 Note the asymmetry — the product trims its own table while the SIEM keeps
 whatever you tell it to keep. That is deliberate: the SIEM copy is the one you
 configure for legal hold, and the database copy exists so the product can *show*
@@ -345,6 +431,7 @@ recent history without a round trip to the SIEM.
 | `GET /api/v1/connectors/health` | connector liveness; `CONNECTOR_HEALTH_STALE_AFTER_SECONDS` (default 120) bounds silence. `online` and the `degraded`/`unknown` health states use the same UTC heartbeat threshold; stored naive timestamps are interpreted as UTC. The two are not synonyms: `health` is the overall verdict and reports a provider error as `failed`, while `online` stays true if that worker still checks in — which is why the DNS page gates its Rescan on `online`, and the dashboard card prints `online` beside `last_seen_at`. The same response carries what the worker last declared about its provider credentials — `credentials_configured`, `credential_state` (`valid`/`invalid`/`unsupported`/`unknown`, a closed vocabulary) and `provider_error` (a fixed list) with `checked_at` — plus `last_success_at`/`last_success_age_seconds`, when collection last completed. The derived fields are served to every role; the raw `readiness` document is administrator-only |
 | `docker compose ps` | container healthchecks: `backend`/`frontend` by HTTP, `celery-worker` and `celery-worker-alerts` by broker round trip, `celery-beat` and the connectors by liveness file, `backup` by dump age |
 | `audit.retention.purged` with `truncated: true` | the sweep is not keeping up; raise `RETENTION_MAX_BATCHES_PER_RUN` or shorten retention |
+| `report.generate.abandoned` | a report had been `generating` for twice the generation timeout with no worker behind it, so the sweep returned it to `failed`; `details.report_ids` names the first fifty. One is a killed worker or a lost message; a row of them means the report queue or the worker pool is being lost, and until they were repaired they counted against `REPORT_QUEUE_MAX_PENDING` |
 | `GET /api/v1/audit/integrity` | where the chain stands: retained vs signed rows, `last_verified_seq`, `last_verified_at`, `retired_through_seq`. Admin-only, and a *status* read: the nightly task is what performs the pass, `make verify-audit-chain` is what performs one now |
 | `GET /api/v1/metrics` | the same signals as numbers a scraper can alert on, plus this replica's request counters. Off (404) until `METRICS_TOKEN` is set — see [Metrics](#metrics) |
 
@@ -369,6 +456,28 @@ own `outbound.blocked` row: that is a security event, not a view, and absorbing
 it into the page's single row would hide it. `/dashboard/stats`,
 `/connectors/health` and `/alerts/health` keep answering for their own callers
 (the DNS page reads the second) and keep their own audit actions.
+
+### What each dashboard number counts
+
+Every tile and series is traced to the query that produces it, because a number
+nobody traced is a number that can drift from the page an operator opens next to
+it. `backend/app/api/v1/routers/dashboard.py` holds the summary;
+`backend/app/services/dashboard_timeline.py` the chart.
+
+| Value | Query | Predicate, and the page it has to agree with |
+|---|---|---|
+| `kpi.total_assets` | `count(drp_assets.id)` | `is_active` only — the tile is captioned *Active assets*. The inventory lists every asset unless `is_active` is given, so an unfiltered list is larger by exactly the deactivated ones |
+| `kpi.total_phishing` | `count(drp_phishing_domains.id)` | every candidate, whatever its verdict or status — the same set `GET /phishing/threats` returns with no filter. The verdict is a separate field an analyst filters on, never a hidden default |
+| `kpi.total_breaches` | `breach_kpi(...)['total_findings']` | the rule the generated report also reads (WI-16), so the two documents publish one definition |
+| `kpi.active_threats_7d` | phishing `created_at >= now-7d` and `status in (active, investigating)` plus `breach_kpi['active_findings_7d']` | the phishing half uses the same `active`/`investigating`/`resolved` vocabulary the threats list filters on; the window is the tile's own question, not the list's |
+| `kpi.new_breach_incidents_7d` | `breach_kpi['new_incidents_7d']` | the sources' own incident catalogue — what arrived upstream, not what matched an address of ours |
+| `timeline` rows | `build_timeline` — one `UNION ALL` of per-module daily counts over `[start, next midnight)` | a module's own table for a native adapter, `drp_findings` filtered by module id for the generic one. A module that stores current state is named in `timeline_excluded` with a reason instead of contributing a silent zero |
+| `timeline_comparison` | the same series over the 30 days before the window, as one total per module | answered by a second aggregate, never by a third pass over the rows |
+| `phishing_by_source` | `group by detection_source` over all candidates | a null source reads as `unknown`; the breakdown is over the same set as `total_phishing` |
+| `assets_by_criticality` | `group by criticality` over active assets | null reads as `medium`; the card is captioned *Active assets*, matching the tile above |
+| `platform.connectors.silent` | enabled connectors whose `last_seen_at` is older than `CONNECTOR_HEALTH_STALE_AFTER_SECONDS`, or that never checked in | the same threshold `/connectors/health` uses, read from one function |
+| `platform.deliveries` | `AlertDeliveryService.channel_delivery_summary` | the function `/alerts/health` calls, so the queue counts and the stuck count cannot disagree with that page |
+| `platform.oldest_running_job_seconds` | `min(jobs.created_at) where status = running` | absent (`null`) when nothing is running — not `0`, which would read as "just started" |
 
 The connector card carries three answers that are not interchangeable.
 `last_seen_at`/`online` say the worker is alive; `health` is the overall verdict,
@@ -498,7 +607,12 @@ dashboard, and `rate()` handles that. Every other value is read from the databas
 on each scrape, so all replicas report the same number. Labels come from the
 platform's own enumerations and from connector *names* (a registered connector is
 a bounded, reviewable set); no request value — an address, a finding title, a
-path — ever becomes a label.
+path — ever becomes a label. `method` is an enumeration too: the platform's own
+verbs (`GET`, `HEAD`, `POST`, `PUT`, `PATCH`, `DELETE`, `OPTIONS`) and one `OTHER`
+bucket, because an HTTP method is a token the caller chooses and a request with an
+invented one still passes through the middleware. `opendrp_http_requests_in_flight`
+includes the scrape that is rendering it, so a single-scraper installation reads
+`1`, not `0`.
 
 The families that can be absent are absent deliberately:
 `opendrp_jobs_oldest_running_seconds` does not exist while nothing is running, and
@@ -536,7 +650,7 @@ becoming unverifiable.
 | Lockout wave | `auth.login.locked` grouped by `user.id` |
 | Session anomaly | `auth.refresh.failure` with `details.reason == "reuse_detected"` — the whole family was revoked, which is worth a look |
 | Asset tampering | `asset.delete` and `user.deleted`, always alertable: these remove the evidence base |
-| Config drift | `settings.update`, `connector.config.updated`, `connector.token.rotated/revoked` |
+| Config drift | `settings.update`, `connector.config.updated`, `connector.token.rotated/revoked`. A `settings.update` row carries `details.changes` — each field that really changed with `from` and `to` — and `updated_fields`, which is the sorted key list of that map, not the submitted form; a credential reads `set`/`unset` instead of a value. `module.updated` carries the same `changes` map for a rename, a redescription and an enable/disable |
 | Exfiltration by readers | `audit.log.view` or `report.download` volume from one `user.id` |
 | Trail maintenance | `audit.retention.purged` outside the nightly window, or with an unexpected `deleted_rows` |
 | Audit trail rewritten | `audit.chain.broken` — the highest-severity rule in this list. The verification task runs nightly and on demand; a pass that does not hold means stored audit rows no longer hash-chain. Read `details.first_broken_seq` and `details.reason`, then compare that position against this index's copy of the stream before touching the database |
@@ -546,6 +660,7 @@ becoming unverifiable.
 | A shared credential was replaced | `auth.password.changed` from an account whose login was recently preceded by a `user.password_reset`/`user.created` for the same `user.id`: the temporary password was used as intended. The same action with `details.was_required=false` is a voluntary change, and worth a glance if it follows a `auth.login.failure` burst — someone changing the password they just guessed |
 | Guessing behind a live session | `auth.password.change_failed`: a valid access token that cannot produce the current password. One is a typo; several in a row from one `user.id` is a session that is not the owner's |
 | The user table left the platform | `users.export` — an administrator downloaded the account list, in the format and with the filter named in `details`. The file contains roles, activity, sign-in times and onboarding state, by design no credentials; a person preparing an access review is the benign explanation, and a download outside that cycle is worth asking about |
+| An administrator inspected another account | `users.view` — the actor is `user_id`, the account looked at is `details.target_user_id`, and `details.view` names which surface (`sessions` for the live-session list). One row per look, like the page view it is: the shape to read is a burst across many targets, or one outside support hours — which is an account harvest rather than a support call |
 | Many accounts changed at once | `users.bulk` — one row for one decision (`details.operation`, `details.target_user_ids`, `details.changed`, `details.refresh_families_revoked`). A large `deactivate` batch is an off-boarding; the same action outside a known joiner/mover/leaver window, or followed by a new account with elevated access, is the shape worth reading |
 | A session was ended by an administrator | `user.sessions.revoked` — `details.target_user_id` names the account whose sessions were signed out and `details.revoked_count` how many. Distinct from `auth.sessions.revoked_others`, which the account does to itself; this one is somebody else's decision about that account |
 | The owner was not told their account changed | `user.notification.failed` or `user.notification.skipped` following `user.password_reset`, `user.mfa.reset`, `user.locked` (`is_active=false`) or `user.deleted` for the same `details.target_user_id`. `details.event` names which change (`password_reset`, `mfa_reset`, `deactivated`, `deleted`); `details.reason` is `smtp_not_configured`, `celery_unavailable`, or a sanitized transport error. `.failed` and `.skipped` are the readable half of a real risk: an administrator can change an account and the owner learns nothing, which is the same observation a person would make if their access stopped working. Group by `details.reason` to tell a deployment that has no SMTP from one whose mail server rejects the sender. The message itself never carries a password, hash, TOTP secret or recovery code; a row whose `details` does is a defect, not a configuration |

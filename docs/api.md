@@ -98,8 +98,8 @@ browser extension would be more likely to keep it.
 | `POST` | `/api/v1/breaches/domain-verification` | analyst+ — `{"domain": "<fqdn>", "action": "generate"\|"verify", "connector": "<name>"}` (the connector is optional while one source is enabled, required when several are): queues one verification step on that source — `generate` returns the TXT value to publish, `verify` checks it — audited as `breach.domain_verification.requested` whether or not it could be queued, and reported back beside the domains in `provider-readiness.verifications` |
 | `GET` | `/api/v1/modules` | viewer+ — declared modules and their schemas |
 | `POST` | `/api/v1/modules` | admin |
-| `PATCH` | `/api/v1/modules/{module_id}` | admin |
-| `GET` | `/api/v1/findings` | viewer+ — findings of declared modules |
+| `PATCH` | `/api/v1/modules/{module_id}` | admin — rename, redescribe or enable/disable. Disabling cancels queued jobs and denies new scans; findings already stored stay readable through `/findings` and the dashboard timeline, because a disable stops collection, not the record. The `module.updated` row carries `changes` with both ends of each transition |
+| `GET` | `/api/v1/findings` | viewer+ — findings of declared modules, including modules since disabled |
 | `PATCH` | `/api/v1/findings/{finding_id}` | analyst+ — triage status |
 | `POST` | `/api/v1/reports/generate` | viewer+ |
 | `GET` | `/api/v1/reports` | viewer+ |

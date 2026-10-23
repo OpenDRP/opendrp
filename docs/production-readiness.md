@@ -35,7 +35,7 @@ delivery, image pinning — is verified on the host with
 | Every service has a healthcheck, a bounded logging policy, resource limits, the edge/data/connector network split, an authenticated broker, and the settings the application refuses to start without | `scripts/check_compose_healthchecks.py` | `repo-hygiene`, `make check-compose` |
 | Every variable a Compose file interpolates is documented in `.env.example`, every documented application setting reaches a container, and no Compose file shadows an entry with a literal | `scripts/check_env_template.py` | `repo-hygiene`, `make check-env` |
 | Every documented command is pasteable as one line in bash, PowerShell and `cmd.exe` | `scripts/check_portable_commands.py` | `repo-hygiene`, `make check-commands` |
-| The release version agrees across `backend/app/__init__.py`, `backend/pyproject.toml`, `CHANGELOG.md`, the connector SDK (`opendrp_connector/__init__.py`, `base.py`'s `SDK_VERSION`, `connectors/base/pyproject.toml`) and `frontend/package.json` | `scripts/check_version_consistency.py` | `repo-hygiene`, `release.yml` |
+| The release version agrees across `backend/app/__init__.py`, `backend/pyproject.toml`, `CHANGELOG.md`, the connector SDK (`opendrp_connector/__init__.py`, `base.py`'s `SDK_VERSION`, `connectors/base/pyproject.toml`), `frontend/package.json`, the `OPENDRP_VERSION` a new installation copies from `.env.example`, the `VITE_APP_VERSION` fallback in `docker-compose.yml` and the frontend image's `ARG` default — ten statements, and the three a deployment is made of are among them | `scripts/check_version_consistency.py` | `repo-hygiene`, `release.yml` |
 | An ignore rule cannot hide a source file from the repository | `scripts/check_tracked_sources.py` | `repo-hygiene` |
 | The SPA fallback cannot redirect a client route into a real build directory | `scripts/check_frontend_spa.py` | `repo-hygiene` |
 | Dependencies are declared in one place, as exact pins, with no second declaration to drift from | `scripts/check_dependency_sources.py` | `repo-hygiene` |
@@ -46,18 +46,20 @@ delivery, image pinning — is verified on the host with
 | The connector protocol is bounded per source address, so a leaked or invented token cannot search the job queue without limit, and the bound leaves the shipped poll interval untouched | `backend/tests/test_connectors_protocol_api.py`, `backend/tests/test_security_boundaries.py` | `backend` job |
 | A connector's scan summary is cut to the audit shape at the wire boundary, and a completion row carries the address and the batches of the scan it ends | `backend/tests/test_bounded_audit_lifecycle.py`, `backend/tests/test_connectors_protocol_api.py` | `backend` job |
 | Every `/api/v1` route a page names is a route `docs/api.md` documents, and every declared exception still appears in the pages | `backend/tests/test_page_routes_contract.py` | `backend` job |
-| Every published route carries a capability or is one of the six named public routes, the connector exemption stays under its own prefix, and every role appears in the capability table | `backend/tests/test_route_access_gate.py` | `backend` job |
+| Every published route carries a capability or is one of the seven named public routes, the connector exemption stays under its own prefix, and every role appears in the capability table | `backend/tests/test_route_access_gate.py` | `backend` job |
 | The `Access` column in `docs/api.md` states the capability the route actually requires, and no route is missing from the page | `backend/tests/test_api_docs_contract.py`, `backend/tests/route_table.py` | `backend` job |
 | A refused role leaves an `authz.denied` row, at most once per account, method and route per window, and the in-process fallback still records it when Redis is down | `backend/tests/test_authorization_denials.py` | `backend` job |
 | No `manage_admin` command changes a role or an active flag unless it is asked to, and every command that changes an account writes its audit row before applying | `backend/tests/test_manage_admin_cli.py` | `backend` job |
 | Every `python -m scripts.<tool>` command in a fenced block is one that script's parser accepts — script, subcommand and each flag | `backend/tests/test_documented_cli_gate.py` | `backend` job |
 | Every number a page promises (limits, retention, password policy, recovery codes, version) is the number the code holds, and the sentence stating it is still on the page | `backend/tests/test_docs_numbers_gate.py` | `backend` job |
+| A test module that executes connector code by path collects in a fresh interpreter, so a sharded run fails no later than the single-process one | `backend/tests/test_connector_test_isolation.py` | `backend` job |
 | The Alembic chain has one head, intact ancestry and no silently empty `downgrade()` | `backend/scripts/check_migrations.py` | `backend` job, `make check-backend-migrations` |
 | Every table and column the ORM maps is created by the revision chain, and everything the chain creates is mapped | `backend/scripts/check_schema_drift.py` | `backend` job |
 | Each security-boundary module stays above its own coverage threshold | `backend/scripts/check_critical_coverage.py` | `backend` job, `make test-backend-critical-coverage` |
 | The mypy error count only ratchets down | `backend/scripts/check_mypy_baseline.py` | `backend` job, `make mypy-backend` |
+| Every SPA request helper names its response type, every request call names a path and verb the API serves, each schema-backed interface the client models declares only fields its response model sends, and every route the SPA reads an interface from declares the `row` it answers — an inventory of the ones that do not, which cannot grow | `backend/scripts/check_api_types.py`, `backend/tests/test_api_types_gate.py` | `backend` job, `make check-api-types` |
 | The PostgreSQL/Redis integration suite actually ran, with a minimum number of passes | `backend/scripts/check_integration_ran.py` | `production-integration` job |
-| A dump taken from a migrated database restores into a scratch one | `scripts/backup.sh`, `scripts/verify_restore.sh` | `production-integration` job, `make backup-verify` |
+| A dump taken from a migrated database restores into a scratch one, and the report archive beside it restores into a scratch directory with a file read back | `scripts/backup.sh`, `scripts/verify_restore.sh`, `backend/tests/test_backup_scripts.py` | `production-integration` job, `make backup-verify` |
 | Every image the Compose files resolve is present in the release matrix | `scripts/check_release_images.py` | `release.yml` |
 | A published image has an SBOM, provenance, and no unfixed HIGH/CRITICAL finding | `trivy` step in `.github/workflows/release.yml` | `release.yml` |
 | Shipped dependencies carry no known advisory, and no credential is in the history | `pip-audit` / `npm audit` / gitleaks steps | `security` and `secrets` jobs |
@@ -111,22 +113,35 @@ thresholds are the rule; the coverage actually measured at each dated snapshot i
 [the appendix](#appendix-measurements-at-a-point-in-time). The table below and the
 gate's own map are checked against each other (`tests/test_critical_coverage_docs.py`),
 so a module cannot be gated without being listed here, or listed here without being
-gated, and the run measures what the gate names because CI and the Makefile print their
-`--cov=` flags from the gate itself.
+gated, and the run measures what the gate reads because CI and the Makefile print their
+coverage flag from the gate itself — one `--cov=app`, not a dotted flag per module. The
+package flag is the portable spelling: resolving `--cov=app.<module>` imports the module
+chain before `conftest` loads, which aborts a Windows development venv inside `bcrypt`
+before a single test runs. Measuring the package loses nothing, because the report then
+holds every file and each threshold below is still read from it.
 
 | Module | Threshold |
 |---|---|
 | `app/core/security.py` | 75% |
 | `app/core/crypto.py` | 75% |
-| `app/api/deps.py` | 75% |
-| `app/services/connector_manifest.py` | 70% |
-| `app/services/connector_service.py` | 70% |
-| `app/services/ingestion_service.py` | 70% |
+| `app/api/v1/routers/auth.py` | 91% |
+| `app/api/deps.py` | 96% |
+| `app/api/v1/routers/users.py` | 91% |
+| `app/schemas/settings.py` | 97% |
+| `app/services/connector_manifest.py` | 94% |
+| `app/services/connector_service.py` | 89% |
+| `app/schemas/connector.py` | 91% |
+| `app/services/ingestion_service.py` | 93% |
+| `app/services/report_service.py` | 89% |
+| `app/services/tls_identity_service.py` | 96% |
+| `app/api/v1/routers/dns_security.py` | 97% |
 | `app/services/connector_credentials.py` | 80% |
-| `app/services/module_registry.py` | 70% |
+| `app/services/module_registry.py` | 97% |
 | `app/core/request_rate_limit.py` | 85% |
-| `app/services/alert_service.py` | 70% |
-| `app/services/alert_delivery_service.py` | 70% |
+| `app/services/alert_service.py` | 94% |
+| `app/services/alert_delivery_service.py` | 94% |
+| `app/services/alert_message.py` | 97% |
+| `app/services/alert_health_cache.py` | 96% |
 | `app/tasks/alert_tasks.py` | 80% |
 | `app/api/v1/routers/alerts.py` | 80% |
 | `app/core/health.py` | 90% |
@@ -134,17 +149,23 @@ gated, and the run measures what the gate names because CI and the Makefile prin
 | `app/services/phishing/whois_service.py` | 80% |
 | `app/services/asset_matching.py` | 90% |
 | `app/services/scan_admission.py` | 90% |
-| `app/tasks/retention_tasks.py` | 80% |
-| `app/services/provider_quota.py` | 75% |
-| `app/tasks/integrity_tasks.py` | 70% |
+| `app/tasks/retention_tasks.py` | 96% |
+| `app/services/provider_quota.py` | 96% |
+| `app/services/audit_archive.py` | 92% |
+| `app/core/config.py` | 93% |
+| `app/tasks/integrity_tasks.py` | 97% |
+| `app/api/v1/routers/connectors.py` | 96% |
+| `app/api/v1/routers/phishing.py` | 97% |
+| `app/services/settings_service.py` | 95% |
+| `app/api/v1/routers/assets.py` | 96% |
+| `app/services/user_notifications.py` | 97% |
+| `app/tasks/user_tasks.py` | 97% |
 | `app/api/v1/routers/metrics.py` | 90% |
 | `app/core/metrics.py` | 85% |
 | `app/services/audit_verification.py` | 90% |
-| `app/services/audit_archive.py` | 75% |
 | `app/services/dns_security_service.py` | 85% |
 | `app/services/source_observations.py` | 90% |
 | `app/services/ingestion_events.py` | 90% |
-| `app/services/source_accounts.py` | 80% |
 | `app/services/alert_content.py` | 80% |
 | `app/services/module_aliases.py` | 90% |
 | `app/services/phishing_score_service.py` | 90% |
@@ -153,6 +174,55 @@ gated, and the run measures what the gate names because CI and the Makefile prin
 | `app/services/breach_kpi.py` | 95% |
 | `app/services/breach_severity.py` | 85% |
 | `app/services/invitations.py` | 90% |
+| `app/core/outbound.py` | 97% |
+| `app/core/artifact_path.py` | 92% |
+| `app/core/authorization_audit.py` | 97% |
+| `app/services/source_accounts.py` | 97% |
+| `app/api/v1/routers/source_inventory.py` | 97% |
+| `app/api/v1/routers/jobs.py` | 97% |
+
+## The staged audit (closed 2026-10-22)
+
+[Plan 009](exec-plans/009-staged-audit.md) read the whole tree in 29 bounded
+steps, every production file owned by exactly one of them. It filed 89 findings: 69
+fixed in the step that found them, each with a regression test that was red first;
+19 carried by [plan 011](exec-plans/011-remediation-pass.md), whose passes A, B and C
+have since closed every one of them; one accepted
+with a sentence in [security.md](security.md#accepted-risks-and-what-bounds-each-one).
+None is open. The register's
+[synthesis](../docs/audit-findings.md#synthesis-at-the-close-of-the-audit-s28-2026-10-22)
+holds the counts by severity and the five root causes behind 32 of them.
+
+What that means for an operator reading this page:
+
+* **What the audit fixed here is now pinned.** The boundary tables above, the
+  package flags CI prints, the version statements, the environment template and the
+  skip inventory are all recomputed by a gate rather than hand-maintained, and
+  several of them were found stale or unguarded by the audit and repaired in place
+  (AUD-001, 075, 079, 080, 082, 083, 086, 087).
+* **Every guarantee the audit found false is held again.** The `REPORT_MAX_ROWS`
+  bound now also refuses a document over 25,000 rows before rendering it (AUD-041),
+  the certificate reminder is keyed per port (AUD-036), the connector health page
+  prints the budget the reservation enforces (AUD-020), the favicon destination check
+  no longer depends on `APP_ENV`, and every WHOIS hop passes the same guard as the
+  candidate (AUD-026, AUD-032). Passes A and B of plan 011 closed those six rows on
+  2026-10-22, and pass C closed the five that followed: the second VirusTotal
+  budget is deleted (AUD-022), a stored phishing score is repaired nightly by
+  `rescore_phishing_candidates` (AUD-033), the Typer/Click pair is pinned
+  compatible so the demo CLI's `--help` works (AUD-057), every request helper in the
+  SPA names its response type and a gate compares the typed interfaces with the
+  OpenAPI models (AUD-060), and the mypy ratchet has a test that fails when it is
+  weakened (AUD-089). No finding is `planned`.
+* **The readiness claims in this page were audited, not assumed.** The skips are
+  inventoried (plan 008), the deploy path, the backup's two halves and the E2E
+  scripts were read against what this page says they prove, and where a claim could
+  not be exercised on a maintenance host the audit says so in the register's closing
+  section instead of leaving it to look covered.
+* **What the audit did not do** is in the same section: no `docker compose up`, no
+  restore of a real backup, no Playwright run, and the dependency lock check against
+  PyPI was never completed on the host it ran on. Those are CI's to prove, and the
+  `production-integration` and `e2e` jobs are what this page's operator claims rest
+  on today.
 
 ## Earlier remediation rounds (historical)
 
@@ -190,7 +260,7 @@ documented command. An item with nothing enforcing it does not belong here.
 | Gap | Closed by |
 |---|---|
 | Audit history and generated reports grew without bound | The retention tables in the baseline schema, the nightly `purge_expired_data` task (`app/tasks/retention_tasks.py`) with `AUDIT_RETENTION_DAYS` / `REPORT_RETENTION_DAYS`, batched deletes, and an `audit.retention.purged` record of what it removed. Tests: `tests/test_retention_tasks.py`. |
-| No backups, and no evidence a backup restores | `scripts/backup.sh` (dump + report store + read-back check), `scripts/restore.sh` (refuses without `CONFIRM_RESTORE=yes`, refuses with other clients connected, takes a safety copy), `scripts/verify_restore.sh`, the `backup` Compose profile, `make backup` / `backup-verify` / `restore`, and a CI job that dumps a migrated database and restores it into a scratch one on every push. Runbook: `docs/backup-restore.md`. |
+| No backups, and no evidence a backup restores | `scripts/backup.sh` (dump + report store, both read back before the pass is trusted), `scripts/restore.sh` (refuses without `CONFIRM_RESTORE=yes`, refuses with other clients connected, takes a safety copy), `scripts/verify_restore.sh` (restores the dump into a scratch database and the report archive into a scratch directory, then reads from both), the `backup` Compose profile, `make backup` / `backup-verify` / `restore`, and a CI job that does both on every push against a migrated database and a one-report store. Runbook: `docs/backup-restore.md`. |
 | Container logs were unbounded | A shared `logging` policy (10 MB × 5) on every service in the Compose file set, plus `docs/observability.md` describing the SIEM path and how to switch to a log driver instead. `scripts/check_compose_healthchecks.py` fails the build if a service loses its bound. |
 | Half the services had no healthcheck | Healthchecks for `celery-worker` (a broker round trip, not a process check), `celery-beat` (a liveness file the wrapper touches) and every connector image (the SDK's watchdog file), with `start_period` values that tolerate a slow first scan. Enforced by the same Compose gate. |
 | An unprovisioned connector could crash-loop forever | `restart` policy and healthcheck tuning per connector; the Compose gate fails if the healthcheck disappears. |
@@ -209,7 +279,7 @@ documented command. An item with nothing enforcing it does not belong here.
 
 | Gap | Closed by |
 |---|---|
-| No second factor | TOTP (`app/core/totp.py`, RFC 6238 — verified against the RFC's own test vectors in `tests/test_mfa.py`), enrolment and removal in `app/api/v1/routers/auth.py` (`/auth/mfa`, `/auth/mfa/setup`, `/auth/mfa/enable`, `/auth/mfa/disable`), login enforcement with replay protection and the same lockout as a wrong password, Fernet-encrypted secrets, an administrator recovery path (`POST /users/{id}/mfa/reset`, audited as `user.mfa.reset`) and a CLI path for a locked-out administrator (`manage_admin mfa-off`). The SPA asks for a code only after the API says it is required, so the endpoint is not an oracle for which accounts use MFA, and every role can enrol from **My security**. |
+| No second factor | TOTP (`app/core/totp.py`, RFC 6238 — verified against the RFC's own test vectors in `tests/test_mfa.py`), enrolment and removal in `app/api/v1/routers/auth.py` (`/auth/mfa`, `/auth/mfa/setup`, `/auth/mfa/enable`, `/auth/mfa/disable`), login enforcement with replay protection and the same lockout as a wrong password, Fernet-encrypted secrets, enrolment ending every other session in the same transaction (a refresh token minted before the factor cannot keep signing in without a code), an administrator recovery path (`POST /users/{id}/mfa/reset`, audited as `user.mfa.reset`) and a CLI path for a locked-out administrator (`manage_admin mfa-off`). The SPA asks for a code only after the API says it is required, so the endpoint is not an oracle for which accounts use MFA, and every role can enrol from **My security**. |
 | Rotating a key meant losing data or signing everyone out | `ENCRYPTION_KEY` + `ENCRYPTION_PREVIOUS_KEYS` (MultiFernet: newest encrypts, all decrypt) and `JWT_SECRET_KEY` + `JWT_PREVIOUS_SECRET_KEYS` (tokens signed with a retired secret keep verifying for as long as it is listed). `python -m scripts.rotate_keys` (`generate` with `--jwt` or `--audit-chain`, then `status`, then `rewrap`) makes the rotation a verifiable three-step procedure; `docs/upgrading.md#rotating-secrets` documents it. Tests: `tests/test_key_rotation.py`. |
 | Supply-chain and static analysis: dependencies audited, code never | A `bandit` gate at medium severity and confidence over `backend/app` and the `connectors/base`, `connectors/dnstwist`, `connectors/shodan` and `connectors/hibp` trees — the DNS Security, intelligence and endpoint workers are outside that scope — plus a `secrets` job that runs the gitleaks OSS binary over the **full history** (`fetch-depth: 0`) with a narrowly scoped `.gitleaks.toml`, and a CodeQL job that runs when the repository is public (`if: github.event.repository.visibility == 'public'`), because the analysis needs GitHub Advanced Security. Every action is pinned to a commit SHA, with Dependabot updating the pins. |
 | Images were only ever built locally | `release.yml` builds and pushes all eight images — the backend, the frontend, and the six connector images (`dnstwist`, `shodan`, `hibp`, `dns-security`, `intelligence`, and the one shared by both endpoint workers) — to GHCR on a `v*` tag with SBOM and provenance attestations, scans each published image with Trivy and fails on an unfixed HIGH/CRITICAL finding, and verifies the tag against `app/__init__.py` before anything is published. |
@@ -270,7 +340,7 @@ is about what the toolchain was allowed to hide rather than about the bug itself
 | Gap | Closed by |
 |---|---|
 | No contribution, conduct, changelog or issue/PR documentation | `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, `CHANGELOG.md`, `.github/ISSUE_TEMPLATE/*`, `.github/pull_request_template.md`, and a `SECURITY.md` supported-versions section that names releases rather than `main`. |
-| Several copies of the version, no releases, no tags | `backend/app/__init__.py` is the single source; `scripts/check_version_consistency.py` fails the build when `backend/pyproject.toml`, `CHANGELOG.md`, the connector SDK (its `__version__`, the `SDK_VERSION` a connector registers as `api_version`, and its package metadata) or `frontend/package.json` disagrees, and it runs in CI **and** in the release workflow, which also refuses a tag that does not match the code. `OPENDRP_VERSION` pins the images Compose resolves, and the SPA's reported version is baked in at build time from that same release. |
+| Several copies of the version, no releases, no tags | `backend/app/__init__.py` is the single source; `scripts/check_version_consistency.py` fails the build when `backend/pyproject.toml`, `CHANGELOG.md`, the connector SDK (its `__version__`, the `SDK_VERSION` a connector registers as `api_version`, and its package metadata), `frontend/package.json`, the `OPENDRP_VERSION` line in `.env.example` or either `VITE_APP_VERSION` build default disagrees, and it runs in CI **and** in the release workflow, which also refuses a tag that does not match the code. `OPENDRP_VERSION` pins the images Compose resolves, and the SPA's reported version is baked in at build time from that same release. |
 | Nothing told an operator what upgrading would break | `docs/upgrading.md`: the procedure, the maintenance window the baseline's index families need on a populated database, the rewrite of the recorded revision that adopts a database an earlier build created, rollback in both directions, the secret-rotation procedures, and what changes when two replicas are in play. |
 | Provisioning was `cp .env.example .env` and five secrets written by hand | `setup.py` is the onboarding path: a small set of deployment and security questions, then every secret generated with the operating system's CSPRNG in the exact shape the validators demand, the finished file checked against the startup rules *before* it is written, and no secret value ever printed (a fingerprint confirms the write). `--check` audits an existing `.env` without touching it and is the mechanical form of the upgrade-time template diff, `--repair` fills only the empties and placeholders, `--force` rotates while moving the replaced keys into the matching `*_PREVIOUS_*` lists so live sessions, stored ciphertext and signed audit history stay valid. It refuses to write a file git would commit. |
 | `.env.example` documented settings that did nothing, and omitted settings Compose read | `scripts/check_env_template.py` (rule 1: every variable a Compose file interpolates is documented; rule 2: every entry the template defines is consumed somewhere real; rule 3: every documented application setting reaches a container; rule 4: no Compose file shadows an entry with a literal; rule 5: a setting one connector reads, and nothing else does, is namespaced after that connector, because `.env` is a single namespace shared by every service). It found seven settings that were documentation-only — including the statement timeout the template told an operator to raise for a large inventory — and nine variables Compose read that the template never mentioned; all are now wired or documented. Tests: `tests/test_env_template_gate.py`, `tests/test_setup_env.py`. |
@@ -306,14 +376,57 @@ is about what the toolchain was allowed to hide rather than about the bug itself
    Advanced Security). The workflow is committed and gated on repository
    visibility, so it starts with the first push after the project is public.
    `bandit` and the full-history secret scan do run today.
-5. **The frontend API client is hand-written.** Endpoint paths are string
-   literals, so removing a backend route does not fail any build — that is exactly
-   how the two dead helpers above survived. Generating the client from
-   `/openapi.json` would remove the class of defect rather than the instance. The
-   documentation half of that class is closed: `docs/api.md` is compared against
+5. **The frontend API client is hand-written.** The paths are no longer unchecked:
+   `backend/scripts/check_api_types.py` reads every `api.<verb>` call under
+   `frontend/src` (109 today, eight of them outside `lib/api.ts`) and compares the
+   path and the verb with the OpenAPI route table, so renaming or removing a route
+   fails the build at the helper that calls it instead of in a browser. What that does
+   not remove is the class — the literals are still written by hand, a route
+   **added** to the API appears in no helper until somebody writes one (a missing
+   feature, not drift), and a path and verb that both exist are still the author's
+   claim about which one the helper meant. The response half is measured rather than
+   closed, and the measurement is `UNMODELLED` in the same script: the routes the
+   SPA reads an interface from whose response describes no **row**, and it is empty:
+   every one of them declares the rows it sends, nested ones included. The rule
+   stays, and the gate fails both when a new typed read joins the list and when an
+   entry whose route gained a row model is left behind, so the class is reported
+   rather than silent.
+   The question is asked of the rows because that is what a page renders: a bare
+   model, a `list[Model]` and a page whose `items` is one are described, while
+   `PaginatedResponse[dict]` and `PaginatedResponse[Any]` are not — which is what
+   brought those two back into view after the list had been emptied of routes with no
+   model at all. The inventory shrank by that procedure: the two orphans-cleanup
+   routes left it when `CleanupResponse` was declared on them, the two test-send
+   routes when their one interface became the two payloads the routes actually send,
+   and the Telegram validation route when
+   its per-chat rows became a discriminated pair of models, followed by the runtime
+   diagnostics payload, the alert-recipient briefing, the certificate scope list, the
+   six scan routes, the four promotion answers, the asset findings view, the
+   source-account list, the connector health page, the module inventory, the
+   account-binding answer, the dashboard overview, the audit filter catalogue, the
+   audit integrity view, the alert queue, and finally the exposure inventory, its
+   triage update and the phishing evidence list. Those last three routes were counted
+   as two until the gate's own interface parser was read: a body that opens and
+   closes on one line (`interface Page extends Paginated<Row> {}`) ended the block
+   walk in the wrong place and hid the interface after it from every rule, and the
+   audit page's `PaginatedResponse[Any]` was the first entry the row question found,
+   followed by the DNS inventory's eighteen fields and the expiry control they resolve,
+   and last by the certificate review — a row of sixteen fields nesting fourteen-field
+   sightings, so the client's two interfaces are compared with two models. Each time
+   the gate was red before the model existed and green after. What the rule still
+   cannot see is an answer the client writes as an **inline object literal**: rules 2
+   and 4 compare declarations, and a literal is not one. Four literals were duplicates
+   or should have been shared — the module scan (which `ScanStartResult` already
+   described), the DNS cleanup (`CleanupResult`), and the two session revocations —
+   and naming them exposed the four routes behind them, which declared nothing; they
+   declare their rows now. The literals that remain (`/reports/generate`, the
+   connector-account writes, the bulk user operation, the invitation answers) have no
+   declaration on either side yet, which is a smaller hole of a different shape.
+   Generating the client from `/openapi.json` would remove the class rather than the
+   instance. The
+   documentation half of it was closed earlier: `docs/api.md` is compared against
    the schema in both directions by `tests/test_api_docs_contract.py`, so a route
-   added, renamed or removed without the reference moving fails the suite. The
-   client's path literals are still unchecked.
+   added, renamed or removed without the reference moving fails the suite.
 6. **The authenticated rate limit fails open** when Redis is unavailable, and the
    manual-action limit behaves the same way: losing the throttle during a Redis
    outage is preferred to locking every operator out. The bound that does not
@@ -424,6 +537,10 @@ docker compose exec -T backend sh -c "COVERAGE_CORE=sysmon python -m pytest -q -
 # Per-module gate against that report
 docker compose exec -T backend sh -c "COVERAGE_CORE=sysmon python -m pytest -q --cov=app --cov-report=json:coverage-critical.json && python scripts/check_critical_coverage.py coverage-critical.json"
 
+# The same gate on a host venv, without Compose: the flag the gate prints works
+# there too (a dotted --cov=app.<module> aborts inside bcrypt before conftest)
+cd backend && COVERAGE_CORE=sysmon python -m pytest -q --cov=app --cov-report=json:coverage-critical.json tests/ && python scripts/check_critical_coverage.py coverage-critical.json
+
 # Static gates
 docker compose exec -T backend sh -c "python -m ruff check app scripts tests && python -m mypy app && python scripts/check_migrations.py && python -m scripts.check_schema_drift"
 
@@ -532,6 +649,103 @@ Chromium, `E2E_BROWSER_HEADLESS=false` opens a window you can watch, and
 `make test-backend`, `make test-backend-fast`, `make test-backend-critical-coverage`
 and `make check-backend-migrations` wrap the same commands.
 
+### What a host run skips, and why
+
+A run on a host without a broker and without PostgreSQL ends with a handful of
+skips, and the number alone says nothing about whether the tree is healthy. Each
+skip is a test that needs something this host does not have, and each names it.
+The 2026-10-21 host run of the full suite (3363 passed, 16 skipped) skipped
+exactly these sixteen, and they fall into the first four of the eight kinds the
+inventory below lists:
+
+| Cause | Skip sites | Skips on that host | Tests | What runs them instead |
+|---|---|---|---|---|
+| **No Redis broker** | 1 | 4 | `tests/conftest.py::live_redis` is the only site: it pings `REDIS_URL` and skips with the reason when nothing answers, which is what the `SET NX` dedup and the real-broker quota gate in `tests/test_celery_boundary.py` and `tests/test_source_intelligence.py` see | The tooling stack (`make up-tools`), the `redis:7-alpine` service CI's `backend` job runs, and any reachable broker execute them for real; `REQUIRE_INTEGRATION=1` turns the skip back into a failure. `tests/test_broker_suites_gate.py` pins both halves. |
+| **No PostgreSQL for the integration suites** | 5 | 5 | five module-level guards: `tests/test_alembic_migrations.py`, `tests/test_asset_involvement_postgres.py`, `tests/test_dns_expiry_postgres.py` and `tests/test_users_rbac_postgres.py` need `INTEGRATION_MIGRATION_DATABASE_URL`; `tests/test_production_integrations.py` needs `INTEGRATION_DATABASE_URL` and `INTEGRATION_REDIS_URL` | The `production-integration` CI job, or those variables pointed at a scratch database; `tests/test_postgres_only_suites_gate.py` fails the build when that job stops selecting the suites or stops forbidding skips. |
+| **SQLite cannot test row locks** | 3 | 3 | `tests/test_auth_defense_in_depth.py::test_refresh_family_row_locking_serializes_concurrent_replays` and `tests/test_tier1_security.py::test_concurrent_replay_of_one_refresh_token_never_issues_two_successors` — two refreshes rotating at once — and `tests/test_users_read_paths.py::test_concurrent_admin_membership_changes_keep_one_active_admin`, the last administrator being demoted | Any PostgreSQL run: the files keep their SQLite cases and skip only the one whose correctness *is* the lock |
+| **No symlink privilege** | 3 | 4 | `tests/test_artifact_path.py::test_a_symlink_out_of_the_store_is_refused`, `tests/test_audit_archive_edges.py::_symlink` (two cases) and `tests/test_retention_tasks.py::test_rejects_a_symlink_that_leaves_the_store` | Linux CI, where `os.symlink` needs no elevation; these are the escape and symlink-refusal cases |
+| **Partial checkout** | 35 | 0 | every other gate test in the inventory below, each of which reads a script, the workflow, the Compose file or the connector SDK before it can answer its question, plus this page's own gate when the page is not mounted | A full checkout: CI runs the suite from one, while the test container mounts the backend subtree only — so these are the skips a container run reports and a local `pytest` run does not |
+| **No `git` binary** | 3 | 0 | the three scratch-repository tests in `tests/test_tracked_sources_gate.py` | Any host with `git` on `PATH`, which is every CI runner |
+| **No POSIX shell** | 1 | 0 | `tests/test_backup_scripts.py`, which runs `scripts/backup.sh` and `scripts/verify_restore.sh` under `sh` | Any Linux host or CI runner, and Windows with Git for Windows on `PATH`; the backup paths themselves are exercised in the `production-integration` job, which runs the scripts in `postgres:17-alpine` |
+| **The checkout root is the filesystem root** | 1 | 0 | `tests/test_release_image_matrix.py::test_matrix_paths_cannot_escape_the_repository`, which needs a checkout root that has a parent | A checkout below `/`: CI clones into a workspace directory, and only a mount whose root is `/` removes the parent |
+| **Total** | 52 | 16 | every site the suite can turn into a skip | — |
+
+Those counts describe one host on one date, not the tree: a broker and PostgreSQL
+turn twelve of the sixteen into ordinary passes, and only the symlink group is
+about the operating system rather than about a service. Running the thirteen files
+that hold them reproduces the sixteen and nothing else (`188 passed, 16 skipped`),
+which is how that table was checked rather than assumed.
+
+The "Skip sites" column is not a reading of a run: it is the number of rows under
+that cause in the inventory below, and
+[backend/tests/test_skip_inventory_gate.py](../backend/tests/test_skip_inventory_gate.py)
+fails when either table disagrees with the tree — a skip site that is not listed,
+a row that names a site the suite no longer has, a count that no longer matches,
+or a `tests/...` reference that does not resolve. A site is named by its file and
+its nearest enclosing function, or by the file alone for a module-level skip,
+which survives an insertion above it; the `file:line` references this section used
+to carry did not.
+
+**Every place the suite can skip.** Every site, grouped by the causes above and
+counted in the total row. A new skip needs a row here in the same change:
+otherwise the next run reports fewer tests than it should and the page cannot say
+why.
+
+| Site | Cause | What makes it skip |
+|---|---|---|
+| `tests/conftest.py::live_redis` | No Redis broker | nothing answers the `REDIS_URL` probe, so the four broker tests that take this fixture skip |
+| `tests/test_alembic_migrations.py` | No PostgreSQL for the integration suites | `INTEGRATION_MIGRATION_DATABASE_URL` unset |
+| `tests/test_asset_involvement_postgres.py` | No PostgreSQL for the integration suites | `INTEGRATION_MIGRATION_DATABASE_URL` unset |
+| `tests/test_dns_expiry_postgres.py` | No PostgreSQL for the integration suites | `INTEGRATION_MIGRATION_DATABASE_URL` unset |
+| `tests/test_production_integrations.py` | No PostgreSQL for the integration suites | one of `INTEGRATION_DATABASE_URL` and `INTEGRATION_REDIS_URL` is unset |
+| `tests/test_users_rbac_postgres.py` | No PostgreSQL for the integration suites | `INTEGRATION_MIGRATION_DATABASE_URL` unset |
+| `tests/test_auth_defense_in_depth.py::test_refresh_family_row_locking_serializes_concurrent_replays` | SQLite cannot test row locks | two refreshes rotating at once need a row lock SQLite cannot take |
+| `tests/test_tier1_security.py::test_concurrent_replay_of_one_refresh_token_never_issues_two_successors` | SQLite cannot test row locks | the same replay, where only the lock decides the outcome |
+| `tests/test_users_read_paths.py::test_concurrent_admin_membership_changes_keep_one_active_admin` | SQLite cannot test row locks | demoting the last administrator needs the advisory lock |
+| `tests/test_artifact_path.py::test_a_symlink_out_of_the_store_is_refused` | No symlink privilege | `os.symlink` needs elevation on this platform |
+| `tests/test_audit_archive_edges.py::_symlink` | No symlink privilege | the helper the two archive symlink cases call |
+| `tests/test_retention_tasks.py::test_rejects_a_symlink_that_leaves_the_store` | No symlink privilege | `os.symlink` needs elevation on this platform |
+| `tests/test_audit_map_gate.py` | Partial checkout | the staged-audit plan it reads is missing |
+| `tests/test_audit_register_gate.py` | Partial checkout | the finding register or the plans directory it reads is missing |
+| `tests/test_broker_suites_gate.py` | Partial checkout | no `.github/workflows/ci.yml` to read |
+| `tests/test_compose_limits_gate.py` | Partial checkout | the Compose gate, the Compose file or the limits page is missing |
+| `tests/test_compose_settings_gate.py` | Partial checkout | the settings gate or the Compose file is missing |
+| `tests/test_connector_body_bounds_gate.py` | Partial checkout | the body-bounds gate script is missing |
+| `tests/test_connector_provider_client.py` | Partial checkout | the connector SDK tree (`connectors/`) is not mounted |
+| `tests/test_connector_provider_limits.py` | Partial checkout | `connectors/` is not mounted |
+| `tests/test_connector_readiness_contract.py` | Partial checkout | one of the connector contract inputs is missing |
+| `tests/test_connector_sdk_contract.py` | Partial checkout | the connector SDK tree (`connectors/`) is not mounted |
+| `tests/test_connector_tests_collected.py` | Partial checkout | `connectors/` or its test runner is missing |
+| `tests/test_docs_consistency_gate.py` | Partial checkout | the documentation gate script or the `docs/` tree is missing |
+| `tests/test_docs_consistency_gate.py::test_the_shipped_documentation_tree_is_clean` | Partial checkout | the checkout root is not mounted, so there is no tree to walk |
+| `tests/test_documented_cli_gate.py::test_every_documented_command_is_one_its_script_accepts` | Partial checkout | `README.md` or the script it documents is missing |
+| `tests/test_edge_rate_limit_wiring.py` | Partial checkout | the edge configuration it reads is missing |
+| `tests/test_frontend_spa_gate.py` | Partial checkout | the SPA gate script it drives is missing |
+| `tests/test_env_template_gate.py` | Partial checkout | the environment-template gate script is missing |
+| `tests/test_github_docs_claims.py` | Partial checkout | one of the pages whose claims it checks is missing |
+| `tests/test_hsts_rendering.py` | Partial checkout | the HSTS rendering script is missing |
+| `tests/test_hsts_wiring.py` | Partial checkout | the edge configuration it reads is missing |
+| `tests/test_logging_config.py::test_a_foreign_wrapper_cannot_silence_an_audit_event` | Partial checkout | the connector SDK source is not mounted |
+| `tests/test_logging_config.py::test_a_platform_logger_is_not_pinned_by_a_connector` | Partial checkout | the connector SDK source is not mounted |
+| `tests/test_logging_config.py::test_the_published_five_fields_survive_a_connector_configure` | Partial checkout | the connector SDK source is not mounted |
+| `tests/test_no_legacy_surface.py` | Partial checkout | the files it scans for the withdrawn surface are missing |
+| `tests/test_portable_commands_gate.py` | Partial checkout | the portable-commands gate script is missing |
+| `tests/test_postgres_only_suites_gate.py` | Partial checkout | no workflow to read |
+| `tests/test_release_image_matrix.py` | Partial checkout | the release-image gate script is missing |
+| `tests/test_setup_env.py` | Partial checkout | the environment-setup script is missing |
+| `tests/test_single_installation_shape.py` | Partial checkout | the Compose file or a settings module it reads is missing |
+| `tests/test_skip_inventory_gate.py` | Partial checkout | the readiness page it reads is missing |
+| `tests/test_tracked_sources_gate.py` | Partial checkout | the tracked-sources gate script is missing |
+| `tests/test_version_consistency_gate.py` | Partial checkout | the version gate script is missing |
+| `tests/test_version_consistency_gate.py::test_the_shipped_tree_declares_one_release_version` | Partial checkout | the checkout root is not mounted, so there is no tree to walk |
+| `tests/test_withdrawn_providers_gate.py` | Partial checkout | the withdrawn-provider gate script is missing |
+| `tests/test_withdrawn_providers_gate.py::test_the_real_repository_holds_no_withdrawn_provider` | Partial checkout | the checkout root is not mounted, so there is no tree to walk |
+| `tests/test_tracked_sources_gate.py::test_the_gate_accepts_an_ignored_virtual_environment` | No `git` binary | its scratch repository is built with `git init` |
+| `tests/test_tracked_sources_gate.py::test_the_gate_accepts_the_deliberately_ignored_internal_records` | No `git` binary | its scratch repository is built with `git init` |
+| `tests/test_tracked_sources_gate.py::test_the_gate_reports_source_hidden_by_an_over_broad_rule` | No `git` binary | its scratch repository is built with `git init` |
+| `tests/test_backup_scripts.py` | No POSIX shell | there is no `sh` on `PATH` to run the two shipped scripts with |
+| `tests/test_release_image_matrix.py::test_matrix_paths_cannot_escape_the_repository` | The checkout root is the filesystem root | `/` is the checkout root, so no path can be outside it |
+
 ### Why `alembic check` is deliberately not a gate
 
 `alembic check` — models against a live database, indexes and constraints
@@ -542,10 +756,16 @@ enforces the same thing, so no runtime behaviour depends on the difference — b
 future `alembic revision --autogenerate` would render it as a migration that drops
 and recreates those objects, which is why it is not wired in as a gate.
 `backend/scripts/check_schema_drift.py` covers the part that actually stops a
-deployment: a table or column the models read and the schema does not have. Closing
-the gap is contained work — declare the indexes the models do not declare, and drop
-the redundant constraints from the baseline revision — and it is worth doing before
-anyone generates a migration from the models.
+deployment — a table, a column, a server default or an index the models rely on and
+the schema does not have — and, since the S22 pass, index coverage in both
+directions: every index a model declares must be created by the revision chain,
+and every index the chain creates must either be declared by a model or named in
+that gate's `_REVISION_ONLY_INDEXES` with its reason. The comparison is by
+*coverage* (table, ordered columns, uniqueness), never by object name, because a
+model's unique index and the revision's unique constraint are one access path under
+two names. What remains open is the naming difference itself: a migration generated
+from the models would still propose dropping `uq_users_email` and creating
+`ix_users_email`, which is why `alembic check` is not a gate.
 
 `make check-backend-migrations` runs *both* static schema gates — the revision
 graph and the models-versus-schema comparison — because running half of that
@@ -574,7 +794,7 @@ later hardening work.
 | `mypy app` | 0 errors, 81 source files |
 | Migration gate (`backend/scripts/check_migrations.py`) | single head, intact ancestry, no no-op downgrades |
 | Schema-drift gate (`backend/scripts/check_schema_drift.py`) | every mapped table and column is created by the revision chain, and everything the chain creates is mapped |
-| Per-module coverage gate (`backend/scripts/check_critical_coverage.py`) | OK — all 14 modules the gate held at that date above threshold (it holds 37 today: see [Gated security boundaries](#gated-security-boundaries)) |
+| Per-module coverage gate (`backend/scripts/check_critical_coverage.py`) | OK — all 14 modules the gate held at that date above threshold (it holds 47 today: see [Gated security boundaries](#gated-security-boundaries)) |
 | Alembic head | `0001_initial_schema` at that date |
 | Frontend typecheck (`tsc -b`) | clean |
 | PostgreSQL migration + parity tests (`tests/test_alembic_migrations.py`, `REQUIRE_INTEGRATION=1`) | 5 passed — clean upgrade to head, downgrade round trip, `Base.metadata` versus the migrated schema, the startup seeder, and the `alembic_version` width |
@@ -582,7 +802,7 @@ later hardening work.
 | Live stack | a single observation from that date, not a verified deployment |
 
 Per-module coverage as measured at that baseline, for the 14 modules the gate held at
-that date; the thresholds are the rule, and today's 37-row table of them lives in
+that date; the thresholds are the rule, and today's 40-row table of them lives in
 [Gated security boundaries](#gated-security-boundaries):
 
 | Module | Measured |
@@ -713,3 +933,30 @@ On a freshly migrated PostgreSQL 17, with the working tree of that date:
 
 This measurement is the reason behind
 [Why `alembic check` is deliberately not a gate](#why-alembic-check-is-deliberately-not-a-gate).
+
+### The difference list refreshed on 2026-10-22 (S22)
+
+Measured on the shipped tree with the extended gate, which reads both sides from
+source and needs no database:
+
+* **Server defaults: two differences, both fixed.** `jobs.created_at` and
+  `jobs.updated_at` were the only columns the models gave a default the baseline did
+  not set; the baseline now sets `now()` on both (AUD-051).
+* **Indexes the models declare and the chain does not create: none.** Every index
+  and unique constraint a model declares has a counterpart in the revision, once
+  compared by table, ordered columns and uniqueness rather than by name.
+* **Indexes the chain creates and no model declares: five plain ones, now
+  declared**, and sixteen that only PostgreSQL can spell. The five —
+  `ix_jobs_status_created`, `ix_ingestion_events_due`, `ix_reports_created_at`,
+  `ix_reports_status`, `ix_drp_audit_logs_user_timestamp` — exist for reads the
+  tests exercise, so they belong on the models the test schema is built from
+  (AUD-056). The sixteen are eleven expression indexes over the matching rules and
+  the JSON details keys, and five trigram GIN indexes for substring search; they
+  are listed with their reasons in `scripts/check_schema_drift.py`
+  (`_REVISION_ONLY_INDEXES`), and the gate fails if one of them stops being created.
+* **Naming: still different, deliberately not compared.** A model's
+  `Column(unique=True, index=True)` renders a unique index while the revision writes
+  a `UniqueConstraint`; both enforce one unique btree. The gate treats that as one
+  coverage key, so the divergence the 2026-10-08 measurement names above is
+  explained rather than filed — and it is still the reason `alembic check` would
+  propose a drop-and-create.

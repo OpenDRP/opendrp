@@ -95,8 +95,16 @@ This restores the newest dump into a throwaway database
 Alembic revision row all came back, and then drops the scratch database. A dump
 that fails this is not a backup, and finding that out now is the entire point.
 
-It runs in CI against a freshly seeded database on every push, so the backup
-path is exercised continuously rather than remembered during an incident.
+The report archive beside the dump is proven on the same run: it is listed,
+extracted into a scratch directory and a file is read back out of it, because an
+archive that cannot be listed or extracted is a store that will not come back. A
+dump with no archive beside it restores as a database-only backup and says so;
+set `REQUIRE_REPORT_ARCHIVE=1` to make a missing archive a failure, which is what
+CI does — a job that quietly stopped capturing the store should not stay green.
+
+It runs in CI against a freshly seeded database and a one-report store on every
+push, so both halves of the backup path are exercised continuously rather than
+remembered during an incident.
 
 ## Restoring over the live database
 
@@ -144,18 +152,27 @@ Notes:
 restored from a dump has report rows whose PDFs are not on disk. The archive is
 `reports-<stamp>.tgz` beside the dump, written by the same pass.
 
-On a development stack the store is the `./reports_store` directory in the
-checkout, and the archive is the whole of it:
+The archive holds exactly one top-level entry, `reports/`: it is made with
+`tar -C "$(dirname "$REPORTS_DIR")" "$(basename "$REPORTS_DIR")"`, and both
+Compose file sets point `REPORTS_DIR` at `/reports` inside the container — the
+development overlay changes which host directory is mounted there, not the path.
+Extracting it into the store's *parent* therefore leaves the PDFs one directory
+away from where the platform looks for them, so extract its contents into the
+store itself:
 
 ```bash
-tar -xzf backups/reports-20260913T041500Z.tgz -C .
+# Development stack: the store is ./reports_store in the checkout.
+tar -xzf backups/reports-20260913T041500Z.tgz -C ./reports_store --strip-components=1
 ```
 
-On an installation the store is the `reports_store` named volume. The archive is
-made with `tar -C <parent> reports_store`, so its one top-level entry is
-`reports_store/`; extract it with a container that mounts that volume
-read-write (the `backup` service mounts it read-only on purpose, so that a backup
-can never modify the store it archives).
+On an installation the store is the `reports_store` named volume, whose full name
+carries the Compose project prefix (`docker volume ls` shows it). The `backup`
+service mounts it read-only on purpose — a backup can never modify the store it
+archives — so use a throwaway container that mounts it read-write:
+
+```bash
+docker run --rm -v opendrp_reports_store:/store -v "$PWD/backups:/backups:ro" alpine:3 sh -c 'tar -xzf /backups/reports-20260913T041500Z.tgz -C /store --strip-components=1'
+```
 
 Either way, check afterwards that a report downloads. A restore that stops at the
 database leaves the inventory and the UI consistent and only the downloads
@@ -183,8 +200,10 @@ Do this on a calendar, not when you need it. The run takes about ten minutes.
    `docker compose -f docker-compose.yml up -d postgres` and nothing else.
 4. `CONFIRM_RESTORE=yes make restore FILE=<the copied dump>` — against the
    throwaway stack — then extract the report archive into the report store, or
-   step 5 cannot download a PDF (`tar -xzf backups/reports-<stamp>.tgz -C .` on a
-   development stack, whose store is `./reports_store`).
+   step 5 cannot download a PDF (`tar -xzf backups/reports-<stamp>.tgz -C
+   ./reports_store --strip-components=1` on a development stack, whose store is
+   `./reports_store`; the archive's one top-level entry is `reports/`, so
+   `--strip-components=1` is what puts the files where the platform looks).
 5. `docker compose up -d`, sign in, and check three things by hand: the asset
    count on the dashboard, the newest audit rows, and that a generated report
    downloads.

@@ -106,8 +106,40 @@ a pending or expired link.
   arrived. Each chart now carries `role="img"` naming the series and window it
   draws, plus a visible total, so the numbers are not available only to sighted
   users.
+- The readiness page's skip count is an inventory a check enforces: every place in
+  `backend/tests` that can turn a test into a skip is listed there with the cause
+  it belongs to, and `tests/test_skip_inventory_gate.py` fails when the tree and
+  the page disagree in either direction — an unlisted skip site, a row for a site
+  that no longer exists, a cause count that no longer matches, or a `tests/...`
+  reference that does not resolve. Sites are named `file::function` rather than
+  `file:line`, so an insertion above one no longer rots it, and the application
+  tree is asserted to contain no skip call at all.
+- A staged audit has a map and a partition it cannot silently lose: `docs/project-map.md`
+  records the layers, the trust boundaries, the measured size of every area and the
+  settled decisions an audit must not re-litigate, and `docs/exec-plans/009-staged-audit.md`
+  splits the whole tree into 29 steps of at most 3,000 lines each, every step ending
+  with a written handoff. `tests/test_audit_map_gate.py` fails when a production file
+  belongs to no step or to two, when a step names a path that has moved, or when a
+  step stops stating its surface, questions and exit.
 
 ### Changed
+
+- The certificate review names every hostname a sighting was reported for. One
+  certificate served for several names at one address is one sighting, and the
+  issuance rules already judged each of those names; the row printed only the one
+  that created it, so a reviewer of a shared address could not see the neighbour the
+  rules had acted on.
+- The interface's accent and destructive colours are darker, because the ones they
+  replaced could not carry their own labels. Measured from `index.css`: white on the
+  accent was 2.30:1 in light mode and 2.32:1 in dark, white on the destructive fill
+  3.60:1, and the focus ring 2.30:1 against the page — under the 4.5:1 and 3:1 WCAG
+  floors on every primary button, default badge, tooltip, field message and the one
+  toast variant that says a request was refused. The accent is 30% lightness in
+  light mode, the dark theme keeps its hue with an ink foreground (8.6:1), the
+  destructive fill is 45%, and the hover fills are their own darker tokens instead
+  of `bg-primary/90`, which blended toward the page and made a hovered button less
+  readable than a resting one. `src/lib/themeContrast.test.ts` computes both themes
+  from the stylesheet and fails with the ratio in the message.
 
 - The connector documentation states how long a provider call may take: the four
   questions every worker answers (attempts, the longest single wait, the body
@@ -287,6 +319,14 @@ a pending or expired link.
 
 ### Removed
 
+- The compact Telegram renderer nothing sent. `alert_message.telegram_text` — with
+  `telegram_finding_line`, `TELEGRAM_DETAIL_FIELDS`, `TELEGRAM_DETAIL_LIMIT`,
+  `escaped` and `OMISSION_NOTE_RESERVE` — had no production caller: the delivery
+  path has always sent `alert_content.telegram_parts`, which prints every field of
+  every finding across as many messages as the budget needs. A second format no
+  channel produces is a format a reader has to rule out, and the test that pinned
+  its breach line went with it; the live channel's date and verification statement
+  are pinned on the path that actually sends.
 - `PATCH /api/v1/users/{user_id}/toggle-active`. Activation is changed through
   `PUT /api/v1/users/{user_id}` with `is_active`, which already audits the change
   as `user.updated`; the second route for the same field was a second audit shape
@@ -294,6 +334,292 @@ a pending or expired link.
 
 ### Fixed
 
+- A backup proves both halves, and says when it only has one. `scripts/backup.sh`
+  writes a report-store archive beside the dump, and `scripts/verify_restore.sh` —
+  which `make backup-verify` and the `production-integration` job run — restored the
+  dump and never opened the archive, so an empty, truncated or wrongly-rooted
+  `reports-*.tgz` passed every gate while the restored instance listed reports it
+  could not download. A pass now reads its own archive back before reporting success
+  and names a store that is not mounted instead of ending with a bare `done`; the
+  verification lists the archive, extracts it into a scratch directory and reads a
+  file out of it, and `REQUIRE_REPORT_ARCHIVE=1` (what CI sets) makes a missing
+  archive a failure. `docs/backup-restore.md` also states the archive's real
+  top-level entry — `reports/`, because `REPORTS_DIR` is `/reports` on both Compose
+  file sets — and gives extraction commands that put the PDFs where the platform
+  looks for them.
+- `scripts/lock_requirements.py` can regenerate the connector locks again. The
+  marker-gated rule that keeps `greenlet` in the runtime lock was applied to every
+  manifest, and none of the seven connector locks installs SQLAlchemy, so each one
+  was refused with "does not pin greenlet" — which is why their headers had never
+  been regenerated. The rule is now scoped to a manifest that installs the package
+  declaring the dependency. `backend/requirements.txt` also carried a header naming
+  `python scripts/lock_requirements.py requirements.txt`, a command that works from
+  no directory (the script is at the repository root, the argument at `backend/`);
+  the header path is anchored to the repository root, and a test pins every shipped
+  runtime lock to what the generator writes.
+- The host requirements an operator sizes a machine from are recomputed instead of
+  copied. `docs/configuration.md` and `docs/deployment.md` both published sums of the
+  Compose file's `mem_limit` and `cpus` values, and both had drifted by 1.0 GiB and 1.25
+  CPU on every row — base 7.0 GiB / 7.75 CPU against 8.0 / 9.0 — while the per-service
+  table between them was gated and green. `deployment.md` recommended 8 GiB of RAM for a
+  sum of 8.0 GiB, contradicting its own rule that the recommendation sits above the sum.
+  The numbers are corrected and `scripts/check_compose_healthchecks.py` recomputes all
+  eight rows and the endpoint sentence from the file; a profile that no published row
+  covers is a finding.
+- The frontend SPA gate can be tested, and is. `scripts/check_frontend_spa.py` shipped
+  without a test and with a relative configuration path, so no fixture could reach it and
+  nothing failed if a rule was deleted: the `/assets` collision and the
+  port-in-redirect leak it exists to prevent could both return silently. It now takes
+  `--root`, exposes `check(root)`, and `backend/tests/test_frontend_spa_gate.py` drives
+  each rule against a mutated configuration.
+- The dependency gate reads every manifest the tree ships. `scripts/check_dependency_sources.py`
+  walked a hand-kept tuple of four manifests while seven ship: `connectors/dns_security`
+  and `connectors/intelligence` were named only in the hash list its scan loop never
+  iterated, and `connectors/exposure_endpoints` — whose Dockerfile installs it with
+  `--require-hashes` — was in neither. Three of the seven files every connector image
+  installs with `--require-hashes` were therefore unchecked for exact pins and hashes,
+  while the gate's success line said each of them pinned a hash. The shipped set is now
+  discovered from `connectors/*/requirements.txt`, the development manifest stays
+  pinned-only and unhashed, and three tests cover the scan and the hash rule the second
+  list had no test for.
+- The environment-template gate asks the model rather than the spelling. Its rule that a
+  documented setting must be passed into a container recognised a `Settings` field only
+  when it was declared with `Field(`, so the five fields written with a plain default —
+  `AUDIT_ARCHIVE_DIR`, `AUDIT_RETENTION_HOLD`, `ALERT_PHISHING_DIGEST_ENABLED`,
+  `ALERT_CANDIDATE_CHANGE_NOTIFICATIONS`, `ALERT_BREACH_NOISE_POLICY` — were exempt from
+  it, 78 of the model's 83 fields being seen. `settings_fields` now parses `class Settings`
+  with `ast`, so the next setting written in the shorter style is covered too.
+- `setup.py --check` states what a setting it does not recognise actually costs. An
+  `.env` from an earlier release keeps lines this one does not read — a withdrawn
+  provider's key, a connector token for a service the release no longer ships, a renamed
+  setting — and every one of them was reported with the summary "the application would
+  refuse to start". It does not: unknown keys are ignored and the stack starts. A name one
+  or two characters from a documented setting is now answered with `did you mean X?` (an
+  edit budget, not a similarity score, so another connector's token is never offered as
+  the correction), any other unknown name is reported as a setting this release does not
+  read that configures nothing on its own and should be deleted, and the summary no longer
+  promises a startup failure that cannot happen.
+- The SPA displays the release it was built from. `frontend/src/lib/appMeta.ts` fell back
+  to the literal `"0.2.0"` when no build injected `VITE_APP_VERSION` — which is every
+  host `npm run dev` and `npm run build` — so a bundle built from this 0.2.1 tree named the
+  previous release while the image named 0.2.1, and no gate read the copy because the
+  version check only saw `frontend/package.json` and the Dockerfile's build argument. The
+  fallback is now the package's own version, the field the version gate already holds to
+  the release.
+- The documentation gate sees a table torn by a blank line. `check_tables` stopped at
+  the first gap, so `docs/audit-findings.md` had been rendering forty-four findings as
+  a paragraph of pipes — with two malformed rows among them — while the gate reported
+  the page clean and `production-readiness.md` listed that rule as enforced. A blank
+  line after a table now reports the rows it orphans, unless a new header and separator
+  follow it; the rule found fourteen such tables in three documents plus four unescaped
+  pipes, all repaired.
+- `make health` checks the port the installation actually publishes. The target curled
+`http://localhost:8000` outright, while the wizard writes `BACKEND_PORT` (and
+`--backend-port`, or a hand edit of `.env`, can move it): on any other port the one
+post-start check the deployment and upgrade runbooks end with reported "API is
+unreachable" for a healthy stack. It now asks the running container
+(`docker compose port backend 8000`), falls back to `BACKEND_PORT` in `.env` and only
+then to 8000, and names the port it used.
+- `make help` lists every target. Seven existed and were documented elsewhere but
+  absent from the list `CONTRIBUTING.md` calls exhaustive — `lint-backend` (which the
+  page's own table tells a contributor to run), `test-backend-fast`, `tools-check`,
+  `pull-prod` and the three connector-credential targets — so the documented way to
+  issue or rotate a connector token was invisible to anyone who asked for help.
+- The release version is one number in every file a deployment is made of.
+`scripts/check_version_consistency.py` compared seven statements and none of the
+three an operator meets first: the `OPENDRP_VERSION` line a new installation copies
+from `.env.example`, and the `VITE_APP_VERSION` build-argument fallbacks in
+`docker-compose.yml` and `frontend/Dockerfile`. A release bump therefore left all
+three at the previous version, so `make up` from this tree built an image tagged
+`0.2.0` running `0.2.1` code, with Settings and `/api/v1/health` reporting different
+versions. The gate now reads ten statements, the three copies name `0.2.1`, and four
+tests in `backend/tests/test_version_consistency_gate.py` fail against the old gate
+and pass after it.
+- The recovery codes are copied one per line from the enrolment block too. The
+security page's copy was fixed and this one — the same list, shown by the flow a
+new account is sent through — kept joining it with an escaped backslash, so the
+clipboard received a single line with a literal backslash and an `n` between the
+codes, and a refused clipboard reported nothing. Both places now write a real
+newline through the same try/catch and say when the write was refused.
+- The data table tells a screen reader what it just did. A sortable header named the
+  column but never the direction, `aria-sort` sat on the header cell rather than on
+  the button the operator is focused on, the column handle was a focusable
+  `separator` with no value — so the arrow keys resized a column silently, and the
+  drag had no upper bound at all — and the current page was only a fill colour. The
+  button now names the direction it is showing, the applied order is announced
+  through a status line, the handle carries its value and bounds (and clamps), and
+  the current page is marked.
+- A console left open follows the system appearance. "System" was read once, when
+  the theme was chosen and never again, so a window opened in the morning stayed
+  light after the desktop switched at dusk; `color-scheme` was never set either, so
+  the browser's own controls — the date inputs on the audit page, a dialog's
+  scrollbar — stayed light inside a dark page. The scheme is followed while
+  selected, painted for the browser too, and the listener is removed when a fixed
+  theme is chosen.
+- A render error announces itself. The boundary never swallowed the failure — it
+  logged it and drew a screen — but the screen was a plain box with no role, and
+  focus was left on `<body>` because the element that had it had been replaced, so
+  a screen reader heard nothing and a keyboard user tabbed from the top to find the
+  explanation. The recovery screen is a `role="alert"` and takes focus, including on
+  the first error of a page's life.
+
+- A batch action on the users page no longer reaches accounts the operator has
+  filtered away. The selection survived a filter, a page-size change or a page
+  change, so "N selected" counted rows the table no longer showed while the batch
+  route applied every id it was given; the selection is now dropped whenever the
+  question the list is answering changes, and kept when the same view is refreshed.
+- Destructive user actions stay in front of the operator until the API answers.
+  Deactivating, deleting, clearing a second factor and a batch
+  activation/deactivation closed their dialog on the click, so the pending state
+  was never visible and the server's refusal — the last active administrator, your
+  own account, an account that is no longer locked — arrived as a toast over a list
+  that still showed the account. The four dialogs now close on success, refuse to
+  be dismissed while the request is in flight, and print the API's reason inside
+  themselves.
+- The audit log can be opened at a known sequence. `GET /audit/logs` has always
+  accepted `after_seq` and the page offered no field for it, so an investigator
+  told where a verification stopped had to page back from the newest row twenty at
+  a time; the filter row now takes a cursor, and the view starts there, oldest
+  first.
+- Recovery codes are copied one per line. The copy button joined them with an
+  escaped backslash, so every code after the first arrived on the same line with a
+  literal `\n` between them — discovered exactly when the codes are the only way
+  back into an account. It also reports a refused clipboard instead of silently
+  doing nothing.
+- A saved schedule minute is no longer rewritten by an unrelated save. The minute
+  control offered only a five-minute grid while the API accepts 0..59; a stored
+  `17` could not be displayed, and the select library answers a value it cannot
+  resolve with an empty one, which the form stored as `0` and marked dirty — so
+  saving any other setting moved the scan from `:17` to `:00` and reported
+  "Settings saved". The control offers the whole range now, and `17` renders as
+  `17`.
+- Revoking a connector credential asks first. The button sits beside "Rotate
+  credential" and its effect is a worker that can no longer claim work until a new
+  token is issued and its container recreated; the confirmation says so before it
+  sends anything.
+- A refused delete stays in front of the operator. Deleting a breach match or a
+  phishing look-alike closed the dialog as soon as it was confirmed, so a slow
+  delete showed no progress anywhere, and a refusal arrived as a toast over a list
+  that still showed the row — with no dialog left to retry from. Both dialogs stay
+  open with the confirm button pending and print the API's reason inside them, the
+  behaviour the inventory and DNS pages already had.
+- An asset's own page no longer answers from a snapshot taken earlier in the
+  session. Its record — criticality, both dates, what monitors the asset type — was
+  read once per tab and never invalidated, so an edit made on the inventory page
+  appeared there and not on the asset's page; it is read once per visit now. When
+  that read fails the page says so and offers a retry, instead of rendering an
+  asset with no criticality and no dates as though nobody had filled it in.
+- A list no longer claims nothing matches when the page it is showing outlived its
+  result. Deleting the last row on the last page left the table asking for a page
+  the server no longer had: an empty table, "No assets match the current filters"
+  about rows that still matched, and a range that ran backwards ("16–15 of 15").
+  It now moves to the last page that exists.
+- A mistyped password no longer signs an operator out. The API answers a wrong
+  current password, a wrong authenticator code and a lapsed invitation token with
+  `401` — the same status an expired access token gets — and the SPA treated every
+  `/auth/` `401` as an expired session: it cleared a valid session, showed
+  "Session expired", and navigated away from the form, losing the enrolment secret
+  an administrator was about to confirm and sending an invitee with a bad link to
+  the sign-in page instead of the page that explains the invitation. Those six
+  requests — and a sign-out whose refresh cookie had already lapsed, which is the
+  outcome the operator asked for — are marked as credential checks now, so the
+  refusal reaches the form that asked, with the API's own sentence; a genuinely
+  expired session is still refreshed once and replayed, and a second refusal still
+  ends it.
+- Certificate Transparency evidence reaches the certificate tables again. The
+  projector that turns stored observations into identities and sightings read
+  `fingerprint_sha256`, `certificate_fingerprint_sha256`, `certificate_id` and
+  `fingerprint` — but not `id`, which is the only spelling the CT worker's
+  historical rows carry and the one the storage key already uses. Every one of
+  those rows was skipped, so the review list and the key-reuse and unexpected-
+  issuance rules only ever saw the single newest certificate per domain. `id` is
+  now accepted, still gated on being a 64-character hex digest.
+- One unusable control row no longer costs a DNS scan. The expiry monitor refuses
+  a `verified` record whose `not_before` is later than the core's clock, and that
+  refusal used to escape the observation ingest, rolling back the whole batch and
+  failing the connector's job — so a worker running minutes ahead of the platform
+  destroyed its own evidence. The refused control is now logged as
+  `dns_control_refused` and skipped: the observations are stored, the other
+  controls advance, and only that control keeps its previous state.
+
+- Closing a phishing candidate now silences the channel, not only the digest. An
+  operator's `resolved` status was read by the daily digest, which skipped those
+  rows, while the delivery path routed the same candidate by its score alone — so a
+  resolved look-alike at 95 was announced immediately, and the same shape at 40 had
+  its event consumed as "digest pending" and then filtered out of the digest, which
+  reported the arrival nowhere at all. The routing now reads the status after the
+  analyst's verdict and consumes the event with `phishing_status_resolved`, which
+  makes the set of candidates the digest skips identical to the set the channel
+  does not reach; a confirmed candidate still alerts, because confirmation asks to
+  be told about exactly these changes.
+- Provider errors are redacted in the shapes they actually arrive in. The
+  sanitiser that every stored provider string passes through masked URLs and
+  `token=…`-style pairs, but not a quoted JSON pair (`"token":"…"`), not an auth
+  scheme — `Authorization: Bearer …` masked the word `Bearer` and left the token
+  behind it — and not a spaced label such as `API key sk-…`. A connector, a
+  channel test or a delivery failure could therefore persist its own provider key
+  in `connector.last_error`, a job's `error_message` or `details.error`, where
+  operators read it and the SIEM keeps it for the retention period. Vendor key
+  prefixes (`sk-`, `ghp_`, `AIza`, `AKIA`, `xox…`) are now masked wherever they
+  appear, credentials behind an auth scheme are masked whole, quoted pairs keep
+  their label and quoting, and a spaced label is masked only when its value
+  carries a digit so ordinary prose survives triage.
+- An administrator reading another account's sessions is now recorded. The list of
+  a user's live sessions — which devices can still be used, and when each last
+  refreshed — answered with no audit row at all, while `GET /users/{id}` next door
+  wrote `users.view`. The read now writes the same action with
+  `details.view = "sessions"` and the number of sessions, so "who looked at whose
+  sessions" is answerable from the trail.
+- Reactivating accounts through the bulk endpoint clears the lockout again.
+  `PUT /users/{id}` had always cleared `failed_login_attempts` and `locked_until`
+  when an account came back, because a revived account must not inherit the
+  counters it collected while it was off; the batch set `is_active` and answered
+  `changed: 1` with the old lock still in place, so the person was refused at the
+  next sign-in.
+- `manage_admin mfa-off` clears the factor's attempt counter and lock. Clearing a
+  lost authenticator left `mfa_locked_until` behind, and both enrolment routes
+  refuse while it is in force: the recovered account could sign in but could not
+  enrol a new factor for another fifteen minutes, with nothing saying why. The
+  audit row carries `mfa_lockout_cleared` so the release is visible.
+- `manage_admin create` takes the active-administrator lock before inserting. The
+  invariant's own documentation says every writer of that set holds it, and the
+  API's create and invite paths do; the one path with no authenticated caller did
+  not, so the serialisation argument was true for every writer but this one.
+- Turning on a second factor now ends every other session, in the same transaction
+  as the enrolment. The sessions that predate it were exactly the ones a factor is
+  meant to stop: their refresh tokens kept minting access tokens without ever being
+  asked for a code, so an account holder who enabled MFA after a password leak
+  stayed signed in wherever the leak had already been used. The browser that
+  performs the enrolment keeps its own session, and the audit row now carries
+  `refresh_families_revoked`. An access token minted before enrolment still lives
+  out its remaining minutes; the indefinite path is the one that is closed.
+- Disabling the second factor and replacing its recovery codes spend the same
+  per-account attempt budget as signing in. Both endpoints checked the lockout but
+  never incremented the counter, so a correct password bought an unthrottled
+  six-digit guess — the one operation that removes the factor for good. Five wrong
+  codes now lock the account for fifteen minutes on all three paths.
+- A successful sign-in is no longer a session without its sign-in row. The route
+  used to commit the refresh family first and write `auth.login.success`
+  afterwards, so a failing audit write left a usable session that the trail could
+  not explain — the event a SIEM correlates every later action with. The family,
+  the `last_login_at` update and the audit row now share one commit: if the trail
+  cannot be written, the answer is 503 and no session exists.
+- The readiness page and the route gate agree on the size of the unauthenticated
+  surface. The page said six routes need no capability while
+  `tests/test_route_access_gate.py` names seven — `/ready` had joined the gate's map
+  without the sentence moving — so a reviewer auditing the public surface from the
+  page came one route short. The count is now a claim in
+  `backend/tests/test_docs_numbers_gate.py`, read from the gate's own map, so the
+  page cannot state a different number without failing the build.
+- A phishing digest calls its candidates candidates. The subject already said
+  "candidates below the alert threshold", while the counted line under it — in the
+  email body, in the Telegram header and in both of Telegram's layouts — still said
+  "N new findings", so a summary of four parked look-alikes read as four findings.
+  The count is now stated once, where the wording lives, and the channels print it:
+  an alert counts "new findings", a phishing digest "candidates below the alert
+  threshold", a breach digest "new incidents from one scan". A digest also counts
+  only its own rows, so a summary no longer reports the alerts that were already
+  sent in the same channel as if they were part of it.
 - The audit trail's last-resort stdout line publishes exactly the five documented
   fields. `_publish_audit_event` falls back to `print()` when the structured
   renderer refuses a record, and it used to serialize the event as it stood: the
@@ -323,6 +649,141 @@ a pending or expired link.
   (`code=query_deadline_exceeded`) when a `has_findings` read or an export
   exceeds its 40-second budget, and the export carries the same involvement
   counters and last-seen value as a list row.
+
+## [0.2.1] - 2026-10-20
+
+### Added
+
+- Coverage work now has a plan of record and a way to choose the next hour by
+evidence instead of by memory. `docs/exec-plans/006-coverage-program/` splits the
+remaining uncovered branches into nine batches — authentication, accounts and
+settings, the connector boundary, alerts, ingestion and reports, TLS and DNS,
+the data lifecycle, the long tail, and the SPA — and each batch keeps its own
+state file: the measurement it was planned from, the work items, the floors it
+raised and a dated progress log, so a later session resumes from the document
+rather than from a fresh full-suite run. `backend/scripts/coverage_gaps.py` ranks
+the modules a run left behind by statements missed rather than by percentage (a
+module at 60% of twelve statements is not the same debt as one at 88% of nine
+hundred), prints a table a batch file can take unchanged, and is covered by
+`tests/test_coverage_gaps.py`. The baseline the program starts from is the
+`backend` job of the 2026-10-19 CI run on `main`: 2 918 passed, 8 skipped, and
+90.65% of `app/` (14 300 statements, 1 337 missed).
+
+- The first batch of that program closes the request boundary's unnamed branches.
+`tests/test_deps_boundaries.py` executes the address parsing a proxy actually
+produces (quoted values, `host:port`, bracketed IPv6, and the malformed forms that
+must be refused rather than recorded as a fragment), a `TRUSTED_PROXY_IPS` value
+with a typo in it, a configuration that cannot be read, a peer whose socket is
+already gone, a failed audit write during a refusal, and the deployment's
+second-factor policy refusing an administrator. `tests/test_mfa.py` gains the
+edges of an enrolment a client can reach by mistake: enabling twice, confirming
+without a code, a wrong password at the second step, a pending secret that is no
+longer there, and recovery-code rotation without a factor, with a wrong password,
+replaying the code that enrolled it, and succeeding while recording its count.
+The batch's closing measurement executes 81 of the 109 baseline misses: `auth.py`
+lands at 94.9% and `deps.py` at 99.5%, and the per-module gate now holds both —
+`auth.py` enters at 91%, `deps.py` rises from 75% to 96%, each three points below
+its measured value, and the full backend run closed the batch.
+
+- The session and durability refusals on the same router are pinned too:
+`tests/test_auth_edges.py` covers the lockout predicates on the naive timestamps
+SQLite returns, a Redis outage in both best-effort login counters, the
+access-token fallback that identifies a browser, an undecryptable pending factor
+secret, a sign-in with no credentials, a locked second factor answering before
+the code is read, `revoke-others` without an identifiable session, a cookie logout
+without the CSRF header, a refresh token without a family, the lock refusals of
+setup, enable and disable, a QR request for a secret no key can read, revoking one
+session with its audit row, a logout whose token cannot be parsed, and a refresh
+whose rotation cannot be committed — which answers `503` rather than returning a
+token storage never accepted. The same suite changes a password and replays the
+refresh token issued before it, which the change must revoke; the test fails if
+the revocation is removed.
+
+- The second batch covers the account and settings surface. `tests/
+test_settings_contract.py` walks every validator branch — the module reaches
+100%, including the empty-value and named-field refusals — and `tests/
+test_users_edges.py` adds the role/activation filters, the duplicate-address
+answers on create and invite, invitation reissue, a bulk no-op, rate-limit
+updates, a naive lockout release, unknown-account 404s on the per-account
+routes, MFA reset, and the storage-conflict translations. The duplicate-create
+test exposed that SQLite names the unique rule `users.email` while the router
+recognised only PostgreSQL's `users_email_key`, so a taken address answered the
+generic constraint message; one shared predicate now answers "already exists"
+on both. `users.py` is gated at 91% and `schemas/settings.py` at 97%.
+
+- The rest of that program's backend batches close on the same rule — a test where
+a range names a behaviour, a deliberate miss recorded where it does not. The
+connector boundary adds the manifest's schema refusals and the service's
+credential, provisioning and rotation edges (`connector_manifest.py` 97.2%,
+`schemas/connector.py` 94.1%, `connector_service.py` 92.0%); alerts and delivery
+add the queue's ambiguity and lease paths, the message layer's redaction and
+clipping, and the health cache's stale window (`alert_message.py` 100%,
+`alert_health_cache.py` 99.1%, `alert_delivery_service.py` 97.6%,
+`alert_service.py` 97.2%); ingestion and reports add the write path's duplicate
+and out-of-order answers and the report assembly's empty and truncated sections
+(`ingestion_service.py` 97.0%, `report_service.py` 92.3%); TLS and DNS add the
+certificate identity rules and the router's refusal edges
+(`tls_identity_service.py` 99.5%, `routers/dns_security.py` 100%); the lifecycle
+batch adds retention's per-table bounds, the audit archive's verification before
+deletion, the per-account quota and the configuration's own refusals
+(`retention_tasks.py` 99.3%, `config.py` 96.6%, `audit_archive.py` 95.7%,
+`provider_quota.py` 99.0%); and the long tail adds the remaining routers and both
+scheduled task bodies (`routers/connectors.py` 99.6%, `routers/phishing.py` 100%,
+`routers/assets.py` 99.6%, `settings_service.py` 98.7%,
+`user_notifications.py` 100%, `tasks/user_tasks.py` 100%,
+`tasks/integrity_tasks.py` 100%). Floors are new or raised for every one of them,
+never lowered, and `docs/production-readiness.md` carries the same map the gate
+holds. `app/` closes at **96.30% (529 missed)** from 90.65% (1 337 missed).
+
+- The SPA's coverage floor is no longer four points below its own functions
+number. `npm run test:coverage` measured 59.4% of functions against a 55% floor
+while every other axis had twenty points of margin, so the batch that closed that
+gap added the interactions an operator actually performs: a refused
+`database_busy` read on the inventory that explains itself and retries, an asset
+detail page whose failed findings read is retried and whose `Refresh` re-reads
+the open module, a DNS review page that reports a refused promotion, deletion and
+orphan cleanup with the server's own sentence and keeps the row on screen after a
+refused delete, the evidence badge that puts a provider's malicious count on the
+row, and the second-factor enrolment flow — password required before a secret is
+generated, a wrong code keeping the secret on screen, and recovery codes shown
+once and only left behind after the operator confirms they saved them. The
+password-change and revoke-others actions on the security page are pinned too:
+a mismatch is refused before anything is sent, and a successful change adopts the
+session the API returned because the change revoked the old refresh family. An
+administrator's password reset is asserted to travel as `new_password` — the
+camelCase name would be dropped by the API and a form that looked successful
+would leave the old password in place — and a checked reset with no value is
+refused before the request. The suite moves from 72.93/72.91/59.38/77.8 to
+**81.17/75.87/76.53/83.71** over 53 files and 495 tests, and the functions floor
+rises 55 → 73 (the other three are left where they were). The functions still uncovered are named in
+`docs/exec-plans/006-coverage-program/batch-09-frontend.md`: the audit `details`
+formatters no fixture produces yet, and the Radix wrappers that only run inside a
+pointer-driven portal jsdom cannot open.
+
+- The coverage program's backend tail is swept where a missing branch is a
+refusal rather than a formatter. Seven modules under fifteen missed statements each
+were taken in the order their miss could cost something: the destination policy
+(the allowlist entry that is a typo, an IP literal classified when DNS answers
+nothing, the pinned SMTP socket that closes the raw connection when the handshake
+fails and tries the next validated address), the artifact store (a drive-relative
+name, the 255-character bound, and a resolution that lands outside the store told
+apart from a resolution that fails), the refusal camera (its window in Redis, its
+fall-back map when the broker is down, the map's bound, and the account a refusal
+was about), the provider-account service (every refusal names its field, and a
+connector only ever receives its own provider's key), the module registry (label
+bounds, metadata truncation, a finding kind owned by a differently-named row, and
+the queue-cancelling a disabled module has done since 0.2.0 — **disabling a module
+cancels the work it had queued**, rather than leaving a provider scan behind for a
+module an administrator switched off — which until this batch had no test standing
+behind it), the source-inventory
+routes (`409` when a scan has nothing to queue, `404` for an observation another
+module owns, an address promoted as `ip_address`, and a promotion that loses a
+race answered with the winner rather than a `500`) and `GET /jobs/{id}` (another
+account's job is a `404` that does not confirm it exists, a system job is readable
+with no email). Floors are new for five of them and raised for two — the registry
+from 70 to 97 and the provider-account service from 80 to 97 — and
+`docs/production-readiness.md` carries the same map. `app/`
+closes at **96.79% (459 missed)** from 96.30%, with 3 354 tests passing.
 
 ## [0.2.0] - 2026-10-19
 

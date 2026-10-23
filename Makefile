@@ -1,4 +1,4 @@
-.PHONY: help setup check-env check-docs up up-tools pull-prod down destroy logs build ps seed-demo shell-backend shell-frontend test-backend test-backend-fast test-backend-integration test-backend-critical-coverage tools-check check-backend-migrations check-compose check-commands check-deps check-providers check-frontend-spa migrate connector-token connector-token-rotate connector-tokens backup backup-verify restore verify-audit-chain typecheck-backend lint-backend mypy-backend restart health verify-replicas clean
+.PHONY: help setup check-env check-docs up up-tools pull-prod down destroy logs build ps seed-demo shell-backend shell-frontend test-backend test-backend-fast test-backend-integration test-backend-critical-coverage tools-check check-backend-migrations check-compose check-commands check-deps check-providers check-frontend-spa check-api-types migrate connector-token connector-token-rotate connector-tokens backup backup-verify restore verify-audit-chain typecheck-backend lint-backend mypy-backend restart health verify-replicas clean
 
 .DEFAULT_GOAL := help
 
@@ -46,6 +46,7 @@ help:
 	@echo "  down            Stop all services (keeps volumes)"
 	@echo "  destroy         ⚠️  Stop + DELETE ALL volumes (postgres_data, redis_data, reports_store)"
 	@echo "  build           Build images only ($(COMPOSE) build)"
+	@echo "  pull-prod       Pull the release images this .env pins (no build)"
 	@echo "  restart         down + up (restart all services)"
 	@echo "  clean           Remove caches, coverage reports and frontend build output"
 	@echo ""
@@ -59,7 +60,7 @@ help:
 	@echo "Monitoring & diagnostics:"
 	@echo "  logs            Tail all container logs in real time (--tail=200)"
 	@echo "  ps              List running containers and their status"
-	@echo "  health          Compose status + API healthcheck http://localhost:8000/api/v1/health"
+	@echo "  health          Compose status + API healthcheck on the port this installation publishes"
 	@echo "  verify-replicas Start two API replicas and prove they share state (see docs/upgrading.md)"
 	@echo ""
 	@echo "Compose file sets (one installation shape, and no variable to pick one):"
@@ -69,8 +70,10 @@ help:
 	@echo "Backend development (the test and lint targets need `make up-tools`):"
 	@echo "  shell-backend   Open /bin/bash inside the backend container"
 	@echo "  shell-frontend  Open sh inside the frontend container"
+	@echo "  tools-check     Guard the test and lint targets run: fails when the tooling stack is down"
 	@echo "  migrate         Apply pending Alembic migrations (alembic upgrade head)"
 	@echo "  test-backend    Run pytest for the backend test suite (tests/)"
+	@echo "  test-backend-fast  Run pytest without the integration marker (the quick loop)"
 	@echo "  test-backend-integration  Run real PostgreSQL/Redis boundary tests inside Compose"
 	@echo "  check-backend-migrations  Verify the Alembic revision graph and that the schema it builds"
 	@echo "                  matches the ORM models (scripts/check_migrations.py + check_schema_drift.py)"
@@ -83,8 +86,15 @@ help:
 	@echo "  check-frontend-spa  Fail if Nginx can redirect an SPA route to a static directory"
 	@echo "  test-backend-critical-coverage  Enforce coverage for security/connector modules"
 	@echo "  typecheck-backend  Compile-time bytecode check (compileall over app scripts tests)"
+	@echo "  lint-backend    Ruff over the same scope CI lints (app, alembic, scripts, tests, connectors)"
 	@echo "  mypy-backend    mypy ratchet gate vs baseline (scripts/check_mypy_baseline.py)"
+	@echo "  check-api-types SPA request paths and response types vs the OpenAPI document (scripts/check_api_types.py)"
 	@echo "  seed-demo       Populate DB with demo data (users + assets + threats + breaches)"
+	@echo ""
+	@echo "Connector credentials (the plaintext is shown once and never stored):"
+	@echo "  connector-token NAME=<connector> TYPE=<module>  Issue a credential and record it in .env"
+	@echo "  connector-token-rotate NAME=<connector>  Replace it; the old token stops working"
+	@echo "  connector-tokens List the credentials the platform currently holds"
 	@echo ""
 
 # The wizard is a host script, not a container one: it runs before the stack
@@ -234,9 +244,11 @@ test-backend-integration: tools-check
 check-backend-migrations:
 	$(COMPOSE) exec -T backend sh -c 'python scripts/check_migrations.py && python -m scripts.check_schema_drift'
 
-# The module list is asked for rather than written here a second time: the gate
-# that reads the report is the one that names the modules, so a module added to
-# it is measured by this target too.
+# The coverage flag is asked for rather than written here a second time: the gate
+# that reads the report prints it, so this target and CI cannot measure different
+# sets. It is one `--cov=app`, because a dotted `--cov=app.<module>` resolves by
+# import and that import aborts a Windows development venv inside `bcrypt` before
+# `conftest` loads; the gate still reads every threshold per file from the report.
 test-backend-critical-coverage: tools-check
 	$(TOOLS) exec -T backend sh -c 'COVERAGE_CORE=sysmon python -m pytest -q $$(python scripts/check_critical_coverage.py --cov-args) --cov-report=json:coverage-critical.json --cov-report=term-missing tests/ && python scripts/check_critical_coverage.py coverage-critical.json'
 
@@ -313,6 +325,17 @@ typecheck-backend: tools-check
 
 mypy-backend: tools-check
 	$(TOOLS) exec -T backend python scripts/check_mypy_baseline.py
+
+# The SPA's request helpers and the API's routes and response models are two
+# declarations of one contract, and until this gate existed only the request half
+# was checked: 56 helpers returned `any`, so a field removed from a response model
+# compiled (AUD-060), and nothing compared the paths those helpers wrote with the
+# routes the application serves, so a renamed route left the client calling a 404
+# (readiness page, limitation 5). Every helper names its type, the eight
+# schema-backed interfaces are compared with the models field by field, and every
+# request path is compared with the route table.
+check-api-types: tools-check
+	$(TOOLS) exec -T backend python scripts/check_api_types.py
 
 # The same scope the `backend` job lints, so a file the container skips is a file
 # nobody lints: `../connectors` and the rest resolve to the read-only mounts the
@@ -399,11 +422,22 @@ verify-replicas:
 		-e ADMIN_EMAIL="$(ADMIN_EMAIL)" -e ADMIN_PASSWORD="$(ADMIN_PASSWORD)" \
 		replica-check
 
+# The port comes from the installation, not from this file: the wizard writes
+# BACKEND_PORT (`127.0.0.1:8000` by default) and `--backend-port`, and a hand edit
+# of `.env`, can change it. A hard-coded 8000 answered "API is unreachable" for a
+# healthy stack on any other port — the one verdict an operator acts on. The
+# running container is asked first, because that is the mapping it was created
+# with; `.env` answers when the stack is down and there is nothing to ask.
 health:
 	$(COMPOSE) ps
 	@echo ""
 	@echo "--- API healthcheck ---"
-	curl -f http://localhost:8000/api/v1/health || (echo "API is unreachable" && exit 1)
+	@port=$$($(COMPOSE) port backend 8000 2>/dev/null | awk -F: '{print $$NF}' | tail -n 1); \
+	if [ -z "$$port" ]; then \
+		port=$$(grep -E '^BACKEND_PORT=' .env 2>/dev/null | tail -n 1 | cut -d= -f2- | tr -d '\r' | awk -F: '{print $$NF}'); \
+	fi; \
+	[ -n "$$port" ] || port=8000; \
+	curl -f "http://localhost:$$port/api/v1/health" || (echo "API is unreachable on port $$port (BACKEND_PORT in .env)" && exit 1)
 	@echo ""
 
 clean:

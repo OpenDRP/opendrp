@@ -118,7 +118,7 @@ docker compose -f docker-compose.yml pull
 ```
 
 A source installation builds the images from the tree instead. This checkout is
-one: 0.2.0 declares its version but publishes no registry images, so a `pull` has
+one: 0.2.1 declares its version but publishes no registry images, so a `pull` has
 nothing to fetch and `make up` is what builds and starts the stack.
 
 ```bash
@@ -281,6 +281,28 @@ docker compose exec postgres psql -U opendrp -d opendrp -c "CREATE INDEX IF NOT 
 On an installation with many candidates these are the longest part of that
 window, and `\di ix_drp_phishing_domains_phishing_domain_trgm` tells whether they
 are already there.
+
+### A column default the baseline gained after your build was created
+
+Adoption records a revision and creates nothing, so a default the baseline has
+gained *since* the build that created your database is not there either.
+`jobs.created_at` and `jobs.updated_at` are that case: every other table in the
+baseline is created with `DEFAULT now()` through `TimestampMixin`, and `jobs` was
+the one that was not. The platform's own writers are ORM statements that supply
+both values, so nothing fails on the older database — but a hand-written `INSERT`
+that omits them is refused `NOT NULL` there and accepted on a database this release
+created, which is the kind of difference that only shows up in a maintenance
+window. Two statements close it:
+
+```bash
+docker compose exec postgres psql -U opendrp -d opendrp -c "ALTER TABLE jobs ALTER COLUMN created_at SET DEFAULT now()"
+docker compose exec postgres psql -U opendrp -d opendrp -c "ALTER TABLE jobs ALTER COLUMN updated_at SET DEFAULT now()"
+```
+
+`make check-backend-migrations` compares the models against the schema the
+revision builds, and its output names this default when a checkout expects it; a
+database this release created has it already, and `\d jobs` is what tells the two
+cases apart.
 
 ### A table the baseline gained after your build was created
 

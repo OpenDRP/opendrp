@@ -108,8 +108,11 @@ jobs:
           DATABASE_URL: sqlite+aiosqlite:///./ci-critical-coverage.sqlite3
           REDIS_URL: redis://127.0.0.1:6379/0
           COVERAGE_CORE: sysmon
-        # The module list is not repeated here: it is asked for, so this run
-        # and the gate that reads its report cannot describe different sets.
+        # The coverage flag is not repeated here: it is asked for, so this run
+        # and the gate that reads its report cannot describe different sets. It is
+        # one `--cov=app`, the spelling that also works on a Windows venv — a
+        # dotted `--cov=app.<module>` resolves by import and aborts there inside
+        # `bcrypt` before `conftest` loads.
         run: >-
           python -m pytest -q
           $(python scripts/check_critical_coverage.py --cov-args)
@@ -119,6 +122,12 @@ jobs:
         run: python scripts/check_critical_coverage.py coverage-critical.json
       - name: Enforce mypy error baseline (ratchet down to zero)
         run: python scripts/check_mypy_baseline.py
+      # The OpenAPI document is built by importing the application, so this half
+      # of the SPA's contract runs here; `npm run build` in the `frontend` job
+      # runs `tsc -b` over the same declarations. Together they catch a field the
+      # server stopped sending and a page that reads the wrong shape (AUD-060).
+      - name: Check the SPA's typed responses against the OpenAPI document
+        run: python scripts/check_api_types.py
 
   production-integration:
     runs-on: ubuntu-latest
@@ -269,6 +278,17 @@ jobs:
       # The dump and the restore both run inside postgres:17-alpine rather than
       # in the runner's own shell: pg_dump refuses to dump a newer server, and
       # the runner's client major version is not ours to choose.
+      #
+      # A store with one report in it, so the archive half of the backup is
+      # exercised too. Without it the pass warns that the store is not in the
+      # backup and the verification has no archive to open — which is how the
+      # store went unproven: the database was restored on every push while the
+      # `reports-*.tgz` beside it was never read.
+      - name: A report store for the backup to capture
+        run: |
+          mkdir -p "${{ github.workspace }}/reports-fixture"
+          printf '%%PDF-1.4 CI fixture report\n' > "${{ github.workspace }}/reports-fixture/report.pdf"
+
       - name: Take a backup
         # BACKUP_ONCE=1, or the script does what the compose profile asks of it:
         # one pass and then `sleep $BACKUP_INTERVAL_SEC`, which with the default
@@ -277,18 +297,24 @@ jobs:
           docker run --rm --network host \
             -v "${{ github.workspace }}/scripts:/backup-scripts:ro" \
             -v "${{ github.workspace }}/backups:/backups" \
+            -v "${{ github.workspace }}/reports-fixture:/reports:ro" \
             -e PGHOST=127.0.0.1 -e PGUSER=opendrp -e PGPASSWORD=integration-password \
             -e PGDATABASE=opendrp_migrations -e BACKUP_DIR=/backups \
             -e BACKUP_ONCE=1 \
             postgres:17-alpine sh /backup-scripts/backup.sh
 
-      - name: Prove the backup restores into a scratch database
+      - name: Prove the backup restores into a scratch database and a scratch store
+        # REQUIRE_REPORT_ARCHIVE=1: the archive this pass should have written is
+        # not optional in this job, so a change that stopped capturing the store
+        # fails here instead of leaving a green run over half a backup.
         run: |
           docker run --rm --network host \
             -v "${{ github.workspace }}/scripts:/backup-scripts:ro" \
             -v "${{ github.workspace }}/backups:/backups" \
+            -v "${{ github.workspace }}/reports-fixture:/reports:ro" \
             -e PGHOST=127.0.0.1 -e PGUSER=opendrp -e PGPASSWORD=integration-password \
-            -e BACKUP_DIR=/backups \
+            -e BACKUP_DIR=/backups -e REPORTS_DIR=/reports \
+            -e REQUIRE_REPORT_ARCHIVE=1 \
             postgres:17-alpine sh /backup-scripts/verify_restore.sh
 
       # The chain's own tests run on SQLite, where the position is "max + 1" and

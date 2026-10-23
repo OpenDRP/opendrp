@@ -409,7 +409,7 @@ reads `<placeholder>` as input redirection.
 6. Open the UI at <http://localhost:3000>, sign in with that address and the
    temporary password, and complete the steps the page asks for.
 
-This checkout declares version `0.2.0`, including DNS Security and passive source intelligence. For this local source installation, set `OPENDRP_VERSION=0.2.0` and build the images from the checkout; this version bump does not publish a GitHub release or registry images. For a published release, pin `OPENDRP_VERSION` to its released version. The setup checks and application reject the moving `latest` tag in production.
+This checkout declares version `0.2.1`, including DNS Security and passive source intelligence. For this local source installation, set `OPENDRP_VERSION=0.2.1` and build the images from the checkout; this version bump does not publish a GitHub release or registry images. For a published release, pin `OPENDRP_VERSION` to its released version. The setup checks and application reject the moving `latest` tag in production.
 
 The public health endpoint is:
 
@@ -1086,6 +1086,8 @@ to.
 - [docs/configuration.md](docs/configuration.md) — configuration ownership, defaults and recreate requirements;
 - [docs/description.md](docs/description.md) — the implementer's reference: module internals, the matching rule and its measurements, the connector protocol, and the authentication and session design;
 - [docs/production-readiness.md](docs/production-readiness.md) — measured current status, gated coverage thresholds, known limitations;
+- [docs/project-map.md](docs/project-map.md) — the code map: layers, trust boundaries, measured sizes, and the partition the staged audit follows;
+- [docs/audit-findings.md](docs/audit-findings.md) — the staged audit's register: severity, the evidence a finding needs, and what has been fixed, planned or accepted;
 - [docs/upgrading.md](docs/upgrading.md) — upgrade and rollback procedure, destructive migrations, secret rotation, two-replica deployments;
 - [docs/backup-restore.md](docs/backup-restore.md) — what is backed up, how to verify a restore, what is not in the dump;
 - [docs/api.md](docs/api.md) — the route inventory: method, path and required role;
