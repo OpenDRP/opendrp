@@ -37,6 +37,7 @@ import type {
   ConnectorHealthResponse,
   DNSObservation,
   DashboardOverview,
+  MfaRecoveryCodes,
   MfaSetup,
   MfaStatus,
   Paginated,
@@ -53,6 +54,8 @@ import type {
   ThreatStatus,
   TokenResponse,
   User,
+  UserBulkResult,
+  UserInvite,
   UserRole,
 } from "@/types/api";
 import {
@@ -408,7 +411,7 @@ export const endpoints = {
       .then((r) => r.data),
   mfaRotateRecoveryCodes: (password: string, code: string) =>
     api
-      .post<{ codes: string[] }>(
+      .post<MfaRecoveryCodes>(
         "/auth/mfa/recovery-codes/rotate",
         { password, code },
         CREDENTIAL_CHECK,
@@ -423,14 +426,9 @@ export const endpoints = {
   // locked, so the UI never has to guess whether the button is meaningful.
   unlockUser: (id: string) => api.post<User>(`/users/${id}/unlock`).then((r) => r.data),
   inviteUser: (data: { email: string; role: string; full_name?: string; rate_limit_minutes?: number }) =>
-    api.post<{ user: User; invitation_token: string; expires_at: string; email_scheduled: boolean }>(
-      "/users/invite",
-      data,
-    ).then((r) => r.data),
+    api.post<UserInvite>("/users/invite", data).then((r) => r.data),
   reissueInvitation: (id: string) =>
-    api.post<{ user: User; invitation_token: string; expires_at: string; email_scheduled: boolean }>(
-      `/users/${id}/invitation`,
-    ).then((r) => r.data),
+    api.post<UserInvite>(`/users/${id}/invitation`).then((r) => r.data),
   acceptInvitation: (token: string, newPassword: string) =>
     api
       .post<{ status: string }>(
@@ -593,7 +591,7 @@ export const endpoints = {
   revokeUserSessions: (id: string) =>
     api.delete<RevokedSessions>(`/users/${id}/sessions`).then((r) => r.data),
   bulkUsers: (payload: { operation: "activate" | "deactivate"; user_ids: string[] }) =>
-    api.post<{ operation: string; changed: number; skipped: number; revoked_sessions: number }>("/users/bulk", payload).then((r) => r.data),
+    api.post<UserBulkResult>("/users/bulk", payload).then((r) => r.data),
   createUser: (data: { email: string; role: UserRole; full_name?: string; password?: string; rate_limit_minutes?: number }) =>
     api.post<User>("/users", data).then((r) => r.data),
   getUser: (id: string) => api.get<User>(`/users/${id}`).then((r) => r.data),

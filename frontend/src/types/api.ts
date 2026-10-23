@@ -1279,6 +1279,46 @@ export interface TestEmailResult {
   to: string;
 }
 
+/**
+ * What an invitation answers: the account, and the one-time token.
+ *
+ * Two routes send this payload — `POST /users/invite` and
+ * `POST /users/{id}/invitation` — and the client wrote it twice as an inline
+ * literal, so each spelling was the other's only check. The token appears here and
+ * in no other response: the server keeps a digest, which is why reading it again is
+ * a reissue rather than a lookup.
+ */
+export interface UserInvite {
+  user: User;
+  invitation_token: string;
+  expires_at: string;
+  email_scheduled: boolean;
+}
+
+/**
+ * What `POST /users/bulk` changed, and what it left alone.
+ *
+ * Three numbers rather than one because a batch of already-active accounts is not
+ * a failure: `changed` can be zero with `skipped` above it. `revoked_sessions`
+ * counts the families a deactivation ended.
+ */
+export interface UserBulkResult {
+  operation: "activate" | "deactivate";
+  changed: number;
+  skipped: number;
+  revoked_sessions: number;
+}
+
+/**
+ * Fresh recovery codes, returned once by `POST /auth/mfa/recovery-codes/rotate`.
+ *
+ * The previous set stops working in the same transaction, so a page that loses
+ * this answer has to rotate again — there is no route that reads the codes back.
+ */
+export interface MfaRecoveryCodes {
+  codes: string[];
+}
+
 /** What `POST /settings/test-telegram` answers, chat by chat. */
 export interface TestTelegramResult {
   /** How many chats accepted the test message. */

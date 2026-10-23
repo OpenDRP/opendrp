@@ -120,6 +120,9 @@ SCHEMA_PAIRS: Mapping[str, str] = {
     "TLSCertificate": "TLSCertificateResponse",
     "TLSCertificateSighting": "TLSCertificateSightingResponse",
     "RevokedSessions": "RevokedSessionsResponse",
+    "UserInvite": "UserInviteResponse",
+    "UserBulkResult": "UserBulkResponse",
+    "MfaRecoveryCodes": "MfaRecoveryCodesResponse",
 }
 
 #: Routes whose successful response describes no row, and the interface the SPA
