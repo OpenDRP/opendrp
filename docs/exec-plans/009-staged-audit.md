@@ -2036,8 +2036,7 @@ row. The map's audit-partition section and the readiness page both state the out
     pipe (`||` in a code span, a TypeScript `string[] | undefined`), and so did a row
     added in this session. Repaired, and the gate now reports a blank line that ends a
     table (three tests, red first); the strengthened rule then found the same defect in
-    `docs/internal/README.md` (ten gaps) and
-    `docs/internal/users-rbac-remediation-plan-2026-10-18.md` (four), plus one more
+    the internal index (ten gaps) and its remediation plan (four), plus one more
     unescaped pipe in the internal index — fourteen torn tables in three documents, all
     repaired (AUD-078, S2: the readiness page lists this rule among the enforced ones).
   - six rows still said `planned: 009 wave C, close-out cleanup` — a wave that closed at
