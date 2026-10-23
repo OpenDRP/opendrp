@@ -189,7 +189,9 @@ async def list_observations(
                 value_asset_target=target,
                 value_in_assets=in_assets(target),
                 expiry_kind=expiry_kind(row),
-                expiry_monitor=monitor,
+                expiry_monitor=(
+                    DNSExpiryMonitorResponse.model_validate(monitor) if monitor else None
+                ),
             )
         )
     return DNSObservationPageResponse(

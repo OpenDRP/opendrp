@@ -4,7 +4,7 @@ import io
 import math
 import uuid
 from datetime import datetime, timezone
-from typing import Literal
+from typing import Literal, cast
 
 from fastapi import APIRouter, Body, Depends, Query, Request, Response
 from fastapi.responses import JSONResponse
@@ -37,6 +37,7 @@ from app.schemas.asset import (
     AssetCreate,
     AssetCriticality,
     AssetFindingCounts,
+    AssetFindingItem,
     AssetFindingsResponse,
     AssetFindingSubject,
     AssetImportItem,
@@ -47,6 +48,7 @@ from app.schemas.asset import (
     AssetResponse,
     AssetSortField,
     AssetUpdate,
+    RelatedFindingModule,
     SortDirection,
     validate_and_normalize_asset_value,
 )
@@ -1010,13 +1012,16 @@ async def list_asset_findings(
             },
         )
 
+    # `selected` is bounded by this route's query pattern and `asset_type` by the
+    # column's enum, so the two casts only state what the request and the schema
+    # already enforce; the response models validate both again on construction.
     # The rows stay dicts from `_related_row`; Pydantic validates a dict as well as
     # an object, so the four module branches stay one function instead of four
     # models. No `exclude_none`: the optional row fields are nulls here by contract.
     return AssetFindingsResponse(
         asset=AssetFindingSubject(
             id=asset.id,
-            asset_type=asset_type_value(asset.asset_type),
+            asset_type=cast(AssetType, asset_type_value(asset.asset_type)),
             asset_value=asset.asset_value,
             is_active=asset.is_active,
         ),
@@ -1024,8 +1029,8 @@ async def list_asset_findings(
         # When each module last saw a finding about this asset (WI-20): a count
         # says an asset is involved, the date says whether that is current.
         last_seen=summary.last_seen,
-        module=selected,
-        items=[_related_row(selected, row) for row in rows],
+        module=cast(RelatedFindingModule, selected),
+        items=[AssetFindingItem.model_validate(_related_row(selected, row)) for row in rows],
         total=total,
         page=page,
         size=size,

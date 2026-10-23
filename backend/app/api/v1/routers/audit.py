@@ -273,7 +273,7 @@ async def list_audit_actions(
     current_user: User = Depends(require_admin),
 ):
     return AuditActionsCatalog(
-        groups=_group_actions_by_prefix(),
+        groups=[AuditActionGroup.model_validate(group) for group in _group_actions_by_prefix()],
         total=len(AUDIT_ALLOWED_ACTIONS),
         actions=sorted(AUDIT_ALLOWED_ACTIONS),
         labels=AUDIT_ACTION_LABELS,
@@ -351,7 +351,7 @@ async def audit_integrity(
             retired=bool(archive and archive.retired_at),
         ),
         retained=AuditRetainedRange(**retained),
-        retired=AuditChainMark(**retired),
+        retired=AuditChainMark.model_validate(retired),
         last_verification=AuditLastVerification(
             through_seq=int(state.last_verified_seq or 0),
             at=state.last_verified_at.isoformat() if state.last_verified_at else None,

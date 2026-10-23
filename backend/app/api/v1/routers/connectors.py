@@ -898,7 +898,7 @@ async def heartbeat(
 
 async def connector_health_items(
     db: AsyncSession, *, user, now: datetime | None = None
-) -> tuple[list[dict], datetime]:
+) -> tuple[list[ConnectorHealth], datetime]:
     """Generic, secret-free health rows for every registered connector.
 
     Shared by ``GET /connectors/health`` and the dashboard overview (DHP-10).
@@ -991,7 +991,7 @@ async def connector_health_items(
                 last_success = last_success.replace(tzinfo=timezone.utc)
             else:
                 last_success = last_success.astimezone(timezone.utc)
-        items.append({
+        items.append(ConnectorHealth.model_validate({
             "name": conn.name,
             "connector_type": conn.connector_type,
             "status": conn.status,
@@ -1036,7 +1036,7 @@ async def connector_health_items(
                 if key in {"api_version", "version", "hostname", "python_version", "capabilities"}
                 and isinstance(value, (str, int, float, bool, list, dict, type(None)))
             },
-        })
+        }))
     return items, now
 
 
@@ -1106,7 +1106,12 @@ async def list_modules(
         user_id=user.id,
         details={"modules": sorted(modules)},
     )
-    return ConnectorModulesResponse(modules=modules)
+    return ConnectorModulesResponse(
+        modules={
+            name: ConnectorModuleEntry.model_validate(entry)
+            for name, entry in modules.items()
+        }
+    )
 
 
 @router.get("/jobs", response_model=PaginatedResponse[JobResponse], dependencies=[Depends(require_admin)])

@@ -8,7 +8,11 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import extract_ip, get_db, require_active_account
-from app.api.v1.routers.alerts import AlertChannelsHealthResponse
+from app.api.v1.routers.alerts import (
+    AlertChannelHealth,
+    AlertChannelsHealthResponse,
+    AlertDeliveryQueue,
+)
 from app.api.v1.routers.connectors import ConnectorHealthResponse
 from app.core import health
 from app.core.audit import AuditLogger, audit_is_degraded
@@ -456,8 +460,10 @@ async def dashboard_overview(
             items=connector_items, generated_at=connectors_generated_at
         ),
         channels=AlertChannelsHealthResponse(
-            items=channel_items,
-            delivery_queue=delivery_queue,
+            items=[
+                AlertChannelHealth.model_validate(item) for item in channel_items
+            ],
+            delivery_queue=AlertDeliveryQueue.model_validate(delivery_queue),
             generated_at=assembled_at,
         ),
         generated_at=assembled_at,
