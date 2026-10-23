@@ -126,6 +126,10 @@ SCHEMA_PAIRS: Mapping[str, str] = {
     "SourceAccountCreated": "SourceAccountCreated",
     "SourceAccountPolicyUpdated": "SourceAccountPolicyUpdated",
     "SourceAccountApiKey": "SourceAccountApiKeyState",
+    "ReportQueued": "ReportQueued",
+    "InvitationAccepted": "InvitationAccepted",
+    "BreachDomainVerificationStarted": "BreachDomainVerificationStarted",
+    "TLSSightingReview": "TLSSightingReview",
 }
 
 #: Routes whose successful response describes no row, and the interface the SPA

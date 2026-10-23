@@ -177,6 +177,27 @@ class BreachDomainVerificationRequest(BaseModel):
         return _validate_fqdn(v)
 
 
+class BreachDomainVerificationStarted(BaseModel):
+    """What `POST /breaches/domain-verification` answers (202).
+
+    `status` is `scheduled` when a job was queued and `no_connector` when no enabled
+    source accepts the request — in that case the answer is still a 202, because the
+    attempt was recorded and audited and the page has to say "nobody could ask"
+    rather than "nothing happened". `error` is sent only in that case, so it stays
+    optional and the route omits it instead of sending `null`.
+
+    The domain is echoed as the operator sent it, and deliberately **not** validated
+    here: the request model is where an FQDN is refused, and a response model that
+    re-ran the check would turn a stored attempt into a 500 the day the rule tightens.
+    """
+
+    status: Literal["scheduled", "no_connector"]
+    domain: str
+    action: Literal["generate", "verify"]
+    job_ids: list[str]
+    error: str | None = None
+
+
 class BreachProviderReadinessResponse(BaseModel):
     """What the last breach scan was allowed to ask, and what it could not (WI-14).
 

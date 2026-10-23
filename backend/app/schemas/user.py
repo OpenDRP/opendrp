@@ -306,6 +306,18 @@ class AcceptInvitationRequest(BaseModel):
         return validate_password_strength(value)  # type: ignore[return-value]
 
 
+class InvitationAccepted(BaseModel):
+    """What `POST /auth/accept-invitation` answers once the password is stored.
+
+    One word, and deliberately not a session: spending the link does not sign the
+    account in, so the page sends the person to the sign-in form. `accepted` is a
+    literal because the route has one success and answers 401 for every failure —
+    invalid and expired links alike.
+    """
+
+    status: Literal["accepted"]
+
+
 class UserBulkRequest(BaseModel):
     """One activation change over many accounts (U-5).
 

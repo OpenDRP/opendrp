@@ -44,3 +44,19 @@ class ReportResponse(ReportBase):
 
 class ReportListResponse(PaginatedResponse):
     items: list[ReportResponse]
+
+
+class ReportQueued(BaseModel):
+    """What `POST /reports/generate` answers once the worker has the job (202).
+
+    Both words are literals rather than free strings: `status` is the report row's
+    state and `queue_state` is the broker's, and the page shows them as two halves of
+    one answer — a report that exists but is not scheduled answers 503 instead, with
+    the job marked failed, so there is no third spelling to model. The ids stay
+    strings because that is what the response has always sent.
+    """
+
+    status: Literal["scheduled"]
+    queue_state: Literal["queued"]
+    report_id: str
+    job_id: str

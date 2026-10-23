@@ -426,6 +426,21 @@ class CertificateVerdict(BaseModel):
     note: str | None = Field(default=None, max_length=2000)
 
 
+class TLSSightingReview(BaseModel):
+    """What `PATCH /dns/certificates/sightings/{id}` answers: the decision, as stored.
+
+    `id` is a string because the route has always sent `str(sighting.id)`, and the
+    page keys the row in its cache by it. `verdict` stays a free string rather than
+    the request's pattern: a row can hold a value written before a verdict was
+    retired, and reading it back is not the place to fail. `reviewed_at` is null for
+    a decision that cleared a verdict instead of setting one.
+    """
+
+    id: str
+    verdict: str
+    reviewed_at: datetime | None = None
+
+
 class CertificateExceptionCreate(BaseModel):
     match_kind: str = Field(pattern="^(fingerprint|spki|ip|asn|issuer)$")
     match_value: str = Field(min_length=1, max_length=255)
@@ -557,7 +572,7 @@ async def list_certificates(
     )
 
 
-@router.patch("/certificates/sightings/{sighting_id}")
+@router.patch("/certificates/sightings/{sighting_id}", response_model=TLSSightingReview)
 async def review_certificate_sighting(
     sighting_id: uuid.UUID,
     payload: CertificateVerdict,
@@ -578,7 +593,11 @@ async def review_certificate_sighting(
         raise NotFoundException("Certificate sighting not found")
     await AuditLogger.emit(db, action=f"tls.sighting.{payload.verdict}", ip_address=extract_ip(request), user_id=user.id, details={"sighting_id": str(sighting.id), "identity_id": str(sighting.identity_id), "ip": sighting.ip, "port": sighting.port, "source": sighting.source, "subject": sighting.subject, "note": payload.note}, require_persistence=True, commit=False)
     await db.commit()
-    return {"id": str(sighting.id), "verdict": sighting.verdict, "reviewed_at": sighting.reviewed_at}
+    return TLSSightingReview(
+        id=str(sighting.id),
+        verdict=sighting.verdict,
+        reviewed_at=sighting.reviewed_at,
+    )
 
 
 @router.get("/certificate-exceptions", response_model=list[CertificateScopeExceptionResponse])

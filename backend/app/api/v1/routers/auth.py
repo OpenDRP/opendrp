@@ -35,6 +35,7 @@ from app.models.user import User, role_name
 from app.schemas.common import RevokedSessionsResponse
 from app.schemas.user import (
     AcceptInvitationRequest,
+    InvitationAccepted,
     LoginRequest,
     MfaCodeRequest,
     MfaSetupRequest,
@@ -422,12 +423,12 @@ async def login(
     return session
 
 
-@router.post("/accept-invitation", status_code=200)
+@router.post("/accept-invitation", status_code=200, response_model=InvitationAccepted)
 async def accept_invitation(
     request: Request,
     payload: AcceptInvitationRequest,
     db: AsyncSession = Depends(get_db),
-) -> dict[str, str]:
+) -> InvitationAccepted:
     """Spend an invitation: the owner chooses the password nobody else knows (U-7).
 
     Unknown and expired links get the same answer: a difference between the two
@@ -466,7 +467,7 @@ async def accept_invitation(
     except Exception:
         await db.rollback()
         raise
-    return {"status": "accepted"}
+    return InvitationAccepted(status="accepted")
 
 
 @router.get("/me", response_model=UserResponse)

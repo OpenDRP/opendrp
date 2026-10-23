@@ -1361,3 +1361,56 @@ export interface TestTelegramResult {
   validation_failed: number;
   results: TelegramChatValidationResult[];
 }
+
+/**
+ * What `POST /reports/generate` answers once the worker has the job (202).
+ *
+ * Both words are literal rather than free strings, because the two halves of the
+ * answer are always the same pair: the report row is `scheduled` and the broker has
+ * it `queued`. A report that could not be scheduled answers 503 with the job marked
+ * failed, so there is no third combination to type.
+ */
+export interface ReportQueued {
+  status: "scheduled";
+  queue_state: "queued";
+  report_id: string;
+  job_id: string;
+}
+
+/**
+ * What `POST /auth/accept-invitation` answers.
+ *
+ * No session and no user: spending the link sets the password and nothing else, so
+ * the page sends the person to the sign-in form afterwards. One success word, and
+ * 401 for an invalid and an expired link alike.
+ */
+export interface InvitationAccepted {
+  status: "accepted";
+}
+
+/**
+ * What `POST /breaches/domain-verification` answers (202).
+ *
+ * `no_connector` is a success with a reason rather than an error: the attempt was
+ * audited and the page has to say "nobody could ask" instead of showing nothing.
+ * `error` is sent only in that case, so it is optional here and absent there.
+ */
+export interface BreachDomainVerificationStarted {
+  status: "scheduled" | "no_connector";
+  domain: string;
+  action: "generate" | "verify";
+  job_ids: string[];
+  error?: string;
+}
+
+/**
+ * What recording a verdict on one certificate sighting answers.
+ *
+ * The decision, as stored: `verdict` is what the next sweep will see, and
+ * `reviewed_at` is null when the change cleared a verdict rather than setting one.
+ */
+export interface TLSSightingReview {
+  id: string;
+  verdict: TLSSightingVerdict;
+  reviewed_at: string | null;
+}

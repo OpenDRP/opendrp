@@ -28,6 +28,7 @@ import type {
   AssetImportReport,
   AuthSession,
   Breach,
+  BreachDomainVerificationStarted,
   BreachList,
   BreachProviderReadiness,
   CertificateExceptionKind,
@@ -37,6 +38,7 @@ import type {
   ConnectorHealthResponse,
   DNSObservation,
   DashboardOverview,
+  InvitationAccepted,
   MfaRecoveryCodes,
   MfaSetup,
   MfaStatus,
@@ -44,6 +46,7 @@ import type {
   PhishingThreat,
   PhishingVerdict,
   Report,
+  ReportQueued,
   RuntimeConfiguration,
   SecurityActivity,
   SourceAccount,
@@ -52,6 +55,7 @@ import type {
   SourceAccountPolicyUpdated,
   SystemSettings,
   TLSCertificate,
+  TLSSightingReview,
   TLSSightingVerdict,
   TelegramChatValidationResponse,
   ThreatStatus,
@@ -434,7 +438,7 @@ export const endpoints = {
     api.post<UserInvite>(`/users/${id}/invitation`).then((r) => r.data),
   acceptInvitation: (token: string, newPassword: string) =>
     api
-      .post<{ status: string }>(
+      .post<InvitationAccepted>(
         "/auth/accept-invitation",
         { token, new_password: newPassword },
         CREDENTIAL_CHECK,
@@ -483,7 +487,7 @@ export const endpoints = {
       .then((r) => r.data),
   reviewTLSSighting: (sightingId: string, payload: { verdict: TLSSightingVerdict; note?: string | null }) =>
     api
-      .patch<{ id: string; verdict: TLSSightingVerdict; reviewed_at: string | null }>(
+      .patch<TLSSightingReview>(
         `/dns/certificates/sightings/${sightingId}`,
         payload,
       )
@@ -553,13 +557,7 @@ export const endpoints = {
     connector?: string | null;
   }) =>
     api
-      .post<{
-        status: string;
-        domain: string;
-        action: "generate" | "verify";
-        job_ids: string[];
-        error?: string;
-      }>("/breaches/domain-verification", payload)
+      .post<BreachDomainVerificationStarted>("/breaches/domain-verification", payload)
       .then((r) => r.data),
   updateBreach: (id: string, data: { status: ThreatStatus }) =>
     api.patch<Breach>(`/breaches/${id}`, data).then((r) => r.data),
@@ -577,7 +575,7 @@ export const endpoints = {
     api.post<ScanStartResult>("/breaches/scan-domain", { domain }).then((r) => r.data),
   getBreach: (id: string) => api.get<Breach>(`/breaches/${id}`).then((r) => r.data),
   deleteBreach: (id: string) => api.delete<void>(`/breaches/${id}`).then(() => ({})),
-  generateReport: (name?: string) => api.post<{ status: "scheduled"; queue_state: "queued"; report_id: string; job_id: string }>("/reports/generate", { report_name: name ?? null }).then((r) => r.data),
+  generateReport: (name?: string) => api.post<ReportQueued>("/reports/generate", { report_name: name ?? null }).then((r) => r.data),
   listReports: (params: QueryParams) =>
     api.get<Paginated<Report>>("/reports", { params }).then((r) => r.data),
   downloadReportBlob: (id: string) =>

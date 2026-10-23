@@ -1,7 +1,7 @@
 import math
 import uuid
 from datetime import timezone
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, Query, Request
 from pydantic import BaseModel
@@ -50,6 +50,7 @@ from app.schemas.breaches import (
     BreachDomainReadiness,
     BreachDomainVerificationReadiness,
     BreachDomainVerificationRequest,
+    BreachDomainVerificationStarted,
     BreachFlag,
     BreachListResponse,
     BreachSeverity,
@@ -576,7 +577,7 @@ async def _domain_verifications(db: AsyncSession) -> list[BreachDomainVerificati
     return [latest[domain] for domain in sorted(latest)]
 
 
-@router.post("/domain-verification", status_code=202)
+@router.post("/domain-verification", status_code=202, response_model=BreachDomainVerificationStarted)
 async def request_domain_verification(
     request: Request,
     payload: BreachDomainVerificationRequest,
@@ -615,7 +616,11 @@ async def request_domain_verification(
             "connector: name the source that should verify this domain — "
             + ", ".join(sorted(conn.name for conn in enabled))
         )
-    status, error, jobs = "scheduled", None, []
+    # Typed rather than inferred so the answer's literal stays one: the model rejects
+    # a third spelling, and mypy rejects one here before the request is served.
+    status: Literal["scheduled", "no_connector"] = "scheduled"
+    error: str | None = None
+    jobs: list[Job] = []
     if not enabled:
         # Recorded as an attempt that could not be queued: "nobody verified this" and
         # "nobody asked" are different answers on the page, and only the audit row keeps
@@ -653,15 +658,16 @@ async def request_domain_verification(
             "jobs": [str(job.id) for job in jobs],
         },
     )
-    body: dict = {
-        "status": status,
-        "domain": payload.domain,
-        "action": payload.action,
-        "job_ids": [str(job.id) for job in jobs],
-    }
-    if error:
-        body["error"] = error
-    return body
+    # The model is built here rather than as a dict so the omitted `error` stays
+    # omitted: `exclude_none` on the route would also strip a null the page needs
+    # elsewhere, and a refusal is the only case that has an error to send.
+    return BreachDomainVerificationStarted(
+        status=status,
+        domain=payload.domain,
+        action=payload.action,
+        job_ids=[str(job.id) for job in jobs],
+        **({"error": error} if error else {}),
+    )
 
 
 @router.get("/provider-readiness", response_model=BreachProviderReadinessResponse)
