@@ -47,7 +47,11 @@ class ModuleCoverage:
 
 
 def _normalized(name: str) -> str:
-    return str(Path(name).as_posix()).lstrip("./")
+    # A report may spell a path with the separator of the host that wrote it, and
+    # the ranking is compared across hosts. `Path.as_posix()` only rewrites the
+    # separator of the running platform, so a Windows-style key read on Linux kept
+    # its backslashes and ranked as a module of its own.
+    return name.replace("\\", "/").lstrip("./")
 
 
 def modules(report: dict[str, Any]) -> list[ModuleCoverage]:

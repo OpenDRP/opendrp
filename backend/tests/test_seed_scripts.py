@@ -17,6 +17,7 @@ had zero coverage. This file pins:
 
 from __future__ import annotations
 
+import re
 from datetime import date
 
 import pytest
@@ -263,8 +264,14 @@ class TestForceGuard:
         result = self._invoke("--help")
 
         assert result.exit_code == 0, result.output
-        assert "--force" in result.output
-        assert "--yes" in result.output
+        # Rich styles the panel and wraps it to the terminal it sees, so the
+        # option names may carry escape codes or a line break at a column that
+        # differs between a Windows console and a CI runner. Strip both before
+        # asking whether the flag is documented at all.
+        plain = re.sub(r"\x1b\[[0-9;]*m", "", result.output)
+        compact = re.sub(r"\s+", "", plain)
+        assert "--force" in compact
+        assert "--yes" in compact
 
 
 class TestSeedDefaults:
