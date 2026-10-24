@@ -751,6 +751,25 @@ jobs:
           python -m pip install --upgrade pip pip-audit
           pip-audit --strict --requirement requirements.txt
 
+      - name: Audit every connector lock for known vulnerabilities
+        # Each connector ships its own image, built with `pip install
+        # --require-hashes -r requirements.txt`, so its lock is a shipped
+        # dependency set the audit above never sees. That gap is how the
+        # vulnerable certifi sat in six connector locks while every pull request
+        # was green: Dependabot raised one connector at a time, and Trivy only
+        # saw the other five once the v0.2.1 images had been pushed. Auditing
+        # every lock here turns that into a failing pull request.
+        # Same rule as above: an advisory without a released fix gets an explicit
+        # `--ignore-vuln <ID>` with its reason in a comment, never a dropped step.
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip pip-audit
+          for requirement in connectors/*/requirements.txt; do
+            echo "::group::pip-audit ${requirement}"
+            pip-audit --strict --requirement "${requirement}"
+            echo "::endgroup::"
+          done
+
       # Static analysis of our own code, which pip-audit cannot see: someone
       # else's CVE is tracked above, a mistake in this repository is not. The
       # gate is set at medium severity and medium confidence, and the current
