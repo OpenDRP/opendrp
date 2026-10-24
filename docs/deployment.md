@@ -162,7 +162,7 @@ it prints which figures belong to which service set.
 
 ## 1. Prepare the checkout and version
 
-This checkout declares version `0.2.1`. Local installations must set `OPENDRP_VERSION=0.2.1` and build from source; this local version bump does not publish a GitHub tag, release or GHCR images. Do not pull `0.2.1` from the registry until it has actually been published. For an available production release, check out its tag and pin the same version in `.env`:
+This checkout declares version `0.2.1`, and that version is published: tag `v0.2.1` on GitHub, with the images below in GHCR. Set `OPENDRP_VERSION=0.2.1` and either pull the published images or build from this tree. For a different release, check out its tag and pin the same version in `.env`:
 
 ```text
 git clone https://github.com/OpenDRP/opendrp.git
@@ -533,6 +533,17 @@ tarball, and load it on the target host:
 ```text
 docker load < opendrp-images-0.2.1.tar
 ```
+
+**The tag, not the branch.** `v0.2.1` is both a branch and a tag in this
+repository, and a checkout that names it bare (`ref: v0.2.1`) resolves the
+branch. That is not hypothetical: the first v0.2.1 release run built the branch,
+which still pinned the `certifi` the tag had already replaced, and only the image
+scan noticed — the tag-versus-code check passed because both declare `0.2.1`. The
+workflow therefore names `refs/tags/<tag>` in every checkout, and
+`scripts/check_release_refs.py` fails CI if one of them stops doing so. The other
+half of the convention is on the operator's side of a release: a version branch
+is reset to the release commit when the tag is cut, so the two refs never point
+at different trees.
 
 Then run the deployment steps as written, without `--build` and without `docker
 compose pull`: Compose finds the images locally because the tag it asks for is the

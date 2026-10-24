@@ -61,6 +61,7 @@ delivery, image pinning — is verified on the host with
 | The PostgreSQL/Redis integration suite actually ran, with a minimum number of passes | `backend/scripts/check_integration_ran.py` | `production-integration` job |
 | A dump taken from a migrated database restores into a scratch one, and the report archive beside it restores into a scratch directory with a file read back | `scripts/backup.sh`, `scripts/verify_restore.sh`, `backend/tests/test_backup_scripts.py` | `production-integration` job, `make backup-verify` |
 | Every image the Compose files resolve is present in the release matrix | `scripts/check_release_images.py` | `release.yml` |
+| Every checkout in the release workflow names a `refs/tags/` ref, so a version branch that shares the tag's name cannot be built in its place | `scripts/check_release_refs.py`, `backend/tests/test_release_refs_gate.py` | `release-image-coverage` job |
 | A published image has an SBOM, provenance, and no unfixed HIGH/CRITICAL finding | `trivy` step in `.github/workflows/release.yml` | `release.yml` |
 | Shipped dependencies carry no known advisory, and no credential is in the history | `pip-audit` / `npm audit` / gitleaks steps | `security` and `secrets` jobs |
 | Every timestamp the UI shows is the stored UTC instant, formatted without the reader's locale, and the table that shows one says so | `frontend/src/lib/timezoneContract.test.ts` | `frontend` job |
