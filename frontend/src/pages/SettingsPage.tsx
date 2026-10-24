@@ -4,7 +4,7 @@ import { zodResolver } from "@hookform/resolvers/zod";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { z } from "zod";
 import { RefreshCw, Save, Mail, Key, Globe, MessageSquare, Send, Bell, Clock, Send as SendIcon, Boxes } from "lucide-react";
-import { Control, useController } from "react-hook-form";
+import { Control, useController, type Resolver } from "react-hook-form";
 import { describeApiError, endpoints } from "@/lib/api";
 import { issueConnectorToken, revokeConnectorToken } from "@/lib/connectors";
 import { fetchModules, updateModule } from "@/lib/modules";
@@ -94,10 +94,20 @@ const settingsSchema = z.object({
   schedule_exposure_days: z.array(z.number().min(0).max(6)),
   schedule_exposure_hour: z.coerce.number().int().min(0).max(23),
   schedule_exposure_minute: z.coerce.number().int().min(0).max(59),
-  schedules: z.record(z.object({ days: z.array(z.number().min(0).max(6)), hour: z.number().int().min(0).max(23), minute: z.number().int().min(0).max(59) }).nullable()).default({}),
+  // zod 4 requires the key schema: `z.record(value)` used to assume string keys.
+  schedules: z.record(z.string(), z.object({ days: z.array(z.number().min(0).max(6)), hour: z.number().int().min(0).max(23), minute: z.number().int().min(0).max(59) }).nullable()).default({}),
 });
 
 type SettingsForm = z.infer<typeof settingsSchema>;
+
+/** The form is typed by what a submit produces, not by what it holds.
+ *
+ * Every numeric field here is `z.coerce.number()`, whose *input* type is
+ * `unknown` — a resolver that reports its own input would make each of those
+ * fields `unknown` in the JSX below. The narrowing is only on the declared type:
+ * the resolver still receives the raw strings the inputs hand it, coerces them, and
+ * the values `handleSubmit` passes to `onSubmit` are the schema's output. */
+const settingsResolver = zodResolver(settingsSchema) as unknown as Resolver<SettingsForm>;
 
 /** The stored tri-state of a budget switch, as the form holds it. `null` is the
  * row's own state for "not decided" — it is not `false`. */
@@ -141,7 +151,7 @@ export default function SettingsPage() {
   });
 
   const form = useForm<SettingsForm>({
-    resolver: zodResolver(settingsSchema),
+    resolver: settingsResolver,
     defaultValues: {
       telegram_bot_token: "",
       smtp_host: "",
