@@ -5,20 +5,31 @@
 # operator pulling `0.2.0` gets bytes somebody can audit. This workflow is what
 # turns `git tag` into that, rather than into a label on a commit.
 #
-# It runs on `v*` tags and does four things, in order:
+# It runs on `v*` tags and does five things, in order:
 #
 #   1. Verifies the tag against `backend/app/__init__.py`. A tag that disagrees
 #      with the code would publish images whose `/api/v1/health` reports a
 #      version no release note describes.
-#   2. Builds and pushes every image Compose references, with per-image SBOM and
-#      build provenance attestations. Attestations are what let an operator check
-#      *which* workflow and source revision produced an image without trusting
-#      this repository's word for it.
-#   3. Scans each pushed image for known vulnerabilities and fails the release
-#      on an unfixed HIGH or CRITICAL finding. A released image is the artifact
-#      customers actually run, so this is the last place the check is meaningful.
-#   4. Publishes the GitHub release with the notes taken from `CHANGELOG.md`, so
+#   2. Builds every image Compose references and pushes it under one tag only:
+#      `<version>-candidate`, with per-image SBOM and build provenance
+#      attestations. Attestations are what let an operator check *which* workflow
+#      and source revision produced an image without trusting this repository's
+#      word for it.
+#   3. Scans that candidate digest for known vulnerabilities and fails the
+#      release on an unfixed HIGH or CRITICAL finding. Nothing a release is
+#      known by exists yet, so a failed scan publishes no release.
+#   4. Promotes the scanned digest to `<version>` and `latest`. A copy, not a
+#      rebuild: the bytes under the release tags are the bytes the scan read,
+#      attestations included.
+#   5. Publishes the GitHub release with the notes taken from `CHANGELOG.md`, so
 #      the curated entry — not a generated commit list — is what a user reads.
+#
+# Steps 2-4 are in that order because they were not. The first v0.2.1 run pushed
+# `<version>` and `latest`, and only then failed on Trivy: the gate stopped the
+# workflow after the publication, so the vulnerable images stayed reachable by
+# `latest` until someone re-ran the release. A gate that runs after the thing it
+# gates is a report, not a gate. `scripts/check_release_publish_order.py` fails
+# CI if a release tag is created before the scan.
 #
 # Actions are pinned to commit SHAs; Dependabot updates them (see
 # .github/dependabot.yml).
@@ -173,25 +184,30 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Two tags per image: the exact release, and `latest`. Compose defaults to
-      # `latest` and pins with OPENDRP_VERSION=<release>, so both are needed —
-      # but the release tag is the one to deploy, and `latest` exists only so an
-      # unpinned `make up` is not a broken reference.
-      - name: Tags and labels
-        id: meta
-        run: |
-          echo "tags=${{ steps.prefix.outputs.value }}/${{ matrix.image }}:${{ needs.verify-version.outputs.version }},${{ steps.prefix.outputs.value }}/${{ matrix.image }}:latest" >> "$GITHUB_OUTPUT"
-
-      - name: Build and push with SBOM and provenance
+      # The one tag this step may create. `<version>` and `latest` are not
+      # pushed here — they do not exist until the scan below has passed. A push
+      # is unavoidable (a digest exists only once the registry holds the image),
+      # so what it guarantees is narrower than "nothing is published before the
+      # scan": what it guarantees is that no tag a release is known by, and no
+      # tag Compose resolves, ever names an unscanned image. A run that fails the
+      # scan leaves `<version>-candidate` behind; that tag is not documented, not
+      # deployed, and carries the version's name only so a maintainer can tell
+      # which build it was.
+      - name: Build the candidate image
+        id: build
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: ${{ matrix.context }}
           file: ${{ matrix.dockerfile }}
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
+          tags: ${{ steps.prefix.outputs.value }}/${{ matrix.image }}:${{ needs.verify-version.outputs.version }}-candidate
           # `sbom` and `provenance` are attestations attached to the image rather
           # than files lost in a workflow artifact: whoever pulls the image can
-          # ask the registry what it contains and how it was built.
+          # ask the registry what it contains and how it was built. They are also
+          # why this job does not build with `load: true` and push afterwards:
+          # the docker exporter cannot carry an attestation, so that shape would
+          # drop both of them silently. Promoting the scanned digest keeps them
+          # and still puts nothing under a release tag before the gate.
           sbom: true
           provenance: mode=max
           build-args: |
@@ -200,21 +216,45 @@ jobs:
           cache-from: type=gha,scope=${{ matrix.image }}
           cache-to: type=gha,scope=${{ matrix.image }},mode=max
 
-      # The scan runs against the pushed digest, not a local build: it is the
-      # published artifact that an operator deploys, and `ignore-unfixed` keeps
-      # the gate actionable — a release cannot fail on a finding that has no fix
-      # to apply, which would only teach maintainers to bypass it.
-      - name: Scan the published image
+      # The scan reads the digest, not a tag: the promotion below copies this
+      # digest, so the artifact that was approved is exactly the artifact the
+      # release tags point at. Scanning a tag would leave a window in which the
+      # tag moves between the read and the push. `ignore-unfixed` keeps the gate
+      # actionable — a release cannot fail on a finding that has no fix to apply,
+      # which would only teach maintainers to bypass it.
+      - name: Scan the candidate digest
         # 0.35.0 is the first immutable, post-incident Trivy Action release;
         # earlier tags were force-moved during the March 2026 compromise.
         uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # 0.35.0
         with:
-          image-ref: ${{ steps.prefix.outputs.value }}/${{ matrix.image }}:${{ needs.verify-version.outputs.version }}
+          image-ref: ${{ steps.prefix.outputs.value }}/${{ matrix.image }}@${{ steps.build.outputs.digest }}
           format: table
           exit-code: "1"
           ignore-unfixed: true
           severity: HIGH,CRITICAL
           vuln-type: os,library
+
+      # Two tags per image: the exact release, and `latest`. Compose defaults to
+      # `latest` and pins with OPENDRP_VERSION=<release>, so both are needed —
+      # but the release tag is the one to deploy, and `latest` exists only so an
+      # unpinned `make up` is not a broken reference.
+      #
+      # `imagetools create` copies the manifest instead of rebuilding it, so this
+      # costs one registry call: the layers are already there from the candidate
+      # push, and the attestation manifests travel with the index. It is also the
+      # reason the scan can name a digest at all — the promoted tag and the
+      # scanned digest are the same bytes by construction, not by convention.
+      - name: Promote the scanned digest to the release tags
+        env:
+          IMAGE: ${{ steps.prefix.outputs.value }}/${{ matrix.image }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+          VERSION: ${{ needs.verify-version.outputs.version }}
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create \
+            --tag "${IMAGE}:${VERSION}" \
+            --tag "${IMAGE}:latest" \
+            "${IMAGE}@${DIGEST}"
 
   release:
     name: Publish the release
