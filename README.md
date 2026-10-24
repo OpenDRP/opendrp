@@ -994,7 +994,7 @@ Two things are worth knowing before you open it:
 
 Runtime dependencies live in `backend/requirements.txt` and are the only ones installed into the production image. Test, lint and type-check tooling lives in `backend/requirements-dev.txt`; the local Compose stack installs it via the `INSTALL_DEV_REQUIREMENTS` build argument so `make test-backend` keeps working, while a production build omits it.
 
-CI runs a `security` job that fails on known vulnerabilities in the shipped dependency sets (`pip-audit` for the backend runtime requirements, `npm audit --omit=dev` for the frontend) and reviews newly introduced dependencies on pull requests. Dependabot keeps pip, npm, Docker and GitHub Actions pins current, grouping patch and minor updates per ecosystem and leaving major bumps for a deliberate migration — GitHub Actions majors are the exception, since an action bump is usually a one-line change and arrives in the group.
+CI runs a `security` job that fails on known vulnerabilities in the shipped dependency sets (`pip-audit` for the backend runtime requirements and for every connector's hash-locked `requirements.txt`, `npm audit --omit=dev` for the frontend) and reviews newly introduced dependencies on pull requests. Dependabot keeps pip, npm, Docker and GitHub Actions pins current, grouping patch and minor updates per ecosystem and leaving major bumps for a deliberate migration — GitHub Actions majors are the exception, since an action bump is usually a one-line change and arrives in the group.
 
 What exactly is pinned — the hash-locked Python manifests, the `npm ci` lockfile,
 and the base image tags that are deliberately left floating — is written down once,
