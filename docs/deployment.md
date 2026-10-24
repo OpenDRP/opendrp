@@ -534,16 +534,24 @@ tarball, and load it on the target host:
 docker load < opendrp-images-0.2.1.tar
 ```
 
-**The tag, not the branch.** `v0.2.1` is both a branch and a tag in this
-repository, and a checkout that names it bare (`ref: v0.2.1`) resolves the
-branch. That is not hypothetical: the first v0.2.1 release run built the branch,
-which still pinned the `certifi` the tag had already replaced, and only the image
-scan noticed — the tag-versus-code check passed because both declare `0.2.1`. The
-workflow therefore names `refs/tags/<tag>` in every checkout, and
-`scripts/check_release_refs.py` fails CI if one of them stops doing so. The other
-half of the convention is on the operator's side of a release: a version branch
-is reset to the release commit when the tag is cut, so the two refs never point
-at different trees.
+**The tag is the only ref.** A release is the tag and nothing else. Until
+2026-10-24 a `vX.Y.Z` branch sat beside each tag, and the two were maintained by
+hand — which is how they came to point at different trees: `v0.2.1` the branch
+still pinned the `certifi` the tag had already replaced, and the first v0.2.1
+release run checked out the bare name, resolved the branch and built it. The
+version check passed, because both declare `0.2.1`, and only the image scan
+noticed, after the push. The branches are gone now (`v0.1.0` … `v0.2.1` deleted),
+because the branch carried nothing the tag did not: a branch is a second ref with
+the same name, a different lifetime and a `git clone --branch` nothing in this
+repository's procedure performs.
+
+Two things keep it that way. `scripts/check_release_refs.py` fails CI if a
+checkout in the release workflow stops naming `refs/tags/<tag>` — a qualified ref
+cannot be shadowed even if someone recreates a branch — and
+`scripts/check_release_branches.py` fails CI when a `vX.Y.Z` branch exists at all,
+printing the `git push origin --delete` that removes it. If you are cutting a
+release, that is `git tag -a vX.Y.Z -m …` and `git push origin refs/tags/vX.Y.Z`;
+there is no branch to create, reset or keep in step.
 
 **The scan, then the tag.** A release does not create `<version>` or `latest`
 until the image behind them has passed the vulnerability scan. Each image is

@@ -67,12 +67,15 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           # Qualified, and it has to stay qualified: `ref: v0.2.1` is ambiguous
-          # when a version branch of that name exists, and checkout resolves the
-          # branch. The release then builds the branch while the tag-existence
-          # check below still passes, because both spell the same version — that
-          # is how the v0.2.1 run built images with the certifi the tag had
-          # already replaced. `scripts/check_release_refs.py` fails the build if
-          # any checkout in this file names a ref a branch can shadow.
+          # when a branch of that name exists, and checkout resolves the branch.
+          # The release then builds the branch while the tag-existence check
+          # below still passes, because both spell the same version — that is how
+          # the v0.2.1 run built images with the certifi the tag had already
+          # replaced. Those branches are deleted now (v0.1.0 … v0.2.1) and
+          # `scripts/check_release_branches.py` fails CI if one returns, but the
+          # checkout is qualified anyway: this line must not depend on a policy
+          # held somewhere else. `scripts/check_release_refs.py` fails the build
+          # if any checkout in this file names a ref a branch can shadow.
           ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.release_tag) || github.ref }}
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
