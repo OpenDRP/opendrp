@@ -62,7 +62,7 @@ delivery, image pinning — is verified on the host with
 | A dump taken from a migrated database restores into a scratch one, and the report archive beside it restores into a scratch directory with a file read back | `scripts/backup.sh`, `scripts/verify_restore.sh`, `backend/tests/test_backup_scripts.py` | `production-integration` job, `make backup-verify` |
 | Every image the Compose files resolve is present in the release matrix | `scripts/check_release_images.py` | `release.yml` |
 | A published image has an SBOM, provenance, and no unfixed HIGH/CRITICAL finding | `trivy` step in `.github/workflows/release.yml` | `release.yml` |
-| Shipped dependencies carry no known advisory, and no credential is in the history | `pip-audit` / `npm audit` / gitleaks steps | `security` and `secrets` jobs |
+| Shipped dependencies carry no known advisory — the backend runtime lock, every connector lock (each is the dependency set its own image installs) and the production npm tree — and no credential is in the history | `pip-audit` over `backend/requirements.txt` and `connectors/*/requirements.txt`, `npm audit --omit=dev`, gitleaks | `security` and `secrets` jobs |
 | Every timestamp the UI shows is the stored UTC instant, formatted without the reader's locale, and the table that shows one says so | `frontend/src/lib/timezoneContract.test.ts` | `frontend` job |
 | The metrics endpoint publishes no row of data as a label, and does not exist until `METRICS_TOKEN` is set | `backend/tests/test_metrics.py` | `backend` job |
 | The frontend suite enforces a coverage floor, and measures every source file rather than the ones a test happened to import | `frontend/vite.config.ts` (`npm run test:coverage`) | `frontend` job |
