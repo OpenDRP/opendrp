@@ -11,6 +11,20 @@ with it.
 
 ## [Unreleased]
 
+### Changed
+
+- Version branches are gone. `v0.2.1` existed as both a branch and a tag, and the two
+pointed at different trees: the branch still pinned the `certifi` the tag had already
+replaced, so the first v0.2.1 release run built the branch and only the image scan
+noticed, after the push. Qualifying every checkout as `refs/tags/<tag>` removed the
+collision from the workflow, but the branch itself carried nothing the tag did not — a
+second ref with the same name, a different lifetime and a `git clone --branch` that no
+procedure here performs. The `v0.1.0` … `v0.2.1` branches are deleted (tags untouched),
+`docs/deployment.md` describes cutting a release as the annotated tag and its push, and
+`scripts/check_release_branches.py` fails CI — printing the `git push origin --delete`
+that fixes it — if a `vX.Y.Z` branch is ever created again. `scripts/check_release_refs.py`
+stays: a qualified ref is unambiguous for anyone who types a bare name anyway.
+
 ### Fixed
 
 - A release can no longer publish an image the scan has rejected. The first v0.2.1

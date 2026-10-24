@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
 """Fail when the release workflow checks out a ref a branch can shadow.
 
-A tag and a branch may share a name, and this repository keeps both: `v0.2.1`
-is a branch *and* the tag of the release. `actions/checkout` with `ref: v0.2.1`
+A tag and a branch may share a name, and this repository kept both: `v0.2.1` was
+a branch *and* the tag of the release. `actions/checkout` with `ref: v0.2.1`
 fetches `+refs/heads/v0.2.1*` and `+refs/tags/v0.2.1*` and then resolves the
 name — to the branch. The v0.2.1 release was built that way: it compiled the
 branch, whose connector locks still pinned the `certifi` the tag had already
 replaced, and the only thing that noticed was Trivy, after the images had been
 pushed.
+
+The version branches were deleted on 2026-10-24, and
+`scripts/check_release_branches.py` fails CI if one is created again. This gate
+remains the second half of the pair: qualification is what makes a name
+unambiguous for a reader or a tool that types it, and it holds even in the window
+before anyone notices a branch exists.
 
 Nothing about that run looked wrong from the inside. The version in the branch
 is the same `0.2.1`, so "the tag does not name the code's version" passed; the
