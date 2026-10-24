@@ -545,6 +545,19 @@ half of the convention is on the operator's side of a release: a version branch
 is reset to the release commit when the tag is cut, so the two refs never point
 at different trees.
 
+**The scan, then the tag.** A release does not create `<version>` or `latest`
+until the image behind them has passed the vulnerability scan. Each image is
+pushed under one tag nothing documents — `<version>-candidate` — Trivy reads that
+digest, and only then is the digest copied to `<version>` and `latest` with
+`docker buildx imagetools create`: a manifest copy, so the SBOM and provenance
+attestations travel with it and no layer is uploaded twice. A run whose scan
+fails leaves the candidate tag and creates no release tag. That is the difference
+between the first v0.2.1 run and this procedure — that run pushed `0.2.1` and
+`latest` and failed the scan afterwards, so `latest` pointed at the image the gate
+had just rejected until someone re-ran the release. `0.2.1-candidate` is not a
+release: no Compose file resolves it, and `scripts/check_release_publish_order.py`
+fails CI if a step creates a release tag before the scan.
+
 Then run the deployment steps as written, without `--build` and without `docker
 compose pull`: Compose finds the images locally because the tag it asks for is the
 same one you loaded. Dependencies are pinned exactly and hash-checked (`backend/requirements.txt`

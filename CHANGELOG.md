@@ -11,6 +11,23 @@ with it.
 
 ## [Unreleased]
 
+### Fixed
+
+- A release can no longer publish an image the scan has rejected. The first v0.2.1
+run pushed the `<version>` and `latest` tags and only then ran Trivy, so the gate
+that failed left the images it had just rejected reachable by `latest` until the
+release was re-run: the check reported the publication instead of preventing it.
+The workflow now pushes a single `<version>-candidate` tag, scans that digest, and
+copies the digest to `<version>` and `latest` with `docker buildx imagetools
+create` — the same bytes, attestations included, no layer uploaded twice — so a
+failed scan leaves no tag a Compose file resolves. Building locally with `load:
+true` and pushing afterwards was rejected for the same reason: the docker exporter
+cannot carry the SBOM and provenance attestations the release promises. The order
+is now enforced by `scripts/check_release_publish_order.py` (run in CI's
+`release-image-coverage` job), which fails on a build that pushes a release tag, a
+`docker push` or tag promotion before the scan, and a scan that reads a tag
+instead of the digest the promotion copies.
+
 ## [0.2.1] - 2026-10-24
 
 ### Added

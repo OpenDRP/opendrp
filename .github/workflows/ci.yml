@@ -436,6 +436,12 @@ jobs:
         # to the branch, and the v0.2.1 release was built from it — with the
         # certifi the tag had already replaced — while the tag check passed.
         run: python scripts/check_release_refs.py
+      - name: Verify no release tag is created before the image scan
+        # The first v0.2.1 run pushed `<version>` and `latest` and failed on
+        # Trivy afterwards: a gate that reports a publication instead of
+        # preventing one. The release pushes a single `-candidate` tag, scans
+        # that digest, and only then promotes it to the release tags.
+        run: python scripts/check_release_publish_order.py
 
   compose:
     runs-on: ubuntu-latest
