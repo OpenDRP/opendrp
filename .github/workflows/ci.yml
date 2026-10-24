@@ -1,7 +1,14 @@
 name: CI
 
 on:
+  # Branch pushes and pull requests only. A tag is a release: `release.yml`
+  # verifies the tag against the code, builds and scans the images and publishes
+  # the notes, and it is the workflow that has to be green before anything is
+  # published. Running this suite again on the tag push bought nothing — the same
+  # commit had just run it as a branch — and cost a second ~50-minute run beside
+  # the release, which is why v0.2.1 had two CI runs in flight at once.
   push:
+    branches: ['**']
   pull_request:
 
 permissions:

@@ -48,8 +48,8 @@ npm run test:coverage
 npm run build          # typecheck + production build
 ```
 
-CI runs these gates and both test suites on every push and pull request, with two
-exceptions: `make seed-demo` and `make verify-replicas` are local diagnostics, and
+CI runs these gates and both test suites on every branch push and pull request,
+with two exceptions: `make seed-demo` and `make verify-replicas` are local diagnostics, and
 the `compose` job validates the two-replica file set's shape without starting it.
 Running the rest locally first is the fastest way to get a change merged, and it
 is the only way to see the failures that CI reports as a fenced log block.

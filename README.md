@@ -191,7 +191,7 @@ entitlement you have not confirmed in the vendor's own console.
 - Structured JSON audit events on stdout (exactly `timestamp`, `user_id`, `action`, `ip_address`, `details`) plus a persistent audit record, both carrying the request's `X-Request-ID` for correlation across HTTP, Celery and the SIEM.
 - Security headers, input validation, parameterized SQLAlchemy queries, refresh-token rotation, login rate limiting, and bounded outbound alert checks.
 - **A metrics scrape endpoint**: `GET /api/v1/metrics` publishes the platform's own health as numbers in the Prometheus text exposition format — alert-queue backlog and the age of its oldest row, recipients still held after an ambiguous delivery, connector silence, job states, and where the audit chain stands. It answers `404` — not `403` — until `METRICS_TOKEN` is set, and a refused scrape is logged rather than written into the audit chain, because a scrape every fifteen seconds would be 5 700 audit rows a day about a read of aggregate counts.
-- **Data retention and backups**: a nightly sweep of audit history and generated reports, and `make backup` / `backup-verify` / `restore` — the restore path runs in CI on every push.
+- **Data retention and backups**: a nightly sweep of audit history and generated reports, and `make backup` / `backup-verify` / `restore` — the restore path runs in CI on every branch push.
 
 ## Prerequisites
 
