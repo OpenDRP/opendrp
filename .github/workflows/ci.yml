@@ -424,6 +424,11 @@ jobs:
           set -euo pipefail
           docker compose --profile '*' --env-file .env.example -f docker-compose.yml config --format json > /tmp/opendrp-compose-release.json
           python scripts/check_release_images.py /tmp/opendrp-compose-release.json
+      - name: Verify the release checks a tag out by a ref no branch can shadow
+        # A version branch and its tag share a name here. `ref: v0.2.1` resolves
+        # to the branch, and the v0.2.1 release was built from it — with the
+        # certifi the tag had already replaced — while the tag check passed.
+        run: python scripts/check_release_refs.py
 
   compose:
     runs-on: ubuntu-latest

@@ -61,6 +61,7 @@ delivery, image pinning — is verified on the host with
 | The PostgreSQL/Redis integration suite actually ran, with a minimum number of passes | `backend/scripts/check_integration_ran.py` | `production-integration` job |
 | A dump taken from a migrated database restores into a scratch one, and the report archive beside it restores into a scratch directory with a file read back | `scripts/backup.sh`, `scripts/verify_restore.sh`, `backend/tests/test_backup_scripts.py` | `production-integration` job, `make backup-verify` |
 | Every image the Compose files resolve is present in the release matrix | `scripts/check_release_images.py` | `release.yml` |
+| Every checkout in the release workflow names a `refs/tags/` ref, so a version branch that shares the tag's name cannot be built in its place | `scripts/check_release_refs.py`, `backend/tests/test_release_refs_gate.py` | `release-image-coverage` job |
 | A published image has an SBOM, provenance, and no unfixed HIGH/CRITICAL finding | `trivy` step in `.github/workflows/release.yml` | `release.yml` |
 | Shipped dependencies carry no known advisory, and no credential is in the history | `pip-audit` / `npm audit` / gitleaks steps | `security` and `secrets` jobs |
 | Every timestamp the UI shows is the stored UTC instant, formatted without the reader's locale, and the table that shows one says so | `frontend/src/lib/timezoneContract.test.ts` | `frontend` job |
@@ -688,11 +689,11 @@ inventory below lists:
 | **No PostgreSQL for the integration suites** | 5 | 5 | five module-level guards: `tests/test_alembic_migrations.py`, `tests/test_asset_involvement_postgres.py`, `tests/test_dns_expiry_postgres.py` and `tests/test_users_rbac_postgres.py` need `INTEGRATION_MIGRATION_DATABASE_URL`; `tests/test_production_integrations.py` needs `INTEGRATION_DATABASE_URL` and `INTEGRATION_REDIS_URL` | The `production-integration` CI job, or those variables pointed at a scratch database; `tests/test_postgres_only_suites_gate.py` fails the build when that job stops selecting the suites or stops forbidding skips. |
 | **SQLite cannot test row locks** | 3 | 3 | `tests/test_auth_defense_in_depth.py::test_refresh_family_row_locking_serializes_concurrent_replays` and `tests/test_tier1_security.py::test_concurrent_replay_of_one_refresh_token_never_issues_two_successors` — two refreshes rotating at once — and `tests/test_users_read_paths.py::test_concurrent_admin_membership_changes_keep_one_active_admin`, the last administrator being demoted | Any PostgreSQL run: the files keep their SQLite cases and skip only the one whose correctness *is* the lock |
 | **No symlink privilege** | 3 | 4 | `tests/test_artifact_path.py::test_a_symlink_out_of_the_store_is_refused`, `tests/test_audit_archive_edges.py::_symlink` (two cases) and `tests/test_retention_tasks.py::test_rejects_a_symlink_that_leaves_the_store` | Linux CI, where `os.symlink` needs no elevation; these are the escape and symlink-refusal cases |
-| **Partial checkout** | 35 | 0 | every other gate test in the inventory below, each of which reads a script, the workflow, the Compose file or the connector SDK before it can answer its question, plus this page's own gate when the page is not mounted | A full checkout: CI runs the suite from one, while the test container mounts the backend subtree only — so these are the skips a container run reports and a local `pytest` run does not |
+| **Partial checkout** | 36 | 0 | every other gate test in the inventory below, each of which reads a script, the workflow, the Compose file or the connector SDK before it can answer its question, plus this page's own gate when the page is not mounted | A full checkout: CI runs the suite from one, while the test container mounts the backend subtree only — so these are the skips a container run reports and a local `pytest` run does not |
 | **No `git` binary** | 3 | 0 | the three scratch-repository tests in `tests/test_tracked_sources_gate.py` | Any host with `git` on `PATH`, which is every CI runner |
 | **No POSIX shell** | 1 | 0 | `tests/test_backup_scripts.py`, which runs `scripts/backup.sh` and `scripts/verify_restore.sh` under `sh` | Any Linux host or CI runner, and Windows with Git for Windows on `PATH`; the backup paths themselves are exercised in the `production-integration` job, which runs the scripts in `postgres:17-alpine` |
 | **The checkout root is the filesystem root** | 1 | 0 | `tests/test_release_image_matrix.py::test_matrix_paths_cannot_escape_the_repository`, which needs a checkout root that has a parent | A checkout below `/`: CI clones into a workspace directory, and only a mount whose root is `/` removes the parent |
-| **Total** | 52 | 16 | every site the suite can turn into a skip | — |
+| **Total** | 53 | 16 | every site the suite can turn into a skip | — |
 
 Those counts describe one host on one date, not the tree: a broker and PostgreSQL
 turn twelve of the sixteen into ordinary passes, and only the symlink group is
@@ -756,6 +757,7 @@ why.
 | `tests/test_portable_commands_gate.py` | Partial checkout | the portable-commands gate script is missing |
 | `tests/test_postgres_only_suites_gate.py` | Partial checkout | no workflow to read |
 | `tests/test_release_image_matrix.py` | Partial checkout | the release-image gate script is missing |
+| `tests/test_release_refs_gate.py` | Partial checkout | the release-ref gate script is missing |
 | `tests/test_setup_env.py` | Partial checkout | the environment-setup script is missing |
 | `tests/test_single_installation_shape.py` | Partial checkout | the Compose file or a settings module it reads is missing |
 | `tests/test_skip_inventory_gate.py` | Partial checkout | the readiness page it reads is missing |
