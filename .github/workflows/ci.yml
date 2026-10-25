@@ -768,9 +768,17 @@ jobs:
         # This check must stay green: if an advisory has no released fix, add an
         # explicit `--ignore-vuln <ID>` line with the reason in a comment rather
         # than dropping the step.
+        # The JSON is what `scripts/check_deferred_advisories.py` reads later: the
+        # README's deferred list is compared with these files, not with the log.
         run: |
           python -m pip install --upgrade pip pip-audit
-          pip-audit --strict --requirement requirements.txt
+          status=0
+          pip-audit --strict --requirement requirements.txt \
+            -f json -o /tmp/audit-backend.json || status=$?
+          # Printed either way: with `-o` the report no longer goes to the log,
+          # and a failing audit has to say which advisory it found.
+          cat /tmp/audit-backend.json 2>/dev/null || true
+          exit "${status}"
 
       - name: Audit every connector lock for known vulnerabilities
         # Each connector ships its own image, built with `pip install
@@ -787,8 +795,13 @@ jobs:
           python -m pip install --upgrade pip pip-audit
           for requirement in connectors/*/requirements.txt; do
             echo "::group::pip-audit ${requirement}"
-            pip-audit --strict --requirement "${requirement}"
+            report="/tmp/audit-connector-$(basename "$(dirname "${requirement}")").json"
+            status=0
+            pip-audit --strict --requirement "${requirement}" \
+              -f json -o "${report}" || status=$?
+            cat "${report}" 2>/dev/null || true
             echo "::endgroup::"
+            [ "${status}" -eq 0 ] || exit "${status}"
           done
 
       # Static analysis of our own code, which pip-audit cannot see: someone
@@ -812,12 +825,25 @@ jobs:
         run: npm audit --omit=dev --audit-level=high
       - name: Report build-toolchain advisories
         working-directory: frontend
-        # Reported, not gated: every remaining advisory is in a devDependency
-        # (vite / esbuild / vitest) and each fix is a major version bump, which
-        # is a migration of its own. Kept visible here so the list cannot be
-        # forgotten. Shipped code is covered by the step above.
+        # Reported, not gated: the tree is audited whole, devDependencies
+        # included, because those are the packages the served bundle's build runs.
+        # The step does not fail the job — a new dev advisory is a decision, not
+        # an outage — but its JSON is what makes that decision visible instead of
+        # remembered: `check_deferred_advisories.py` compares it with the README's
+        # deferred list, so an advisory nobody wrote down fails the job below.
         continue-on-error: true
-        run: npm audit
+        run: |
+          npm audit --json > /tmp/audit-frontend.json || true
+          npm audit || true
+
+      - name: Compare the README's deferred advisories with the audits
+        # The list in README.md is a claim about this tree. It aged silently once
+        # — it named four packages that had already been fixed and would not have
+        # named one that appeared — because the exemption it described was the
+        # part no gate read. This step reads it: the audits above wrote their
+        # JSON, and the two sets have to be the same set, in both directions.
+        run: |
+          python scripts/check_deferred_advisories.py README.md /tmp/audit-*.json
       - name: Review new dependencies introduced by this pull request
         if: github.event_name == 'pull_request'
         uses: actions/dependency-review-action@2031cfc080254a8a887f58cffee85186f0e49e48 # v4.9.0

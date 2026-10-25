@@ -11,6 +11,24 @@ with it.
 
 ## [Unreleased]
 
+### Added
+
+- The README's "Known deferred findings" paragraph is recomputed on every run instead
+of remembered. It named three advisories a patch and a minor had already fixed, and it
+would not have named one that appeared: the exemption it described was the only part of
+the supply chain no gate read, because the full `npm audit` ran with
+`continue-on-error` and nobody compared its log with the prose.
+`scripts/check_deferred_advisories.py` is that comparison — the `security` job's audits
+now write their JSON (`pip-audit -f json` over the backend runtime lock and every
+connector lock, `npm audit --json` over the whole frontend tree) and the gate compares
+it with the README in both directions: an advisory an audit reports and the paragraph
+omits fails, printing the row to paste, and a row no audit reports any more fails with
+"drop the row". A section that says neither "none at the time of writing" nor holds the
+table is exit 2 rather than agreement. Both `pip-audit -f json` shapes are read — the
+`{"dependencies": [...], "fixes": []}` envelope 2.x writes and the bare list 0.x wrote —
+because the audit step pins a date, not a version, and the shape changed under one
+`pip install --upgrade` already.
+
 ### Changed
 
 - Version branches are gone. `v0.2.1` existed as both a branch and a tag, and the two

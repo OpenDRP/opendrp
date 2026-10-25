@@ -1017,10 +1017,27 @@ A `repo-hygiene` job runs the repository gates where the checkout is complete: `
 
 The rest of the workflow covers the same ground from other angles: the `frontend` job runs the SPA suite with its coverage floors and a production build; `production-integration` runs the PostgreSQL-only suites and the migration round trip against a real database; `compose` validates the two-replica file set without starting it; `release-image-coverage` resolves every Compose profile and fails if an image the stack can ask for is not one the release publishes, and checks that the release creates its tags (`<version>`, `latest`) only from the digest the scan approved; `secrets` scans the whole history with gitleaks (`.gitleaks.toml` allowlists test fixtures by path and nothing else); and `codeql` starts analysing the day the repository is public, because it needs GitHub Advanced Security while it is private.
 
-Known deferred findings, tracked rather than ignored:
+Known deferred findings, tracked rather than ignored: **none at the time of writing.**
+The build-toolchain advisories this list used to carry were devDependencies, and the
+entry claimed every fix was a major bump; measured against the tree, that was wrong on
+both counts. `npm audit` over `frontend/package-lock.json` — the full one, dev
+included — reports no advisory, and the fix was a patch and a minor
+(`source-map-js` 1.2.1 → 1.2.2, `vitest` 4.1.11 → 4.1.12, which is also the first
+version `@vitest/mocker` is patched in). On the Python side the test runner is on
+pytest 9 with the pytest-asyncio 1.x line it requires and the SPA is on react-router
+7, so the pytest-asyncio and react-router entries this list used to carry are fixed
+rather than tolerated.
 
-- The Vite/esbuild/vitest toolchain advisories are devDependencies; every fix is a major bump. CI prints them on each run so the list stays visible.
-- Nothing else is deferred at the time of writing: the test runner is on pytest 9 with the pytest-asyncio 1.x line it requires, and the SPA is on react-router 7, so the two advisories this list used to carry are fixed rather than tolerated. Read the `pip-audit` and `npm audit` output of the security job before treating this list as complete — it records what CI reports, not what the pins suggest.
+The `security` job, not this paragraph, is what keeps that true: shipped dependencies
+are a blocking gate (`npm audit --omit=dev --audit-level=high`, and `pip-audit` over the
+backend runtime plus every connector's hash-locked `requirements.txt`), while the full
+`npm audit` runs beside it reported-only — so a dev-toolchain advisory reappears in the
+job's output the day it lands. `scripts/check_deferred_advisories.py` then compares those
+audits' JSON with this section, in both directions: an advisory they report and this
+list omits fails the job, and so does a row here that no audit reports any more — which
+is exactly how the old paragraph aged. A deferral, when one is worth making, is a row
+in this section's table (`| Package | Ecosystem | Why it is deferred |`); the sentence
+above means the table is empty.
 
 ## Development commands
 
