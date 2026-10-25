@@ -162,7 +162,7 @@ it prints which figures belong to which service set.
 
 ## 1. Prepare the checkout and version
 
-This checkout declares version `0.2.1`, and that version is published: tag `v0.2.1` on GitHub, with the images below in GHCR. Set `OPENDRP_VERSION=0.2.1` and either pull the published images or build from this tree. For a different release, check out its tag and pin the same version in `.env`:
+This checkout declares version `0.2.2`; the release run on tag `v0.2.2` publishes the images below to GHCR. Set `OPENDRP_VERSION=0.2.2` and either pull those images once that run has finished or build from this tree. For a different release, check out its tag and pin the same version in `.env`:
 
 ```text
 git clone https://github.com/OpenDRP/opendrp.git
@@ -184,7 +184,7 @@ One installation runs one release: this value is the image tag every service is 
 Run the wizard interactively:
 
 ```text
-python setup.py --public-url https://drp.example.com --version 0.2.1
+python setup.py --public-url https://drp.example.com --version 0.2.2
 ```
 
 On Windows, use `py -3 setup.py` if `python` is not the Python 3 launcher. The wizard uses only the Python standard library. It generates database, JWT, encryption and audit-chain secrets with the operating system CSPRNG, and it writes one shape of file: the production one. No flag selects another, because an installation that differs from the one users reach is not one worth checking.
@@ -225,7 +225,7 @@ says that on purpose.
 For a non-interactive installation, the same values come from flags:
 
 ```text
-python setup.py --non-interactive --public-url https://drp.example.com --version 0.2.1 --connectors dnstwist,hibp --mfa
+python setup.py --non-interactive --public-url https://drp.example.com --version 0.2.2 --connectors dnstwist,hibp --mfa
 ```
 
 `--version` may be omitted: the version this checkout declares is used, and a
@@ -519,7 +519,7 @@ checkout on a connected machine, then carry the images as files:
 
 ```text
 docker compose -f docker-compose.yml build
-docker save ghcr.io/opendrp/opendrp/backend:0.2.1 ghcr.io/opendrp/opendrp/frontend:0.2.1 > opendrp-images-0.2.1.tar
+docker save ghcr.io/opendrp/opendrp/backend:0.2.2 ghcr.io/opendrp/opendrp/frontend:0.2.2 > opendrp-images-0.2.2.tar
 ```
 
 The release matrix builds eight images — `backend`, `frontend`,

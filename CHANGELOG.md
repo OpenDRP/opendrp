@@ -11,6 +11,8 @@ with it.
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-10-25
+
 ### Added
 
 - The README's "Known deferred findings" paragraph is recomputed on every run instead

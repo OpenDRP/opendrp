@@ -322,10 +322,10 @@ _CLAIMS: tuple[Claim, ...] = (
     ),
     Claim(
         page="docs/upgrading.md",
-        promise="this version publishes no registry images",
+        promise="a pull for this version fetches the images its tag's release run published",
         pattern=(
-            r"([0-9]+\.[0-9]+\.[0-9]+) declares its version but publishes no "
-            r"registry images"
+            r"([0-9]+\.[0-9]+\.[0-9]+) declares its version, and the images a "
+            r"`pull` would fetch for it come from the release run"
         ),
         source=_platform_version,
         source_name="app.__version__",
