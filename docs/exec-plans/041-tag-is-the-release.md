@@ -71,14 +71,16 @@ Decisions:
 
 - [x] After deletion `git ls-remote --heads origin` lists `main`, `ci/dev-deps-and-tag-trigger`
       and `ci/scan-before-publish` — no version branch; `git tag` still lists `v0.1.0`
-      … `v0.2.1`.
+      … `v0.2.1`. (Those two CI branches were merged and deleted the same day, so the
+      remote now lists `main` alone.)
 - [x] `python scripts/check_release_branches.py` — `no version branch exists — 3 branch(es)
       checked`; with a `refs/heads/v0.2.1` line appended to a saved listing it exits 1 and
       prints `git push origin --delete refs/heads/v0.2.1`.
 - [x] `test_release_branches_gate.py` — 10 passed: ordinary branches pass, a version
       branch is reported, `v0.2`, `v0.2.1-rc1`, `release/v0.2.1` and tag refs are not
       version branches, an unreadable listing is exit 2, and CI runs the gate.
-- [ ] CI green on the pull request.
+- [x] CI green on the pull request (#44) and on `main` after the squash merge —
+      run `40134765094` on `dfc32c1`: `success` in all eleven jobs.
 - [x] The skip inventory, docs and CI gates pass with the new module and row.
 
 ## Progress and Milestones
@@ -88,3 +90,8 @@ Decisions:
 - **2026-10-24 — branches deleted.** Remote and local; tags untouched.
 - **2026-10-24 — closed in code.** Gate, tests and pages; the live proof is the next
   release cut from a tag alone.
+- **2026-10-24 — merged.** PR #44 squash-merged as `dfc32c1` after a rebase onto #42 and
+  #43, which resolved the skip inventory both plans had edited: the new module and its
+  row (counted 37/54 → 38/55) sit beside the publish-order gate's. CI is green on `main`.
+  The one remaining proof is a release cut from the tag alone, which is now the only ref
+  a release can be cut from.
