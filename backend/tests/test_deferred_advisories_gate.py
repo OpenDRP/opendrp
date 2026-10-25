@@ -70,15 +70,35 @@ def _npm(tmp_path: Path, *packages: str, name: str = "npm-audit.json") -> Path:
     return path
 
 
-def _pip(tmp_path: Path, *packages: str, name: str = "pip-audit.json") -> Path:
-    path = tmp_path / name
-    entries = [
-        {"name": package, "version": "1.0", "vulns": [] if package.startswith("!") else [{"id": "CVE-1"}]}
+def _pip_entries(packages: tuple[str, ...]) -> list[dict[str, object]]:
+    """`pip-audit`'s per-dependency rows; a leading `!` marks a clean one."""
+
+    return [
+        {
+            "name": package.lstrip("!"),
+            "version": "1.0",
+            "vulns": [] if package.startswith("!") else [{"id": "CVE-1"}],
+        }
         for package in packages
     ]
-    for entry in entries:
-        entry["name"] = entry["name"].lstrip("!")
-    path.write_text(json.dumps(entries), encoding="utf-8")
+
+
+def _pip(tmp_path: Path, *packages: str, name: str = "pip-audit.json") -> Path:
+    """`pip-audit -f json` as 2.x writes it: the `dependencies` envelope."""
+
+    path = tmp_path / name
+    path.write_text(
+        json.dumps({"dependencies": _pip_entries(packages), "fixes": []}),
+        encoding="utf-8",
+    )
+    return path
+
+
+def _pip_legacy(tmp_path: Path, *packages: str, name: str = "pip-audit-0.json") -> Path:
+    """`pip-audit -f json` as 0.x wrote it: the bare list of dependencies."""
+
+    path = tmp_path / name
+    path.write_text(json.dumps(_pip_entries(packages)), encoding="utf-8")
     return path
 
 
@@ -210,7 +230,21 @@ def test_an_audit_in_neither_shape_is_unreadable(
     readme = _readme(tmp_path, "Known deferred findings: none at the time of writing.\n")
 
     assert _GATE.main([str(readme), str(other)]) == 2
-    assert "expected an object with a `vulnerabilities` map" in capsys.readouterr().err
+    assert "neither an npm audit nor a pip-audit report" in capsys.readouterr().err
+
+
+def test_a_pip_audit_dependency_list_without_a_name_is_unreadable(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The envelope is read only as far as it makes sense: a row without a name
+    cannot be compared with anything."""
+
+    other = tmp_path / "odd.json"
+    other.write_text(json.dumps({"dependencies": [{"version": "1.0"}]}), encoding="utf-8")
+    readme = _readme(tmp_path, "Known deferred findings: none at the time of writing.\n")
+
+    assert _GATE.main([str(readme), str(other)]) == 2
+    assert "has no `name`" in capsys.readouterr().err
 
 
 def test_an_unreadable_audit_file_is_exit_two(
@@ -226,6 +260,30 @@ def test_a_clean_pip_audit_entry_is_not_an_advisory(tmp_path: Path) -> None:
     """`pip-audit` lists every pinned package; only `vulns` makes one deferred."""
 
     assert _GATE.read_audit(_pip(tmp_path, "!certifi", "!pytest")) == set()
+
+
+def test_the_2x_envelope_is_read(tmp_path: Path) -> None:
+    """pip-audit 2.10.1 writes `{"dependencies": [...], "fixes": []}`, which the
+    first version of this gate read as "not a pip-audit report" and exited 2."""
+
+    report = _pip(tmp_path, "certifi")
+
+    assert json.loads(report.read_text(encoding="utf-8"))["dependencies"][0]["vulns"]
+    assert _GATE.read_audit(report) == {_GATE.Advisory("pip", "certifi")}
+
+
+def test_the_legacy_bare_list_is_still_read(tmp_path: Path) -> None:
+    """An older pip-audit on a developer's PATH writes the list; the gate reads it."""
+
+    assert _GATE.read_audit(_pip_legacy(tmp_path, "certifi")) == {
+        _GATE.Advisory("pip", "certifi")
+    }
+
+
+def test_an_enveloped_advisory_agrees_with_the_readme_row(tmp_path: Path) -> None:
+    readme = _readme(tmp_path, _HEADER + "| `PyYAML` | pip | dev only |\n")
+
+    assert _GATE.main([str(readme), str(_pip(tmp_path, "pyyaml"))]) == 0
 
 
 def test_the_shipped_readme_declares_nothing_now() -> None:

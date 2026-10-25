@@ -45,9 +45,12 @@ Usage
     python scripts/check_deferred_advisories.py README.md /tmp/audit-*.json
 
 Each audit file is classified by its shape — a JSON object with a
-`vulnerabilities` map is `npm audit --json`, a JSON list of
-`{name, version, vulns}` entries is `pip-audit -f json` — so the workflow can
-hand over every file it wrote without labelling them twice.
+`vulnerabilities` map is `npm audit --json`, and a JSON object with a
+`dependencies` list (pip-audit 2.x) or a bare list of `{name, version, vulns}`
+entries (pip-audit 0.x) is `pip-audit -f json` — so the workflow can hand over
+every file it wrote without labelling them twice. Both pip-audit shapes are read
+because the audit step pins a date rather than a version: the shape changed
+under a `pip install --upgrade pip-audit` once already.
 
 What this does not cover: the Python *development* requirements
 (`backend/requirements-dev.txt`) have no audit step in CI, so an advisory there is
@@ -211,14 +214,22 @@ def npm_advisories(payload: Any) -> set[Advisory]:
 
 
 def pip_advisories(payload: Any) -> set[Advisory]:
-    """The packages `pip-audit -f json` reports: only the entries with `vulns`."""
-    if not isinstance(payload, list):
+    """The packages `pip-audit -f json` reports: only the entries with `vulns`.
+
+    pip-audit 2.x writes an envelope — `{"dependencies": [...], "fixes": []}` —
+    and 0.x wrote the bare list. Both have to parse: the workflow installs
+    whatever `pip install --upgrade pip-audit` gives it that morning, and the
+    first version of this gate read only the list, which is how the step failed
+    on its first run with an envelope on disk.
+    """
+    entries = payload.get("dependencies") if isinstance(payload, dict) else payload
+    if not isinstance(entries, list):
         raise GateError(
-            "not a `pip-audit -f json` report: expected a list of "
-            "`{name, version, vulns}` entries"
+            "not a `pip-audit -f json` report: expected a `dependencies` list or "
+            "a list of `{name, version, vulns}` entries"
         )
     reported: set[Advisory] = set()
-    for entry in payload:
+    for entry in entries:
         if not isinstance(entry, dict) or "name" not in entry:
             raise GateError(f"a pip-audit entry has no `name`: {entry!r}")
         if entry.get("vulns"):
@@ -237,8 +248,10 @@ def read_audit(path: Path) -> set[Advisory]:
 
     if isinstance(payload, list):
         return pip_advisories(payload)
-    if isinstance(payload, dict):
+    if isinstance(payload, dict) and "vulnerabilities" in payload:
         return npm_advisories(payload)
+    if isinstance(payload, dict) and "dependencies" in payload:
+        return pip_advisories(payload)
     raise GateError(f"{path} is neither an npm audit nor a pip-audit report")
 
 

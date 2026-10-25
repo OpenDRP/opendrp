@@ -51,7 +51,9 @@ because they are two different failures:
    section from its opener line — the empty set is declared on that line, so reading
    only the lines below it misses the sentence — and the table, when one exists, by its
    header. `read_audit()` classifies a file by shape: an object with a `vulnerabilities`
-   map is `npm audit --json`, a list of `{name, version, vulns}` is `pip-audit -f json`.
+   map is `npm audit --json`, an object with a `dependencies` list is `pip-audit -f json`
+   as 2.x writes it, and a bare list of `{name, version, vulns}` is the 0.x shape of the
+   same report.
 2. **Compare both ways in one pass.** `compare()` prints, for a missing advisory, the
    row that would fix the paragraph, and for a stale one, the instruction to drop it.
    A disagreement is exit 1; a malformed README section or an unreadable report is exit
@@ -80,6 +82,11 @@ because they are two different failures:
       the connector loop was driven with a stubbed `pip-audit`: six reports written,
       JSON printed, exit 0 when clean and 1 at the first failing lock.
 - [x] The skip inventory, docs and repo gates pass with the new module and row.
+- [x] The first CI run failed for a reason worth keeping: `pip-audit` 2.10.1 writes
+      `{"dependencies": [...], "fixes": []}` and the gate read the 0.x bare list, so the
+      step exited 2. The gate now reads both, with a test per shape; driven against the
+      envelope CI actually wrote, a clean report agrees and a `certifi` advisory exits 1
+      with the row to paste.
 - [ ] CI green on the pull request.
 
 ## Progress and Milestones
@@ -90,3 +97,8 @@ because they are two different failures:
   pages. What it does not cover is written down in the script and here: the Python
   development requirements (`backend/requirements-dev.txt`) have no audit step, so an
   advisory there is in no file the gate reads.
+- **2026-10-25 — the first run taught the second shape.** `security` failed on the gate
+  with `not an npm audit --json report`: `pip-audit` 2.10.1 had written a
+  `{"dependencies": ...}` envelope, and the gate had been written against the bare list
+  that 0.x produced — a shape nothing in this repository pinned, because the step runs
+  `pip install --upgrade pip-audit`. Reading both shapes, and testing each, is the fix.

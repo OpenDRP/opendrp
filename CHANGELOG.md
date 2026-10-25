@@ -24,7 +24,10 @@ connector lock, `npm audit --json` over the whole frontend tree) and the gate co
 it with the README in both directions: an advisory an audit reports and the paragraph
 omits fails, printing the row to paste, and a row no audit reports any more fails with
 "drop the row". A section that says neither "none at the time of writing" nor holds the
-table is exit 2 rather than agreement.
+table is exit 2 rather than agreement. Both `pip-audit -f json` shapes are read — the
+`{"dependencies": [...], "fixes": []}` envelope 2.x writes and the bare list 0.x wrote —
+because the audit step pins a date, not a version, and the shape changed under one
+`pip install --upgrade` already.
 
 ### Changed
 
