@@ -81,9 +81,12 @@ Decisions:
       `localhost:5001`, `demo:0.0.0`, `demo:latest` and `demo:0.0.0-candidate` all report
       index digest `sha256:237ef31a…`, and the promoted index holds the
       `unknown/unknown` attestation manifest next to the `linux/amd64` image.
-- [ ] CI green on the pull request (`release-image-coverage` runs the new gate).
+- [x] CI green on the pull request (#43) — every check `success` — and `release-image-coverage`
+      runs the new gate in it.
 - [ ] The next release run is the live proof: images appear under
-      `<version>-candidate` first, and `<version>`/`latest` only after the scan step.
+      `<version>-candidate` first, and `<version>`/`latest` only after the scan step. This
+      is the one acceptance item this plan cannot close from the tree: it closes when
+      v0.2.2 is cut from its tag, and not before.
 - [x] The documentation gates and `test_github_docs_claims.py` pass with the new rows.
 
 ## Progress and Milestones
