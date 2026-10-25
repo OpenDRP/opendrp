@@ -114,7 +114,7 @@ RUN set -euo pipefail; \
   ls -la dist;
 
 # ---- Stage 2: Runtime — Nginx serve SPA + reverse-proxy /api → backend ------
-FROM nginx:1.29.8-alpine3.23 AS runtime
+FROM nginx:1.31.0-alpine3.23 AS runtime
 
 # Keep packages in the base image current with security updates published for
 # this Alpine branch after the upstream nginx image was built.
