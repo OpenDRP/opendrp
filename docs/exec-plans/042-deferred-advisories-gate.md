@@ -87,10 +87,14 @@ because they are two different failures:
       step exited 2. The gate now reads both, with a test per shape; driven against the
       envelope CI actually wrote, a clean report agrees and a `certifi` advisory exits 1
       with the row to paste.
-- [ ] CI green on the pull request.
+- [x] CI green on the pull request (#45): all twelve checks `success` on run
+      `40159524599`, `security` (which runs the gate) in 1m14s and `backend` the long one;
+      squash-merged as `d1ccf20`.
 
 ## Progress and Milestones
 
+- **2026-10-25 — merged.** PR #45 squash-merged as `d1ccf20`; the gate now runs in the
+  `security` job on every push and pull request, and `README.md` says what recomputes it.
 - **2026-10-25 — opened.** The README paragraph was rewritten to say "none", and the
   question it left behind is this plan: what stops the next one from ageing the same way.
 - **2026-10-25 — closed in code.** The gate, the JSON the audits write, the tests and the
