@@ -118,8 +118,9 @@ docker compose -f docker-compose.yml pull
 ```
 
 A source installation builds the images from the tree instead. This checkout is
-one: 0.2.1 declares its version but publishes no registry images, so a `pull` has
-nothing to fetch and `make up` is what builds and starts the stack.
+one: 0.2.2 declares its version, and the images a `pull` would fetch for it come
+from the release run on tag `v0.2.2`, so `make up` is what builds and starts the
+stack here.
 
 ```bash
 docker compose -f docker-compose.yml build

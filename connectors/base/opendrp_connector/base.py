@@ -126,7 +126,7 @@ def configure_connector_logging() -> None:
 #: version — the same value ``backend/app/__init__.py`` declares, which
 #: ``scripts/check_version_consistency.py`` enforces. The wire-protocol revision
 #: is a separate number (``protocol_version``), and it is an integer.
-SDK_VERSION = "0.2.1"
+SDK_VERSION = "0.2.2"
 
 #: Default liveness file. Lives on the connector's tmpfs, so it costs no disk
 #: and always starts absent after a container restart. The directory is asked

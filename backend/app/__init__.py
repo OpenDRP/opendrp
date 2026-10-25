@@ -11,4 +11,4 @@ version that was never released — or a connector reports a release the core it
 was built with never had.
 """
 
-__version__ = "0.2.1"
+__version__ = "0.2.2"
