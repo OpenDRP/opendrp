@@ -83,10 +83,14 @@ Decisions:
       `unknown/unknown` attestation manifest next to the `linux/amd64` image.
 - [x] CI green on the pull request (#43) — every check `success` — and `release-image-coverage`
       runs the new gate in it.
-- [ ] The next release run is the live proof: images appear under
-      `<version>-candidate` first, and `<version>`/`latest` only after the scan step. This
-      is the one acceptance item this plan cannot close from the tree: it closes when
-      v0.2.2 is cut from its tag, and not before.
+- [x] The next release run is the live proof: images appear under
+      `<version>-candidate` first, and `<version>`/`latest` only after the scan step.
+      Closed by the v0.2.2 run, `40226422411`: eight `Build …` jobs each pushed one
+      `-candidate` tag, scanned that digest, and only then created `<version>` and
+      `latest` from it — `backend:0.2.2` and `backend:latest` both name
+      `sha256:11d41fed…`, the digest the scan was pointed at, and the same holds for the
+      other seven images. `Publish the release` ran last and published the notes taken
+      from the `[0.2.2]` section.
 - [x] The documentation gates and `test_github_docs_claims.py` pass with the new rows.
 
 ## Progress and Milestones
@@ -97,3 +101,8 @@ Decisions:
   `load: true` shape cannot, so the plan does not take it.
 - **2026-10-24 — closed in code.** Workflow reordered, gate and tests added, pages
   updated. The live proof is the next tagged release.
+- **2026-10-25 — live proof, v0.2.2.** Run `40226422411` on tag `v0.2.2`: the
+  `-candidate` tags were the only refs the build created, the scans read digests rather
+  than tags, the promotion copied those digests to `0.2.2` and `latest` per image, and
+  the release was published afterwards. Nothing a Compose file resolves existed before
+  its scan passed — the property this plan was written for, observed instead of assumed.
