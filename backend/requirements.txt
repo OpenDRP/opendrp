@@ -414,9 +414,9 @@ fonttools==4.66.1 \
     --hash=sha256:fdf4afd75c643e60ef4a96fe64fc8a9def27d2a542112332371a9e5066885f9a
 
 # --- PDF Generation ----------------------------------------------------------
-fpdf2==2.8.1 \
-    --hash=sha256:02f9e81ea5a0ec723c467de392bc6f4c54ea7859857e6fcee46579bd02bd335f \
-    --hash=sha256:8866161396f942c8f7e3f022c4afb5e671b4d044745d4ed13c5d2ccc16ae5091
+fpdf2==2.8.8 \
+    --hash=sha256:3557a478fc577a929c94aace9666aed4dcc432b5ab6764232e6a59f1ccd75f17 \
+    --hash=sha256:9e94e155e85e8053329a9a1fce8b566fd7a7c5bb79e98a1a3952d379b947c5b9
 
 # SQLAlchemy's asyncio extension imports greenlet at runtime on
 # linux/amd64. pip resolves this lock with `--platform`, which does not
