@@ -137,6 +137,7 @@ limit that a stale `.env` could raise is not a limit.
 | `DNSTWIST_MX_CHECK` | phishing-dnstwist | `false` | the CLI's MX check plus one SPF TXT question, so `mx_without_spf` is answered |
 | `DNSTWIST_CONTENT_INSPECTION` | phishing-dnstwist | `false` | page similarity (`--lsh tlsh`); unavailable without the TLSh module, never `--phash` |
 | `SHODAN_SCAN_*` | phishing-shodan | three on, five off | which provider questions run; the five added later are opt-in per account |
+| `SHODAN_SCAN_HTTP_BODY`, `SHODAN_SCAN_CERT_SUBJECT`, `SHODAN_SCAN_HTML_HASH`, `SHODAN_SCAN_PIVOTS`, `SHODAN_SCAN_HOST_LOOKUP` | phishing-shodan | `false` | the five opt-in provider questions; each also requires `SHODAN_TERMS_ACKNOWLEDGED=true` before it is asked |
 | `max_pages`, `max_broad_results`, `max_pivots`, `max_exclusions` | phishing-shodan | `3`, `1000`, `3`, `15` | pages per query, result size refused as too broad, follow-up pivots per scan, and how many of our own names go into the paid query |
 | `requests_per_minute`, `burst`, `max_aliases_per_domain`, `max_requests_per_scan`, `max_catalogue_entries` | breaches-hibp | `10`, `1`, `200`, `500`, `2000` | the key's pace (a subscription's own `Rpm` can only lower it), the alias expansion and whole-scan budget, and how much of the incident catalogue one sweep stores |
 | `stealer_logs_enabled` | breaches-hibp | `false` | whether the stealer-log pass runs at all; those routes are sold separately and a plan that does not include them is never asked |

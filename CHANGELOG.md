@@ -11,6 +11,17 @@ with it.
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-11-05
+
+### Security
+
+- Updated the shipped dependency locks for four packages: `dnspython`
+  2.6.1 → 2.9.0 (CVE-2026-114605), `fpdf2` 2.8.1 → 2.8.8 (CVE-2026-114609 and
+  CVE-2026-114610), `msgpack` 1.2.1 → 1.2.3 (CVE-2026-114613), and
+  `follow-redirects` 1.16.1 → 1.16.2. The backend and DNS Security connector
+  locks were regenerated with `scripts/lock_requirements.py`, so every pin is
+  resolved for the Python 3.12 image and carries its published hashes.
+
 ## [0.2.2] - 2026-10-25
 
 ### Added

@@ -421,11 +421,11 @@ survives every later sweep:
 
 * `GET /api/v1/dns/certificates` lists certificates with their sightings
   (`foreign_only`, `verdict`, `page`, `size`).
-* `PATCH /api/v1/dns/certificates/sightings/{id}` records a verdict — `candidate`,
+* `PATCH /api/v1/dns/certificates/sightings/{sighting_id}` records a verdict — `candidate`,
   `expected`, `shared_infrastructure`, `confirmed_foreign` or `rejected` — and is
   written to the audit trail as `tls.sighting.<verdict>`.
 * `GET|POST /api/v1/dns/certificate-exceptions` and
-  `DELETE /api/v1/dns/certificate-exceptions/{id}` manage the identities a rule must
+  `DELETE /api/v1/dns/certificate-exceptions/{exception_id}` manage the identities a rule must
   not alert on, matched by `fingerprint`, `spki`, `ip`, `asn` or `issuer`, with a reason
   and an optional end date. An expired exception stops applying on its own rather than
   needing somebody to remember it. Adding and removing one is administrator-only and

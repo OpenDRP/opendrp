@@ -28,9 +28,9 @@ Every connector runs the shared SDK (`connectors/base`) loop:
 2. **Poll for work** (`GET /api/v1/connectors/me/work`) — the core
    atomically hands out one pending scan job (204 when the queue is empty).
 3. **Scan** its external data source (dnstwist binary / Shodan API / HIBP API).
-4. **Submit findings** in batches (`POST /api/v1/connectors/me/findings/{job}`)
+4. **Submit findings** in batches (`POST /api/v1/connectors/me/findings/{job_id}`)
    — the core validates, dedups, enriches, and fans out alerts.
-5. **Report completion** with a JSON summary (`POST /api/v1/connectors/me/complete/{job}`).
+5. **Report completion** with a JSON summary (`POST /api/v1/connectors/me/complete/{job_id}`).
 
 A connector is **stateless**: it holds no DB credentials and cannot write to
 the database directly. Disable it in the UI and it simply stops receiving work.
@@ -78,9 +78,9 @@ connector's row (registration upserts by name).
 {
   "name": "phishing-dnstwist",
   "connector_type": "phishing",
-  "api_version": "0.2.0",
+  "api_version": "0.2.3",
   "protocol_version": 2,
-  "info": {"version": "0.2.0", "python": "3.12.11", "hostname": "…", "platform": "linux"},
+  "info": {"version": "0.2.3", "python": "3.12.11", "hostname": "…", "platform": "linux"},
   "default_job_type": "phishing.dnstwist",
   "finding_kind": "phishing",
   "asset_types": ["domain"],
