@@ -9,7 +9,7 @@ because a route in backticks is not a link any link rule reaches.
 
 Every ``/api/v1/...`` token a reader can see on a page is collected, its path
 parameters normalised (``{asset_id}`` and ``{job_id}`` describe the same slot),
-and compared with the paths ``docs/api.md`` lists. Three things are deliberately
+and compared with the paths ``docs/api.md`` lists. Two things are deliberately
 not findings:
 
 * a token that names only a **namespace** — ``/api/v1/dns``, the prefix of routes
@@ -18,8 +18,10 @@ not findings:
   schema-level test catches a route the application stopped serving;
 * the connector-facing protocol, excluded by the same object the schema-level
   test filters with, because those routes are documented where a connector
-  author looks;
-* ``/api/v1/openapi.json``, which is the schema itself rather than a route in it.
+  author looks.
+
+The schema document itself lives at ``/api/openapi.json``, outside the
+``/api/v1/...`` namespace this scan reads, so it is never collected as a route.
 
 The exceptions live in ``test_api_docs_contract.py`` in one declared list with a
 reason each, and a test here asserts every one of them still occurs in the pages:
