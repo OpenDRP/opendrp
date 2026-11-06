@@ -409,7 +409,7 @@ reads `<placeholder>` as input redirection.
 6. Open the UI at <http://localhost:3000>, sign in with that address and the
    temporary password, and complete the steps the page asks for.
 
-This checkout declares version `0.2.2`, including DNS Security and passive source intelligence. For this local source installation, set `OPENDRP_VERSION=0.2.2` and build the images from the checkout; a version's registry images are published by the release run on its tag, never from a working tree, so pin `OPENDRP_VERSION` to a released version when pulling instead. The setup checks and application reject the moving `latest` tag in production.
+This checkout declares version `0.2.3`, including DNS Security and passive source intelligence. For this local source installation, set `OPENDRP_VERSION=0.2.3` and build the images from the checkout; a version's registry images are published by the release run on its tag, never from a working tree, so pin `OPENDRP_VERSION` to a released version when pulling instead. The setup checks and application reject the moving `latest` tag in production.
 
 The public health endpoint is:
 
@@ -960,7 +960,7 @@ Every instant the UI shows is the stored UTC instant, rendered without the reade
 
 The operator-facing route inventory — every method, path and required role — is in
 **[docs/api.md](docs/api.md)**. That page is the hand-maintained reference;
-`GET /api/v1/openapi.json` (with its UI at `/api/docs`, served outside production)
+`GET /api/openapi.json` (with its UI at `/api/docs`, served outside production)
 is the generated one, and where the two disagree the schema is right.
 
 Two things are worth knowing before you open it:

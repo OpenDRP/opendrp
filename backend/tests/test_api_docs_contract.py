@@ -90,11 +90,6 @@ _PAGE_ROUTE_EXCEPTIONS: Dict[str, str] = {
         _route_path(operation): _CONNECTOR_FACING_REASON
         for operation in _CONNECTOR_FACING
     },
-    "/api/v1/openapi.json": (
-        "the machine-readable schema the page describes: it is the reference "
-        "itself rather than an endpoint in it, and it is served only outside "
-        "production"
-    ),
     **{
         path: (
             "the deprecated DNS Security prefix: the same handlers as "

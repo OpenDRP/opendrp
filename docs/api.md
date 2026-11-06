@@ -118,8 +118,8 @@ The DNS Security routes moved to `/api/v1/dns` when the module was renamed from
 `dns_security`. The previous prefix still answers — a connector or script written
 against it keeps working — but it is kept out of the OpenAPI document, so only the
 `dns` spelling is advertised and there is one route to maintain. The deprecated
-spelling requires exactly what its `/api/v1/dns` counterpart does, for all ten
-paths: `GET /api/v1/dns-security/observations`,
+spelling requires exactly what its `/api/v1/dns` counterpart does, for all nine
+paths (ten operations): `GET /api/v1/dns-security/observations`,
 `POST /api/v1/dns-security/scan`,
 `DELETE /api/v1/dns-security/observations/{observation_id}`,
 `POST /api/v1/dns-security/observations/{observation_id}/asset`,

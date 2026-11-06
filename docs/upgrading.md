@@ -43,7 +43,7 @@ compared with the release.
 An installation pins the release through `OPENDRP_VERSION` in `.env`:
 
 ```dotenv
-OPENDRP_VERSION=0.2.0
+OPENDRP_VERSION=0.2.3
 ```
 
 Left unset, Compose resolves every `opendrp` image to `:latest`. The wizard always
@@ -106,7 +106,7 @@ step that makes the migration a single, unambiguous event.
 ### 2. Set the target version
 
 ```dotenv
-OPENDRP_VERSION=0.2.0
+OPENDRP_VERSION=0.2.3
 ```
 
 ### 3. Start the new images
@@ -118,8 +118,8 @@ docker compose -f docker-compose.yml pull
 ```
 
 A source installation builds the images from the tree instead. This checkout is
-one: 0.2.2 declares its version, and the images a `pull` would fetch for it come
-from the release run on tag `v0.2.2`, so `make up` is what builds and starts the
+one: 0.2.3 declares its version, and the images a `pull` would fetch for it come
+from the release run on tag `v0.2.3`, so `make up` is what builds and starts the
 stack here.
 
 ```bash
