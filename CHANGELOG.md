@@ -11,6 +11,18 @@ with it.
 
 ## [Unreleased]
 
+## [0.2.4] - 2026-11-07
+
+### Added
+
+- The release workflow now starts the images it publishes. A
+  `smoke-published-images` job pulls all eight release images onto a clean
+  runner, fails on any image that carries no registry digest (so the check
+  cannot pass on a local build), raises the stack with `docker compose up -d
+  --wait`, and requires `/api/v1/health` to report the tagged version,
+  `/api/v1/ready` to be ready and the frontend to serve the SPA mount point. The
+  release notes are published only after it passes.
+
 ## [0.2.3] - 2026-11-05
 
 ### Security

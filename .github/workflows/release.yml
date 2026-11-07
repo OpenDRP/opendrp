@@ -5,7 +5,7 @@
 # operator pulling `0.2.0` gets bytes somebody can audit. This workflow is what
 # turns `git tag` into that, rather than into a label on a commit.
 #
-# It runs on `v*` tags and does five things, in order:
+# It runs on `v*` tags and does six things, in order:
 #
 #   1. Verifies the tag against `backend/app/__init__.py`. A tag that disagrees
 #      with the code would publish images whose `/api/v1/health` reports a
@@ -21,7 +21,10 @@
 #   4. Promotes the scanned digest to `<version>` and `latest`. A copy, not a
 #      rebuild: the bytes under the release tags are the bytes the scan read,
 #      attestations included.
-#   5. Publishes the GitHub release with the notes taken from `CHANGELOG.md`, so
+#   5. Pulls the tags it just promoted onto a clean runner, raises the stack from
+#      those images and asserts the API reports the version the tag names. Steps
+#      2-4 prove what the images *are*; only this one proves they *run*.
+#   6. Publishes the GitHub release with the notes taken from `CHANGELOG.md`, so
 #      the curated entry — not a generated commit list — is what a user reads.
 #
 # Steps 2-4 are in that order because they were not. The first v0.2.1 run pushed
@@ -259,9 +262,203 @@ jobs:
             --tag "${IMAGE}:latest" \
             "${IMAGE}@${DIGEST}"
 
+  # Everything above proves what the published images are: built from the tagged
+  # tree, scanned, and copied to the release tags. None of it proves they start.
+  # v0.2.3 was checked by hand on a workstation — `docker compose pull`, then
+  # `up -d --wait`, then `/api/v1/health` answering with its own version — and
+  # that check is what this job makes automatic. It is also a gate on the notes:
+  # `release` waits for it, so a release is not published for images nobody has
+  # seen run.
+  smoke-published-images:
+    name: Start the published images
+    needs: [verify-version, build-and-push]
+    runs-on: ubuntu-latest
+    # Five containers and two datastores on a fresh runner. The manual pass this
+    # replaces reached healthy in about two minutes; the bound is for the step
+    # that stops returning, not for a healthy run.
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      # The images are private: reading them back is the whole exercise, and the
+      # job token can read the packages this same repository pushed.
+      packages: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # The tag, by a ref no branch can shadow, for the same reason the build
+          # job qualifies its own checkout: the smoke has to read the Compose file
+          # the release was built from, not one a branch happens to carry.
+          ref: refs/tags/${{ needs.verify-version.outputs.release_tag }}
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+
+      - name: Name the registry these images were pushed to
+        # `github.repository_owner` keeps the owner's case, and a GHCR path is
+        # lower-case, so the prefix is computed the same way the build job
+        # computes it rather than assumed to be the documented default. Both
+        # values go to `$GITHUB_ENV` so every later step reads them, including
+        # the ones Compose runs.
+        run: |
+          set -euo pipefail
+          prefix="ghcr.io/$(echo '${{ github.repository_owner }}/opendrp' | tr '[:upper:]' '[:lower:]')"
+          echo "OPENDRP_IMAGE_PREFIX=${prefix}" >> "$GITHUB_ENV"
+          # Pinned here, not only in the template: a template edit that stopped
+          # pinning the version must not turn this job into a pull of `latest`,
+          # which is by definition not the artifact the scan approved.
+          echo "OPENDRP_VERSION=${{ needs.verify-version.outputs.version }}" >> "$GITHUB_ENV"
+          echo "smoke: ${prefix} at ${{ needs.verify-version.outputs.version }}"
+
+      - name: Write the installation's configuration
+        # The wizard an operator runs, not a hand-written `.env`: a release whose
+        # wizard produces a configuration the stack rejects fails here as well.
+        run: python3 setup.py --non-interactive --public-url http://127.0.0.1
+
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull every image the release published
+        # Every image the matrix names, including the connectors this job does not
+        # start: a tag that resolves to a missing manifest is a release an
+        # operator cannot install, and `pull` is the cheapest place to find out.
+        run: docker compose pull
+
+      - name: Refuse an image that was built instead of pulled
+        # The smoke has to test the artifact and not the source tree. A locally
+        # built image carries no `RepoDigest` — only a registry can supply one —
+        # so this is what separates "the published image starts" from "an image
+        # with the same name starts". It also catches a name that pulled
+        # successfully while Compose resolved a different one.
+        run: |
+          set -euo pipefail
+          python3 - "${{ needs.verify-version.outputs.version }}" <<'PY'
+          import json, os, subprocess, sys
+
+          version = sys.argv[1]
+          prefix = os.environ["OPENDRP_IMAGE_PREFIX"]
+          images = [
+              "backend",
+              "frontend",
+              "connector-dnstwist",
+              "connector-shodan",
+              "connector-hibp",
+              "connector-dns-security",
+              "connector-intelligence",
+              "connector-exposure-endpoints",
+          ]
+          problems = []
+          for image in images:
+              reference = f"{prefix}/{image}:{version}"
+              inspected = subprocess.run(
+                  ["docker", "image", "inspect", reference],
+                  capture_output=True,
+                  text=True,
+              )
+              if inspected.returncode != 0:
+                  problems.append(f"{reference}: not present on this runner")
+                  continue
+              digests = json.loads(inspected.stdout)[0].get("RepoDigests") or []
+              # A `RepoDigests` entry names the repository without the tag
+              # (`ghcr.io/owner/opendrp/backend@sha256:…`), so comparing it with
+              # the tagged reference reports a pulled image as locally built —
+              # which is how this guard first failed against a real 0.2.3 pull.
+              repository = f"{prefix}/{image}@"
+              if not any(digest.startswith(repository) for digest in digests):
+                  problems.append(
+                      f"{reference}: has no registry digest, so it was built locally "
+                      "rather than pulled"
+                  )
+          if problems:
+              sys.exit("\n".join(problems))
+          print(f"smoke: {len(images)} images carry a registry digest at {version}")
+          PY
+
+      - name: Raise the stack from the published images
+        # `--wait` is the assertion: every service named here has a healthcheck,
+        # and Compose exits non-zero when one of them never reports healthy. The
+        # connector containers are deliberately absent — a connector needs a
+        # core-issued token (`docs/deployment.md` step 6) and the provider ones an
+        # API key, so a fresh installation shows them restarting by design. Their
+        # images are pulled and digest-checked above; what is proven here is that
+        # the images an operator starts on their first run do start.
+        run: >-
+          docker compose up -d --wait --wait-timeout 600
+          postgres redis backend celery-worker celery-worker-alerts celery-beat
+          frontend
+
+      - name: Assert the API reports the version the tag names
+        # The failure this catches is a release whose images were built from a
+        # tree that disagreed with its tag: `/api/v1/health` then names a version
+        # no release note describes. The build job reads the file; this reads the
+        # running artifact.
+        run: |
+          set -euo pipefail
+          python3 - "${{ needs.verify-version.outputs.version }}" <<'PY'
+          import json, sys, urllib.request
+
+          expected = sys.argv[1]
+          with urllib.request.urlopen("http://127.0.0.1:8000/api/v1/health", timeout=30) as response:
+              payload = json.load(response)
+          if payload.get("version") != expected:
+              sys.exit(
+                  f"/api/v1/health reports {payload.get('version')!r} while the tag is "
+                  f"{expected!r}"
+              )
+          print(f"smoke: /api/v1/health reports {expected}")
+          PY
+
+      - name: Assert readiness and the SPA answer
+        # `/ready` is the deeper half of health: it names the dependencies the API
+        # reached, so a stack that is up but cannot see its database or its audit
+        # chain fails here instead of passing on a 200 from `/health`.
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, sys, urllib.request
+
+          with urllib.request.urlopen("http://127.0.0.1:8000/api/v1/ready", timeout=30) as response:
+              ready = json.load(response)
+          if ready.get("status") != "ready" or ready.get("audit_degraded"):
+              sys.exit(f"/api/v1/ready is not ready: {ready}")
+          unhealthy = {
+              name: value
+              for name, value in (ready.get("checks") or {}).items()
+              if value != "ok"
+          }
+          if unhealthy:
+              sys.exit(f"/api/v1/ready names unhealthy dependencies: {unhealthy}")
+
+          with urllib.request.urlopen("http://127.0.0.1:3000/", timeout=30) as response:
+              content_type = response.headers.get("Content-Type", "")
+              body = response.read().decode("utf-8", "replace")
+          if "text/html" not in content_type:
+              sys.exit(f"the frontend answered {content_type!r}, not HTML")
+          if '<div id="root">' not in body:
+              sys.exit("the frontend answered without the SPA mount point")
+          print("smoke: /api/v1/ready is ready and the frontend served the SPA")
+          PY
+
+      - name: Print the stack's logs when a step failed
+        # A failed `up --wait` names the blocked service, never the reason, and a
+        # runner's logs are gone when the job ends. Both halves are printed here.
+        if: failure()
+        run: |
+          docker compose ps
+          docker compose logs --no-color --tail=200
+
+      - name: Tear the stack down
+        if: always()
+        run: docker compose down -v
+
   release:
     name: Publish the release
-    needs: [verify-version, build-and-push]
+    # The notes wait for the smoke: a release note is a claim that these images
+    # work, and the job above is the only one that reads the published artifact
+    # rather than the tree it came from.
+    needs: [verify-version, build-and-push, smoke-published-images]
     runs-on: ubuntu-latest
     permissions:
       contents: write
