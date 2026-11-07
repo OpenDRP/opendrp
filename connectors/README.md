@@ -78,9 +78,9 @@ connector's row (registration upserts by name).
 {
   "name": "phishing-dnstwist",
   "connector_type": "phishing",
-  "api_version": "0.2.3",
+  "api_version": "0.2.4",
   "protocol_version": 2,
-  "info": {"version": "0.2.3", "python": "3.12.11", "hostname": "…", "platform": "linux"},
+  "info": {"version": "0.2.4", "python": "3.12.11", "hostname": "…", "platform": "linux"},
   "default_job_type": "phishing.dnstwist",
   "finding_kind": "phishing",
   "asset_types": ["domain"],

@@ -59,7 +59,7 @@ A useful report contains:
 
 ## Supported versions
 
-The current checkout declares `0.2.3`. The latest published release is the most
+The current checkout declares `0.2.4`. The latest published release is the most
 recent entry in GitHub Releases and the matching GHCR images; a development
 checkout can be ahead of it. `main` is the supported development branch. Fixes
 are published on `main`, and reports against older commits may be answered with
