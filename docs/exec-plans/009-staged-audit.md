@@ -1904,7 +1904,9 @@ row. The map's audit-partition section and the readiness page both state the out
     and no page claims a bound for the rest.
   - *`ci.yml` has no `concurrency` group.* Two pushes to one branch both run a full
     suite; that is a runner cost, not a correctness claim, and it is carried as an
-    open thread rather than filed.
+    open thread rather than filed. Closed 2026-11-07: `push` is `main` only, so a
+    branch with a pull request no longer runs twice, and a `concurrency` group
+    cancels the run a newer push supersedes.
   Verified: both new tests fail before the Makefile change — `assert targets - listed
   == set()` listing exactly the seven targets, and `assert 'BACKEND_PORT' in <the old
   recipe>` — and the file is 7 passed after. The new port resolution was replayed with
