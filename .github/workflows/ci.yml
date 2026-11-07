@@ -1,18 +1,34 @@
 name: CI
 
 on:
-  # Branch pushes and pull requests only. A tag is a release: `release.yml`
+  # `main` pushes and pull requests only. A tag is a release: `release.yml`
   # verifies the tag against the code, builds and scans the images and publishes
   # the notes, and it is the workflow that has to be green before anything is
   # published. Running this suite again on the tag push bought nothing — the same
   # commit had just run it as a branch — and cost a second ~50-minute run beside
   # the release, which is why v0.2.1 had two CI runs in flight at once.
+  #
+  # A branch push bought nothing either, for the same reason one layer over: a
+  # branch that has a pull request ran the suite twice, once for `push` on the
+  # head and once for `pull_request` on the merge commit, and those are the same
+  # tree whenever the pull request is mergeable. Pushing `release/0.2.4` started
+  # both copies within seconds of each other, as every Dependabot branch does.
+  # `main` keeps its push run because a merge there raises no pull-request event.
   push:
-    branches: ['**']
+    branches: [main]
   pull_request:
 
 permissions:
   contents: read
+
+# One run per change, not one per event. A newer push to the same branch, or a
+# new commit on the same pull request (a Dependabot rebase), cancels the run it
+# supersedes instead of running beside it. Keying on the pull request number is
+# what makes the superseded run the same group as its replacement: `github.ref`
+# of a pull request is the merge ref, which changes with every new commit.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   backend:
