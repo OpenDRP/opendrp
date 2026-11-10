@@ -23,6 +23,30 @@ with it.
   `/api/v1/ready` to be ready and the frontend to serve the SPA mount point. The
   release notes are published only after it passes.
 
+### Fixed
+
+- The connector images upgrade their Debian base layer before installing their
+  own packages. All six build `FROM python:3.12-slim`, and the snapshot that
+  image carried at 0.2.4 shipped a `zlib1g` (`1:1.3.dfsg+really1.3.1-1+b1`) with
+  two HIGH findings whose fix was already published as `+deb13u1`. The release
+  workflow fails an image that carries a fixable HIGH, so the first tagged run of
+  0.2.4 stopped at the image scan of every connector while backend and frontend
+  passed — the backend image had upgraded its base layer for exactly this reason
+  and the connectors never did. The upgrade runs before each image installs its
+  own packages, so a pinned package such as `dnstwist=0~20250130-1` is still what
+  apt applies last and a rebuild cannot move it.
+- The release smoke job pulls every image the release publishes, not the six
+  Compose fetches by default. Four of the six connectors sit behind profiles
+  (`shodan`, `hibp`, `netlas`, `netlas-endpoints`, `shodan-endpoints`), and
+  `docker compose pull` skips an inactive profile without saying so: the job
+  fetched six of the eight images, and the digest guard after it — which checks
+  all eight — then reported four images the release had published as missing.
+  The pull now takes its list from `docker compose --profile '*' config
+  --images`, so a new connector is covered by the Compose file alone rather than
+  by a second list in the workflow, and `scripts/check_release_images.py` fails
+  CI if the list the guard reads stops matching the build matrix, so the two
+  copies that failed here cannot drift apart again.
+
 ## [0.2.3] - 2026-11-05
 
 ### Security
