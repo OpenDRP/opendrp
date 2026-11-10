@@ -277,6 +277,14 @@ jobs:
     # replaces reached healthy in about two minutes; the bound is for the step
     # that stops returning, not for a healthy run.
     timeout-minutes: 25
+    env:
+      # The images the release matrix publishes, named once for the whole job: the
+      # pull below and the digest guard after it read this list, so a connector
+      # added to the matrix is one edit here rather than two that can drift. It is
+      # the matrix that is authoritative; this is the copy the job can iterate.
+      RELEASE_IMAGES: >-
+        backend frontend connector-dnstwist connector-shodan connector-hibp
+        connector-dns-security connector-intelligence connector-exposure-endpoints
     permissions:
       contents: read
       # The images are private: reading them back is the whole exercise, and the
@@ -321,10 +329,20 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Pull every image the release published
-        # Every image the matrix names, including the connectors this job does not
-        # start: a tag that resolves to a missing manifest is a release an
-        # operator cannot install, and `pull` is the cheapest place to find out.
-        run: docker compose pull
+        # Pulled by name, not left to `docker compose pull`. Compose only pulls the
+        # services of active profiles, and four of the six connectors sit behind
+        # profiles (`shodan`, `hibp`, `netlas`, `netlas-endpoints`,
+        # `shodan-endpoints`): with no profile enabled it fetched six images of the
+        # eight the matrix publishes, silently, and the guard below then reported
+        # four published images as missing. That is how this job failed on its
+        # first real run, at 0.2.4. Compose still pulls afterwards for the
+        # datastores the stack starts with.
+        run: |
+          set -euo pipefail
+          for image in $RELEASE_IMAGES; do
+            docker pull "${OPENDRP_IMAGE_PREFIX}/${image}:${OPENDRP_VERSION}"
+          done
+          docker compose pull
 
       - name: Refuse an image that was built instead of pulled
         # The smoke has to test the artifact and not the source tree. A locally
@@ -339,16 +357,7 @@ jobs:
 
           version = sys.argv[1]
           prefix = os.environ["OPENDRP_IMAGE_PREFIX"]
-          images = [
-              "backend",
-              "frontend",
-              "connector-dnstwist",
-              "connector-shodan",
-              "connector-hibp",
-              "connector-dns-security",
-              "connector-intelligence",
-              "connector-exposure-endpoints",
-          ]
+          images = os.environ["RELEASE_IMAGES"].split()
           problems = []
           for image in images:
               reference = f"{prefix}/{image}:{version}"
