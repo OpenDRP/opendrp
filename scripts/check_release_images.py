@@ -84,6 +84,51 @@ def _release_matrix(source: str) -> tuple[dict[str, tuple[str, str]], list[str]]
     return entries, failures
 
 
+_FOLDED_SCALAR = {">", ">-", ">+", "|", "|-", "|+"}
+
+
+def _job_block(source: str, job: str) -> list[str]:
+    """The lines of one job, from its `key:` line up to the next job."""
+    block: list[str] = []
+    in_job = False
+    for line in source.splitlines():
+        stripped = line.strip()
+        indent = len(line) - len(line.lstrip())
+        if indent == 2 and stripped.endswith(":") and not stripped.startswith("#"):
+            in_job = stripped[:-1] == job
+            continue
+        if in_job:
+            block.append(line)
+    return block
+
+
+def _job_env_list(block: list[str], key: str) -> tuple[list[str], bool]:
+    """Read a whitespace-separated list from a job's `env:` block."""
+    values: list[str] = []
+    found = False
+    in_env = False
+    collecting = False
+    for line in block:
+        stripped = line.strip()
+        indent = len(line) - len(line.lstrip())
+        if collecting:
+            if stripped and indent > 6 and not stripped.startswith("#"):
+                values.extend(stripped.split())
+                continue
+            collecting = False
+        if indent == 4 and stripped and not stripped.startswith("#"):
+            in_env = stripped == "env:"
+            continue
+        if in_env and indent == 6 and stripped.startswith(f"{key}:"):
+            found = True
+            value = stripped.split(":", 1)[1].strip()
+            if value in _FOLDED_SCALAR:
+                collecting = True
+            else:
+                values = value.split()
+    return values, found
+
+
 def _repo_path(path: str, root: str | Path = ROOT) -> str:
     """Normalize POSIX or Windows paths to repo-relative POSIX form."""
     root_path = str(root)
@@ -214,6 +259,56 @@ def validate_release_coverage(release_source: str, compose_config: dict) -> list
     return failures
 
 
+def validate_published_image_list(release_source: str) -> list[str]:
+    """Fail when the smoke job's image list drifts from the build matrix.
+
+    The smoke job pulls the images it starts by name, and the digest guard after
+    it reads the same list. Both used to keep their own copy of the matrix's
+    images, which is how the job's first real run at 0.2.4 asked the runner for
+    four images nobody had pulled. The matrix stays the authority; this checks
+    that the list the job iterates is exactly the matrix, with nothing missing
+    and nothing invented.
+    """
+    matrix, failures = _release_matrix(release_source)
+    block = _job_block(release_source, "smoke-published-images")
+    if not block:
+        failures.append(
+            "release workflow has no smoke-published-images job, so nothing pulls "
+            "the images the release publishes"
+        )
+        return failures
+    listed, found = _job_env_list(block, "RELEASE_IMAGES")
+    if not found or not listed:
+        failures.append("the smoke job names no images: RELEASE_IMAGES is missing or empty")
+        return failures
+    duplicates = sorted({image for image in listed if listed.count(image) > 1})
+    if duplicates:
+        failures.append("RELEASE_IMAGES repeats images: " + ", ".join(duplicates))
+    unknown = sorted(set(listed) - set(matrix))
+    if unknown:
+        failures.append(
+            "RELEASE_IMAGES names images the build matrix does not produce: "
+            + ", ".join(unknown)
+        )
+    missing = sorted(set(matrix) - set(listed))
+    if missing:
+        failures.append(
+            "RELEASE_IMAGES is missing images the build matrix publishes: "
+            + ", ".join(missing)
+        )
+    uses = [
+        line
+        for line in block
+        if "RELEASE_IMAGES" in line and not line.strip().startswith("RELEASE_IMAGES:")
+    ]
+    if not uses:
+        failures.append(
+            "RELEASE_IMAGES is declared but no step reads it, so the pull is not "
+            "the list this gate checked"
+        )
+    return failures
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("compose_json", type=Path, help="resolved `docker compose config --format json` output")
@@ -225,12 +320,16 @@ def main(argv: list[str] | None = None) -> int:
         print(f"release image gate: FAILED — {exc}")
         return 2
     failures = validate_release_coverage(release, compose)
+    failures += validate_published_image_list(release)
     if failures:
         print("release image gate: FAILED")
         for failure in failures:
             print(f"  {failure}")
         return 1
-    print("release image gate: OK — every resolved Compose image has a matching release build")
+    print(
+        "release image gate: OK — every resolved Compose image has a matching "
+        "release build, and the smoke job pulls exactly that set"
+    )
     return 0
 
 
