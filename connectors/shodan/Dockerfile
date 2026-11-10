@@ -1,5 +1,17 @@
 FROM python:3.12-slim
 
+# The base layer is upgraded, not just the packages this image asks for. The
+# official `python:3.12-slim` carries a Debian trixie snapshot, and its
+# point-release security fixes reach the archive only after Docker rebuilds that
+# image: at 0.2.4 the snapshot shipped a `zlib1g` that Trivy reports as HIGH
+# (CVE-2026-76844, CVE-2026-85091) with a fix already published as `+deb13u1`.
+# The release workflow fails on a fixable HIGH, so nothing ships until this
+# layer moves. `upgrade`, not `dist-upgrade`: only packages the base image
+# already installed are moved, and no new package is added.
+RUN apt-get update \
+    && apt-get upgrade -y --no-install-recommends \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 
 # Shared SDK first (cached layer).
