@@ -11,7 +11,11 @@ RUN pip install --no-cache-dir --require-hashes -r /app/requirements.txt
 # against the system store is the point of the authoritative pass, and `%{certs}`
 # needs curl 7.88 (the worker records its version and refuses to probe on an older
 # build rather than reporting hosts as certificate-less).
+# The base layer is upgraded before the probe's packages are installed; the
+# reason is in `connectors/hibp/Dockerfile`. It keeps whether this image passes
+# the release scan from depending on when Docker last rebuilt the base.
 RUN apt-get update \
+    && apt-get upgrade -y --no-install-recommends \
     && apt-get install -y --no-install-recommends curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 COPY connectors/dns_security/main.py connectors/dns_security/tls_probe.py /app/

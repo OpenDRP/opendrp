@@ -14,7 +14,12 @@ FROM python:3.12-slim
 # for the same domain — a change that would otherwise arrive silently in a rebuild.
 # The pin is a Debian version; a base-image bump whose archive serves another one
 # fails the build rather than the scan.
+# The base layer is upgraded before the pin is installed (reason:
+# `connectors/hibp/Dockerfile`), so the pinned install is the last thing apt
+# does here and the upgrade cannot move dnstwist off the release that
+# `_EXPECTED_DNSTWIST_VERSION` names.
 RUN apt-get update \
+    && apt-get upgrade -y --no-install-recommends \
     && apt-get install -y --no-install-recommends dnstwist=0~20250130-1 python3-dnspython \
     && rm -rf /var/lib/apt/lists/*
 

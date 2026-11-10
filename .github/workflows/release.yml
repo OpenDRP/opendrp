@@ -277,6 +277,14 @@ jobs:
     # replaces reached healthy in about two minutes; the bound is for the step
     # that stops returning, not for a healthy run.
     timeout-minutes: 25
+    env:
+      # The images the release matrix publishes, named once for the whole job: the
+      # pull below and the digest guard after it read this list, so a connector
+      # added to the matrix is one edit here rather than two that can drift. It is
+      # the matrix that is authoritative; this is the copy the job can iterate.
+      RELEASE_IMAGES: >-
+        backend frontend connector-dnstwist connector-shodan connector-hibp
+        connector-dns-security connector-intelligence connector-exposure-endpoints
     permissions:
       contents: read
       # The images are private: reading them back is the whole exercise, and the
@@ -321,10 +329,20 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Pull every image the release published
-        # Every image the matrix names, including the connectors this job does not
-        # start: a tag that resolves to a missing manifest is a release an
-        # operator cannot install, and `pull` is the cheapest place to find out.
-        run: docker compose pull
+        # Compose is the list: `config --images` resolves the image of every
+        # service, and `--profile '*'` turns on the profiles the connectors sit
+        # behind (`shodan`, `hibp`, `netlas`, `netlas-endpoints`,
+        # `shodan-endpoints`). Without that wildcard `docker compose pull` fetched
+        # only the six images of the active profiles and said nothing, and the
+        # guard below reported four published images as missing — how this job
+        # failed on its first real run, at 0.2.4. Reading the set from Compose also
+        # means a new connector is covered by the Compose file alone, rather than
+        # by a second list in this workflow that has to be kept in step.
+        run: |
+          set -euo pipefail
+          docker compose --profile '*' config --images \
+            | sort -u \
+            | xargs -r -n1 docker pull
 
       - name: Refuse an image that was built instead of pulled
         # The smoke has to test the artifact and not the source tree. A locally
@@ -339,16 +357,7 @@ jobs:
 
           version = sys.argv[1]
           prefix = os.environ["OPENDRP_IMAGE_PREFIX"]
-          images = [
-              "backend",
-              "frontend",
-              "connector-dnstwist",
-              "connector-shodan",
-              "connector-hibp",
-              "connector-dns-security",
-              "connector-intelligence",
-              "connector-exposure-endpoints",
-          ]
+          images = os.environ["RELEASE_IMAGES"].split()
           problems = []
           for image in images:
               reference = f"{prefix}/{image}:{version}"

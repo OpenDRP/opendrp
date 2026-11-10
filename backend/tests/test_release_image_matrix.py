@@ -210,3 +210,75 @@ def test_dockerfile_outside_repository_is_reported_from_config() -> None:
     assert any("connector-intelligence" in failure and "context/dockerfile" in failure for failure in failures)
 
 
+def test_smoke_job_pulls_every_image_the_matrix_builds() -> None:
+    assert _GATE.validate_published_image_list(_release()) == []
+
+
+def test_smoke_image_list_missing_a_matrix_image_is_reported() -> None:
+    source = _release().replace(
+        "connector-dnstwist connector-shodan connector-hibp",
+        "connector-dnstwist connector-shodan",
+    )
+
+    failures = _GATE.validate_published_image_list(source)
+
+    assert any("connector-hibp" in failure and "missing" in failure for failure in failures)
+
+
+def test_smoke_image_list_naming_an_unpublished_image_is_reported() -> None:
+    source = _release().replace(
+        "backend frontend connector-dnstwist",
+        "backend frontend connector-otherwise-unpublished",
+    )
+
+    failures = _GATE.validate_published_image_list(source)
+
+    assert any("connector-otherwise-unpublished" in failure for failure in failures)
+
+
+def test_smoke_image_list_repeating_an_image_is_reported() -> None:
+    source = _release().replace(
+        "backend frontend connector-dnstwist",
+        "backend frontend backend connector-dnstwist",
+    )
+
+    failures = _GATE.validate_published_image_list(source)
+
+    assert any("repeats" in failure and "backend" in failure for failure in failures)
+
+
+def test_smoke_job_without_the_shared_list_is_reported() -> None:
+    source = _release().replace("      RELEASE_IMAGES: >-\n", "      SOMETHING_ELSE: >-\n")
+
+    failures = _GATE.validate_published_image_list(source)
+
+    assert any("RELEASE_IMAGES" in failure for failure in failures)
+
+
+def test_smoke_job_whose_list_no_step_reads_is_reported() -> None:
+    source = _release().replace(
+        'images = os.environ["RELEASE_IMAGES"].split()', 'images = ["backend"]'
+    )
+
+    failures = _GATE.validate_published_image_list(source)
+
+    assert any("no step reads it" in failure for failure in failures)
+
+
+def test_smoke_pull_asks_compose_for_every_profile() -> None:
+    """Plain `docker compose pull` skips the profiled connectors, which is the
+    failure this step exists to prevent."""
+    smoke = "\n".join(_GATE._job_block(_release(), "smoke-published-images"))
+
+    assert "--profile '*'" in smoke
+    assert "config --images" in smoke
+
+
+def test_smoke_job_missing_entirely_is_reported() -> None:
+    source = _release().replace("  smoke-published-images:\n", "  start-images:\n")
+
+    failures = _GATE.validate_published_image_list(source)
+
+    assert any("no smoke-published-images job" in failure for failure in failures)
+
+
