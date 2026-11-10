@@ -257,12 +257,21 @@ def test_smoke_job_without_the_shared_list_is_reported() -> None:
 
 def test_smoke_job_whose_list_no_step_reads_is_reported() -> None:
     source = _release().replace(
-        "for image in $RELEASE_IMAGES; do", "for image in backend frontend; do"
-    ).replace('images = os.environ["RELEASE_IMAGES"].split()', 'images = ["backend"]')
+        'images = os.environ["RELEASE_IMAGES"].split()', 'images = ["backend"]'
+    )
 
     failures = _GATE.validate_published_image_list(source)
 
     assert any("no step reads it" in failure for failure in failures)
+
+
+def test_smoke_pull_asks_compose_for_every_profile() -> None:
+    """Plain `docker compose pull` skips the profiled connectors, which is the
+    failure this step exists to prevent."""
+    smoke = "\n".join(_GATE._job_block(_release(), "smoke-published-images"))
+
+    assert "--profile '*'" in smoke
+    assert "config --images" in smoke
 
 
 def test_smoke_job_missing_entirely_is_reported() -> None:

@@ -329,20 +329,20 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Pull every image the release published
-        # Pulled by name, not left to `docker compose pull`. Compose only pulls the
-        # services of active profiles, and four of the six connectors sit behind
-        # profiles (`shodan`, `hibp`, `netlas`, `netlas-endpoints`,
-        # `shodan-endpoints`): with no profile enabled it fetched six images of the
-        # eight the matrix publishes, silently, and the guard below then reported
-        # four published images as missing. That is how this job failed on its
-        # first real run, at 0.2.4. Compose still pulls afterwards for the
-        # datastores the stack starts with.
+        # Compose is the list: `config --images` resolves the image of every
+        # service, and `--profile '*'` turns on the profiles the connectors sit
+        # behind (`shodan`, `hibp`, `netlas`, `netlas-endpoints`,
+        # `shodan-endpoints`). Without that wildcard `docker compose pull` fetched
+        # only the six images of the active profiles and said nothing, and the
+        # guard below reported four published images as missing — how this job
+        # failed on its first real run, at 0.2.4. Reading the set from Compose also
+        # means a new connector is covered by the Compose file alone, rather than
+        # by a second list in this workflow that has to be kept in step.
         run: |
           set -euo pipefail
-          for image in $RELEASE_IMAGES; do
-            docker pull "${OPENDRP_IMAGE_PREFIX}/${image}:${OPENDRP_VERSION}"
-          done
-          docker compose pull
+          docker compose --profile '*' config --images \
+            | sort -u \
+            | xargs -r -n1 docker pull
 
       - name: Refuse an image that was built instead of pulled
         # The smoke has to test the artifact and not the source tree. A locally
