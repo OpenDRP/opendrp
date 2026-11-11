@@ -11,6 +11,18 @@ with it.
 
 ## [Unreleased]
 
+### Fixed
+
+- The MFA QR code can be rendered while an account is being walked through
+  enrolment. `GET /api/v1/auth/mfa/qr` draws the pending secret that
+  `POST /api/v1/auth/mfa/setup` has just written, but the credential-onboarding
+  gate listed only `setup` and `enable` as part of the factor step, so the image
+  the enrolment page requests immediately after `setup` answered 200 was refused
+  with a 403 from the gate — an administrator held on that page by
+  `REQUIRE_MFA_FOR_ADMINS` could only type the secret by hand. The route now
+  belongs to the same step as the two calls it draws from, and a test pins the
+  QR's reachability for an account with a pending factor.
+
 ## [0.2.4] - 2026-11-07
 
 ### Added

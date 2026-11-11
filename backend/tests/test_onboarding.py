@@ -225,6 +225,32 @@ class TestTheGate:
         assert setup.status_code == 200, setup.text
 
     @pytest.mark.anyio
+    async def test_the_factor_step_can_show_the_qr_of_the_secret_it_just_issued(
+        self, client, db_session
+    ):
+        """The QR belongs to the enrolment step rather than behind it.
+
+        The gate allowed `setup` and `enable` and not `qr`, so the image built from
+        the pending secret was refused the moment the enrolment page requested it —
+        an administrator forced into enrolment by the deployment policy could only
+        type the secret by hand. The endpoint itself never refuses with 403 (it
+        answers 409 when nothing is pending), which is why the gate is what this
+        test holds to account.
+        """
+        user = await _user_with_flags(db_session, "qrcode@example.com", mfa=True)
+        headers = _headers(user)
+
+        setup = await client.post(
+            "/api/v1/auth/mfa/setup", json={"password": PASSWORD}, headers=headers
+        )
+        assert setup.status_code == 200, setup.text
+
+        qr = await client.get("/api/v1/auth/mfa/qr", headers=headers)
+        assert qr.status_code == 200, qr.text
+        assert qr.headers["content-type"].startswith("image/svg+xml")
+        assert b"<svg" in qr.content[:500]
+
+    @pytest.mark.anyio
     async def test_the_refusal_is_a_log_line_and_not_an_audit_row(
         self, client, db_session, capsys
     ):
