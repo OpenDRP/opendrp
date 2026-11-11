@@ -43,9 +43,17 @@ _ONBOARDING_ALWAYS_ALLOWED = frozenset(
 # re-check the password: if a temporary password were still in force, the new
 # factor would be bound to the credential its owner is about to replace — and the
 # administrator who chose that password would have been present at the enrolment.
+#
+# The QR belongs to the same step and not to a later one: it renders the pending
+# secret `setup` has just written, which is the artefact the enrolment page shows
+# beside the manual one. Leaving it out refused the image that the page requests
+# immediately after `setup` answered 200 — an administrator forced into enrolment
+# by the deployment policy could only ever type the secret by hand, and the
+# refusal arrived as a 403 from the gate rather than from the endpoint.
 _ONBOARDING_MFA_ALLOWED = frozenset(
     {
         "/api/v1/auth/mfa/setup",
+        "/api/v1/auth/mfa/qr",
         "/api/v1/auth/mfa/enable",
     }
 )
