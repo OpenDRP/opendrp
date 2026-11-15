@@ -1,4 +1,4 @@
-FROM python:3.12-slim
+FROM python:3.15-slim
 
 # The base layer is upgraded, not just the packages this image asks for. The
 # official `python:3.12-slim` carries a Debian trixie snapshot, and its
